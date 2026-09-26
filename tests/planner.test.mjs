@@ -317,7 +317,7 @@ test('a native request launches its validated plan with the session authorizatio
     budget: { maxTokens: 100000, maxSteps: 100, maxWorkers: 2, maxDurationMs: 3600000, maxTasks: 6, maxExperiments: 0 },
     members: [{ key: 'builder', role: 'implementation', maxOutputTokens: 4096 }, { key: 'reviewer', role: 'verification', maxOutputTokens: 2048 }],
     workstreams: [{ key: 'main', title: 'Delivery', objective: 'Complete the change' }],
-    tasks: [{ key: 'code', workstreamKey: 'main', title: 'Code', objective: 'Implement the change', kind: 'implementation', outputs: [], scope: ['src/'], acceptance: ['works'], assigneeKey: 'builder', checks: ['test -d .'], maxRecoveryAttempts: 1, checkTimeoutMs: 1000 }] }
+    tasks: [{ key: 'code', workstreamKey: 'main', title: 'Code', objective: 'Implement the change', kind: 'implementation', outputs: [], scope: ['src/'], acceptance: ['works'], covers: ['c1'], assigneeKey: 'builder', checks: ['test -d .'], maxRecoveryAttempts: 1, checkTimeoutMs: 1000 }] }
   const { mission } = await f.runtime.startPlan({ sessionId: f.agent.id }, request.id, plan, request.planningEpoch)
   assert.equal(mission.status, 'active', 'the validated plan launched')
   assert.deepEqual([mission.workspaceAuthorizationSource, mission.workspaceGrantRoot], ['session', f.root], 'the mission records the request authorization')

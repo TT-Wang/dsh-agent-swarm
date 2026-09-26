@@ -24,7 +24,7 @@ function plan(workspace) {
     members: [{ key: 'builder', name: 'Builder', role: 'implementation', maxOutputTokens: 4096 }, { key: 'reviewer', name: 'Reviewer', role: 'verification', maxOutputTokens: 2048 }],
     workstreams: [{ key: 'main', title: 'Delivery', objective: 'Complete the change' }],
     tasks: [
-      { key: 'deliver', workstreamKey: 'main', title: 'Deliver', objective: 'Implement final change', kind: 'integration', outputs: [], scope: ['src/'], acceptance: ['works'], assigneeKey: 'builder', checks: ['node check.cjs'], maxRecoveryAttempts: 5, checkTimeoutMs: 45000 },
+      { key: 'deliver', workstreamKey: 'main', title: 'Deliver', objective: 'Implement final change', kind: 'integration', outputs: [], scope: ['src/'], acceptance: ['works'], covers: ['c1'], assigneeKey: 'builder', checks: ['node check.cjs'], maxRecoveryAttempts: 5, checkTimeoutMs: 45000 },
       { key: 'review', workstreamKey: 'main', title: 'Review', objective: 'Verify immutable artifact', kind: 'verification', outputs: [], scope: ['src/'], acceptance: ['works'], assigneeKey: 'reviewer', reviewOf: 'deliver', maxRecoveryAttempts: 5 },
     ] }
 }
@@ -145,7 +145,7 @@ test('automatic admission rejects incomplete topology before creating workers or
     input => { input.tasks[0].assigneeKey = undefined },
     // One reviewed implementation is deliverable alone; several implementation branches still need a final integration.
     input => { input.tasks[0].kind = 'implementation'; input.tasks.push({ ...input.tasks[0], key: 'second', title: 'Second' }, { ...input.tasks[1], key: 'second-review', title: 'Second review', reviewOf: 'second' }) },
-    input => { input.acceptance = ['uncovered obligation'] },
+    input => { input.acceptance.push('uncovered obligation') },
     input => { delete input.tasks[0].maxRecoveryAttempts },
     input => { delete input.tasks[0].checkTimeoutMs },
     input => { delete input.members[0].maxOutputTokens },
@@ -173,21 +173,25 @@ test('automatic implementation plans require a final integration dependency and 
   assert.equal(snapshot.mission.status, 'active')
 })
 
-test('missing acceptance diagnostics identify the exact strings and a corrected plan launches', async t => {
-  const f = await fixture(t)
+test('an uncovered criterion is named by id and text, copied text never covers it, and citing its id on the deliverable or on its review launches', async t => {
   const exact = 'Keep the existing response shape, including empty results.'
-  f.input.acceptance.push(exact)
-  f.input.tasks[0].acceptance = ['works', 'Keep compatible responses']
-  const request = f.runtime.requestStart(f.owner, f.requestInput, { grantRoot: f.requestInput.workspace, source: 'session' })
-  await assert.rejects(f.runtime.startPlan(f.owner, request.id, f.input), error => {
-    assert.ok(error.message.includes(JSON.stringify([exact])))
-    assert.match(error.message, /Copy each missing string into the acceptance array/)
-    return true
-  })
-  assert.equal(f.workers.prepared.length, 0)
-  f.input.tasks[0].acceptance.push(exact)
-  const snapshot = await f.runtime.startPlan(f.owner, request.id, f.input)
-  assert.equal(snapshot.mission.status, 'active')
+  for (const cite of [input => input.tasks[0].covers.push('c2'), input => { input.tasks[1].covers = ['c2'] }]) {
+    const f = await fixture(t)
+    f.input.acceptance.push(exact)
+    f.input.tasks[0].acceptance = ['works', exact]
+    const request = f.runtime.requestStart(f.owner, f.requestInput, { grantRoot: f.requestInput.workspace, source: 'session' })
+    await assert.rejects(f.runtime.startPlan(f.owner, request.id, f.input), error => {
+      assert.match(error.message, /^Automatic plan rejected; repair every item/)
+      assert.ok(error.message.includes(`[plan_criterion_uncovered] No deliverable covers c2 ${JSON.stringify(exact)}. Add each id to \`covers\``), error.message)
+      return true
+    })
+    assert.equal(f.workers.prepared.length, 0)
+    cite(f.input)
+    const snapshot = await f.runtime.startPlan(f.owner, request.id, f.input)
+    assert.equal(snapshot.mission.status, 'active')
+    assert.deepEqual(snapshot.tasks.find(task => task.kind === 'integration').covers, ['c1', 'c2'], 'a review\'s covers move onto its source')
+    assert.equal(snapshot.tasks.find(task => task.kind === 'verification').covers, undefined, 'a stored review cites nothing')
+  }
 })
 
 test('failed assembly and retries retain one deterministic plan and worker roster', async t => {

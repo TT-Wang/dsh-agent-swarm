@@ -120,7 +120,7 @@ try {
   owner = undefined
   const task = ctx.swarm.propose(actor, missionId, {
     outputs: [], workstreamId: stream.id, title: 'Deliver value two', kind: 'integration', assigneeId: builder.id,
-    scope: ['value.cjs'], acceptance: ['value.cjs exports 2 and node check.cjs passes'], checks: ['node check.cjs'],
+    scope: ['value.cjs'], acceptance: ['value.cjs exports 2 and node check.cjs passes'], covers: ['c1'], checks: ['node check.cjs'],
     objective: [
       'Change value.cjs to export 2, preserving check.cjs. Work only in your assigned directory. Be concise.',
       'Your assignment message carries your task and attempt IDs; swarm_observe returns the same focused view. Use bash to inspect/change value.cjs and run node check.cjs.',

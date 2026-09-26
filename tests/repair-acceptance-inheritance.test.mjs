@@ -75,7 +75,8 @@ test('a repair of several withdrawn tasks inherits each list in order, de-duplic
 
 test('mission completion coverage sees the criteria a repair inherited', async t => {
   const f = await fixture(t)
-  const original = f.propose({ title: 'Original', acceptance: ['works', 'is documented'] })
+  // The repair cites nothing itself: it answers for the ids its lineage cites.
+  const original = f.propose({ title: 'Original', acceptance: ['works', 'is documented'], covers: ['c1', 'c2'] })
   await f.verdict(original, 'reject')
   const current = () => f.runtime.store.get('missions', f.mission.id)
   assert.match(f.runtime.completionError(current()), /unfinished or blocked/)
@@ -158,7 +159,7 @@ test('a repair that omits outputs inherits every replaced task\'s declaration in
   const both = await call({ title: 'Both', replaces: [lost.id], acceptance: ['works'] })
   assert.equal(both.rendered.note, `Acceptance inherited from ${lost.id} beyond the supplied list: "is documented". Outputs inherited from ${lost.id}: ["src/lost.md"]; explicit outputs on a repair replace this list, and the owner can amend it with swarm_control changes.outputs.`)
   // The schema text says an explicit list replaces the inherited one.
-  assert.match(tool.description, /repair inherits their acceptance and declared outputs, and explicit outputs replace the inherited ones/)
+  assert.match(tool.description, /repair inherits their acceptance, covers and declared outputs, and explicit outputs replace the inherited ones/)
   assert.match(tool.parameters.properties.outputs.description, /On a repair, explicit outputs replace the outputs it would otherwise inherit from every task in replaces\./)
 })
 

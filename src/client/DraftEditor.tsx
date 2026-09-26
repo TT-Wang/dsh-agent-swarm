@@ -30,7 +30,7 @@ export function newPlan(workspace: string, budget: Budget): PlanInput {
     members: [{ key: 'builder', name: 'Builder', role: 'Implement and integrate the mission deliverable.' }, { key: 'reviewer', name: 'Reviewer', role: 'Independently check the immutable artifact against acceptance criteria.' }],
     workstreams: [{ key: 'delivery', title: 'Delivery', objective: 'Deliver and independently verify the mission objective.' }],
     tasks: [
-      { key: 'deliver', workstreamKey: 'delivery', title: 'Deliver the mission', objective: 'Implement the mission objective, run relevant checks, publish evidence, and submit an immutable artifact.', kind: 'integration', scope: ['**'], acceptance: [...acceptance], checks: ['npm test'], assigneeKey: 'builder', dependencies: [] },
+      { key: 'deliver', workstreamKey: 'delivery', title: 'Deliver the mission', objective: 'Implement the mission objective, run relevant checks, publish evidence, and submit an immutable artifact.', kind: 'integration', scope: ['**'], acceptance: [...acceptance], covers: ['c1'], checks: ['npm test'], assigneeKey: 'builder', dependencies: [] },
       { key: 'review', workstreamKey: 'delivery', title: 'Independent verification', objective: 'Check the delivered immutable artifact against the mission acceptance criteria and report evidence.', kind: 'verification', scope: ['**'], acceptance: [...acceptance], assigneeKey: 'reviewer', dependencies: [], reviewOf: 'deliver' },
     ],
   }

@@ -46,7 +46,7 @@ async function fixture(t, { members = ['Author', 'Reviewer'], maxTasks = 100 } =
   const live = source => reviewsOf(source).filter(task => task.status === 'pending' || task.status === 'running')
   const ownerNotices = pattern => runtime.store.list('deliveries', mission.id).filter(delivery => delivery.to === 'owner' && pattern.test(delivery.content))
   const propose = (title, extra = {}) => runtime.propose(owner, mission.id, { outputs: [], workstreamId: stream.id, title, objective: title,
-    kind: 'implementation', scope: ['src/'], acceptance: ['works'], checks: ['test'], assigneeId: m[0].id, ...extra })
+    kind: 'implementation', scope: ['src/'], acceptance: ['works'], covers: ['c1'], checks: ['test'], assigneeId: m[0].id, ...extra })
   const proposeReview = (source, extra = {}) => runtime.propose(owner, mission.id, { outputs: [], workstreamId: stream.id, title: `Review ${source.title}`,
     objective: 'Independent review', kind: 'verification', scope: ['src/'], acceptance: ['works'], checks: [], reviewOf: source.id, ...extra })
   /** Claim and submit `task` as `member`, publishing one host-backed claim first when `claim` is given. */
@@ -83,7 +83,7 @@ test('a rework re-pends its rejecting review, which reviews the resubmission at 
     members: [{ key: 'builder', name: 'Builder', role: 'implementation', maxOutputTokens: 4096 }, { key: 'reviewer', name: 'Reviewer', role: 'verification', maxOutputTokens: 2048 }, { key: 'other', name: 'Other', role: 'research', maxOutputTokens: 2048 }],
     workstreams: [{ key: 'main', title: 'Delivery', objective: 'Complete the change' }],
     tasks: [
-      { key: 'long', workstreamKey: 'main', title: 'Long', objective: 'Audit the module at length', kind: 'research', outputs: [], scope: ['src/'], acceptance: ['works'], assigneeKey: 'other', maxRecoveryAttempts: 2, assignmentMode: 'pinned' },
+      { key: 'long', workstreamKey: 'main', title: 'Long', objective: 'Audit the module at length', kind: 'research', outputs: [], scope: ['src/'], acceptance: ['works'], covers: ['c1'], assigneeKey: 'other', maxRecoveryAttempts: 2, assignmentMode: 'pinned' },
       { key: 'impl', workstreamKey: 'main', title: 'Impl', objective: 'Implement the change', kind: 'implementation', outputs: [], scope: ['src/'], acceptance: ['works'], assigneeKey: 'builder', checks: ['test'], maxRecoveryAttempts: 4, checkTimeoutMs: 45_000 },
     ],
   })

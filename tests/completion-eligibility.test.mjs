@@ -14,13 +14,13 @@ async function fixture(t, acceptance) {
   const put = task => { runtime.store.put('tasks', task); return task }
   return { runtime, owner, mission, put }
 }
-const record = (mission, id, kind, status, acceptance, commit) => ({ id, missionId: mission.id, workstreamId: 'stream', title: id, objective: id, kind, dependencies: [],
-  scope: ['src/'], acceptance, checks: [], status, priority: 50, experiment: false, epoch: 0, evidenceIds: [],
+const record = (mission, id, kind, status, acceptance, commit, covers) => ({ id, missionId: mission.id, workstreamId: 'stream', title: id, objective: id, kind, dependencies: [],
+  scope: ['src/'], acceptance, ...(covers === undefined ? {} : { covers }), checks: [], status, priority: 50, experiment: false, epoch: 0, evidenceIds: [],
   ...(commit === undefined ? {} : { artifact: { commit, baseCommit: 'b'.repeat(40), workspace: '/isolated', changedPaths: [] } }) })
 
 test('a verification task acceptance string cannot cover a mission criterion', async t => {
   const f = await fixture(t, ['works', 'extra'])
-  f.put(record(f.mission, 'deliverable', 'implementation', 'accepted', ['works'], '1'.repeat(40)))
+  f.put(record(f.mission, 'deliverable', 'implementation', 'accepted', ['works'], '1'.repeat(40), ['c1']))
   f.put(record(f.mission, 'review', 'verification', 'accepted', ['works', 'extra']))
   const snapshot = f.runtime.snapshot(f.owner, f.mission.id)
   assert.equal(snapshot.completion.eligible, false)
@@ -30,14 +30,24 @@ test('a verification task acceptance string cannot cover a mission criterion', a
 
 test('completion becomes eligible exactly when control(complete) succeeds', async t => {
   const f = await fixture(t, ['works', 'extra'])
-  f.put(record(f.mission, 'deliverable', 'implementation', 'accepted', ['works'], '1'.repeat(40)))
+  f.put(record(f.mission, 'deliverable', 'implementation', 'accepted', ['works'], '1'.repeat(40), ['c1']))
   f.put(record(f.mission, 'review', 'verification', 'accepted', ['works', 'extra']))
   assert.equal(f.runtime.snapshot(f.owner, f.mission.id).completion.eligible, false)
-  f.put(record(f.mission, 'cover', 'research', 'accepted', ['works', 'extra']))
+  f.put(record(f.mission, 'cover', 'research', 'accepted', ['works', 'extra'], undefined, ['c2']))
   const snapshot = f.runtime.snapshot(f.owner, f.mission.id)
   assert.equal(snapshot.completion.eligible, true)
   assert.equal(snapshot.completion.reason, undefined)
   assert.equal(f.runtime.control(f.owner, f.mission.id, 'complete', 'covered').status, 'completed')
+})
+
+test('a deliverable\'s own acceptance text never covers a mission criterion: only a cited id does, and the reason names the id, its text and the exit', async t => {
+  const f = await fixture(t, ['works', 'extra'])
+  f.put(record(f.mission, 'deliverable', 'implementation', 'accepted', ['works', 'extra'], '1'.repeat(40), ['c1']))
+  const reason = 'Accepted tasks do not cover every mission acceptance criterion: c2 "extra". Propose a deliverable that names them in `covers` with `swarm_propose`; an accepted task cannot gain covers'
+  assert.deepEqual(f.runtime.snapshot(f.owner, f.mission.id).completion, { eligible: false, reason })
+  assert.throws(() => f.runtime.control(f.owner, f.mission.id, 'complete', 'the text is there'), error => error.message === reason)
+  f.put(record(f.mission, 'cover', 'research', 'accepted', [], undefined, ['c2']))
+  assert.deepEqual(f.runtime.snapshot(f.owner, f.mission.id).completion, { eligible: true })
 })
 
 test('unfinished work makes completion ineligible with the same reason the control reports', async t => {

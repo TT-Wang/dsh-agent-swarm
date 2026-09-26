@@ -44,7 +44,7 @@ const stagedPlan = {
   ],
   workstreams: [{ key: 'delivery', title: 'Value delivery', objective: 'Change and independently verify the exported value.' }],
   tasks: [
-    { key: 'implement', workstreamKey: 'delivery', title: 'Deliver value two', objective: 'Change value.cjs to export two and record host evidence.', kind: 'integration', outputs: [], scope: ['value.cjs'], acceptance, checks: ['node check.cjs'], assigneeKey: 'builder' },
+    { key: 'implement', workstreamKey: 'delivery', title: 'Deliver value two', objective: 'Change value.cjs to export two and record host evidence.', kind: 'integration', outputs: [], scope: ['value.cjs'], acceptance, covers: ['c1'], checks: ['node check.cjs'], assigneeKey: 'builder' },
     { key: 'review', workstreamKey: 'delivery', title: 'Independent review', objective: 'Verify the exact submitted artifact using swarm_verify.', kind: 'verification', outputs: [], reviewOf: 'implement', scope: ['value.cjs'], acceptance, assigneeKey: 'reviewer' },
   ],
 }

@@ -238,7 +238,7 @@ test('automatic plan admission adds the independent review a code deliverable la
     budget,
     members: [{ key: 'builder', name: 'Builder', role: 'implementation', maxOutputTokens: 4096 }, { key: 'reviewer', name: 'Reviewer', role: 'verification', maxOutputTokens: 2048 }],
     workstreams: [{ key: 'main', title: 'Delivery', objective: 'Complete the change' }],
-    tasks: [{ key: 'deliver', workstreamKey: 'main', title: 'Deliver', objective: 'Implement final change', kind: 'integration', outputs: [], scope: ['src/'], acceptance: ['works'],
+    tasks: [{ key: 'deliver', workstreamKey: 'main', title: 'Deliver', objective: 'Implement final change', kind: 'integration', outputs: [], scope: ['src/'], acceptance: ['works'], covers: ['c1'],
       assigneeKey: 'builder', checks: ['node check.cjs'], maxRecoveryAttempts: 5, checkTimeoutMs: 45000 }] }
   const synthesized = await runtime.startPlan(owner, request.id, plan)
   assert.equal(synthesized.mission.status, 'active')

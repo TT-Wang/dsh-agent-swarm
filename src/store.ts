@@ -13,7 +13,7 @@ import { mkdirSync, openSync, closeSync, readSync, fsyncSync, readFileSync, unli
 import { dirname, join, basename, resolve } from 'node:path'
 import { createHash, randomUUID } from 'node:crypto'
 import { execFileSync } from 'node:child_process'
-import type { AutoStart, Delivery, DraftPlan, Evidence, Member, Mission, Post, PostKind, SwarmEvent, Task, ToolRun, Workstream } from './types.ts'
+import { criterionId, type AutoStart, type Delivery, type DraftPlan, type Evidence, type Member, type Mission, type PlanTask, type Post, type PostKind, type SwarmEvent, type Task, type ToolRun, type Workstream } from './types.ts'
 import type { AdmissionReason, AdmissionRecord, LimitRule } from './scheduler.ts'
 import { PROGRESS_KINDS, type EventKind } from './events.ts'
 // R17-G7: one derivation for the derived member status; the store never persists it.
@@ -50,8 +50,8 @@ export interface PostFilter {
   newest?: boolean
   limit?: number
 }
-/** v3 adds the append-only `posts` board table; older versions are read-compatible. */
-const SCHEMA_VERSION = 3
+/** v3 adds the append-only `posts` board table; v4 cites mission criteria by id (`citeCriteria`). Older versions are upgraded at open. */
+const SCHEMA_VERSION = 4
 const CHANGE_HISTORY = 1024
 const DEFAULT_BUSY_TIMEOUT_MS = 5000
 const DEFAULT_WRITER_ATTEMPTS = 3
@@ -346,7 +346,7 @@ export class SwarmStore {
       chmodSync(path, 0o600)
       this.db.exec(`PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA busy_timeout=${this.busyTimeoutMs}; PRAGMA wal_autocheckpoint=${WAL_AUTOCHECKPOINT_PAGES}; PRAGMA journal_size_limit=${WAL_JOURNAL_SIZE_LIMIT};`)
       const version = this.db.prepare('PRAGMA user_version').get()?.user_version
-      if (version !== 0 && version !== 1 && version !== 2 && version !== SCHEMA_VERSION) throw new Error(`Unsupported swarm schema ${String(version)}; expected ${SCHEMA_VERSION}`)
+      if (typeof version !== 'number' || version < 0 || version > SCHEMA_VERSION) throw new Error(`Unsupported swarm schema ${String(version)}; expected ${SCHEMA_VERSION}`)
       this.db.exec('BEGIN IMMEDIATE')
       try {
         for (const table of TABLES) {
@@ -361,6 +361,7 @@ export class SwarmStore {
         this.db.exec("CREATE INDEX IF NOT EXISTS events_task_fact ON events(mission_id, type, json_extract(data,'$.taskId'), seq); CREATE INDEX IF NOT EXISTS events_type ON events(mission_id, type, seq);")
         this.db.exec("CREATE INDEX IF NOT EXISTS events_trace_attempt ON events(mission_id, json_extract(data,'$.attemptId'), json_extract(data,'$.step'), seq) WHERE type='trace/span';")
         this.db.exec('CREATE TABLE IF NOT EXISTS state_revision (id INTEGER PRIMARY KEY CHECK (id=1), revision INTEGER NOT NULL); INSERT OR IGNORE INTO state_revision(id,revision) VALUES(1,0); CREATE TABLE IF NOT EXISTS state_changes (revision INTEGER PRIMARY KEY, scopes TEXT NOT NULL);')
+        if (version < SCHEMA_VERSION) this.citeCriteria()
         this.db.exec(`PRAGMA user_version=${SCHEMA_VERSION}; COMMIT`)
       } catch (error) { this.db.exec('ROLLBACK'); throw error }
     } catch (error) {
@@ -450,6 +451,20 @@ export class SwarmStore {
     const result: unknown = JSON.parse(json)
     if (result === null || typeof result !== 'object' || !('id' in result) || typeof result.id !== 'string' || (id !== undefined && result.id !== id)) throw new Error('Corrupt swarm record identity')
     return result as Tables[T]
+  }
+  /**
+   * The v4 upgrade, run once in the opening transaction: no v4 decision reads criterion
+   * text, so a deliverable (or draft plan task) that copied a mission criterion cites its
+   * id in `covers`, keeping the verdict the copy decided, instead of a compatibility
+   * branch reading text. Reviews never covered anything; history stays as recorded.
+   */
+  private citeCriteria(): void {
+    const cite = (task: Task | PlanTask, texts: unknown): void => {
+      const covers = task.kind === 'verification' || !Array.isArray(texts) || !Array.isArray(task.acceptance) ? [] : texts.flatMap((text, index) => task.acceptance.includes(text) ? [criterionId(index)] : [])
+      if (covers.length) task.covers = covers
+    }
+    for (const task of this.list('tasks')) { cite(task, this.get('missions', task.missionId)?.acceptance); this.upsert('tasks', task) }
+    for (const draft of this.list('drafts')) { draft.input.tasks.forEach(task => cite(task, draft.input.acceptance)); this.upsert('drafts', draft) }
   }
   /** Read a mission's records, or all records for host recovery. */
   list<T extends Table>(table: T, missionId?: string): Tables[T][] {
@@ -821,7 +836,7 @@ export class SwarmStore {
       const check = probe.prepare('PRAGMA integrity_check').get() as { integrity_check?: unknown }
       if (check?.integrity_check !== 'ok') throw new StoreRecoveryError('snapshot_invalid', `Snapshot ${snapshotPath} failed integrity_check: ${String(check?.integrity_check)}`, statePath)
       const version = probe.prepare('PRAGMA user_version').get()?.user_version
-      if (version !== 0 && version !== 1 && version !== 2 && version !== SCHEMA_VERSION) throw new StoreRecoveryError('snapshot_invalid', `Snapshot ${snapshotPath} has unsupported schema ${String(version)}; expected ${SCHEMA_VERSION}`, statePath)
+      if (typeof version !== 'number' || version < 0 || version > SCHEMA_VERSION) throw new StoreRecoveryError('snapshot_invalid', `Snapshot ${snapshotPath} has unsupported schema ${String(version)}; expected ${SCHEMA_VERSION}`, statePath)
     } catch (error) {
       if (error instanceof StoreRecoveryError) throw error
       throw new StoreRecoveryError('snapshot_invalid', `Snapshot ${snapshotPath} is not a usable database: ${error instanceof Error ? error.message : String(error)}`, statePath)

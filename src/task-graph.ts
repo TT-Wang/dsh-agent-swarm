@@ -166,6 +166,10 @@ export function taskGraphIndex(tasks: readonly Task[]) {
   return { byId, lineage, effective, identities, dependencyMet, reviewSource, covers, replacementDescendants, liveReplacement, replacedLineage, criteriaOf, checklist }
 }
 
+/** Each mission criterion whose id `covered` lacks, as the id and its quoted text (`c2 "text"`), in mission order. */
+export const uncoveredCriteria = (criteria: readonly string[], covered: ReadonlySet<string>): string[] =>
+  criteria.flatMap((text, index) => covered.has(criterionId(index)) ? [] : [`${criterionId(index)} ${JSON.stringify(text)}`])
+
 /** Reuse only while the indexed task rows remain unchanged within one synchronous read. */
 export type TaskGraphIndex = ReturnType<typeof taskGraphIndex>
 

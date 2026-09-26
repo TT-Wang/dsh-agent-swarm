@@ -297,7 +297,7 @@ try {
   await waitUntil(() => ctx.swarm.snapshot({ sessionId: ownerId }, missionId).tasks.find(task => task.id === implementation.id)?.status === 'accepted', 'implementation and peer-proposed review')
   const integration = (await ownerCall('swarm_propose', {
     missionId, workstreamId: workstream.id, title: 'Integrate value two', objective: 'Integrate the accepted implementation and validate the deliverable.',
-    kind: 'integration', dependencies: [implementation.id], scope: ['value.cjs'], acceptance: ['value is two'], outputs: ['value.cjs'], checks: ['node check.cjs'], assigneeId: builder.id,
+    kind: 'integration', dependencies: [implementation.id], scope: ['value.cjs'], acceptance: ['value is two'], covers: ['c1'], outputs: ['value.cjs'], checks: ['node check.cjs'], assigneeId: builder.id,
   })).result
   await waitUntil(() => ctx.swarm.snapshot({ sessionId: ownerId }, missionId).tasks.find(task => task.id === integration.id)?.status === 'accepted', 'integration and independent verification')
   const completion = await ownerCall('swarm_control', { missionId, action: 'complete', reason: 'The accepted integration artifact meets the mission acceptance criterion.' })
@@ -399,7 +399,7 @@ try {
   workerMode = 'wait'
   const recoveryTask = (await ownerCall('swarm_propose', {
     missionId: recoveryId, workstreamId: recoveryStream.id, title: 'Recover value two', objective: 'Change value.cjs to export two after recovery.',
-    kind: 'implementation', scope: ['value.cjs'], acceptance: ['value is two'], outputs: ['value.cjs'], checks: ['node check.cjs'], assigneeId: recoveryBuilder.id,
+    kind: 'implementation', scope: ['value.cjs'], acceptance: ['value is two'], covers: ['c1'], outputs: ['value.cjs'], checks: ['node check.cjs'], assigneeId: recoveryBuilder.id,
   })).result
   await waitUntil(() => waitingSessions.has(recoveryBuilder.sessionId), 'worker reaches an active real model request')
   const interrupted = ctx.swarm.snapshot({ sessionId: ownerId }, recoveryId).tasks.find(task => task.id === recoveryTask.id)

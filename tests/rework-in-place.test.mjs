@@ -50,7 +50,7 @@ async function fixture(t) {
   const events = type => runtime.store.events(mission.id, 5000).filter(event => event.type === type)
   const tasks = () => runtime.store.list('tasks', mission.id)
   const propose = (title, extra = {}) => runtime.propose(owner, mission.id, { outputs: [], workstreamId: stream.id, title, objective: title,
-    kind: 'implementation', scope: ['src/'], acceptance: ['works'], checks: ['test'], assigneeId: author.id, ...extra })
+    kind: 'implementation', scope: ['src/'], acceptance: ['works'], covers: ['c1'], checks: ['test'], assigneeId: author.id, ...extra })
   /** Claim as the author, publish one host-backed claim when given, and submit. */
   async function submit(task, claim) {
     const claimed = await runtime.claim(actor(author), mission.id, task.id)

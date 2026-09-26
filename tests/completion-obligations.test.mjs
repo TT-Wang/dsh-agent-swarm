@@ -22,7 +22,7 @@ async function fixture(t) {
   const owner = { sessionId: 'report-owner' }
   const common = { workstreamKey: 'audit', scope: ['docs/reviews/'], acceptance, outputs: [], maxRecoveryAttempts: 3 }
   const research = (key, dependencies = []) => ({ ...common, key, title: key, objective: key,
-    kind: 'research', assigneeKey: 'author', dependencies })
+    kind: 'research', covers: ['c1', 'c2'], assigneeKey: 'author', dependencies })
   const review = (key, reviewOf) => ({ ...common, key, title: key, objective: key,
     kind: 'verification', assigneeKey: 'reviewer', reviewOf })
   const request = runtime.requestStart(owner, { commandId: 'review-command', goal: 'Audit and deliver a final report', workspace: directory }, { grantRoot: directory, source: 'session' })

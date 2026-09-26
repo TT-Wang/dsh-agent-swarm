@@ -295,9 +295,10 @@ export async function setup({ workers = new FakeWorkers(), config = {}, budget: 
   // admissions kicked settle, so a scenario starts from a quiescent runtime.
   await runtime.settle(mission.id)
   const actor = member => ({ sessionId: member.sessionId })
+  // A deliverable cites every mission criterion by id; a review cites none.
   const propose = (extra = {}) => runtime.propose(owner, mission.id, {
     outputs: [], workstreamId: stream.id, title: 'Implement', objective: 'Implement the scoped change',
-    kind: 'implementation', scope: ['**'], acceptance, checks, assigneeId: author.id, ...extra,
+    kind: 'implementation', scope: ['**'], acceptance, ...(extra.kind === 'verification' ? {} : { covers: acceptance.map((_, index) => `c${index + 1}`) }), checks, assigneeId: author.id, ...extra,
   })
   const cleanup = async () => { await runtime.dispose(); await rm(dir, { recursive: true, force: true }) }
   return { dir, runtime, workers, owner, mission, stream, author, reviewer, actor, propose, cleanup, clock }

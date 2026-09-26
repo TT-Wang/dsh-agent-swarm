@@ -1,6 +1,6 @@
 /** Pure validation shared by staged browser plans and their launch boundary. */
 import { isAbsolute } from 'node:path'
-import { AdmissionError, assertDeclaredOutputs, assertScopeSelectors, classifyCheck, loadPackageScripts, dependencyAssumptions, formatDiagnostic, normalizeReviewDependencies, normalizeScopeSelectors, normalizeTaskCeilings, requireHostChecks, type AdmissionDiagnostic, type TaskCeilingInput } from './admission.ts'
+import { AdmissionError, assertCovers, assertDeclaredOutputs, assertScopeSelectors, classifyCheck, loadPackageScripts, dependencyAssumptions, formatDiagnostic, normalizeReviewDependencies, normalizeScopeSelectors, normalizeTaskCeilings, requireHostChecks, type AdmissionDiagnostic, type TaskCeilingInput } from './admission.ts'
 import { canOwnReview } from './assignment.ts'
 import type { PolicyErrorCategory } from './policy-error.ts'
 import { nextWorkerName, type CheckSyntaxIssue, type PlanInput, type PlanReviewOverride, type PlanTask } from './types.ts'
@@ -168,6 +168,7 @@ export function validatePlan(value: unknown, options: PlanValidationOptions = {}
       assertScopeSelectors(task.scope as string[], `tasks[${index}].scope`, value.scope as string[])
     })
     inspectAdmission(() => strings(task.acceptance, `${at}.acceptance`))
+    if (task.covers !== undefined) inspectAdmission(() => assertCovers(task.covers, (value.acceptance as string[]).length, `${at}.covers`))
     // A plan states its deliverables: `outputs` is the only record of the files
     // a task writes, so a launched task must carry it. Empty is legal and means
     // "writes no file". Outputs are matched only against a scope of strings: a
@@ -221,6 +222,8 @@ export function validatePlan(value: unknown, options: PlanValidationOptions = {}
         if (source.kind === 'verification') throw new AdmissionError('plan_review_source_invalid', 'tool_error', `${at}.reviewOf cannot name another verification task`, `${at}.reviewOf`)
         // A planned source's only author is its assignee.
         if (task.assigneeKey && !canOwnReview({ assigneeId: source.assigneeKey as string | undefined }, String(task.assigneeKey))) throw new AdmissionError('plan_review_independence_required', 'tool_error', `${at}.assigneeKey must differ from the reviewed source's assignee ${JSON.stringify(source.assigneeKey)}`, `${at}.assigneeKey`)
+        // A review's covers count for its source: they move onto it, so a stored review carries none.
+        if (Array.isArray(task.covers)) { source.covers = [...new Set([...(source.covers as string[] | undefined ?? []), ...task.covers])]; delete task.covers }
       } else if (task.reviewOf !== undefined) throw new AdmissionError('plan_review_not_verification', 'tool_error', `${at}.reviewOf is only valid on verification tasks`, `${at}.reviewOf`)
     })
     if (task.review !== undefined) inspectAdmission(() => reviewOverride(task, `${at}.review`, members, tasks, Number((value.budget as Record<string, unknown>).maxSteps)))
@@ -254,8 +257,8 @@ export function validatePlan(value: unknown, options: PlanValidationOptions = {}
 }
 
 /** Exactly the admitted task fields in one fixed order: a retry compares saved and new plans as JSON. */
-function canonicalTask({ key, workstreamKey, title, objective, kind, scope, acceptance, outputs, checks, maxRecoveryAttempts, maxSteps, maxFindings, ceilingProvenance, checkTimeoutMs, priority, experiment, assigneeKey, assignmentMode, dependencies, reviewOf, review }: PlanTask): PlanTask {
-  return { key, workstreamKey, title, objective, kind, scope, acceptance, outputs, checks, maxRecoveryAttempts, maxSteps, maxFindings, ceilingProvenance, checkTimeoutMs, priority, experiment, assigneeKey, assignmentMode, dependencies, reviewOf,
+function canonicalTask({ key, workstreamKey, title, objective, kind, scope, acceptance, covers, outputs, checks, maxRecoveryAttempts, maxSteps, maxFindings, ceilingProvenance, checkTimeoutMs, priority, experiment, assigneeKey, assignmentMode, dependencies, reviewOf, review }: PlanTask): PlanTask {
+  return { key, workstreamKey, title, objective, kind, scope, acceptance, covers, outputs, checks, maxRecoveryAttempts, maxSteps, maxFindings, ceilingProvenance, checkTimeoutMs, priority, experiment, assigneeKey, assignmentMode, dependencies, reviewOf,
     ...(review === undefined ? {} : { review: JSON.parse(JSON.stringify({ assigneeKey: review.assigneeKey, objective: review.objective, acceptance: review.acceptance, maxSteps: review.maxSteps, maxRecoveryAttempts: review.maxRecoveryAttempts })) as PlanReviewOverride }) }
 }
 

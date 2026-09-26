@@ -266,7 +266,7 @@ test('draft defaults preserve independent verification and line editing', () => 
   assert.equal(input.tasks[0].checks.length > 0, true, 'code task template carries the required host checks')
   input.title = 'Template test'; input.objective = 'Deliver the test objective'
   assert.doesNotThrow(() => validatePlan(input))
-  assert.equal(input.acceptance.every(criterion => input.tasks[0].acceptance.includes(criterion) && input.tasks[1].acceptance.includes(criterion)), true, 'template task acceptance covers the mission contract')
+  assert.deepEqual(input.tasks.map(task => task.covers), [['c1'], undefined], 'the template deliverable cites the template criterion by id; its review cites nothing')
   input.scope = ['src/', '', ' tests/ ']
   assert.deepEqual(cleanPlan(input).scope, ['src/', 'tests/'])
   assert.deepEqual(input.scope, ['src/', '', ' tests/ '], 'normalization does not change an in-progress field')

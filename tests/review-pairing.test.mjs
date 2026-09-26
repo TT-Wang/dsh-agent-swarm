@@ -24,7 +24,7 @@ class PairingWorkers extends FakeWorkers {
 }
 
 const deliverable = extra => ({ key: 'deliver', workstreamKey: 'main', title: 'Deliver', objective: 'Implement the change', kind: 'implementation', outputs: [],
-  scope: ['src/'], acceptance: ['works'], assigneeKey: 'builder', checks: ['node check.cjs'], maxRecoveryAttempts: 4, checkTimeoutMs: 45_000, priority: 70, ...extra })
+  scope: ['src/'], acceptance: ['works'], covers: ['c1'], assigneeKey: 'builder', checks: ['node check.cjs'], maxRecoveryAttempts: 4, checkTimeoutMs: 45_000, priority: 70, ...extra })
 
 function plan(workspace, { tasks = [deliverable()], maxTasks = 12 } = {}) {
   return {
