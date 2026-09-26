@@ -51,13 +51,10 @@ export function boardIndex(tasks: readonly Task[]): BoardIndex {
     // source can no longer become submitted (the runtime calls the latter
     // unschedulable); a pending task assigned to a stopped member has no live
     // owner either way.
-    if (task.reviewOf !== undefined) {
-      const source = reviewSource(task)
-      if (source?.status !== 'submitted') return source !== undefined && alive(source.status) ? 'queued' : 'blocked'
-    }
+    const source = reviewSource(task)
+    if (task.reviewOf !== undefined && source?.status !== 'submitted') return source !== undefined && alive(source.status) ? 'queued' : 'blocked'
     const unmet = blockedDependencies(task)
     if (unmet.length > 0) return unmet.every(id => { const dependency = effective(id); return dependency !== undefined && alive(dependency.status) }) ? 'queued' : 'blocked'
-    const source = task.reviewOf === undefined ? undefined : byId.get(task.reviewOf)
     return members.some(member => member.status !== 'stopped' && canOwnReview(source, member.id)
       && assignmentAllows(task, member.id, reviews.get(task.id) ?? [])) ? 'ready' : 'blocked'
   }
