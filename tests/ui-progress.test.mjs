@@ -303,7 +303,13 @@ test('OWNER PASS 2026-09-11 (second pass, item 5): the focus line states what it
   assert.match(markup, /data-swarm-owner-label="">Waiting for your decision<\/p>/, 'and the projection’s own label')
   assert.match(markup, /data-swarm-owner-note="">A submitted artifact has no live independent review path\.<\/p>/)
   assert.match(markup, /data-swarm-owner-evidence="">task t4 status=submitted without a live review<\/span>/, 'the durable fact behind the phase is printed')
-  assert.match(markup, /data-swarm-decision-content="">Admit an independent review or cancel the submission\./, 'and the decision says what to do about it')
+  // No blocker is recorded for it yet (the review grace), so the decision names none.
+  assert.match(markup, /data-swarm-decision-content="">No live independent review yet\./, 'and the decision invents no exit')
+  // Once the runtime records why no review is live, the decision is that reason, which names its own exit.
+  const blockedReview = uiSnapshot()
+  const reason = 'the mission task budget is exhausted (5/5 admitted tasks), so no verification task can be admitted: raise maxTasks with swarm_budget(budget, reason), or withdraw the source with swarm_cancel(taskId, reason)'
+  blockedReview.events.push({ seq: 40, missionId: blockedReview.mission.id, type: 'task/review-blocked', actor: 'runtime', data: { taskId: 't4', kind: 'implementation', reason }, createdAt: blockedReview.mission.updatedAt })
+  assert.ok(render(SwarmBoard, { snapshot: blockedReview }).includes(`data-swarm-decision-content="">${reason}`), 'the decision is the recorded blocker')
   // A running task is the working phase, with the same derivation available.
   const running = uiSnapshot()
   running.tasks[3] = { ...running.tasks[3], status: 'accepted' }
