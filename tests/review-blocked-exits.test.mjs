@@ -36,6 +36,8 @@ const { definitions } = await toolSchemaIndex()
 const MISSION = { title: 'Review exits', objective: 'Every review-path blocker names an exit that works', scope: ['**'], acceptance: MISSION_ACCEPTANCE }
 const STREAM = { title: 'Exits', objective: 'Exercise each review-path blocker' }
 const memberInput = (name, index) => ({ name, role: index === 0 ? 'implementation' : 'verification', maxOutputTokens: 5_000 })
+/** The allocations the primary agent chooses on a launched mission's proposals (`SwarmRuntime.chosenAllocations`). */
+const CHOSEN = { maxRecoveryAttempts: 2, checkTimeoutMs: 30_000 }
 
 /**
  * A mission with the named members on the fake clock; the first member authors
@@ -71,15 +73,16 @@ async function fixture(t, { members = ['Author', 'Reviewer'], budget: overrides,
   await runtime.settle(mission.id)
   const f = { dir, runtime, workers, budget, clock, owner, mission, stream, author, reviewer, planned }
   const actor = member => ({ sessionId: member.sessionId })
+  // On a launched mission the owner's every proposal carries the allocations the primary agent chooses.
   const propose = (extra = {}) => runtime.propose(owner, mission.id, { outputs: [], workstreamId: stream.id, title: 'Implement', objective: 'Implement the scoped change',
-    kind: 'implementation', scope: ['**'], acceptance: MISSION_ACCEPTANCE, checks: ['test -d .'], assigneeId: author.id, ...extra })
+    kind: 'implementation', scope: ['**'], acceptance: MISSION_ACCEPTANCE, checks: ['test -d .'], assigneeId: author.id, ...(launched ? CHOSEN : {}), ...extra })
   return {
     ...f, actor, propose, tool: await ownerTools(f), refused: [],
     submit: async source => {
       const claimed = await runtime.claim(actor(author), mission.id, source.id)
       await runtime.submit(actor(author), mission.id, { taskId: source.id, attemptId: claimed.attempt.id, output: 'candidate' })
     },
-    /** Unrelated work `member` keeps running, so the host admits no review and the transition classifier names the source. */
+    /** Unrelated work `member` keeps running, so the host admits no review and its admission pass names the running board. */
     run: async member => {
       const running = propose({ title: 'Unrelated work', kind: 'research', checks: [], assigneeId: member.id })
       await runtime.claim(actor(member), mission.id, running.id)
@@ -138,6 +141,9 @@ async function perform(f, source, reason, tool, named) {
     },
     taskId: () => tool === 'swarm_control' ? /^review (\S+) deferred/.exec(reason)[1] : source.id,
     taskBudget: () => ({ checkTimeoutMs: 90_000 }),
+    // The allocations a launched mission's admission requires, when the call names them.
+    maxRecoveryAttempts: () => CHOSEN.maxRecoveryAttempts,
+    checkTimeoutMs: () => CHOSEN.checkTimeoutMs,
     reviewOf: () => source.id,
     replaces: () => [source.id],
     // The corrected command a repair holds.
@@ -229,8 +235,7 @@ const DEFERRAL = {
 async function deferred(f, { running, kind = 'infrastructure' } = {}) {
   const source = f.propose()
   await f.submit(source)
-  const review = f.runtime.propose(f.owner, f.mission.id, { outputs: [], workstreamId: f.stream.id, title: 'Review the source', objective: 'Independently review the scoped change',
-    kind: 'verification', reviewOf: source.id, scope: ['**'], acceptance: MISSION_ACCEPTANCE, assigneeId: f.reviewer.id })
+  const review = f.propose({ title: 'Review the source', objective: 'Independently review the scoped change', kind: 'verification', reviewOf: source.id, checks: undefined, assigneeId: f.reviewer.id })
   const taken = await f.runtime.claim(f.actor(f.reviewer), f.mission.id, review.id)
   f.workers.checks = [DEFERRAL[kind]]
   assert.equal((await f.runtime.verify(f.actor(f.reviewer), f.mission.id, { taskId: review.id, attemptId: taken.attempt.id, verdict: 'accept', reason: 'Review against acceptance' })).status, 'blocked')
@@ -242,6 +247,11 @@ async function deferred(f, { running, kind = 'infrastructure' } = {}) {
 
 const author = f => f.author
 const reviewer = f => f.reviewer
+/** On a launched mission the owner first withdraws the planned deliverable (its paired review goes with it), so the board holds only what `block` adds. */
+const unplanned = block => async f => {
+  await f.tool('swarm_cancel', { taskId: f.planned.id, reason: 'Superseded by the work below' })
+  return block(f)
+}
 const BUDGET = n => new RegExp(`^the mission task budget is exhausted \\(${n}/${n} admitted tasks\\), so no verification task can be admitted: `)
 const NO_MEMBER = /^no live member other than the author \(member_[\w-]+\) can review this artifact independently: add /
 const WITHDRAWN = /^the automatically admitted review task_auto_review_\w+ was withdrawn: /
@@ -290,6 +300,38 @@ const FAMILIES = [
     name: 'the owner withdrew the automatic review',
     block: f => withdrawn(f),
     steps: [[WITHDRAWN, PROPOSE_OR_CANCEL]],
+  },
+  // A launched mission's admission requires the primary agent's allocations,
+  // so each exit that admits a task names them there.
+  {
+    name: 'on a launched mission, the owner withdrew the automatic review',
+    options: { launched: true },
+    block: unplanned(f => withdrawn(f)),
+    steps: [[WITHDRAWN, PROPOSE_OR_CANCEL]],
+  },
+  {
+    name: 'on a launched mission, the automatic review\'s admission is refused',
+    options: { launched: true },
+    block: unplanned(refusedAdmission),
+    steps: [[REFUSED, PROPOSE_OR_CANCEL]],
+  },
+  {
+    name: 'on a launched mission, the rest of the board keeps running',
+    options: { launched: true },
+    block: unplanned(f => submitted(f, { running: reviewer })),
+    steps: [[RUNNING, PROPOSE_OR_CANCEL]],
+  },
+  {
+    name: 'on a launched mission, a review deferred its verdict at a check deadline',
+    options: { launched: true },
+    block: unplanned(f => deferred(f, { kind: 'timeout' })),
+    steps: [[DEFERRED_TIMEOUT, ['swarm_budget', ...REPLACE]]],
+  },
+  {
+    name: 'on a launched mission, a review deferred its verdict on a command that could not run',
+    options: { launched: true },
+    block: unplanned(f => deferred(f, { kind: 'unrunnable' })),
+    steps: [[DEFERRED_UNRUNNABLE, REPLACE]],
   },
   {
     name: 'the owner withdrew the automatic review and no independent member is live',

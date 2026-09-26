@@ -27,7 +27,7 @@ import {
   uncoveredCodeLiterals, formatSite, DELEGATED_MESSAGES,
 } from './refusal-inventory.mjs'
 import { formatDiagnostic } from '../lib/admission.js'
-import { ADMIT_REVIEW, WITHDRAW_SOURCE } from '../lib/notices.js'
+import { WITHDRAW_SOURCE, admitReview } from '../lib/notices.js'
 import { workspaceAuthorizationDiagnostic } from '../lib/authorization.js'
 import { guardTerminal } from '../lib/refusals.js'
 import { constructorArguments, sourceErrorClasses, sourceTree } from './source-semantics.mjs'
@@ -48,8 +48,8 @@ async function inventory() {
   const index = await toolSchemaIndex()
   index.probes = {
     workspaceAuthorizationDiagnostic: () => workspaceAuthorizationDiagnostic('probe', { grants: [], loadedAt: 0, unresolved: [] }),
-    // The declared composer of the missing-review exit must really carry it.
-    reviewPathExit: () => [ADMIT_REVIEW, WITHDRAW_SOURCE].every(exit => callExitViolations(exit, index).length === 0),
+    // The declared composer of the missing-review exit must really carry it, with every allocation a mission's admission may require.
+    reviewPathExit: () => [admitReview([]), admitReview(['maxRecoveryAttempts', 'checkTimeoutMs']), WITHDRAW_SOURCE].every(exit => callExitViolations(exit, index).length === 0),
   }
   const sitesByFile = IN_SCOPE_SOURCES.map(file => refusalSites(read(file), file))
   index.diagnosticProducers = diagnosticProducers(sitesByFile)

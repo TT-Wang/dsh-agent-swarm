@@ -32,15 +32,15 @@ export function unexecutedCheck(command: string, error: unknown): CheckResult {
 }
 
 const RESUME = 'resume the review with swarm_control(action: "resume", taskId, reason)'
-const REPLACE = 'or, if the command itself is wrong, cancel the source with swarm_cancel(taskId, reason) and repair it with swarm_propose(replaces, checks) holding corrected commands'
+const replace = (chosen: readonly string[]) => `or, if the command itself is wrong, cancel the source with swarm_cancel(taskId, reason) and repair it with swarm_propose(${['replaces', 'checks', ...chosen].join(', ')}) holding corrected commands`
 /** The one exit per failure kind classified on the row, an older host's rows included; it names no id and bounds row data, so a deferral has a fixed maximum. */
-const RECOVERY_EXITS: Record<NonNullable<CheckResult['failureKind']>, (check: CheckResult) => string> = {
-  timeout: () => `a check reached its deadline: raise the source's checkTimeoutMs with swarm_budget(taskId, taskBudget: { checkTimeoutMs }, reason), then ${RESUME}; ${REPLACE}`,
+const RECOVERY_EXITS: Record<NonNullable<CheckResult['failureKind']>, (check: CheckResult, repair: string) => string> = {
+  timeout: (_, repair) => `a check reached its deadline: raise the source's checkTimeoutMs with swarm_budget(taskId, taskBudget: { checkTimeoutMs }, reason), then ${RESUME}; ${repair}`,
   infrastructure: () => `the host could not execute a check: repair the host condition its output reports, then ${RESUME}`,
-  unrunnable: ({ environment }) => {
+  unrunnable: ({ environment }, repair) => {
     const links = environment?.dependencyLinks
     const found = links === undefined ? '' : ` (dependency directories ${links.mode === 'copy' ? 'copied' : 'linked'} from the source: ${excerpt(links.materializedPaths?.length ? links.materializedPaths.join(', ') : `none of verificationDependencyDirs ${JSON.stringify(links.dirs)}`, 60)})`
-    return `a command could not run in the clean verification checkout${found}: provide what it needs in the source project or on the host, then ${RESUME}; ${REPLACE}`
+    return `a command could not run in the clean verification checkout${found}: provide what it needs in the source project or on the host, then ${RESUME}; ${repair}`
   },
 }
 
@@ -181,10 +181,10 @@ export class DeclaredChecks {
     return failures.length > 0 && failures.every(check => check.failureKind !== undefined)
   }
 
-  /** A deferred review's exit: its last classified failure's (a pass stops at its first failing check), or resuming when no row has a kind. */
-  recoveryExit(checks: ReadonlyArray<CheckResult>): string {
+  /** A deferred review's exit on `source`: its last classified failure's (a pass stops at its first failing check), the repair naming what the source's mission admits (`SwarmRuntime.chosenAllocations`), or resuming when no row has a kind. */
+  recoveryExit(checks: ReadonlyArray<CheckResult>, source: Task): string {
     const failure = checks.findLast(check => check.failureKind !== undefined)
-    return failure?.failureKind === undefined ? RESUME : RECOVERY_EXITS[failure.failureKind](failure)
+    return failure?.failureKind === undefined ? RESUME : RECOVERY_EXITS[failure.failureKind](failure, replace(this.rt.chosenAllocations(source.missionId, source)))
   }
 
   /**
