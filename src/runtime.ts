@@ -2469,8 +2469,7 @@ export class SwarmRuntime {
     // S5: a durable `task/review-missing` row newer than the row that opened the need is the gate.
     if ((this.store.latestTaskEvent(mission.id, source.id, 'task/review-missing')?.seq ?? 0) > need.seq) return false
     const reason = this.missingReviewPath(source) ?? `no live independent verification task reviews this submitted ${source.kind} artifact`
-    const submissionSeq = this.store.latestTaskEvent(mission.id, source.id, 'task/submitted')?.seq ?? 0
-    this.commit(mission.id, () => this.store.event(mission.id, 'task/review-missing', 'runtime', { taskId: source.id, kind: source.kind, submissionSeq, reason }))
+    this.commit(mission.id, () => this.store.event(mission.id, 'task/review-missing', 'runtime', { taskId: source.id, kind: source.kind, reason }))
     return true
   }
   /**
