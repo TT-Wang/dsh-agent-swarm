@@ -226,9 +226,13 @@ about one run in ten under load, was its intermittent failure (`f8f45c0`).
   the review need, `latestTaskEvent` or `challenge()` passed 273/273 (`tests/rework-review.test.mjs` also 20/20 in
   each of two concurrent copies over three rounds). On 0.1.7-rc.1 only typecheck, the fault suite (24/24 in two
   runs), F18 (8/8) and `tests/rework-review.test.mjs` with `tests/review-path.test.mjs` (29/29) ran.
-- Not run at `c65f7f1`: the full `node --test` suite and `test:pack`/`test:profile`/`test:bundle` on either host, and
-  the build, `test:harness`, `test:replay` and both web smokes on 0.1.7-rc.1. The integrator commits `a65f837`,
-  `bb242d9`, `cb331ca` and `27fa353` have had no independent review.
+- Final gate at `33ea76f` (after `0ff86e2`). On 0.1.7-rc.1: build, `node --test` 1577/1577, `test:harness`,
+  `test:replay` (digest unchanged), `test:pack`, `test:profile`, `test:bundle`, the fault suite 24/24, `test:web`
+  (13 checks) and `test:command-web` (10 checks) passed. On 0.1.5-rc.3 the same gates passed except `node --test`,
+  which ran during a host load spike (57 minutes instead of about 3) and failed 16 of 1577 on time bounds (7 host git
+  deadlines of 300 s, worker startup and stop deadlines, and lease expiries); the 13 files holding them passed
+  157/157 when rerun on a quiet host. The integrator commits (`a65f837`, the resolutions in `bb242d9` and `cb331ca`,
+  `27fa353`) were checked by the final skeptic round, which found no medium or high defect in them.
 
 **What the review got wrong.** M-15 (a rejected native dispose leaks the worker handle, so stop and unload should
 retry it) was implemented in `213e630` and reverted in `d36efd8`. On both supported hosts the handle's dispose is
