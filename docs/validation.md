@@ -18,7 +18,7 @@ without the claim argument the authorization branch made required. `19dbc30` fix
 11/11 three times on 0.1.5-rc.3 and once on 0.1.7-rc.1. Every other gate passed on both hosts (table below). Six
 repair commits followed (`832b4a3` to `95318c0`); each fix is recorded below with its own regression (`b7f78f2` is a
 refactor covered by the existing `tests/authorized-workspace.test.mjs` cases), and the gate figures are those of
-`27fa353` and `19dbc30`. A second repair series (`dc5d0f6` to `c65f7f1`, 2026-09-26) has its own gate record below.
+`27fa353` and `19dbc30`. A second repair series (`dc5d0f6` to `0ff86e2`, 2026-09-25 to 2026-09-26) has its own gate record below.
 `src` net against `75b765a`: −464 lines (+649/−1113) at `19dbc30`, −478 (+664/−1142) at `95318c0`, where the
 behavioral suite has 1571 tests, −482 (+682/−1164) at `8b97e07`, and −497 (+749/−1246) at `c65f7f1`, where it has
 1577.
@@ -148,7 +148,7 @@ about one run in ten under load, was its intermittent failure (`f8f45c0`).
   reload); a mission-wide key stayed held after the root was restored, so a later revocation reached no one (`A
   revocation after the root was restored wakes the owner again`).
 
-**Second repair series** (`dc5d0f6` to `c65f7f1`, 2026-09-26).
+**Second repair series** (`dc5d0f6` to `0ff86e2`, 2026-09-25 to 2026-09-26).
 
 - `dc5d0f6`: a challenge that re-opens an automatically reviewed source (accepted back to submitted, or a running
   automatic review invalidated on a submitted source) gets a fresh automatic review for the re-opened need, as a
@@ -189,8 +189,9 @@ about one run in ten under load, was its intermittent failure (`f8f45c0`).
   Since `db41b05` that dispatch awaits an on-disk re-validation, so the read saw `pending` in about half the runs on
   both hosts; the scenario now waits until the task is running (interleaved on 0.1.5-rc.3, the old scenario failed
   4/8 and the new one passed 8/8; 8/8 on 0.1.7-rc.1).
-- `c65f7f1`: a review need re-opens only when a challenge takes a review away. `dc5d0f6` and `dff54b2` keyed the
-  need on one token per challenge of the source's claims and dated it from the newest `evidence/challenged` row, so
+- `c65f7f1`: a review need re-opens only when a challenge takes a review away. `dc5d0f6` keyed the automatic review,
+  and `dff54b2` every missing-review fact, on one token per challenge of the source's claims, and `dff54b2` dated the
+  need from the newest `evidence/challenged` row, so
   each challenge of an unreviewed submission minted a new need (another identical owner decision and
   `task/review-missing` row, and a restarted grace), and a challenge while the automatic review was still pending
   moved the need off that live review, so a second automatic review was admitted if that one later blocked. The need
@@ -201,6 +202,16 @@ about one run in ten under load, was its intermittent failure (`f8f45c0`).
   `SwarmStore.latestTaskEvent` is keyed by task id only again (`dff54b2` had replaced its unused `reviewOf` key with
   an `evidenceId` key only the challenge lookup used) (`a challenge that takes no review away leaves the review need
   as it was` in `tests/rework-review.test.mjs`).
+- `0ff86e2`: a review-blocked decision has one emitter and one identity. The runtime's review admission keyed each
+  decision on the review need, but the transition classifier emitted its own multi-subject review-blocked decision
+  keyed on `subject@epoch`, and relevance and reminders judged either kind per source (submitted and unreviewable).
+  A re-opened need therefore revived the previous need's decision beside the new one, and the owner was reminded of
+  both. The classifier now names each unreviewable source through `notifyReviewBlocked` under its current need,
+  `reviewBlockedKey` builds the key once, and `openReviewBlock` (the counterpart of `openStallRoot`) is the one test
+  relevance and reminders use, so a re-opened need retires the old decision. The classifier's body now carries the
+  `review_path_missing` code like every other review-blocked decision; the model-visible snapshot and the replay digest
+  are unchanged (`a re-opened need blocked for the reason an earlier need was blocked wakes the owner again` now also
+  pins that the earlier decision is irrelevant and never reminded; it fails before `0ff86e2`).
 
 **Gate for the second series.**
 
