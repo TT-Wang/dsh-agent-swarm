@@ -502,6 +502,20 @@ test('two sources share the last task slot: the first gets the host review, the 
   assert.deepEqual(f.reviewsOf(second), [])
 })
 
+test('two sources on a board with nothing else to do and a free task slot each: one pass admits both host reviews and names no blocker', async t => {
+  const f = await fixture(t)
+  const first = f.propose(), second = f.propose({ title: 'Implement the rest' })
+  await f.submit(first)
+  await f.submit(second)
+  await f.pass()
+  // The pass judges the stall once, as it found the board: the first admission does not make the second source's board a running one.
+  for (const source of [first, second]) {
+    assert.match(f.reviewsOf(source).map(review => review.id).join(), /^task_auto_review_\w+$/, `the host admitted a review of ${source.title}`)
+    assert.deepEqual(events(f.runtime, f.mission.id, 'task/review-blocked').filter(event => event.data.taskId === source.id).map(event => event.data.reason), [], `no blocker is recorded for ${source.title}`)
+    assert.deepEqual(f.runtime.store.list('deliveries', f.mission.id).filter(delivery => delivery.notice?.dedupKey?.startsWith(`review-blocked:${f.mission.id}:${source.id}:`)).map(delivery => delivery.content), [], `no decision names ${source.title}`)
+  }
+})
+
 for (const family of FAMILIES) {
   test(`${family.name}: each decision names its own exits, and performing them reaches a live review`, async t => {
     const f = await fixture(t, family.options)
