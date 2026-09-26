@@ -95,7 +95,7 @@ export async function loadWorkspaceGrants(configured: readonly WorkspaceGrant[] 
     if (grant.expiresAt !== undefined && grant.expiresAt <= now) { unresolved.push(`${grant.path} (expired)`); continue }
     grants.push({ path: canonical, ...(grant.note === undefined ? {} : { note: grant.note }), ...(grant.expiresAt === undefined ? {} : { expiresAt: grant.expiresAt }) })
   }
-  return { grants, loadedAt: now, unresolved }
+  return { grants, unresolved }
 }
 
 /**
