@@ -2448,19 +2448,20 @@ export class SwarmRuntime {
   /**
    * F2: the review need of one submitted source, the one identity every
    * missing-review fact is keyed on. The need is the submission (the epoch
-   * fences every resubmission, even of an unchanged commit) and each challenge
-   * of its claims, which re-opens it. `id` keys its automatic review and its
-   * blocker decisions; `seq` and `age` are those of the newest durable row that
-   * opened it (the `task/submitted` row, or a later `evidence/challenged` row of
-   * one of its claims), from which its grace, its missing-review record and an
-   * owner withdrawal are dated. S5: derived from the log and the evidence rows,
-   * so a restart or a lost cache re-derives the same need.
+   * fences every resubmission, even of an unchanged commit) and each review of
+   * it a challenge took away (the one that accepted it or one in progress: its
+   * `task/invalidated` row), which re-opens it. `id` keys its automatic review
+   * and its blocker decisions; `seq` and `age` are those of the newest row that
+   * opened it, from which its grace, its missing-review record and an owner
+   * withdrawal are dated. S5: derived from the log, so a restart or a lost
+   * cache re-derives the same need.
    */
   reviewNeed(source: Task): ReviewNeed {
-    const challenged = source.evidenceIds.flatMap(evidenceId => this.store.get('evidence', evidenceId)?.challenges.map(() => evidenceId) ?? [])
-    const opened = [...new Set(challenged)].map(evidenceId => this.store.latestTaskEvent(source.missionId, evidenceId, 'evidence/challenged', 'evidenceId'))
-      .reduce((newest, row) => row !== undefined && row.seq > (newest?.seq ?? 0) ? row : newest, this.store.latestTaskEvent(source.missionId, source.id, 'task/submitted'))
-    return { id: createHash('sha256').update([source.missionId, source.id, source.epoch, source.artifact?.commit ?? '', ...challenged].join(':')).digest('hex').slice(0, 32),
+    const submitted = this.store.latestTaskEvent(source.missionId, source.id, 'task/submitted')
+    const reopened = this.store.list('tasks', source.missionId).filter(review => review.reviewOf === source.id)
+      .flatMap(review => this.store.latestTaskEvent(source.missionId, review.id, 'task/invalidated') ?? []).filter(row => row.seq > (submitted?.seq ?? 0)).sort((a, b) => a.seq - b.seq)
+    const opened = reopened.at(-1) ?? submitted
+    return { id: createHash('sha256').update([source.missionId, source.id, source.epoch, source.artifact?.commit ?? '', ...reopened.map(row => row.seq)].join(':')).digest('hex').slice(0, 32),
       seq: opened?.seq ?? 0, age: opened === undefined ? undefined : Math.max(0, this.now() - opened.createdAt) }
   }
   /** Record the missing review once per review need; false when it is already recorded. */

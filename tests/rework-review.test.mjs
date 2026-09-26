@@ -336,6 +336,37 @@ test('a re-opened need blocked for the reason an earlier need was blocked wakes 
   assert.match(decisions()[1].content, /no live member other than the author/)
 })
 
+/**
+ * Only a challenge that takes a review away from the source re-opens its need:
+ * one that invalidates the review that accepted it or a review in progress. A
+ * challenge of a submission nobody reviews, or one whose review is still
+ * pending, leaves the need, its grace, its record and its decision as they were.
+ */
+test('a challenge that takes no review away leaves the review need as it was', async t => {
+  const f = await fixture(t, { members: ['Author'] })
+  const [author] = f.m
+  const decisions = () => f.runtime.store.list('deliveries', f.mission.id).filter(delivery => delivery.to === 'owner' && delivery.notice?.dedupKey?.startsWith('review-blocked:'))
+  const source = f.propose('Implement')
+  const claim = await f.submit(author, source, 'The change meets the criterion')
+  await f.pastReviewGrace(2)
+  const { id, seq } = f.runtime.reviewNeed(f.current(source))
+  for (const reason of ['A counterexample overturns the claim', 'A second counterexample']) {
+    f.runtime.challenge(f.owner, f.mission.id, { evidenceId: claim.id, reason, toolRunIds: [] })
+    const need = f.runtime.reviewNeed(f.current(source))
+    assert.deepEqual([need.id, need.seq], [id, seq], 'a challenge of an unreviewed submission re-opens nothing')
+    await f.pastReviewGrace(2)
+  }
+  assert.equal(decisions().length, 1, 'the owner is told once for the one need')
+  assert.equal(f.events('task/review-missing').length, 1, 'the one need records its missing review once')
+  await f.runtime.addMember(f.owner, f.mission.id, { name: 'Reviewer', role: 'implementation' })
+  await f.pastReviewGrace()
+  const [automatic] = f.live(source)
+  assert.equal(automatic.status, 'pending')
+  f.runtime.challenge(f.owner, f.mission.id, { evidenceId: claim.id, reason: 'A third counterexample', toolRunIds: [] })
+  assert.equal(f.current(automatic).status, 'pending', 'a pending review is not taken away')
+  assert.equal(`task_auto_review_${f.runtime.reviewNeed(f.current(source)).id}`, automatic.id, 'the pending automatic review is still the need\'s review')
+})
+
 test('a real unchanged resubmission is re-reviewed by the automatic review that rejected it', async t => {
   const repo = await makeRepo('rework-review-real')
   const workspaces = makeWorkspaces(repo.root)
