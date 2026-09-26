@@ -217,21 +217,48 @@ test('a stored span row whose id is not a string is judged like any malformed ro
   assert.deepEqual(recorder.spansFor('m').map(row => row.step), ['swarm_create', 'swarm_launch', 'swarm_workstream'])
 })
 
+/** A recorder over `rows`, all inside its span window. */
+const windowed = rows => new TraceRecorder({ events: () => rows, event() {}, transaction: body => body() })
+/** A recorder over `before` and `after` around more rows of another attempt than the window holds, so parent lookup reads the durable rows by scope. */
+function beyondWindow(before, after = []) {
+  const filler = { type: 'trace/span', data: { spanId: 'fedcba9876543210', attemptId: 'other', step: 'swarm_publish' } }
+  const rows = [...before, ...Array.from({ length: 20_001 }, () => filler), ...after]
+  const traceEvents = (_missionId, limit, filter = {}) => rows.filter(row => Object.entries(filter).every(([key, value]) => row.data[key] === value)).slice(-limit)
+  const recorder = new TraceRecorder({ events: () => [], traceEvents, event() {}, transaction: body => body() })
+  assert.equal(recorder.windowFor('m').truncated, true)
+  return recorder
+}
+const call = scope => () => ({ missionId: 'm', actor: 'worker', ...scope, input: {}, output: {}, status: 'ok', startedAt: 0, durationMs: 0 })
+
 test('an attempt whose stored claim row has no string id gives its next span no parent, in the window and beyond it', () => {
   // The attempt's claim is its scoped parent; a valid publish of the same
   // attempt is only the fallback when no claim row exists.
   const claim = { type: 'trace/span', data: { attemptId: 'a', step: 'swarm_claim' } }
   const publish = { type: 'trace/span', data: { spanId: '0123456789abcdef', attemptId: 'a', step: 'swarm_publish' } }
-  const submit = () => ({ missionId: 'm', actor: 'worker', attemptId: 'a', input: {}, output: {}, status: 'ok', startedAt: 0, durationMs: 0 })
-  const windowed = new TraceRecorder({ events: () => [claim, publish], event() {}, transaction: body => body() })
-  assert.equal(windowed.record('swarm_submit', submit).parentSpanId, undefined, 'the indexed claim row is the parent, and it has no valid id')
-  // Beyond the window, parent lookup reads the durable rows by scope.
-  const filler = { type: 'trace/span', data: { spanId: 'fedcba9876543210', attemptId: 'other', step: 'swarm_publish' } }
-  const rows = [...Array.from({ length: 20_001 }, () => filler), claim, publish]
-  const traceEvents = (_missionId, limit, filter = {}) => rows.filter(row => Object.entries(filter).every(([key, value]) => row.data[key] === value)).slice(-limit)
-  const beyond = new TraceRecorder({ events: () => [], traceEvents, event() {}, transaction: body => body() })
-  assert.equal(beyond.windowFor('m').truncated, true)
-  assert.equal(beyond.record('swarm_submit', submit).parentSpanId, undefined, 'the durable claim row is the parent, and it has no valid id')
+  const submit = call({ attemptId: 'a' })
+  assert.equal(windowed([claim, publish]).record('swarm_submit', submit).parentSpanId, undefined, 'the indexed claim row is the parent, and it has no valid id')
+  assert.equal(beyondWindow([], [claim, publish]).record('swarm_submit', submit).parentSpanId, undefined, 'the durable claim row is the parent, and it has no valid id')
+})
+
+test('a new proposal whose newest mission-level row has no string id gets no parent, in the window and beyond it', () => {
+  // A proposal joins the newest mission-level setup span; an older valid
+  // setup row is not a fallback for it.
+  const create = { type: 'trace/span', data: { spanId: '0123456789abcdef', step: 'swarm_create' } }
+  const launch = { type: 'trace/span', data: { step: 'swarm_launch' } }
+  const propose = call({ taskId: 'new' })
+  assert.equal(windowed([create, launch]).record('swarm_propose', propose).parentSpanId, undefined, 'the indexed launch row is the parent, and it has no valid id')
+  // Beyond the window no setup row is indexed; the durable lookup reads it by step.
+  assert.equal(beyondWindow([create, launch]).record('swarm_propose', propose).parentSpanId, undefined, 'the durable launch row is the parent, and it has no valid id')
+})
+
+test('a verdict whose reviewed submission row has no string id gets no parent, in the window and beyond it', () => {
+  // A verdict joins the reviewed task's submission; a later valid row of that
+  // task is only the fallback when no submission row exists.
+  const submit = { type: 'trace/span', data: { taskId: 't', attemptId: 'a', step: 'swarm_submit' } }
+  const challenge = { type: 'trace/span', data: { spanId: '0123456789abcdef', taskId: 't', step: 'swarm_challenge' } }
+  const verify = call({ taskId: 'review', reviewOfTaskId: 't' })
+  assert.equal(windowed([submit, challenge]).record('swarm_verify', verify).parentSpanId, undefined, 'the indexed submission row is the parent, and it has no valid id')
+  assert.equal(beyondWindow([submit, challenge]).record('swarm_verify', verify).parentSpanId, undefined, 'the durable submission row is the parent, and it has no valid id')
 })
 
 test('an agent without an id is refused at the session guard, so a span actor is never empty', async t => {
