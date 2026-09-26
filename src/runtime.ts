@@ -2421,24 +2421,22 @@ export class SwarmRuntime {
    * silently parked. After a grace period (one scheduler period, floor 1s) the
    * runtime records the missing review durably; each pass then admits a
    * bounded independent verification or names the source's current blocker,
-   * judging every source on the board as the pass found it. The grace keeps
-   * the runtime from racing a review the author is proposing in the same turn
-   * and keeps the durable log free of redundant events.
+   * the stall judged once as the pass found the board, each source's own causes
+   * after the earlier sources' admissions. The grace keeps the runtime from racing a
+   * review the author is proposing in the same turn and keeps the durable log free of redundant events.
    */
   private admitMissingReviews(mission: Mission): void {
     const tasks = this.store.list('tasks', mission.id)
     const members = this.store.list('members', mission.id)
     const grace = Math.max(this.config.tickMs, AUTO_REVIEW_GRACE_MS)
-    const judged: Array<[Task, ReviewNeed, string | undefined]> = []
+    const stalled = this.reviewPathStalled(tasks, members)
     for (const source of tasks) {
       if (source.status !== 'submitted' || source.artifact === undefined) continue
       if (this.reviewable(source, tasks, members)) continue
       const need = this.reviewNeed(source)
       if (need.age !== undefined && need.age < grace) continue
       this.reportMissingReview(mission, source, need)
-      judged.push([source, need, this.reviewPathBlocker(source, need)])
-    }
-    for (const [source, need, blocked] of judged) {
+      const blocked = this.reviewPathBlocker(source, need, stalled)
       if (blocked !== undefined) this.notifyReviewBlocked(mission, source, need, blocked)
       else this.admitAutomaticReview(mission, source, need)
     }
@@ -2477,11 +2475,11 @@ export class SwarmRuntime {
    * admits one now. A review the owner admits needs a task slot and an
    * independent member, so the owner's withdrawal of the automatic review is
    * named after those, and the host's own waits for a board with nothing else
-   * to do. That withdrawal is the automatic review (host-minted id) with a
-   * durable `task/cancelled` row newer than the row that opened the need; a
-   * review a verdict, rework or challenge retired was never cancelled by the owner.
+   * to do (`stalled`, as the admission pass judged it). That withdrawal is the automatic
+   * review (host-minted id) with a durable `task/cancelled` row newer than the row that
+   * opened the need; a review a verdict, rework or challenge retired was never cancelled by the owner.
    */
-  reviewPathBlocker(source: Task, need: ReviewNeed): string | undefined {
+  reviewPathBlocker(source: Task, need: ReviewNeed, stalled?: boolean): string | undefined {
     const mission = this.mission(source.missionId)
     const tasks = this.store.list('tasks', mission.id), members = this.store.list('members', mission.id)
     const deferred = tasks.find(task => task.status === 'blocked' && task.reviewOf === source.id && task.verificationRecovery !== undefined && task.verificationRecovery.commit === source.artifact?.commit)
@@ -2492,7 +2490,7 @@ export class SwarmRuntime {
     const withdrawn = tasks.find(review => review.reviewOf === source.id && review.status === 'cancelled'
       && review.id.startsWith(AUTOMATIC_REVIEW_PREFIX) && (this.store.latestTaskEvent(mission.id, review.id, 'task/cancelled')?.seq ?? 0) > need.seq)
     if (withdrawn !== undefined) return `the automatically admitted review ${withdrawn.id} was withdrawn: ${ADMIT_REVIEW}, or ${WITHDRAW_SOURCE}`
-    return this.reviewPathStalled(tasks, members) ? undefined : BOARD_RUNNING
+    return (stalled ?? this.reviewPathStalled(tasks, members)) ? undefined : BOARD_RUNNING
   }
   /** Admit the bounded independent review for one unreviewable submitted deliverable once: its id is keyed on the review need, so an existing row is that review. */
   private admitAutomaticReview(mission: Mission, source: Task, need: ReviewNeed): void {

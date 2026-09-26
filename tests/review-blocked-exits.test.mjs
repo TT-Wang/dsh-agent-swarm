@@ -394,6 +394,21 @@ test('beside running work, no reminder repeats the budget cause the owner remove
   assert.ok(reminders.some(delivery => delivery.notice.reason === running.id), 'the cause that holds now is the one reminded')
 })
 
+test('two sources share the last task slot: the first gets the host review, the second the budget decision, and no decision is stale when written', async t => {
+  const f = await fixture(t, { budget: { maxTasks: 3 } })
+  const first = f.propose(), second = f.propose({ title: 'Implement the rest' })
+  await f.submit(first)
+  await f.submit(second)
+  await f.pass()
+  assert.match(f.reviewsOf(first).map(review => review.id).join(), /^task_auto_review_\w+$/, 'the first source takes the last slot')
+  const decisions = f.runtime.store.list('deliveries', f.mission.id).filter(delivery => delivery.to === 'owner' && delivery.notice?.class === 'decision')
+  // The host judged the second source after the first's admission: it proposed no review the budget refuses.
+  assert.deepEqual(decisions.filter(delivery => delivery.notice.dedupKey.startsWith(`review-blocked:${f.mission.id}:${second.id}:`)).map(delivery => delivery.notice.reason),
+    [blockedNotice(f, second, BUDGET(3)).notice.reason], 'the second source has the one budget decision')
+  assert.deepEqual(decisions.filter(delivery => !f.runtime.ownerDeliveryRelevant(f.runtime.mission(f.mission.id), delivery)).map(delivery => delivery.content), [], 'no decision is stale when written')
+  assert.deepEqual(f.reviewsOf(second), [])
+})
+
 for (const family of FAMILIES) {
   test(`${family.name}: each decision names its own exits, and performing them reaches a live review`, async t => {
     const f = await fixture(t, family.options)
