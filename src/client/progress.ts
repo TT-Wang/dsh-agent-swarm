@@ -360,10 +360,10 @@ export function sidebarState(snapshot: Snapshot, connection: ConnectionState = '
       evidence: `task ${blocked.id} status=blocked epoch ${blocked.epoch}` }
   }
   if (unreviewed !== undefined) {
-    const latest = lastEvent(snapshot, unreviewed.id, reviewPathEventTypes)
+    const latest = lastEvent(snapshot, unreviewed.id, reviewPathEventTypes), reason = latest?.type === 'task/review-blocked' ? record(latest.data).reason : undefined
     return { ...base, phase: 'waiting-for-owner', label: 'Waiting for your decision',
       note: 'A submitted artifact has no live independent review path.',
-      decision: { subject: taskSubject(unreviewed), content: (latest?.type === 'task/review-blocked' ? brief(record(latest.data).reason) : undefined) ?? 'No live independent review yet.', queuedAt: latest?.createdAt ?? mission.updatedAt, consumption: 'unknown' },
+      decision: { subject: taskSubject(unreviewed), content: typeof reason === 'string' && reason.trim() ? reason : 'No live independent review yet.', queuedAt: latest?.createdAt ?? mission.updatedAt, consumption: 'unknown' },
       evidence: `task ${unreviewed.id} status=submitted without a live review` }
   }
   if (recovering !== undefined) {

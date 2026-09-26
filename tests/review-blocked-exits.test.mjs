@@ -30,6 +30,7 @@ import { writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { assertNamedCalls, ownerTools, toolSchemaIndex } from './refusal-inventory.mjs'
 import { FakeClock, MISSION_ACCEPTANCE, events, makeRuntime, taskOf } from './faults/harness.mjs'
+import { sidebarState } from '../lib/types/client/progress.js'
 
 const { definitions } = await toolSchemaIndex()
 
@@ -457,6 +458,7 @@ test('a refused admission, then running work, then a stall: the refusal is again
   assert.deepEqual(recorded, [refusal.notice.reason, busy.notice.reason, refusal.notice.reason], 'the recorded cause follows the derived one')
   const outstanding = notice => f.runtime.ownerDeliveryRelevant(f.runtime.mission(f.mission.id), f.runtime.store.get('deliveries', notice.id))
   assert.deepEqual([outstanding(refusal), outstanding(busy)], [true, false], 'the refusal is outstanding again, the running board no longer')
+  assert.equal(sidebarState(f.runtime.snapshot(f.owner, f.mission.id), 'connected', f.clock.now()).decision.content, refusal.notice.reason, 'and the sidebar shows it in full')
   blockedNotice(f, source, REFUSED)
 })
 

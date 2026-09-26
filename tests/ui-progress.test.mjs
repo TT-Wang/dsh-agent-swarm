@@ -3,7 +3,7 @@ import test from 'node:test'
 import React from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { uiSnapshot } from './fixtures/ui-snapshot.mjs'
-import { currentProgress, recentProgress, acceptanceSummary, activityDuration } from '../lib/types/client/progress.js'
+import { currentProgress, recentProgress, acceptanceSummary, activityDuration, sidebarState } from '../lib/types/client/progress.js'
 import { MissionOverview } from '../lib/types/client/LiveWorkPanel.js'
 import { SwarmBoard } from '../lib/types/client/SwarmBoard.js'
 import { activityGroups } from '../lib/types/client/projection.js'
@@ -293,6 +293,27 @@ test('OWNER PASS 2026-09-11 (second pass, item 3): a long durable reason is one 
   const inline = render(SwarmBoard, { snapshot: short, initialView: 'board' })
   assert.match(inline, /data-swarm-task-reason="">Workspace preparation failed<\/p>/, 'a short reason stays on the card, inline')
   assert.doesNotMatch(inline, /data-swarm-reason="full"/, 'with no second disclosure to open')
+})
+
+test('the review decision is the newest recorded blocker in full, queued when it was recorded, and a resubmission after it records none yet', () => {
+  const at = uiSnapshot().mission.updatedAt
+  const decided = events => {
+    const snapshot = uiSnapshot()
+    snapshot.events.push(...events.map((event, index) => ({ seq: 40 + index, missionId: snapshot.mission.id, actor: 'runtime', ...event })))
+    return { markup: render(SwarmBoard, { snapshot }), decision: sidebarState(snapshot, 'connected', at).decision }
+  }
+  // A deadline deferral on a launched mission: its repair exit ends past 400 characters.
+  const reason = 'review task_r deferred its verdict on this artifact: a check reached its deadline: raise the source\'s checkTimeoutMs with swarm_budget(taskId, taskBudget: { checkTimeoutMs }, reason), then resume the review with swarm_control(action: "resume", taskId, reason); or, if the command itself is wrong, cancel the source with swarm_cancel(taskId, reason) and repair it with swarm_propose(replaces, checks, maxRecoveryAttempts, checkTimeoutMs) holding corrected commands'
+  assert.ok(reason.length > 400, `the reason is ${reason.length} characters`)
+  const submitted = { type: 'task/submitted', data: { taskId: 't4' }, createdAt: at - 5_000 }
+  const blocked = { type: 'task/review-blocked', data: { taskId: 't4', kind: 'research', reason }, createdAt: at - 2_000 }
+  const recorded = decided([submitted, blocked])
+  assert.equal(recorded.decision.content, reason, 'the decision keeps the exit its reason ends with')
+  assert.match(recorded.markup, /data-swarm-decision-content="">[^<]*holding corrected commands</, 'and so does the sidebar')
+  assert.equal(recorded.decision.queuedAt, at - 2_000, 'queued when the blocker was recorded')
+  const resubmitted = decided([submitted, blocked, { type: 'task/submitted', data: { taskId: 't4' }, createdAt: at - 1_000 }])
+  assert.equal(resubmitted.decision.content, 'No live independent review yet.', 'a resubmission retires the blocker recorded before it')
+  assert.equal(resubmitted.decision.queuedAt, at - 1_000, 'and is queued when it was submitted')
 })
 
 test('OWNER PASS 2026-09-11 (second pass, item 5): the focus line states what its phase was derived from', () => {
