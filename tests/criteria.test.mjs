@@ -9,6 +9,7 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { taskGraphIndex } from '../lib/task-graph.js'
 import { criterionId } from '../lib/types.js'
+import { FakeClock, setup } from './faults/harness.mjs'
 
 const criteria = ['value is two', 'docs mention two', 'no other file changes']
 const row = (id, extra = {}) => ({ id, missionId: 'm', workstreamId: 's', title: id, objective: id, kind: 'implementation', status: 'pending', dependencies: [], scope: ['src/'], acceptance: [], checks: [], priority: 50, experiment: false, epoch: 0, evidenceIds: [], createdAt: 1, ...extra })
@@ -54,4 +55,21 @@ test('a copy-era row without covers checks exactly its stored list, and so does 
   ])
   assert.deepEqual(graph.checklist('repair', criteria), stored)
   assert.deepEqual(graph.checklist('review', criteria), stored)
+})
+
+test('an authored review is assigned, shown and registered with everything its source must satisfy, then its own criteria', async t => {
+  const f = await setup({ clock: new FakeClock(), acceptance: ['value is two'] })
+  t.after(f.cleanup)
+  const source = f.propose({ acceptance: ['value is two', 'adds a test'] })
+  const claimed = await f.runtime.claim(f.actor(f.author), f.mission.id, source.id)
+  await f.runtime.submit(f.actor(f.author), f.mission.id, { taskId: source.id, attemptId: claimed.attempt.id, output: 'candidate' })
+  const review = f.runtime.propose(f.owner, f.mission.id, { outputs: [], workstreamId: f.stream.id, title: 'Review', objective: 'Independent review',
+    kind: 'verification', reviewOf: source.id, scope: ['**'], acceptance: ['reads the diff'], assigneeId: f.reviewer.id })
+  await f.runtime.claim(f.actor(f.reviewer), f.mission.id, review.id)
+  const checklist = ['value is two', 'adds a test', 'reads the diff']
+  const assignment = f.runtime.store.list('deliveries', f.mission.id).find(delivery => delivery.kind === 'assignment' && delivery.taskId === review.id)
+  assert.deepEqual(JSON.parse(assignment.content).task.acceptance, checklist, 'the reviewer is assigned its source\'s criteria')
+  assert.deepEqual(f.runtime.observe(f.actor(f.reviewer), f.mission.id).current.task.acceptance, checklist, 'and observes them')
+  assert.deepEqual(f.runtime.observe(f.owner, f.mission.id, { taskId: review.id }).task.acceptance, checklist, 'and the owner reads them')
+  assert.deepEqual(f.runtime.store.get('tasks', review.id).acceptance, ['reads the diff'], 'nothing is copied onto the stored review')
 })
