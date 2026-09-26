@@ -24,6 +24,7 @@ import assert from 'node:assert/strict'
 import { join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { setup, makeRuntime, events, taskOf, FakeWorkers, FakeClock, SwarmRuntime, MISSION_ACCEPTANCE } from './faults/harness.mjs'
+import { reviewGraceMs, waitsLegitimately } from '../lib/notices.js'
 
 /** `count` ticks of the timer a fake-clock runtime does not run, one tick unit of clock time apart. */
 async function ticks(f, count) { for (let n = 0; n < count; n += 1) { f.clock.advance(f.runtime.config.tickMs); await f.runtime.tick() } }
@@ -1093,17 +1094,40 @@ test('manualTick runs no timer while tickMs stays the tick unit: settle() return
     await f.runtime.tick()
     assert.equal(checks, 1, 'one tick runs the watchdog once')
     assert.equal(scheduling.passes.has(f.mission.id), false, 'and returns once the body it kicked has settled')
-    // The unreviewed-submission grace is 30 tick units (at most 1 s) of clock
-    // time from the durable submission, so a submission is not a stall inside it.
+    // The review grace (one tick unit, at least 1 s) is clock time from the
+    // durable submission, so a submission is not a stall inside it.
     const claimed = taskOf(f.runtime, task.id)
     await f.runtime.submit(f.actor(f.author), f.mission.id, { taskId: task.id, attemptId: claimed.attempt.id, output: 'candidate' })
     const unreviewed = () => f.runtime.scheduling.unreviewedStall([taskOf(f.runtime, task.id)])
     assert.equal(unreviewed(), false, 'a submission is not a stall at its own instant')
-    clock.advance(30 * tickMs - 1)
+    clock.advance(reviewGraceMs(f.runtime.config) - 1)
     assert.equal(unreviewed(), false, 'nor one clock millisecond inside the grace')
     clock.advance(1)
     assert.equal(unreviewed(), true, 'it is one once the grace has elapsed on the clock')
   } finally { await f.cleanup() }
+})
+
+test('an unreviewed submission is a stall exactly when it stops waiting legitimately: both read the one review grace, fast tick or slow', async () => {
+  for (const tickMs of [10, 60_000]) {
+    const clock = new FakeClock()
+    const f = await setup({ clock, config: { tickMs, stallPasses: 1_000 } })
+    try {
+      f.workers.autoIdle = true
+      const task = f.propose()
+      await f.runtime.settle(f.mission.id)
+      const claimed = taskOf(f.runtime, task.id)
+      await f.runtime.submit(f.actor(f.author), f.mission.id, { taskId: task.id, attemptId: claimed.attempt.id, output: 'candidate' })
+      const classified = () => {
+        const tasks = f.runtime.store.list('tasks', f.mission.id)
+        const row = tasks.find(candidate => candidate.id === task.id)
+        return { stall: f.runtime.scheduling.unreviewedStall([row]), waits: waitsLegitimately(f.runtime, row, tasks) }
+      }
+      clock.advance(reviewGraceMs(f.runtime.config) - 1)
+      assert.deepEqual(classified(), { stall: false, waits: true }, `tickMs ${tickMs}: inside the grace the submission still waits`)
+      clock.advance(1)
+      assert.deepEqual(classified(), { stall: true, waits: false }, `tickMs ${tickMs}: past it the submission is a stall`)
+    } finally { await f.cleanup() }
+  }
 })
 
 test('settle() is not quiescence: a kick coalesced into an open body is run by the next tick, as the timer would run it', async () => {
