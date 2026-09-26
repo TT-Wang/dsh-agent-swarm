@@ -154,15 +154,26 @@ export async function ownerTools(f) {
   return async (name, args) => (await definitions.get(name).execute({ missionId: f.mission.id, ...args }, { signal: new AbortController().signal, agent: { id: f.owner.sessionId } })).result
 }
 
-/** Every `swarm_*(...)` call a text names is one of `expected`, with each parameter it names declared by that tool's own schema. */
-export async function assertNamedCalls(text, expected) {
-  const index = await toolSchemaIndex()
-  const calls = [...text.matchAll(/(swarm_\w+)\(([^()]*)\)/g)].map(([, tool, args]) => [tool, args.replace(/"[^"]*"/g, '').match(/[A-Za-z]\w*/g) ?? []])
-  assert.deepEqual(calls.map(([tool]) => tool).sort(), [...expected].sort(), `the exits named: ${text}`)
+/** The `swarm_*(...)` calls a text names, in order, each with the parameter names it gives (a given value is dropped). */
+const namedCallParams = text => [...text.matchAll(/(swarm_\w+)\(([^()]*)\)/g)].map(([, tool, args]) => [tool, args.replace(/"[^"]*"/g, '').match(/[A-Za-z]\w*/g) ?? []])
+
+/** The contract of an exit written as calls: an imperative verb, and at least one `swarm_*(...)` call, each a registered tool whose own schema declares every parameter it names. */
+export function callExitViolations(text, index) {
+  const calls = namedCallParams(text)
+  const violations = []
+  if (!IMPERATIVE_ACTIONS.test(text)) violations.push('no imperative next step (action verb)')
+  if (!calls.length) violations.push('names no swarm_*(...) call')
   for (const [tool, params] of calls) {
-    assert.ok(index.toolNames.has(tool), `${tool} is a registered tool`)
-    for (const param of params) assert.ok(index.ownProperties.get(tool).has(param), `${tool} declares ${param}`)
+    if (!index.toolNames.has(tool)) violations.push(`names unknown tool ${tool}`)
+    else for (const param of params) if (!index.ownProperties.get(tool).has(param)) violations.push(`${tool} does not declare ${param}`)
   }
+  return violations
+}
+
+/** Every `swarm_*(...)` call a text names is one of `expected`, and the text holds the call-exit contract. */
+export async function assertNamedCalls(text, expected) {
+  assert.deepEqual(namedCallParams(text).map(([tool]) => tool).sort(), [...expected].sort(), `the exits named: ${text}`)
+  assert.deepEqual(callExitViolations(text, await toolSchemaIndex()), [], text)
 }
 
 /**
@@ -191,9 +202,9 @@ export const CALLER_COMPOSED_MESSAGES = [
   {
     file: 'src/admission.ts',
     code: 'review_path_missing',
-    authoredIn: 'src/notices.ts',
+    authoredIn: 'src/runtime.ts',
     probe: 'reviewPathExit',
-    note: 'Each review-blocked reason names its own exit: SwarmRuntime.reviewPathBlocker, the automatic-review admission failure and the classifier fallback compose it, with the shared ADMIT_REVIEW/WITHDRAW_SOURCE exits in src/notices.ts; tests/review-blocked-exits.test.mjs performs every named exit.',
+    note: 'Each review-blocked reason names its own exit: SwarmRuntime.reviewPathBlocker and the automatic-review admission failure compose it in src/runtime.ts, the transition classifier\'s running-board fallback in src/notices.ts. The probe holds the exits they share (ADMIT_REVIEW, WITHDRAW_SOURCE) to callExitViolations; tests/review-blocked-exits.test.mjs performs every exit a reason names.',
   },
 ]
 
