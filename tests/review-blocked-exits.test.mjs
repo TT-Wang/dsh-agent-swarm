@@ -460,6 +460,31 @@ test('a refused admission, then running work, then a stall: the refusal is again
   blockedNotice(f, source, REFUSED)
 })
 
+test('a wedged pass never reaches the host\'s admission: the classifier names every unreviewable source, a legacy one on any pass, with the runtime\'s own blocker', async t => {
+  const f = await fixture(t, { budget: { maxTasks: 2 } })
+  const source = f.propose(), legacy = f.propose({ title: 'Implement the rest' })
+  await f.submit(source)
+  await f.submit(legacy)
+  // The row as an older build left it: a submission without an artifact, which the host's admission skips.
+  f.runtime.store.transaction(() => { const row = taskOf(f.runtime, legacy.id); delete row.artifact; f.runtime.store.put('tasks', row) })
+  await f.runtime.settle(f.mission.id)
+  f.clock.advance(1_500)
+  // Past the review grace with no scheduling pass: only the classifier can name the board.
+  const publish = async wedged => {
+    if (wedged) f.runtime.notices.expectWedgedRelease(f.mission.id)
+    f.runtime.notices.transition(f.mission.id)
+    await new Promise(resolve => queueMicrotask(resolve))
+  }
+  await publish(false)
+  const decisionsOn = task => f.runtime.store.list('deliveries', f.mission.id).filter(delivery => delivery.notice?.dedupKey?.startsWith(`review-blocked:${f.mission.id}:${task.id}:`))
+  blockedNotice(f, legacy, BUDGET(2))
+  assert.deepEqual(decisionsOn(source), [], 'an ordinary pass leaves a source with an artifact to the host\'s admission')
+  await publish(true)
+  blockedNotice(f, source, BUDGET(2))
+  assert.deepEqual(events(f.runtime, f.mission.id, 'task/review-missing'), [], 'the host\'s admission never ran: the classifier named both')
+  await followExits(f, { source }, { steps: [[BUDGET(2), ['swarm_budget', 'swarm_cancel']]] })
+})
+
 test('two sources share the last task slot: the first gets the host review, the second the budget decision, and no decision is stale when written', async t => {
   const f = await fixture(t, { budget: { maxTasks: 3 } })
   const first = f.propose(), second = f.propose({ title: 'Implement the rest' })
