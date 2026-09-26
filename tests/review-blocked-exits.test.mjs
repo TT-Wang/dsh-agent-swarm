@@ -31,20 +31,43 @@ import { FakeClock, MISSION_ACCEPTANCE, events, makeRuntime, taskOf } from './fa
 
 const { definitions } = await toolSchemaIndex()
 
-/** A mission with the named members on the fake clock; the first member authors every source. */
-async function fixture(t, { members = ['Author', 'Reviewer'], budget: overrides } = {}) {
+const MISSION = { title: 'Review exits', objective: 'Every review-path blocker names an exit that works', scope: ['**'], acceptance: MISSION_ACCEPTANCE }
+const STREAM = { title: 'Exits', objective: 'Exercise each review-path blocker' }
+const memberInput = (name, index) => ({ name, role: index === 0 ? 'implementation' : 'verification', maxOutputTokens: 5_000 })
+
+/**
+ * A mission with the named members on the fake clock; the first member authors
+ * every source. `launched` starts it from a plan, as `swarm_launch` does (the
+ * default /agent-swarm path): the plan's members are admitted with it, and its
+ * one deliverable (`planned`) is paired with an unassigned host review.
+ * Otherwise the owner assembles it (`swarm_create`, `swarm_add_member`).
+ */
+async function fixture(t, { members = ['Author', 'Reviewer'], budget: overrides, launched = false } = {}) {
   const clock = new FakeClock()
   const { dir, runtime, workers, budget } = await makeRuntime(t, { clock, budget: overrides })
   await runtime.start()
   const owner = { sessionId: 'review-exits-owner' }
-  const mission = runtime.create(owner, { title: 'Review exits', objective: 'Every review-path blocker names an exit that works', workspace: dir,
-    scope: ['**'], acceptance: MISSION_ACCEPTANCE, budget }, { grantRoot: dir, source: 'session' })
-  const stream = runtime.workstream(owner, mission.id, { title: 'Exits', objective: 'Exercise each review-path blocker' })
-  const added = []
-  for (const [index, name] of members.entries()) added.push(await runtime.addMember(owner, mission.id, { name, role: index === 0 ? 'implementation' : 'verification', maxOutputTokens: 5_000 }))
+  const claim = { grantRoot: dir, source: 'session' }
+  let mission, stream, added, planned
+  if (launched) {
+    const snapshot = await runtime.startPlan(owner, runtime.requestStart(owner, { commandId: 'review-exits', goal: MISSION.objective, workspace: dir }, claim).id, {
+      ...MISSION, workspace: dir, budget, members: members.map((name, index) => ({ key: `m${index}`, ...memberInput(name, index) })),
+      workstreams: [{ key: 'main', ...STREAM }],
+      tasks: [{ key: 'impl', workstreamKey: 'main', title: 'Implement', objective: 'Implement the scoped change', kind: 'implementation', outputs: [], scope: ['**'], acceptance: MISSION_ACCEPTANCE, assigneeKey: 'm0', checks: ['test -d .'], maxRecoveryAttempts: 2, checkTimeoutMs: 30_000 }],
+    })
+    mission = snapshot.mission
+    ;[stream] = runtime.store.list('workstreams', mission.id)
+    added = members.map((_, index) => snapshot.members.find(member => member.id.endsWith(`_m${index}`)))
+    planned = snapshot.tasks.find(task => task.kind === 'implementation')
+  } else {
+    mission = runtime.create(owner, { ...MISSION, workspace: dir, budget }, claim)
+    stream = runtime.workstream(owner, mission.id, STREAM)
+    added = []
+    for (const [index, name] of members.entries()) added.push(await runtime.addMember(owner, mission.id, memberInput(name, index)))
+  }
   const [author, reviewer] = added
   await runtime.settle(mission.id)
-  const f = { dir, runtime, workers, budget, clock, owner, mission, stream, author, reviewer }
+  const f = { dir, runtime, workers, budget, clock, owner, mission, stream, author, reviewer, planned }
   const actor = member => ({ sessionId: member.sessionId })
   const propose = (extra = {}) => runtime.propose(owner, mission.id, { outputs: [], workstreamId: stream.id, title: 'Implement', objective: 'Implement the scoped change',
     kind: 'implementation', scope: ['**'], acceptance: MISSION_ACCEPTANCE, checks: ['test -d .'], assigneeId: author.id, ...extra })
@@ -143,8 +166,7 @@ async function followExits(f, blocked, { steps, afterExits }) {
 }
 
 /** Submit a source and let the review grace pass, beside `running`'s unrelated work when given. */
-async function submitted(f, { running } = {}) {
-  const source = f.propose()
+async function submitted(f, { running, source = f.propose() } = {}) {
   await f.submit(source)
   const blocked = { source, running: running === undefined ? undefined : await f.run(running(f)) }
   await f.pass()
@@ -182,6 +204,7 @@ const author = f => f.author
 const reviewer = f => f.reviewer
 const BUDGET = n => new RegExp(`^the mission task budget is exhausted \\(${n}/${n} admitted tasks\\), so no verification task can be admitted: `)
 const NO_MEMBER = /^no live member other than the author \(member_[\w-]+\) can review this artifact independently: add /
+const NO_SLOT = /^no live member other than the author \(member_[\w-]+\) can review this artifact independently: every worker slot is taken \(1\/1 live members\), so raise maxWorkers with /
 const WITHDRAWN = /^the automatically admitted review task_auto_review_\w+ was withdrawn: /
 const DEFERRED = /^review task_[\w-]+ deferred its verdict on this artifact: the host could not execute a check: /
 const RUNNING = /^it has no live independent review path and cannot reach a verdict while the rest of the board keeps running: /
@@ -202,6 +225,19 @@ const FAMILIES = [
     name: 'no live member other than the author can review',
     options: { members: ['Author'] },
     block: f => submitted(f),
+    steps: [[NO_MEMBER, ['swarm_add_member', 'swarm_cancel']]],
+  },
+  {
+    name: 'no live member other than the author can review, and every worker slot is taken',
+    options: { members: ['Author'], budget: { maxWorkers: 1 } },
+    block: f => submitted(f),
+    steps: [[NO_SLOT, ['swarm_budget', 'swarm_add_member', 'swarm_cancel']]],
+  },
+  {
+    name: 'on a launched mission, no live member other than the author can review its planned deliverable',
+    options: { launched: true },
+    block: f => { f.stop(f.reviewer); return submitted(f, { source: f.planned }) },
+    // The host paired the deliverable at launch; the added member makes that review live.
     steps: [[NO_MEMBER, ['swarm_add_member', 'swarm_cancel']]],
   },
   {

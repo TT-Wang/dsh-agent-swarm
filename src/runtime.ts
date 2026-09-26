@@ -2488,8 +2488,8 @@ export class SwarmRuntime {
     const deferred = tasks.find(task => task.status === 'blocked' && task.reviewOf === source.id && task.verificationRecovery?.commit === source.artifact?.commit)
     if (deferred !== undefined) return `review ${deferred.id} deferred its verdict on this artifact: ${this.declaredChecks.recoveryExit(this.store.toolRuns(mission.id, { taskId: deferred.id }).filter(run => run.tool === 'swarm.host_verification').map(run => run.result as CheckResult))}`
     if (tasks.length >= mission.budget.maxTasks) return `the mission task budget is exhausted (${tasks.length}/${mission.budget.maxTasks} admitted tasks), so no verification task can be admitted: raise maxTasks with swarm_budget(budget, reason), or ${WITHDRAW_SOURCE}`
-    const authors = [...authorIdsOf(source)]
-    if (!this.store.list('members', mission.id).some(member => memberPhaseOf(member) !== 'stopped' && canOwnReview(source, member.id))) return `no live member other than the author (${authors.join(', ') || 'unknown'}) can review this artifact independently: add an independent member with swarm_add_member(role), or ${WITHDRAW_SOURCE}`
+    const authors = [...authorIdsOf(source)], live = this.store.list('members', mission.id).filter(member => memberPhaseOf(member) !== 'stopped')
+    if (!live.some(member => canOwnReview(source, member.id))) return `no live member other than the author (${authors.join(', ') || 'unknown'}) can review this artifact independently: ${live.length < mission.budget.maxWorkers ? '' : `every worker slot is taken (${live.length}/${mission.budget.maxWorkers} live members), so raise maxWorkers with swarm_budget(budget, reason), then `}add an independent member with swarm_add_member(role, maxOutputTokens), or ${WITHDRAW_SOURCE}`
     const withdrawn = tasks.find(review => review.reviewOf === source.id && review.status === 'cancelled'
       && review.id.startsWith(AUTOMATIC_REVIEW_PREFIX) && (this.store.latestTaskEvent(mission.id, review.id, 'task/cancelled')?.seq ?? 0) > need.seq)
     return withdrawn === undefined ? undefined : `the automatically admitted review ${withdrawn.id} was withdrawn: ${ADMIT_REVIEW}, or ${WITHDRAW_SOURCE}`

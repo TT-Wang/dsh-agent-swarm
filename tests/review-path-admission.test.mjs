@@ -35,6 +35,6 @@ test('the missing-review diagnostic is machine-checkable and names the task', ()
 })
 
 test('the review-blocked notice is the diagnostic alone: the reason carries its own exit and the template appends none', () => {
-  const reason = 'no live member other than the author (member_1) can review this artifact independently: add an independent member with swarm_add_member(role), or withdraw the source with swarm_cancel(taskId, reason)'
+  const reason = 'no live member other than the author (member_1) can review this artifact independently: add an independent member with swarm_add_member(role, maxOutputTokens), or withdraw the source with swarm_cancel(taskId, reason)'
   assert.equal(NOTICE_TEMPLATES['review-blocked'].build({ sourceId: 'task_1', reason }), `[review_path_missing] task "task_1": ${reason}`)
 })
