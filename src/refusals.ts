@@ -241,8 +241,8 @@ export class RefusalRegistry {
  * chain's last element escalates without conditions, so a dead end is
  * structurally impossible". A *guard chain* is the ordered set of predicates a
  * control path evaluates before it can act: budget, workspace state, the
- * attempt/lease lifecycle, per-task ceilings, review admission, dispatch
- * preconditions and the owner's reply to a delivered question. The *terminal
+ * attempt/lease lifecycle, per-task ceilings, dispatch preconditions and the
+ * owner's reply to a delivered question. The *terminal
  * element* is what happens when every predicate
  * before it answers "no": it must be an unconditional escalation that emits a
  * durable decision request naming the executable exits. It has no conditions of
@@ -265,8 +265,8 @@ export class RefusalRegistry {
  * lint (`tests/refusal-inventory.mjs`) is run over every one of them.
  * ------------------------------------------------------------------------- */
 
-/** The seven control-path chains whose terminal element must escalate. */
-export type GuardChainId = 'budget' | 'workspace' | 'attempt_lease' | 'task_ceiling' | 'review_admission' | 'dispatch_preconditions' | 'owner_reply'
+/** The six control-path chains whose terminal element must escalate. */
+export type GuardChainId = 'budget' | 'workspace' | 'attempt_lease' | 'task_ceiling' | 'dispatch_preconditions' | 'owner_reply'
 
 /** One executable exit: the tool, the parameter of that tool, and the instruction. */
 interface DecisionExit {
@@ -298,7 +298,6 @@ const GUARD_TERMINAL_CODES: Record<GuardChainId, string> = {
   workspace: 'workspace_terminal',
   attempt_lease: 'attempt_terminal',
   task_ceiling: 'task_ceiling_terminal',
-  review_admission: 'review_admission_terminal',
   dispatch_preconditions: 'dispatch_terminal',
   // L2: the owner was asked a question and closed the turn in prose, so the
   // answer never reached the asker. The chain names the receipt, not the model.
@@ -321,7 +320,6 @@ export function guardTerminal(chain: GuardChainId, context: GuardTerminalContext
     workspace: `[workspace_terminal] ${task} cannot prepare its workspace (${described(context, 'workspace state is unresolved')}). Repair the condition, then use \`swarm_control\` with \`taskId\`, \`action: resume\` and \`reason\`; or amend the same task's scope/dependencies/assignee with \`action: amend\` and \`changes\`.`,
     attempt_lease: `[attempt_terminal] ${task} cannot advance (${described(context, 'the lease or workspace guard refused it')}). The owner can use \`swarm_control\` with \`taskId\`, \`action: amend\`, \`changes.assigneeId\` and \`reason\` to fence and reassign it, or \`action: resume\` after repair. No member attemptId is required.`,
     task_ceiling: context.taskId === undefined ? `[task_ceiling_terminal] Mission admission reached its allocation (${described(context, 'admission budget')}). Review the need and use \`swarm_budget\` with a finite raised \`budget\` and \`reason\`, then retry the original admission.` : `[task_ceiling_terminal] ${task} reached its execution estimate (${described(context, 'step limit')}). Review progress, then raise its finite allocation with \`swarm_budget\` using \`taskId\`, \`taskBudget\` and \`reason\`. Raise the mission budget first if needed. Preserve this task, its consumption, dependencies and evidence; no replacement is needed.`,
-    review_admission: `[review_admission_terminal] Submitted work ${task} has no live independent review path, so no verdict can ever land. Admit a review with \`swarm_propose\` by passing \`kind\`, \`reviewOf\`, \`scope\` and \`acceptance\`, or withdraw the source with \`swarm_cancel\` and its \`taskId\`.`,
     owner_reply: `[owner_reply_missing] An owner-facing question was delivered and the owner's turn ended without binding an answer to it (${described(context, 'the receipt is still open')}). Answer it with \`swarm_message\` by passing \`to\`, \`kind: 'question'\`, the answer in \`content\` and the asked question's id in \`replyTo\`, or close it deliberately with \`dismiss: true\` and a \`replyTo\`; prose in the conversation is never delivered to the asker.`,
     dispatch_preconditions: `[dispatch_terminal] No executable action remains (${described(context, 'no task is ready for a live member and no attempt is in flight')}). Inspect the blocker with \`swarm_observe\` and its \`taskId\`. Extend resource allocations with \`swarm_budget\`; amend an unsubmitted task, or resume it with \`swarm_control\` and its \`taskId\` after environment repair, which reworks a rejected task in place. Only when resume cannot rework it, propose a repair with \`swarm_propose\` and \`replaces\`; the repair inherits its acceptance. Withdraw mistaken work with \`swarm_cancel\`, or decide to complete or stop with \`swarm_control\` and its \`action\`.`,
   }
@@ -344,10 +342,6 @@ export function guardTerminal(chain: GuardChainId, context: GuardTerminalContext
     ] : [
       { tool: 'swarm_budget', parameter: 'taskBudget', instruction: 'raise the finite allocation of this taskId' },
       { tool: 'swarm_cancel', parameter: 'taskId', instruction: 'withdraw the exhausted task' },
-    ],
-    review_admission: [
-      { tool: 'swarm_propose', parameter: 'reviewOf', instruction: 'admit an independent verification task' },
-      { tool: 'swarm_cancel', parameter: 'taskId', instruction: 'withdraw the unreviewable source' },
     ],
     owner_reply: [
       { tool: 'swarm_message', parameter: 'replyTo', instruction: 'bind the answer to the question delivery id' },

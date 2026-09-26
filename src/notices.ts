@@ -486,7 +486,7 @@ function backoffExpiredSince(rt: Pick<LineageRuntime, 'config' | 'now'>, tasks: 
  * Co-firing guards, named: this classifier x the stall-root classifier (a blocked
  * predecessor is the ROOT's subject, named by the root notice with its
  * dependents, never re-named here) x the review grace (`reviewable` and the
- * review-admission terminal) x the off-pass wedged-pass classification.
+ * review-blocked emitter) x the off-pass wedged-pass classification.
  */
 export function waitsLegitimately(rt: LineageRuntime, task: Task, tasks: Task[]): boolean {
   if (TERMINAL_STATES.has(task.status)) return false
@@ -1558,7 +1558,7 @@ export class Notices {
    * Co-firing guards, named: this classifier x the stall-root classifier (a
    * blocked predecessor is the ROOT's subject, named by the root notice with its
    * dependents, never re-named here) x the review grace (`reviewable` and the
-   * review-admission terminal: a pending review follows its SOURCE identity, so a
+   * review-blocked emitter: a pending review follows its SOURCE identity, so a
    * cancelled source with a live repair still has no review path) x the off-pass
    * wedged-pass classification (D1/D2: the wedge changes who generates the
    * decision, never which boards are waiting).
