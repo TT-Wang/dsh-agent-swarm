@@ -220,11 +220,32 @@ test('a worker the host tore down first stops without reading its retired inbox,
   await f.adapter.deliver(f.member, { ...message(f.member, 'finding-one'), kind: 'finding', content: 'A finding for the next step.' })
   assert.deepEqual(f.ctx.agents.get(SessionId(f.member.sessionId)).inbox.nextStep.map(item => item.id), ['swarm:finding-one'])
   await f.agentLoop.dispose()
+  // The worker's handle ended with the agent, so no adapter reader reaches the retired inbox.
+  assert.equal(f.adapter.isIdle(f.member.id), false, 'a worker whose agent the host retired is not startable')
+  await assert.rejects(f.adapter.deliver(f.member, { ...message(f.member, 'finding-two'), kind: 'finding', content: 'A later finding.' }), /Worker is stopping/,
+    'the delivery stays a durable outbox obligation')
   await f.adapter.stop(f.member.id)
   await f.ctx.plugin(AgentLoop, { agents: [] })
   await f.adapter.start(f.spec)
   assert.deepEqual(f.ctx.agents.get(SessionId(f.member.sessionId)).inbox.nextStep.map(item => item.id), ['swarm:finding-one'],
     'the journal restores the accepted input the host teardown cleared')
+})
+
+test('input a worker conversation received natively and had not consumed survives a stop and restart', async t => {
+  // A worker conversation also opens natively: a user's steer or a hook's
+  // context reaches the same inbox without passing through deliver().
+  const f = await fixture(t, undefined, {
+    beforeChunks: (_action, options, count) => count === 1 ? new Promise((_resolve, reject) => {
+      options.signal.addEventListener('abort', () => reject(options.signal.reason), { once: true })
+    }) : undefined,
+  })
+  await f.adapter.deliver(f.member, message(f.member))
+  await eventually(() => f.requests.length === 1, 'the assignment turn never reached the provider', 10000)
+  f.ctx.agents.get(SessionId(f.member.sessionId)).steer(freezeMessage({ id: MessageId('user-typed-note'), role: 'user', content: [{ type: 'text', text: 'A note typed into the worker conversation.' }], source: { kind: 'user' } }))
+  await f.adapter.stop(f.member.id)
+  await f.adapter.start(f.spec)
+  assert.deepEqual(f.ctx.agents.get(SessionId(f.member.sessionId)).inbox.nextStep.map(item => item.id), ['user-typed-note'],
+    'the stop journaled what the live agent still held')
 })
 
 const reasoningModel = model => model === 'plain-model' ? {} : {

@@ -511,8 +511,12 @@ export class HarnessWorkers implements WorkerAdapter {
     return `${this.workspaces.metadataPath(spec.mission.id, spec.member.id)}.inbox.json`
   }
 
-  /** Native handle disposal clears Inbox; journal the input this resident accepted from its own record, never the native inbox. */
+  /** Native handle disposal clears Inbox; retain accepted, unclaimed input, and what the resident's live agent still holds, across that lifecycle. */
   private async preserveInbox(resident: Resident): Promise<void> {
+    const agent = resident.handle?.agent
+    for (const [target, messages] of agent === undefined ? [] : [['next-step', agent.inbox.nextStep], ['next-turn', agent.inbox.nextTurn]] as const) {
+      for (const message of messages) resident.recoveryInbox.set(message.id, { target, message })
+    }
     const writing = resident.journalWrites.then(async () => {
       const entries = [...resident.recoveryInbox.values()].filter(({ message }) => !this.revokedAssignment(resident, message))
       await writePrivateJson(this.inboxJournal(resident.spec), {
@@ -815,6 +819,8 @@ export class HarnessWorkers implements WorkerAdapter {
           })
         }
       })
+      // The handle ends where the host ends this agent (its own dispose or a factory teardown), so no reader reaches a retired inbox.
+      agentCtx.effect(() => () => { if (resident.handle?.agent === agent) resident.handle = undefined }, 'swarm.worker-handle')
       agentCtx.on('agent/error', ({ error }) => { this.failure(spec.member.id, error) })
       agentCtx.on('agent/status', ({ status }) => {
         if (status !== 'idle') return
@@ -970,7 +976,7 @@ export class HarnessWorkers implements WorkerAdapter {
       resident.recoveryInbox.set(message.id, { target, message })
       await this.preserveInbox(resident)
       resident.abort.signal.throwIfAborted()
-      if (this.closing || resident.stopping !== undefined) throw new Error('Worker is stopping')
+      if (this.closing || resident.stopping !== undefined || resident.handle === undefined) throw new Error('Worker is stopping')
       // Claims and findings are visible at the next step; a new assignment owns a turn.
       resident.handle.agent.send(message, target, true)
       resident.delivered.add(id)
@@ -1039,12 +1045,9 @@ export class HarnessWorkers implements WorkerAdapter {
         await handle.agent.whenIdle()
         await this.drainObservations(resident)
         try {
-          await resident.journalWrites
-          // Cordis tears sibling effects down concurrently. The native factory
-          // may already have retired this exact Session; persistence owns that
-          // retired drain, while flush() only accepts a currently attached one.
-          const sessions = this.ctx.get('sessions')
-          if (sessions?.get(handle.agent.id) === handle.agent.session) await sessions.flush(handle.agent.session)
+          await this.preserveInbox(resident)
+          // Persistence drains the session of an agent the host retired meanwhile; flush() accepts only an attached one.
+          if (resident.handle === handle) await this.ctx.get('sessions')?.flush(handle.agent.session)
         }
         finally { await handle.dispose() }
       }

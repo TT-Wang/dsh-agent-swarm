@@ -15,7 +15,8 @@ async function fixture(t, create) {
   const agent = { id: 'worker-session', status: 'idle', inbox: { nextTurn: [], nextStep: [], remove() {} },
     session: { snapshotEvents: () => [], append() {} }, cancel() { calls.cancelled++ }, async whenIdle() {}, send() { calls.sent++ } }
   const handle = { agent, async dispose() { calls.disposed++ } }
-  const agentCtx = { agent, on: on(nativeHooks), systemPrompt: { section() {} }, tools: { schemas: () => [], restrict() {}, guard(fn) { guard = fn } } }
+  const effects = []
+  const agentCtx = { agent, on: on(nativeHooks), effect(execute) { effects.push(execute()) }, systemPrompt: { section() {} }, tools: { schemas: () => [], restrict() {}, guard(fn) { guard = fn } } }
   const ctx = { on: on(hooks), logger: { warn() {}, error() {} }, sessions: { async flush() {}, get: () => agent.session },
     get(name) { if (name === 'sessionPersistence') return { async stat() {} }; if (name === 'sandboxPolicy' || name === 'approval') return {}; if (name === 'sessions') return this.sessions },
     agents: { withoutInitiator: fn => fn(), async create(options) { calls.create++; await options.setup(agentCtx, agent); return create ? await create({ options, handle }) : handle } } }
@@ -27,7 +28,13 @@ async function fixture(t, create) {
   const member = { id: 'worker', missionId: 'm', sessionId: agent.id, workspace: '/worker' }
   const spec = { member, mission: { id: 'm' }, ownerSessionId: 'owner' }
   t.after(async () => { await adapter.dispose().catch(() => {}); await rm(root, { recursive: true, force: true }) })
-  return { adapter, spec, member, calls, hooks, nativeHooks, agent, handle, guard: () => guard }
+  // The host's teardown clears the inbox, releases its registration and ends the agent's scope.
+  const retire = () => {
+    const gone = () => { throw new Error('agent "worker-session" cannot read inbox state: its projection registration is not active') }
+    agent.inbox = { get nextTurn() { return gone() }, get nextStep() { return gone() }, remove: gone }
+    for (const dispose of effects.splice(0)) dispose()
+  }
+  return { adapter, spec, member, calls, hooks, nativeHooks, agent, handle, retire, guard: () => guard }
 }
 
 test('cancelled unpublished setup fences tool guards, steps, execution and provider streams before a late handle is released', async t => {
@@ -89,21 +96,80 @@ test('uncooperative pre-factory setup cannot hang disposal; timed-out disposal r
   assert.equal(f.adapter.residents.size, 0, 'late settlement completes the retained cleanup continuation')
 })
 
-test('late shutdown keeps accepted pending input journaled without querying the closed runtime observer', async t => {
+const journal = async f => JSON.parse(await readFile(`${f.adapter.workspaces.metadataPath()}.inbox.json`, 'utf8'))
+const nativeNote = { id: 'native-note', role: 'user', content: [], source: { kind: 'user' } }
+
+test('late shutdown journals accepted and native pending input without querying the closed runtime observer', async t => {
   const f = await fixture(t)
   await f.adapter.start(f.spec)
   const resident = f.adapter.residents.get(f.member.id)
-  // The resident journals the assignment when it accepts it; shutdown reads neither the native inbox nor the observer.
   await f.adapter.deliver(f.member, { id: 'delivery', missionId: 'm', from: 'owner', to: f.member.id, kind: 'assignment', content: 'work', createdAt: 1 })
+  // Input that reached the live agent natively (a user's steer in the worker conversation), never through deliver().
+  const pending = { id: 'assignment', role: 'user', content: [], source: { kind: 'swarm', deliveryKind: 'assignment', deliveryId: 'native' } }
+  f.agent.inbox.nextTurn.push(pending)
+  f.agent.inbox.nextStep.push(nativeNote)
   const idle = deferred()
   f.agent.whenIdle = () => idle.promise
   const disposing = f.adapter.dispose()
   f.adapter.callbacks = new Proxy({}, { get() { assert.fail('runtime observer was already closed') } })
   idle.resolve(); await disposing
-  assert.equal(resident.recoveryInbox.has('swarm:delivery'), true, 'pending provenance is retained for validation on next activation')
-  const journal = JSON.parse(await readFile(`${f.adapter.workspaces.metadataPath()}.inbox.json`, 'utf8'))
-  assert.deepEqual(journal.nextTurn.map(message => message.id), ['swarm:delivery'])
+  assert.equal(resident.recoveryInbox.has('assignment'), true, 'pending provenance is retained for validation on next activation')
+  const saved = await journal(f)
+  assert.deepEqual([saved.nextTurn.map(message => message.id), saved.nextStep.map(message => message.id)], [['swarm:delivery', 'assignment'], ['native-note']])
   assert.equal(f.calls.disposed, 1)
+})
+
+test('stop releases the handle only after the journal write in flight has settled', async t => {
+  const f = await fixture(t)
+  await f.adapter.start(f.spec)
+  const resident = f.adapter.residents.get(f.member.id)
+  const write = deferred()
+  resident.journalWrites = write.promise // an earlier delivery's journal write, still in flight
+  f.agent.inbox.nextStep.push(nativeNote)
+  let stopped = false
+  const stopping = f.adapter.stop(f.member.id).then(() => { stopped = true })
+  for (let turn = 0; turn < 5; turn++) await flush()
+  assert.deepEqual([stopped, f.calls.disposed], [false, 0], 'a restart cannot race the late write')
+  write.resolve(); await stopping
+  assert.equal(f.calls.disposed, 1)
+  assert.deepEqual((await journal(f)).nextStep.map(message => message.id), ['native-note'], 'the stop wrote its journal after the earlier one')
+})
+
+test('a delivery the host overtakes mid-journal is refused, never sent to the retired agent', async t => {
+  const f = await fixture(t)
+  await f.adapter.start(f.spec)
+  const write = deferred()
+  f.adapter.residents.get(f.member.id).journalWrites = write.promise
+  const delivering = f.adapter.deliver(f.member, { id: 'late', missionId: 'm', from: 'owner', to: f.member.id, kind: 'finding', content: 'late', createdAt: 1 })
+  await flush()
+  f.retire()
+  write.resolve()
+  await assert.rejects(delivering, /Worker is stopping/, 'the delivery stays a durable outbox obligation')
+  assert.equal(f.calls.sent, 0)
+})
+
+test('a stop the host overtakes reads neither the retired inbox nor its session, and journals the resident record', async t => {
+  const f = await fixture(t)
+  await f.adapter.start(f.spec)
+  await f.adapter.deliver(f.member, { id: 'delivery', missionId: 'm', from: 'owner', to: f.member.id, kind: 'assignment', content: 'work', createdAt: 1 })
+  let flushed = 0
+  f.adapter.ctx.sessions.flush = async () => { flushed++ }
+  const idle = deferred()
+  f.agent.whenIdle = () => idle.promise
+  const stopping = f.adapter.stop(f.member.id)
+  await flush()
+  f.retire()
+  idle.resolve(); await stopping
+  assert.equal(flushed, 0, 'persistence drains the session of a retired agent')
+  assert.equal(f.calls.disposed, 1, 'the stop still joins the handle disposal')
+  assert.deepEqual((await journal(f)).nextTurn.map(message => message.id), ['swarm:delivery'])
+})
+
+test('activation journals the input a restored session still holds, so a later host teardown cannot lose it', async t => {
+  const f = await fixture(t)
+  f.agent.inbox.nextStep.push(nativeNote) // pending in the resumed session, absent from any journal
+  await f.adapter.start(f.spec)
+  assert.deepEqual((await journal(f)).nextStep.map(message => message.id), ['native-note'])
 })
 
 
