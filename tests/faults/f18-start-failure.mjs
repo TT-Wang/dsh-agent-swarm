@@ -104,13 +104,15 @@ async function perRoute() {
     assert.equal(reassigned.data.to, f.reviewer.id, 'a capable live member receives the work')
     assert.equal(reassigned.data.consecutiveFailures, 3)
     assert.match(reassigned.data.reason, /injected provider outage at worker start/)
-    const current = taskOf(f.runtime, task.id)
+    // The re-route's dispatch re-validates the workspace on disk before the new
+    // attempt starts, so the dispatch is awaited, not read in the same poll.
+    const current = await eventually(() => { const row = taskOf(f.runtime, task.id); return row.status === 'running' ? row : undefined },
+      'the re-routed task is dispatched to the live member')
     assert.equal(current.recoveryCount ?? 0, 0, 'I18: a start failure spends no task recovery credit')
     const failed = events(f.runtime, f.mission.id, 'task/start-failed').filter(event => event.data.taskId === task.id)
     assert.deepEqual(failed.map(event => event.data.consecutiveFailures), [1, 2, 3], 'I18: the route is bounded by k consecutive failures')
     assert.deepEqual(failed.map(event => event.data.status), ['pending', 'pending', 'pending'], 'every start failure re-pends the task')
     assert.equal(f.runtime.store.get('members', f.author.id).phase, 'stopped', 'I18: the failing route is retired at k')
-    assert.equal(current.status, 'running', 'the re-routed task is dispatched to the live member')
     assert.equal(current.attempt.ownerId, f.reviewer.id)
     assert.equal(current.assigneeId, f.reviewer.id)
     assert.equal(events(f.runtime, f.mission.id, 'task/blocked').length, 0, 'the task never blocks before its recovery limit')
