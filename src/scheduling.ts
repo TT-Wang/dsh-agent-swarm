@@ -13,7 +13,7 @@ import { assignmentAllows, canBorrowTask, canOwnReview, strandedReview } from '.
 import { liveReviewFor } from './admission.ts'
 import { pendingStopOwner, stopPending } from './attempts.ts'
 import { hasNotice } from './arena.ts'
-import { reviewGraceMs, subjectsOfTasks, taskSubject } from './notices.ts'
+import { subjectsOfTasks, taskSubject } from './notices.ts'
 import { emitGuardTerminal, type GuardChainId, type GuardTerminal, type GuardTerminalContext } from './refusals.ts'
 import { AdmissionRefusedError } from './scheduler.ts'
 import { isolationIssues } from './workspace-admission.ts'
@@ -22,6 +22,16 @@ import { memberPhaseOf } from './projection.ts'
 import { PolicyError } from './policy-error.ts'
 import type { SwarmRuntime } from './runtime.ts'
 import { type Actor, type Attempt, type Member, type Mission, type Task } from './types.ts'
+
+/**
+ * Round-8 F1: scheduling passes an unreviewed submission must persist before
+ * the board is reported stalled. The owner may be admitting the review it just
+ * planned; a submission that stays unreviewable past this bounded grace is a
+ * stall. The wall-clock bound keeps the notice prompt even with a slow tick.
+ */
+const STALL_GRACE_PASSES = 30
+
+const STALL_GRACE_MAX_MS = 1000
 
 const id = (prefix: string) => `${prefix}_${randomUUID()}`
 
@@ -553,7 +563,8 @@ export class Scheduling {
    * have elapsed yet.
    */
   unreviewedStall(unreviewed: Task[]): boolean {
-    return unreviewed.every(task => { const { age } = this.rt.reviewNeed(task); return age !== undefined && age >= reviewGraceMs(this.rt.config) })
+    const grace = Math.min(this.rt.config.tickMs * STALL_GRACE_PASSES, STALL_GRACE_MAX_MS)
+    return unreviewed.every(task => { const { age } = this.rt.reviewNeed(task); return age !== undefined && age >= grace })
   }
 
   /**
