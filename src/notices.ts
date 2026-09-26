@@ -390,10 +390,10 @@ export function taskFromSubject(subject: string, tasks: readonly Task[]): Task |
  * keeps a fast tick from turning a same-turn proposal into a race.
  */
 export const AUTO_REVIEW_GRACE_MS = 1000
-/** The exits a review-path blocker may name beside its own cause's (admit the review, naming the allocations `chosen` its mission's admission requires, `SwarmRuntime.chosenAllocations`; or withdraw the source), and the blocker while the host's own review waits for the board. */
-export const admitReview = (chosen: readonly string[]): string => `admit a review with swarm_propose(${['kind: "verification", reviewOf, acceptance, outputs: []', ...chosen].join(', ')})`
+/** The exits a review-path blocker may name beside its own cause's (admit the review, naming the recovery limit a launched mission's admission requires and every mission accepts; or withdraw the source), and the blocker while the host's own review waits for the board. */
+export const ADMIT_REVIEW = 'admit a review with swarm_propose(kind: "verification", reviewOf, acceptance, outputs: [], maxRecoveryAttempts)'
 export const WITHDRAW_SOURCE = 'withdraw the source with swarm_cancel(taskId, reason)'
-export const boardRunning = (chosen: readonly string[]): string => `it has no live independent review path and cannot reach a verdict while the rest of the board keeps running: ${admitReview(chosen)}, or ${WITHDRAW_SOURCE}`
+export const BOARD_RUNNING = `it has no live independent review path and cannot reach a verdict while the rest of the board keeps running: ${ADMIT_REVIEW}, or ${WITHDRAW_SOURCE}`
 
 /**
  * R17-G9: the runtime slice the lineage rules read, so the classifiers and the
@@ -1385,7 +1385,7 @@ export class Notices {
       // The runtime admission's one emitter and blocker: a decision per source and review need.
       for (const task of named) {
         const need = this.rt.reviewNeed(task)
-        this.notifyReviewBlocked(view.mission, task, need.id, this.rt.reviewPathBlocker(task, need) ?? boardRunning(this.rt.chosenAllocations(task.missionId, { kind: 'verification' })))
+        this.notifyReviewBlocked(view.mission, task, need.id, this.rt.reviewPathBlocker(task, need) ?? BOARD_RUNNING)
       }
       return true
     }

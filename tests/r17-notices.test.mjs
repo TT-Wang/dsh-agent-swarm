@@ -252,7 +252,7 @@ const DECISIONS = {
   parked: ['held by a parked member', 'without spending a recovery attempt'],
   'integration-gap': ['integration task depending on every branch'],
   'coverage-complete': ['stays active until you decide', 'swarm_control complete', 'more work with swarm_propose'],
-  'review-blocked': ['admit a review with swarm_propose(kind: "verification", reviewOf, acceptance, outputs: [])', 'withdraw the source with swarm_cancel(taskId, reason)'],
+  'review-blocked': ['admit a review with swarm_propose(kind: "verification", reviewOf, acceptance, outputs: [], maxRecoveryAttempts)', 'withdraw the source with swarm_cancel(taskId, reason)'],
 }
 function assertDecision(notice, family) {
   for (const anchor of DECISIONS[family]) assert.ok(notice.content.includes(anchor), `the ${family} body keeps "${anchor}"`)

@@ -223,7 +223,7 @@ test('the owner\'s withdrawal of the automatic review of a resubmission is honou
       assert.deepEqual(f.reviewsOf(source).map(task => [task.id, task.status]), [[review.id, 'cancelled']], 'no task slot is spent')
       assert.equal(f.events('task/review-admitted').length, 1)
       assert.deepEqual(f.events('task/review-blocked').map(event => event.data.reason),
-        [`the automatically admitted review ${review.id} was withdrawn: admit a review with swarm_propose(kind: "verification", reviewOf, acceptance, outputs: []), or withdraw the source with swarm_cancel(taskId, reason)`])
+        [`the automatically admitted review ${review.id} was withdrawn: admit a review with swarm_propose(kind: "verification", reviewOf, acceptance, outputs: [], maxRecoveryAttempts), or withdraw the source with swarm_cancel(taskId, reason)`])
       const notices = f.ownerNotices(/was withdrawn/)
       assert.equal(notices.length, 1, 'the owner is told once')
       assert.match(notices[0].content, /review_path_missing/)

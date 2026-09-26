@@ -7,7 +7,7 @@ import { PolicyError } from './policy-error.ts'
 export { WorkspaceRevokedError } from './authorization.ts'
 import { recordedClaim, type WorkspaceClaim } from './authorization.ts'
 import { WorkspaceAdmission, gitWriteDeniedMessage, TEMP_RENDEZVOUS_WINDOW_MS, type TempMention } from './workspace-admission.ts'
-import { Notices, AUTO_REVIEW_GRACE_MS, NOTICE_TEMPLATES, REJECTION_DECISION_TRIGGER, TERMINAL_STATES, WITHDRAW_SOURCE, admitReview, boardRunning, missionSubject, renderNotice, subjectsOfTasks, taskSubject, type NotifyOptions } from './notices.ts'
+import { Notices, AUTO_REVIEW_GRACE_MS, NOTICE_TEMPLATES, REJECTION_DECISION_TRIGGER, TERMINAL_STATES, ADMIT_REVIEW, BOARD_RUNNING, WITHDRAW_SOURCE, missionSubject, renderNotice, subjectsOfTasks, taskSubject, type NotifyOptions } from './notices.ts'
 import { RefusalRegistry, emitGuardTerminal, queueWriterBusy, requireStrings, requireText, sameChecks, unsupportedEffort, validatedBudget } from './refusals.ts'
 import { Scheduling, progressed, type SchedulingPass } from './scheduling.ts'
 // R17-G6/G7: the one derivation of mission derived state and its host projection.
@@ -1223,11 +1223,6 @@ export class SwarmRuntime {
     this.commit(missionId, () => { this.store.put('workstreams', stream); this.store.event(missionId, 'workstream/created', key, stream) })
     return stream
   }
-  /** The allocations only the primary agent chooses, which this mission's admission requires of a proposal: on an automatic mission its recovery limit, and a check timeout for work with checks. */
-  chosenAllocations(missionId: string, task: Pick<ProposeTaskInput, 'kind' | 'checks'>): Array<'maxRecoveryAttempts' | 'checkTimeoutMs'> {
-    if (!this.store.list('starts', missionId).length) return []
-    return task.kind !== 'verification' && task.checks?.length ? ['maxRecoveryAttempts', 'checkTimeoutMs'] : ['maxRecoveryAttempts']
-  }
   /** Distributed task proposals are admitted by deterministic scope, budget and dependency rules. */
   propose(actor: Actor, missionId: string, input: ProposeTaskInput, admittedId?: string): Task {
     const { mission, key, owner } = this.active(actor, missionId, admittedId !== undefined)
@@ -1253,23 +1248,24 @@ export class SwarmRuntime {
     // checked, and the inherited acceptance iterates it: a malformed list is
     // refused here, typed, before either reads it.
     if (input.replaces != null && (!Array.isArray(input.replaces) || !input.replaces.every(previousId => typeof previousId === 'string' && previousId.trim() !== ''))) throw new PolicyError('task_replaces_invalid', 'validation_error', '[task_replaces_invalid] `replaces` must list task ids. Pass `replaces` as an array of the blocked or cancelled task ids this repair replaces with `swarm_propose`, or omit it for new work, then retry.')
-    const chosen = this.chosenAllocations(missionId, input)
-    if (chosen.length && !owner) {
-      // Workers may extend the board but cannot enlarge execution policy set
-      // by the primary agent. Follow the source/repair/prerequisite lineage.
-      const reference = input.reviewOf ?? input.replaces?.[0] ?? input.dependencies?.[0]
-      const origin = reference ? this.task(missionId, reference) : this.store.list('tasks', missionId)[0]
-      const source = origin?.reviewOf ? this.task(missionId, origin.reviewOf) : origin
-      input = { ...input, maxRecoveryAttempts: origin?.maxRecoveryAttempts,
-        checkTimeoutMs: origin?.checkTimeoutMs ?? source?.checkTimeoutMs,
-        maxSteps: input.maxSteps ?? origin?.maxSteps, maxFindings: input.maxFindings ?? origin?.maxFindings,
-        ceilingProvenance: {
-          maxSteps: input.maxSteps == null ? origin?.ceilingProvenance?.maxSteps : input.ceilingProvenance?.maxSteps,
-          maxFindings: input.maxFindings == null ? origin?.ceilingProvenance?.maxFindings : input.ceilingProvenance?.maxFindings,
-        } }
+    if (this.store.list('starts', missionId).length) {
+      if (!owner) {
+        // Workers may extend the board but cannot enlarge execution policy set
+        // by the primary agent. Follow the source/repair/prerequisite lineage.
+        const reference = input.reviewOf ?? input.replaces?.[0] ?? input.dependencies?.[0]
+        const origin = reference ? this.task(missionId, reference) : this.store.list('tasks', missionId)[0]
+        const source = origin?.reviewOf ? this.task(missionId, origin.reviewOf) : origin
+        input = { ...input, maxRecoveryAttempts: origin?.maxRecoveryAttempts,
+          checkTimeoutMs: origin?.checkTimeoutMs ?? source?.checkTimeoutMs,
+          maxSteps: input.maxSteps ?? origin?.maxSteps, maxFindings: input.maxFindings ?? origin?.maxFindings,
+          ceilingProvenance: {
+            maxSteps: input.maxSteps == null ? origin?.ceilingProvenance?.maxSteps : input.ceilingProvenance?.maxSteps,
+            maxFindings: input.maxFindings == null ? origin?.ceilingProvenance?.maxFindings : input.ceilingProvenance?.maxFindings,
+          } }
+      }
+      if (input.maxRecoveryAttempts === undefined) throw new PolicyError('task_recovery_limit_required', 'validation_error', '[task_recovery_limit_required] Automatic tasks require a recovery limit chosen by the primary agent. Pass `maxRecoveryAttempts` as a positive safe integer on this task with `swarm_propose` (or `swarm_launch` for a new plan), then retry the same task.')
+      if (input.kind !== 'verification' && input.checks?.length && input.checkTimeoutMs === undefined) throw new PolicyError('task_check_timeout_required', 'validation_error', '[task_check_timeout_required] Automatic task checks require a timeout chosen by the primary agent. Pass `checkTimeoutMs` in milliseconds on this task with `swarm_propose` (or `swarm_launch` for a new plan), then retry the same task.')
     }
-    if (chosen.includes('maxRecoveryAttempts') && input.maxRecoveryAttempts === undefined) throw new PolicyError('task_recovery_limit_required', 'validation_error', '[task_recovery_limit_required] Automatic tasks require a recovery limit chosen by the primary agent. Pass `maxRecoveryAttempts` as a positive safe integer on this task with `swarm_propose` (or `swarm_launch` for a new plan), then retry the same task.')
-    if (chosen.includes('checkTimeoutMs') && input.checkTimeoutMs === undefined) throw new PolicyError('task_check_timeout_required', 'validation_error', '[task_check_timeout_required] Automatic task checks require a timeout chosen by the primary agent. Pass `checkTimeoutMs` in milliseconds on this task with `swarm_propose` (or `swarm_launch` for a new plan), then retry the same task.')
     requireText(input.title, 'title'); requireText(input.objective, 'objective')
     if (input.acceptance === undefined && !input.replaces?.length) throw new PolicyError('task_acceptance_required', 'validation_error', '[task_acceptance_required] A new task needs its own acceptance criteria. Pass `acceptance` as nonempty strings with `swarm_propose`, or name the rejected task in `replaces` to inherit its criteria, then retry.')
     // The proposal's own criteria are checked before any replaced task is read;
@@ -1750,7 +1746,7 @@ export class SwarmRuntime {
       // prose. A judgement rejection with no failing check keeps the prose.
       const rejection = passed ? input.reason : this.declaredChecks.rejectionReason(input.reason, checks)
       if (this.declaredChecks.recoveryRequired(checks)) {
-        const deferral = `\nReview ${task.id} deferred its verdict on the immutable source ${source.id} at ${artifact.commit}, which remains submitted: ${this.declaredChecks.recoveryExit(checks, source)}.`
+        const deferral = `\nReview ${task.id} deferred its verdict on the immutable source ${source.id} at ${artifact.commit}, which remains submitted: ${this.declaredChecks.recoveryExit(checks)}.`
         const reason = `${excerpt(rejection, Math.max(0, this.config.maxMessageChars - deferral.length - 32))}${deferral}`
         this.commit(missionId, () => {
           const runIds = this.declaredChecks.recordRuns(missionId, { memberId: member.id, taskId: task.id, attemptId: input.attemptId, commit: artifact.commit }, checks)
@@ -2487,15 +2483,14 @@ export class SwarmRuntime {
     const mission = this.mission(source.missionId)
     const tasks = this.store.list('tasks', mission.id), members = this.store.list('members', mission.id)
     const deferred = tasks.find(task => task.status === 'blocked' && task.reviewOf === source.id && task.verificationRecovery !== undefined && task.verificationRecovery.commit === source.artifact?.commit)
-    if (deferred !== undefined) return `review ${deferred.id} deferred its verdict on this artifact: ${this.declaredChecks.recoveryExit(this.store.toolRuns(mission.id, { taskId: deferred.id }).filter(run => run.tool === 'swarm.host_verification').map(run => run.result as CheckResult), source)}`
+    if (deferred !== undefined) return `review ${deferred.id} deferred its verdict on this artifact: ${this.declaredChecks.recoveryExit(this.store.toolRuns(mission.id, { taskId: deferred.id }).filter(run => run.tool === 'swarm.host_verification').map(run => run.result as CheckResult))}`
     if (tasks.length >= mission.budget.maxTasks) return `the mission task budget is exhausted (${tasks.length}/${mission.budget.maxTasks} admitted tasks), so no verification task can be admitted: raise maxTasks with swarm_budget(budget, reason), or ${WITHDRAW_SOURCE}`
     const authors = [...authorIdsOf(source)]
     if (!members.some(member => memberPhaseOf(member) !== 'stopped' && canOwnReview(source, member.id))) return `no live member other than the author (${authors.join(', ') || 'unknown'}) can review this artifact independently: add an independent member with swarm_add_member(role, maxOutputTokens), or ${WITHDRAW_SOURCE}`
     const withdrawn = tasks.find(review => review.reviewOf === source.id && review.status === 'cancelled'
       && review.id.startsWith(AUTOMATIC_REVIEW_PREFIX) && (this.store.latestTaskEvent(mission.id, review.id, 'task/cancelled')?.seq ?? 0) > need.seq)
-    const chosen = this.chosenAllocations(mission.id, { kind: 'verification' })
-    if (withdrawn !== undefined) return `the automatically admitted review ${withdrawn.id} was withdrawn: ${admitReview(chosen)}, or ${WITHDRAW_SOURCE}`
-    return (stalled ?? this.reviewPathStalled(tasks, members)) ? undefined : boardRunning(chosen)
+    if (withdrawn !== undefined) return `the automatically admitted review ${withdrawn.id} was withdrawn: ${ADMIT_REVIEW}, or ${WITHDRAW_SOURCE}`
+    return (stalled ?? this.reviewPathStalled(tasks, members)) ? undefined : BOARD_RUNNING
   }
   /** Admit the bounded independent review for one unreviewable submitted deliverable once: its id is keyed on the review need, so an existing row is that review. */
   private admitAutomaticReview(mission: Mission, source: Task, need: ReviewNeed): void {
@@ -2515,7 +2510,7 @@ export class SwarmRuntime {
     } catch (error) {
       // Admission can still refuse a field copied from the source. The
       // submission stands; the owner is told exactly what to admit instead.
-      this.notifyReviewBlocked(mission, source, need, `automatic review admission failed: ${admitReview(this.chosenAllocations(mission.id, { kind: 'verification' }))} correcting what its refusal names, or ${WITHDRAW_SOURCE}. The refusal: ${error instanceof Error ? error.message : String(error)}`)
+      this.notifyReviewBlocked(mission, source, need, `automatic review admission failed: ${ADMIT_REVIEW} correcting what its refusal names, or ${WITHDRAW_SOURCE}. The refusal: ${error instanceof Error ? error.message : String(error)}`)
       return
     }
     // The review already exists and its task/proposed event is durable; a busy

@@ -89,8 +89,8 @@ test('exit 127: the row is unrunnable with the command\'s own output, and the en
   assert.ok(reason.includes('a command could not run in the clean verification checkout (dependency directories copied from the source: node_modules)'), reason)
   assert.ok(reason.includes(`\nReview ${review.id} deferred its verdict on the immutable source ${source.id} at ${taskOf(f.runtime, source.id).artifact.commit}, which remains submitted: `), reason)
   assert.ok(reason.includes('then resume the review with swarm_control(action: "resume", taskId, reason)'), 'the environment exit resumes the same review')
-  assert.ok(reason.includes('cancel the source with swarm_cancel(taskId, reason) and repair it with swarm_propose(replaces, checks)'), 'the replacement exit is named')
-  assert.doesNotMatch(reason, /checkTimeoutMs/, 'a deadline is not this failure\'s exit')
+  assert.ok(reason.includes('cancel the source with swarm_cancel(taskId, reason) and repair its checks with swarm_propose(replaces, checks, maxRecoveryAttempts, checkTimeoutMs)'), 'the replacement exit is named')
+  assert.doesNotMatch(reason, /reached its deadline|swarm_budget/, 'a deadline is not this failure\'s exit')
   await assertNamedCalls(reason, ['swarm_control', 'swarm_cancel', 'swarm_propose'])
 
   // The environment exit: install the toolchain in the source project, then resume the same review.
@@ -110,15 +110,15 @@ test('exit 126: the replacement exit named in the reason really works end to end
   assert.deepEqual(hostRuns(f).map(run => [run.result.exitCode, run.result.failureKind]), [[126, 'unrunnable'], [126, 'unrunnable']])
   const reason = deferredReason(f)
   assert.ok(reason.includes('dependency directories copied from the source: node_modules'), reason)
-  assert.ok(reason.includes('or, if the command itself is wrong, cancel the source with swarm_cancel(taskId, reason) and repair it with swarm_propose(replaces, checks) holding corrected commands'), reason)
+  assert.ok(reason.includes('or, if a command is wrong, cancel the source with swarm_cancel(taskId, reason) and repair its checks with swarm_propose(replaces, checks, maxRecoveryAttempts, checkTimeoutMs)'), reason)
   await assertNamedCalls(reason, ['swarm_control', 'swarm_cancel', 'swarm_propose'])
 
-  // The command itself is wrong (the script is not executable): withdraw, then repair with corrected checks.
+  // The command itself is wrong (the script is not executable): withdraw, then repair with corrected checks, naming every parameter the exit names.
   await f.tool('swarm_cancel', { taskId: source.id, reason: 'the declared check cannot run as written' })
   assert.equal(taskOf(f.runtime, source.id).status, 'cancelled')
   assert.equal(taskOf(f.runtime, review.id).status, 'cancelled', 'the deferred review is retired with its source')
   const repair = await f.tool('swarm_propose', { workstreamId: f.stream.id, title: 'Repair', objective: 'Implement the scoped change',
-    kind: 'implementation', scope: ['**'], replaces: [source.id], checks: ['sh ./check.sh'], assigneeId: f.author.id })
+    kind: 'implementation', scope: ['**'], replaces: [source.id], checks: ['sh ./check.sh'], maxRecoveryAttempts: 2, checkTimeoutMs: 30_000, assigneeId: f.author.id })
   assert.deepEqual(repair.checks, ['sh ./check.sh'])
   const next = await submitForReview(f, taskOf(f.runtime, repair.id), answer(f))
   assert.equal((await next.verify()).status, 'accepted')
@@ -150,7 +150,7 @@ test('exit 124: the reason names checkTimeoutMs through swarm_budget, and that e
   const { source, review, verdict } = await deferOn(f, [{ command: 'test -d .', exitCode: 124, failureKind: 'timeout', output: '[swarm] Execution timed out after 30000ms' }])
   assert.equal(verdict.status, 'blocked')
   const reason = deferredReason(f)
-  assert.ok(reason.includes(`\nReview ${review.id} deferred its verdict on the immutable source ${source.id} at ${'a'.repeat(40)}, which remains submitted: a check reached its deadline: raise the source's checkTimeoutMs with swarm_budget(taskId, taskBudget: { checkTimeoutMs }, reason), then resume the review with swarm_control(action: "resume", taskId, reason); or, if the command itself is wrong, cancel the source with swarm_cancel(taskId, reason) and repair it with swarm_propose(replaces, checks) holding corrected commands.`), reason)
+  assert.ok(reason.includes(`\nReview ${review.id} deferred its verdict on the immutable source ${source.id} at ${'a'.repeat(40)}, which remains submitted: a check reached its deadline: raise the source's checkTimeoutMs with swarm_budget(taskId, taskBudget: { checkTimeoutMs }, reason), then resume the review with swarm_control(action: "resume", taskId, reason); or, if a command is wrong, cancel the source with swarm_cancel(taskId, reason) and repair its checks with swarm_propose(replaces, checks, maxRecoveryAttempts, checkTimeoutMs).`), reason)
   await assertNamedCalls(reason, ['swarm_budget', 'swarm_control', 'swarm_cancel', 'swarm_propose'])
   await f.tool('swarm_budget', { taskId: source.id, taskBudget: { checkTimeoutMs: 90_000 }, reason: 'The suite needs a longer deadline' })
   assert.equal(taskOf(f.runtime, source.id).checkTimeoutMs, 90_000)
@@ -223,6 +223,7 @@ test('the reason fits the smallest message bound with the longest ids, and the b
   assert.ok(reason.length <= 1_000, `the composed reason stays within maxMessageChars: ${reason.length}`)
   assert.ok(reason.includes('dependency directories copied from the source: packages/p0/node_modules, '), reason)
   assert.match(reason, /… \[\d{7} more chars\]\): provide what it needs/)
+  assert.ok(reason.endsWith('swarm_propose(replaces, checks, maxRecoveryAttempts, checkTimeoutMs).'), 'measured on the one repair text every mission names')
   const deferral = reason.slice(reason.lastIndexOf('\nReview '))
   assert.deepEqual([deferral.split(source.id).length - 1, deferral.split(review.id).length - 1], [1, 1], `each id is named once: ${deferral}`)
   await assertNamedCalls(reason, ['swarm_control', 'swarm_cancel', 'swarm_propose'])
@@ -288,7 +289,7 @@ test('the reason and the blocker take the exit from the deciding pass: the retry
   assert.deepEqual(hostRuns(f).map(run => [run.arguments.attempt, run.result.failureKind]), [[1, 'timeout'], [2, 'unrunnable']], 'both passes are durable')
   const reason = deferredReason(f)
   assert.ok(reason.includes('a command could not run in the clean verification checkout'), reason)
-  assert.doesNotMatch(reason, /checkTimeoutMs/, 'the retry decided, not the first pass')
+  assert.doesNotMatch(reason, /reached its deadline|swarm_budget/, 'the retry decided, not the first pass')
   assert.equal(blocker(f, source), `review ${review.id} deferred its verdict on this artifact: ${reason.slice(reason.indexOf('a command could not run'), -1)}`)
 
   // Resumed, the review defers again on a new kind: the blocker follows the latest deferral only.

@@ -302,14 +302,14 @@ test('the review decision is the newest recorded blocker in full, queued when it
     snapshot.events.push(...events.map((event, index) => ({ seq: 40 + index, missionId: snapshot.mission.id, actor: 'runtime', ...event })))
     return { markup: render(SwarmBoard, { snapshot }), decision: sidebarState(snapshot, 'connected', at).decision }
   }
-  // A deadline deferral on a launched mission: its repair exit ends past 400 characters.
-  const reason = 'review task_r deferred its verdict on this artifact: a check reached its deadline: raise the source\'s checkTimeoutMs with swarm_budget(taskId, taskBudget: { checkTimeoutMs }, reason), then resume the review with swarm_control(action: "resume", taskId, reason); or, if the command itself is wrong, cancel the source with swarm_cancel(taskId, reason) and repair it with swarm_propose(replaces, checks, maxRecoveryAttempts, checkTimeoutMs) holding corrected commands'
+  // A deadline deferral: its repair exit ends past 400 characters.
+  const reason = 'review task_r deferred its verdict on this artifact: a check reached its deadline: raise the source\'s checkTimeoutMs with swarm_budget(taskId, taskBudget: { checkTimeoutMs }, reason), then resume the review with swarm_control(action: "resume", taskId, reason); or, if a command is wrong, cancel the source with swarm_cancel(taskId, reason) and repair its checks with swarm_propose(replaces, checks, maxRecoveryAttempts, checkTimeoutMs)'
   assert.ok(reason.length > 400, `the reason is ${reason.length} characters`)
   const submitted = { type: 'task/submitted', data: { taskId: 't4' }, createdAt: at - 5_000 }
   const blocked = { type: 'task/review-blocked', data: { taskId: 't4', kind: 'research', reason }, createdAt: at - 2_000 }
   const recorded = decided([submitted, blocked])
   assert.equal(recorded.decision.content, reason, 'the decision keeps the exit its reason ends with')
-  assert.match(recorded.markup, /data-swarm-decision-content="">[^<]*holding corrected commands</, 'and so does the sidebar')
+  assert.match(recorded.markup, /data-swarm-decision-content="">[^<]*maxRecoveryAttempts, checkTimeoutMs\)</, 'and so does the sidebar')
   assert.equal(recorded.decision.queuedAt, at - 2_000, 'queued when the blocker was recorded')
   const resubmitted = decided([submitted, blocked, { type: 'task/submitted', data: { taskId: 't4' }, createdAt: at - 1_000 }])
   assert.equal(resubmitted.decision.content, 'No live independent review yet.', 'a resubmission retires the blocker recorded before it')

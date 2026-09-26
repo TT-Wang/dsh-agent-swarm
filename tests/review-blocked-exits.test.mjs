@@ -37,7 +37,7 @@ const { definitions } = await toolSchemaIndex()
 const MISSION = { title: 'Review exits', objective: 'Every review-path blocker names an exit that works', scope: ['**'], acceptance: MISSION_ACCEPTANCE }
 const STREAM = { title: 'Exits', objective: 'Exercise each review-path blocker' }
 const memberInput = (name, index) => ({ name, role: index === 0 ? 'implementation' : 'verification', maxOutputTokens: 5_000 })
-/** The allocations the primary agent chooses on a launched mission's proposals (`SwarmRuntime.chosenAllocations`). */
+/** The allocations only the primary agent chooses: a launched mission's admission requires them, and every exit that admits a task names them. */
 const CHOSEN = { maxRecoveryAttempts: 2, checkTimeoutMs: 30_000 }
 
 /**
@@ -142,7 +142,7 @@ async function perform(f, source, reason, tool, named) {
     },
     taskId: () => tool === 'swarm_control' ? /^review (\S+) deferred/.exec(reason)[1] : source.id,
     taskBudget: () => ({ checkTimeoutMs: 90_000 }),
-    // The allocations a launched mission's admission requires, when the call names them.
+    // The allocations an exit names; a swarm_create mission accepts them too.
     maxRecoveryAttempts: () => CHOSEN.maxRecoveryAttempts,
     checkTimeoutMs: () => CHOSEN.checkTimeoutMs,
     reviewOf: () => source.id,
@@ -303,7 +303,7 @@ const FAMILIES = [
     steps: [[WITHDRAWN, PROPOSE_OR_CANCEL]],
   },
   // A launched mission's admission requires the primary agent's allocations,
-  // so each exit that admits a task names them there.
+  // which each exit that admits a task names on every mission.
   {
     name: 'on a launched mission, the owner withdrew the automatic review',
     options: { launched: true },
