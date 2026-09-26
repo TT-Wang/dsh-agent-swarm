@@ -202,9 +202,12 @@ test('a reminder queued before review admission is retained in the ledger but ne
     f.runtime.store.put('tasks', other)
     f.runtime.notify(f.mission.id, 'Legacy review decision', [`${source.id}@${source.epoch}`])
   })
-  // Each review-blocked decision comes from the one emitter, per source and review need.
+  // Each review-blocked decision comes from the one emitter, per source and review need, with the blocker the runtime derives.
   const mission = f.runtime.mission(f.mission.id)
-  for (const task of [source, other]) f.runtime.notices.notifyReviewBlocked(mission, task, f.runtime.reviewNeed(task).id, `no live independent review admits ${task.id}`)
+  for (const task of [source, other]) {
+    const need = f.runtime.reviewNeed(task)
+    f.runtime.notices.notifyReviewBlocked(mission, task, need.id, f.runtime.reviewPathBlocker(task, need) ?? `no live independent review admits ${task.id}`)
+  }
   const decisionOf = task => f.rows().find(row => row.notice?.dedupKey?.startsWith(`review-blocked:${f.mission.id}:${task.id}:`))
   await f.runtime.flushOutbox(f.mission.id)
   for (const row of [f.rows().find(row => row.id === reminder.id), decisionOf(source), f.rows().find(row => row.content === 'Legacy review decision')]) {

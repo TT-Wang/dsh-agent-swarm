@@ -133,8 +133,8 @@ await runScenario({
 
     // Row 5b/5c — verifier-1 challenge (evidence_a454a771): an unreviewable
     // submitted artifact must be witnessed even while unrelated work runs.
-    // `stalled`/`admitMissingReviews` only notify when the whole board would
-    // otherwise stall, so without this the state stays silent behind live work.
+    // `stalled` only reports a board that would otherwise stall, so the
+    // runtime's review admission names the blocker on every pass.
     // Proven for an implementation artifact and a research artifact.
     for (const kind of ['implementation', 'research']) {
       const f = await setup()

@@ -148,20 +148,20 @@ async function perform(f, source, reason, tool, named) {
 /**
  * Walk a family's steps: each step's decision is checked (the cause, the body,
  * exactly the calls expected, each resolving in its tool's schema) and every
- * call it names but the withdrawal is performed in order, then one tick runs.
- * The last step's exits, and what the board does after them when the family
- * says (`afterExits`), must leave the source with a live review.
+ * call it names but the withdrawal is performed in order, then one tick runs;
+ * the decision is then no longer outstanding, so no reminder repeats a cause
+ * its exit removed. The last step's exits must leave the source with a live
+ * review, with no action a decision did not name.
  */
-async function followExits(f, blocked, { steps, afterExits }) {
-  const { source } = blocked
+async function followExits(f, { source }, { steps }) {
   for (const [cause, calls] of steps) {
     assert.equal(f.live(source), false, `the source has no live review before ${cause}`)
     const notice = blockedNotice(f, source, cause)
     await assertNamedCalls(notice.content, calls)
     for (const [tool, named] of namedCalls(notice.content)) if (tool !== 'swarm_cancel') await perform(f, source, notice.notice.reason, tool, named)
     await f.pass()
+    assert.equal(f.runtime.ownerDeliveryRelevant(f.runtime.mission(f.mission.id), f.runtime.store.get('deliveries', notice.id)), false, `the exit retires its decision: ${notice.content}`)
   }
-  if (afterExits !== undefined) { await afterExits(f, blocked); await f.pass() }
   assert.equal(f.live(source), true, 'the exits named give the source a live review')
 }
 
@@ -299,11 +299,8 @@ const FAMILIES = [
     name: 'beside running work, the mission task budget is exhausted',
     options: { budget: { maxTasks: 2 } },
     block: f => submitted(f, { running: reviewer }),
-    steps: [[BUDGET(2), ['swarm_budget', 'swarm_cancel']]],
-    // The raise frees the slot; the board state the owner was told about is
-    // unchanged (F(S) holds no ceiling), so the host admits the review once the
-    // unrelated work ends and the board has nothing else to do.
-    afterExits: (f, { running }) => f.tool('swarm_cancel', { taskId: running.id, reason: 'The unrelated work ends' }),
+    // The raise frees the slot; the board still runs, so the host admits no review itself.
+    steps: [[BUDGET(2), ['swarm_budget', 'swarm_cancel']], [RUNNING, PROPOSE_OR_CANCEL]],
   },
   {
     name: 'beside running work, the owner withdrew the automatic review',
@@ -336,6 +333,19 @@ const FAMILIES = [
     steps: [[RUNNING, PROPOSE_OR_CANCEL]],
   },
 ]
+
+test('beside running work, no reminder repeats the budget cause the owner removed', async t => {
+  const f = await fixture(t, { budget: { maxTasks: 2 } })
+  const { source } = await submitted(f, { running: reviewer })
+  const notice = blockedNotice(f, source, BUDGET(2))
+  f.runtime.notices.obligationFollowupMs = 0
+  await perform(f, source, notice.notice.reason, 'swarm_budget', namedCalls(notice.content)[0][1])
+  for (let pass = 0; pass < 3; pass++) await f.pass()
+  const reminders = f.runtime.store.list('deliveries', f.mission.id).filter(delivery => delivery.notice?.trigger === 'owner-decision-unresolved')
+  assert.deepEqual(reminders.filter(delivery => delivery.notice.reason === notice.id).map(delivery => delivery.content), [], 'the removed cause is never reminded')
+  const running = blockedNotice(f, source, RUNNING)
+  assert.ok(reminders.some(delivery => delivery.notice.reason === running.id), 'the cause that holds now is the one reminded')
+})
 
 for (const family of FAMILIES) {
   test(`${family.name}: each decision names its own exits, and performing them reaches a live review`, async t => {

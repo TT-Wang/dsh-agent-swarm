@@ -390,9 +390,10 @@ export function taskFromSubject(subject: string, tasks: readonly Task[]): Task |
  * keeps a fast tick from turning a same-turn proposal into a race.
  */
 export const AUTO_REVIEW_GRACE_MS = 1000
-/** The exits a review-path blocker may name beside its own cause's: admit the review, or withdraw the source. */
+/** The exits a review-path blocker may name beside its own cause's (admit the review, or withdraw the source), and the blocker while the host's own review waits for the board. */
 export const ADMIT_REVIEW = 'admit a review with swarm_propose(kind: "verification", reviewOf, acceptance, outputs: [])'
 export const WITHDRAW_SOURCE = 'withdraw the source with swarm_cancel(taskId, reason)'
+export const BOARD_RUNNING = `it has no live independent review path and cannot reach a verdict while the rest of the board keeps running: ${ADMIT_REVIEW}, or ${WITHDRAW_SOURCE}`
 
 /**
  * R17-G9: the runtime slice the lineage rules read, so the classifiers and the
@@ -1095,14 +1096,14 @@ export class Notices {
     return task !== undefined && stallRootsFor(this.rt, tasks).some(candidate => candidate.id === task.id) ? [root!] : []
   }
 
-  /** A review-blocked decision is outstanding while its source is unreviewable under the same review need; a re-opened need retires it. */
+  /** A review-blocked decision is outstanding while its reason is its source's blocker under the same review need: the one derived now, else the last one recorded (a refused admission). */
   private openReviewBlock(missionId: string, delivery: Delivery, tasks: Task[]): string[] {
-    const key = delivery.notice?.dedupKey
-    const reason = noticeRow(delivery)?.reason ?? ''
     return (delivery.subjects ?? []).filter(subject => {
       const task = taskFromSubject(subject, tasks)
-      return task?.status === 'submitted' && !this.rt.reviewable(task, tasks)
-        && key === reviewBlockedKey(missionId, task.id, this.rt.reviewNeed(task).id, reason)
+      if (task?.status !== 'submitted' || this.rt.reviewable(task, tasks)) return false
+      const need = this.rt.reviewNeed(task)
+      const blocker = this.rt.reviewPathBlocker(task, need) ?? (this.rt.store.latestTaskEvent(missionId, task.id, 'task/review-blocked')?.data as { reason: string } | undefined)?.reason
+      return blocker !== undefined && delivery.notice?.dedupKey === reviewBlockedKey(missionId, task.id, need.id, blocker)
     })
   }
 
@@ -1371,20 +1372,17 @@ export class Notices {
         const { age } = this.rt.reviewNeed(task)
         return age === undefined || age >= grace
       })
-      // On a board with no other progress (`reviewPathStalled`) the runtime's
-      // own review admission owns every submitted artifact: its pass admits the
-      // review or names the exact blocker, so a second, generic fact here would
-      // only race it. This branch names the rest: submissions behind a board
-      // that keeps running, as its body says, everything when a wedged pass
-      // never reaches that admission, and a legacy submission without an
-      // artifact, which that admission skips.
-      const admitted = options.wedged !== true && this.rt.reviewPathStalled(tasks, members)
-      const named = admitted ? ripe.filter(task => task.artifact === undefined) : ripe
+      // The runtime's own review admission owns every submitted artifact: each
+      // pass admits the review or names the current blocker, so a second fact
+      // here would only race it. This branch names the rest: everything when a
+      // wedged pass never reaches that admission, and a legacy submission
+      // without an artifact, which that admission skips.
+      const named = options.wedged === true ? ripe : ripe.filter(task => task.artifact === undefined)
       if (!named.length) return false
       // The runtime admission's one emitter and blocker: a decision per source and review need.
       for (const task of named) {
         const need = this.rt.reviewNeed(task)
-        this.notifyReviewBlocked(view.mission, task, need.id, this.rt.reviewPathBlocker(task, need) ?? `it has no live independent review path and cannot reach a verdict while the rest of the board keeps running: ${ADMIT_REVIEW}, or ${WITHDRAW_SOURCE}`)
+        this.notifyReviewBlocked(view.mission, task, need.id, this.rt.reviewPathBlocker(task, need) ?? BOARD_RUNNING)
       }
       return true
     }
