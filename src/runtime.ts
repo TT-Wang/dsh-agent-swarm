@@ -2485,7 +2485,7 @@ export class SwarmRuntime {
   reviewPathBlocker(source: Task, need: ReviewNeed): string | undefined {
     const mission = this.mission(source.missionId)
     const tasks = this.store.list('tasks', mission.id)
-    const deferred = tasks.find(task => task.status === 'blocked' && task.reviewOf === source.id && task.verificationRecovery?.commit === source.artifact?.commit)
+    const deferred = tasks.find(task => task.status === 'blocked' && task.reviewOf === source.id && task.verificationRecovery !== undefined && task.verificationRecovery.commit === source.artifact?.commit)
     if (deferred !== undefined) return `review ${deferred.id} deferred its verdict on this artifact: ${this.declaredChecks.recoveryExit(this.store.toolRuns(mission.id, { taskId: deferred.id }).filter(run => run.tool === 'swarm.host_verification').map(run => run.result as CheckResult))}`
     if (tasks.length >= mission.budget.maxTasks) return `the mission task budget is exhausted (${tasks.length}/${mission.budget.maxTasks} admitted tasks), so no verification task can be admitted: raise maxTasks with swarm_budget(budget, reason), or ${WITHDRAW_SOURCE}`
     const authors = [...authorIdsOf(source)], live = this.store.list('members', mission.id).filter(member => memberPhaseOf(member) !== 'stopped')

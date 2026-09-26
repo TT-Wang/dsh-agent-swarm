@@ -277,6 +277,13 @@ const FAMILIES = [
     steps: [[DEFERRED, ['swarm_control']]],
   },
   {
+    name: 'a review deferred its verdict on the artifact, and the task budget is exhausted',
+    options: { budget: { maxTasks: 2 } },
+    block: f => deferred(f),
+    // Resuming the deferred review needs no task slot, so the deferral is named first.
+    steps: [[DEFERRED, ['swarm_control']]],
+  },
+  {
     name: 'the rest of the board keeps running',
     block: f => submitted(f, { running: reviewer }),
     steps: [[RUNNING, PROPOSE_OR_CANCEL]],
@@ -307,6 +314,26 @@ const FAMILIES = [
     name: 'beside running work, a review deferred its verdict on the artifact',
     block: f => deferred(f, { running: author }),
     steps: [[DEFERRED, ['swarm_control']]],
+  },
+  {
+    name: 'beside running work, a submission an older build left without an artifact has a blocked review that did not defer',
+    block: async f => {
+      const source = f.propose()
+      await f.submit(source)
+      const review = f.runtime.propose(f.owner, f.mission.id, { outputs: [], workstreamId: f.stream.id, title: 'Review the source', objective: 'Independently review the scoped change',
+        kind: 'verification', reviewOf: source.id, scope: ['**'], acceptance: MISSION_ACCEPTANCE, assigneeId: f.reviewer.id })
+      // The rows as that build left them: no artifact on the submission, and a
+      // review blocked by something other than a deferral (no recovery record).
+      f.runtime.store.transaction(() => {
+        const row = taskOf(f.runtime, source.id); delete row.artifact; f.runtime.store.put('tasks', row)
+        f.runtime.store.put('tasks', { ...taskOf(f.runtime, review.id), status: 'blocked' })
+      })
+      await f.run(f.author)
+      await f.pass()
+      return { source }
+    },
+    // A deferral is a recorded recovery of the source's artifact; neither exists here.
+    steps: [[RUNNING, PROPOSE_OR_CANCEL]],
   },
 ]
 
