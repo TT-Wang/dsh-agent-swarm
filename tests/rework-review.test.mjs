@@ -224,7 +224,7 @@ test('the owner\'s withdrawal of the automatic review of a resubmission is honou
       assert.deepEqual(f.reviewsOf(source).map(task => [task.id, task.status]), [[review.id, 'cancelled']], 'no task slot is spent')
       assert.equal(f.events('task/review-admitted').length, 1)
       assert.deepEqual(f.events('task/review-blocked').map(event => event.data.reason),
-        [`the automatically admitted review ${review.id} was withdrawn; admit a replacement review (kind verification, reviewOf ${source.id}) or cancel the source task`])
+        [`the automatically admitted review ${review.id} was withdrawn: admit a review with swarm_propose(kind: "verification", reviewOf, acceptance, outputs: [], maxRecoveryAttempts), or withdraw the source with swarm_cancel(taskId, reason)`])
       const notices = f.ownerNotices(/was withdrawn/)
       assert.equal(notices.length, 1, 'the owner is told once')
       assert.match(notices[0].content, /review_path_missing/)
@@ -565,7 +565,7 @@ test('a missing review path names every author of a reworked artifact', async t 
   f.runtime.cancel(f.owner, f.mission.id, { taskId: review.id, reason: 'Hand the rework over' })
   f.runtime.controlTask(f.owner, f.mission.id, source.id, 'amend', { assigneeId: reviewer.id }, 'The author is unavailable')
   await f.submit(reviewer, source)
-  const blocker = f.runtime.reviewPathBlocker(f.runtime.mission(f.mission.id), f.current(source), f.runtime.store.list('members', f.mission.id))
+  const blocker = f.runtime.reviewPathBlocker(f.current(source), f.runtime.reviewNeed(f.current(source)))
   assert.match(blocker, /^no live member other than the author \(/)
   assert.ok(blocker.includes(author.id) && blocker.includes(reviewer.id), `both authors are named: ${blocker}`)
 })

@@ -188,7 +188,7 @@ export const zh: Record<string, string> = {
   'Cannot make progress without a repair.': '没有修复就无法继续。',
   'Repair the task or withdraw it.': '修复该子任务，或将其撤销。',
   'A submitted artifact has no live independent review path.': '已提交的产物没有可用的独立审查路径。',
-  'Admit an independent review or cancel the submission.': '准入一次独立审查，或取消该提交。',
+  'No live independent review yet.': '尚无可用的独立审查。',
   'A recovery attempt is running for this task.': '该子任务正在进行一次恢复尝试。',
   'Recovering': '正在恢复',
   'The worker handle is acknowledging its stop before the task can be re-pended; no recovery credit is spent.': '成员正在确认停止，之后子任务才能重新排队；此过程不消耗恢复次数。',

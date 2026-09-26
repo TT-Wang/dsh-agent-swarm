@@ -11,10 +11,10 @@
 
 /**
  * The control-path chains the board model classifies. `owner_reply`, the
- * seventh `GuardChainId`, is a receipt chain with no board state here; its
+ * sixth `GuardChainId`, is a receipt chain with no board state here; its
  * terminal is exercised by tests/owner-reply.test.mjs.
  */
-export const CHAINS = ['budget', 'workspace', 'attempt_lease', 'task_ceiling', 'review_admission', 'dispatch_preconditions']
+export const CHAINS = ['budget', 'workspace', 'attempt_lease', 'task_ceiling', 'dispatch_preconditions']
 
 export const TASK_STATUS = ['pending', 'running', 'submitted', 'blocked', 'accepted', 'cancelled']
 export const ATTEMPTS = [{ label: 'no-attempt' }, { label: 'live-attempt', attempt: { leaseLive: true } }, { label: 'lapsed-attempt', attempt: { leaseLive: false } }]

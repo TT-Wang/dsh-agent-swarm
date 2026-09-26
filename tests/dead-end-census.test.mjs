@@ -42,9 +42,11 @@
  * (`guardBoard` in tests/guard-model.mjs) and must classify as 0 dead ends and
  * exactly 4 owner-gated. Over the whole reachable closure the corrected
  * (task-scoped) census reports **52 recoverable / 11148 owner-gated / 0 dead
- * ends** over six board chains (60/12740/0 while the R12-F9 dependency guard
- * was a seventh, dispatch-time `admission` chain with its own `assumed-content`
- * seed; that guard now refuses at the call that writes a dependency set, so the
+ * ends** over five board chains (the same counts over six until the
+ * `review_admission` chain, which nothing in src emitted, was deleted:
+ * an unreviewable source is the review-blocked emitter's; 60/12740/0 while the
+ * R12-F9 dependency guard was a seventh, dispatch-time `admission` chain with
+ * its own `assumed-content` seed; that guard now refuses at the call that writes a dependency set, so the
  * seed and its states are gone); before the D1 fix it reported 86/12714/0, the
  * difference being the states whose only "action" was an unrelated member's
  * `working` status. The

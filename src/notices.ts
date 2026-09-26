@@ -282,8 +282,7 @@ export const NOTICE_TEMPLATES = {
   },
   'review-blocked': {
     trigger: 'task/review-blocked',
-    build: (input: { diagnostic: string; sourceId: string }) =>
-      `${input.diagnostic}. Admit an independent verification task with swarm_propose (kind verification, reviewOf ${input.sourceId}) or cancel the source task; the mission cannot complete while it is unreviewable.`,
+    build: (input: { sourceId: string; reason: string }) => formatDiagnostic(missingReviewDiagnostic(input.sourceId, input.reason)),
   },
   'integration-gap': {
     trigger: 'task/proposed',
@@ -391,6 +390,10 @@ export function taskFromSubject(subject: string, tasks: readonly Task[]): Task |
  * keeps a fast tick from turning a same-turn proposal into a race.
  */
 export const reviewGraceMs = (config: { tickMs: number }): number => Math.max(config.tickMs, 1000)
+/** The exits a review-path blocker may name beside its own cause's (admit the review, naming the recovery limit a launched mission's admission requires and every mission accepts; or withdraw the source), and the blocker while the host's own review waits for the board. */
+export const ADMIT_REVIEW = 'admit a review with swarm_propose(kind: "verification", reviewOf, acceptance, outputs: [], maxRecoveryAttempts)'
+export const WITHDRAW_SOURCE = 'withdraw the source with swarm_cancel(taskId, reason)'
+export const BOARD_RUNNING = `it has no live independent review path and cannot reach a verdict while the rest of the board keeps running: ${ADMIT_REVIEW}, or ${WITHDRAW_SOURCE}`
 
 /**
  * R17-G9: the runtime slice the lineage rules read, so the classifiers and the
@@ -484,7 +487,7 @@ function backoffExpiredSince(rt: Pick<LineageRuntime, 'config' | 'now'>, tasks: 
  * Co-firing guards, named: this classifier x the stall-root classifier (a blocked
  * predecessor is the ROOT's subject, named by the root notice with its
  * dependents, never re-named here) x the review grace (`reviewable` and the
- * review-admission terminal) x the off-pass wedged-pass classification.
+ * review-blocked emitter) x the off-pass wedged-pass classification.
  */
 export function waitsLegitimately(rt: LineageRuntime, task: Task, tasks: Task[]): boolean {
   if (TERMINAL_STATES.has(task.status)) return false
@@ -1093,16 +1096,19 @@ export class Notices {
     return task !== undefined && stallRootsFor(this.rt, tasks).some(candidate => candidate.id === task.id) ? [root!] : []
   }
 
-  /** A review-blocked decision is outstanding while its source is unreviewable under the same review need; a re-opened need retires it. */
+  /** A review-blocked decision is outstanding while its reason is its source's blocker under the same review need: the one derived now, else the last one recorded (a refused admission). */
   private openReviewBlock(missionId: string, delivery: Delivery, tasks: Task[]): string[] {
-    const key = delivery.notice?.dedupKey
-    const reason = noticeRow(delivery)?.reason ?? ''
     return (delivery.subjects ?? []).filter(subject => {
       const task = taskFromSubject(subject, tasks)
-      return task?.status === 'submitted' && !this.rt.reviewable(task, tasks)
-        && key === reviewBlockedKey(missionId, task.id, this.rt.reviewNeed(task).id, reason)
+      if (task?.status !== 'submitted' || this.rt.reviewable(task, tasks)) return false
+      const need = this.rt.reviewNeed(task)
+      const blocker = this.rt.reviewPathBlocker(task, need) ?? this.recordedBlocker(missionId, task.id)
+      return blocker !== undefined && delivery.notice?.dedupKey === reviewBlockedKey(missionId, task.id, need.id, blocker)
     })
   }
+
+  /** The newest review blocker recorded for a source; it follows each derived one, whether or not that one woke the owner. */
+  private recordedBlocker(missionId: string, sourceId: string): string | undefined { return (this.rt.store.latestTaskEvent(missionId, sourceId, 'task/review-blocked')?.data as { reason?: string } | undefined)?.reason }
 
   /** A cancelled task can still owe preservation; its exact stop fault ends when cleanup succeeds. */
   private stopFailureSubjects(missionId: string, delivery: Delivery): string[] | undefined {
@@ -1363,18 +1369,18 @@ export class Notices {
       // evidence_a454a771). The age comes from the durable row that opened the
       // review need, so a restart cannot reset the grace.
       const ripe = unreviewed.filter(task => { const { age } = this.rt.reviewNeed(task); return age === undefined || age >= reviewGraceMs(this.rt.config) })
-      // On a board with no other progress (`reviewPathStalled`) the runtime's
-      // own review admission owns every submitted artifact: its pass admits the
-      // review or names the exact blocker, so a second, generic fact here would
-      // only race it. This branch names the rest: submissions behind a board
-      // that keeps running, as its body says, everything when a wedged pass
-      // never reaches that admission, and a legacy submission without an
-      // artifact, which that admission skips.
-      const admitted = options.wedged !== true && this.rt.reviewPathStalled(tasks, members)
-      const named = admitted ? ripe.filter(task => task.artifact === undefined) : ripe
+      // The runtime's own review admission owns every submitted artifact: each
+      // pass admits the review or names the current blocker, so a second fact
+      // here would only race it. This branch names the rest: everything when a
+      // wedged pass never reaches that admission, and a legacy submission
+      // without an artifact, which that admission skips.
+      const named = options.wedged === true ? ripe : ripe.filter(task => task.artifact === undefined)
       if (!named.length) return false
-      // The runtime admission's one emitter: a decision per source and review need.
-      for (const task of named) this.notifyReviewBlocked(view.mission, task, this.rt.reviewNeed(task).id, 'it has no live independent review path and cannot reach a verdict while the rest of the board keeps running')
+      // The runtime admission's one emitter and blocker: a decision per source and review need.
+      for (const task of named) {
+        const need = this.rt.reviewNeed(task)
+        this.notifyReviewBlocked(view.mission, task, need.id, this.rt.reviewPathBlocker(task, need) ?? BOARD_RUNNING)
+      }
       return true
     }
     // Row 3 (documented scope): a board whose *every* non-terminal task is
@@ -1547,7 +1553,7 @@ export class Notices {
    * Co-firing guards, named: this classifier x the stall-root classifier (a
    * blocked predecessor is the ROOT's subject, named by the root notice with its
    * dependents, never re-named here) x the review grace (`reviewable` and the
-   * review-admission terminal: a pending review follows its SOURCE identity, so a
+   * review-blocked emitter: a pending review follows its SOURCE identity, so a
    * cancelled source with a live repair still has no review path) x the off-pass
    * wedged-pass classification (D1/D2: the wedge changes who generates the
    * decision, never which boards are waiting).
@@ -1643,18 +1649,19 @@ export class Notices {
     })
   }
 
-  /** Wake the owner once per distinct blocker for one review need (`SwarmRuntime.reviewNeed`) of an unreviewable submitted deliverable. */
+  /** Record an unreviewable submitted deliverable's blocker whenever it changes, and wake the owner once per blocker and review need (`SwarmRuntime.reviewNeed`). */
   notifyReviewBlocked(mission: Mission, source: Task, need: string, reason: string): void {
     const view = this.interpretation(mission.id)
     const row = view.tasks.find(candidate => candidate.id === source.id) ?? source
     const key = reviewBlockedKey(mission.id, row.id, need, reason)
-    // S5: the durable notice ledger (class, key, sender) is the gate; its row is
+    // S5: the durable notice ledger (class, key, sender) gates the wake; its row is
     // written in this call, so neither a restart nor a repeat can re-emit it.
-    if (hasNotice(this.rt.store.list('deliveries', mission.id), { class: 'decision', dedupKey: key, from: 'runtime' })) return
-    const diagnostic = formatDiagnostic(missingReviewDiagnostic(source.id, reason))
+    const woken = hasNotice(this.rt.store.list('deliveries', mission.id), { class: 'decision', dedupKey: key, from: 'runtime' })
+    if (woken && this.recordedBlocker(mission.id, source.id) === reason) return
     this.rt.commit(mission.id, () => {
       this.rt.store.event(mission.id, 'task/review-blocked', 'runtime', { taskId: source.id, kind: source.kind, reason })
-      const { content, statement } = renderNotice('review-blocked', { diagnostic, sourceId: row.id })
+      if (woken) return
+      const { content, statement } = renderNotice('review-blocked', { sourceId: row.id, reason })
       this.notify(mission.id, content, view.subjectsOf([row]),
         { dedupe: true, dedupKey: key, trigger: NOTICE_TEMPLATES['review-blocked'].trigger, reason, statement })
     })

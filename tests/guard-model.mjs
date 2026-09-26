@@ -124,7 +124,7 @@ export function guardProgressActions(board) {
       actions.push({ kind: 'progress', chain: 'attempt_lease', taskId: task.id, detail: 'a running attempt holds a live lease' })
     }
     if (task.status === 'submitted' && task.reviewOf === undefined && task.reviewSourceLive !== false) {
-      actions.push({ kind: 'progress', chain: 'review_admission', taskId: task.id, detail: 'a submitted source has a live review path' })
+      actions.push({ kind: 'progress', chain: 'dispatch_preconditions', taskId: task.id, detail: 'a submitted source has a live review path' })
     }
   }
   for (const member of board.members) {
@@ -145,7 +145,6 @@ export function guardTerminalChain(board) {
   if (live.length > 0 && board.mission.workspace !== 'authorized') return 'workspace'
   if (board.tasks.some(task => task.status === 'running' && task.attempt !== undefined && !task.attempt.leaseLive)) return 'attempt_lease'
   if (board.tasks.some(task => task.ceilingExhausted === true && task.status !== 'accepted' && task.status !== 'cancelled')) return 'task_ceiling'
-  if (board.tasks.some(task => task.status === 'submitted' && task.reviewSourceLive === false)) return 'review_admission'
   return 'dispatch_preconditions'
 }
 

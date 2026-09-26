@@ -273,16 +273,16 @@ interface SidebarStateView {
   modelTurn: false
 }
 
-const submissionEventTypes = new Set(['task/submitted'])
+const reviewPathEventTypes = new Set(['task/submitted', 'task/review-blocked'])
 const recoveryEventTypes: ReadonlySet<string> = new Set<EventKind | keyof typeof LEGACY_EVENT_LABELS>(['task/claimed', 'attempt/started', 'task/start-failed', 'task/lease-expired', 'task/preparation-failed', 'task/restart-repended', 'task/quiescence-recovered', 'task/checkpointed', 'member/resume-failed'])
 
 /** Newest persisted event for one task among `types`, or undefined. */
-function lastEventAt(snapshot: Snapshot, taskId: string, types: ReadonlySet<string>): number | undefined {
+function lastEvent(snapshot: Snapshot, taskId: string, types: ReadonlySet<string>): Snapshot['events'][number] | undefined {
   for (let index = snapshot.events.length - 1; index >= 0; index--) {
     const event = snapshot.events[index]!
     if (!types.has(event.type)) continue
     const data = event.data as { taskId?: unknown } | undefined
-    if (data?.taskId === taskId) return event.createdAt
+    if (data?.taskId === taskId) return event
   }
   return undefined
 }
@@ -346,7 +346,7 @@ export function sidebarState(snapshot: Snapshot, connection: ConnectionState = '
   if (stopping !== undefined) {
     const stop = stopping.resumeAfterStop!
     const since = stop.at
-    const start = since ?? lastEventAt(snapshot, stopping.id, recoveryEventTypes)
+    const start = since ?? lastEvent(snapshot, stopping.id, recoveryEventTypes)?.createdAt
     return { ...base, phase: 'recovering',
       label: 'Recovering',
       note: 'The worker handle is acknowledging its stop before the task can be re-pended; no recovery credit is spent.',
@@ -356,18 +356,18 @@ export function sidebarState(snapshot: Snapshot, connection: ConnectionState = '
   if (blocked !== undefined) {
     return { ...base, phase: 'waiting-for-owner', label: 'Waiting for your decision',
       note: blocked.output ?? 'Cannot make progress without a repair.',
-      decision: { subject: taskSubject(blocked), content: blocked.output ?? 'Repair the task or withdraw it.', queuedAt: lastEventAt(snapshot, blocked.id, recoveryEventTypes) ?? mission.updatedAt, consumption: 'unknown' },
+      decision: { subject: taskSubject(blocked), content: blocked.output ?? 'Repair the task or withdraw it.', queuedAt: lastEvent(snapshot, blocked.id, recoveryEventTypes)?.createdAt ?? mission.updatedAt, consumption: 'unknown' },
       evidence: `task ${blocked.id} status=blocked epoch ${blocked.epoch}` }
   }
   if (unreviewed !== undefined) {
-    const queuedAt = lastEventAt(snapshot, unreviewed.id, submissionEventTypes) ?? mission.updatedAt
+    const latest = lastEvent(snapshot, unreviewed.id, reviewPathEventTypes), reason = latest?.type === 'task/review-blocked' ? record(latest.data).reason : undefined
     return { ...base, phase: 'waiting-for-owner', label: 'Waiting for your decision',
       note: 'A submitted artifact has no live independent review path.',
-      decision: { subject: taskSubject(unreviewed), content: 'Admit an independent review or cancel the submission.', queuedAt, consumption: 'unknown' },
+      decision: { subject: taskSubject(unreviewed), content: typeof reason === 'string' && reason.trim() ? reason : 'No live independent review yet.', queuedAt: latest?.createdAt ?? mission.updatedAt, consumption: 'unknown' },
       evidence: `task ${unreviewed.id} status=submitted without a live review` }
   }
   if (recovering !== undefined) {
-    const since = lastEventAt(snapshot, recovering.id, recoveryEventTypes)
+    const since = lastEvent(snapshot, recovering.id, recoveryEventTypes)?.createdAt
     const limit = recovering.maxRecoveryAttempts
     const attemptNumber = (recovering.recoveryCount ?? 0) + 1
     return { ...base, phase: 'recovering', label: 'Recovering',

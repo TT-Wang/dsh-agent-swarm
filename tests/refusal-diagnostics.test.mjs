@@ -23,10 +23,11 @@ import assert from 'node:assert/strict'
 import { readdirSync, readFileSync } from 'node:fs'
 import ts from 'typescript'
 import {
-  refusalSites, assessRefusal, assessText, diagnosticProducers, toolSchemaIndex, applyAllowlist,
+  refusalSites, assessRefusal, assessText, callExitViolations, diagnosticProducers, toolSchemaIndex, applyAllowlist,
   uncoveredCodeLiterals, formatSite, DELEGATED_MESSAGES,
 } from './refusal-inventory.mjs'
 import { formatDiagnostic } from '../lib/admission.js'
+import { ADMIT_REVIEW, WITHDRAW_SOURCE } from '../lib/notices.js'
 import { workspaceAuthorizationDiagnostic } from '../lib/authorization.js'
 import { guardTerminal } from '../lib/refusals.js'
 import { constructorArguments, sourceErrorClasses, sourceTree } from './source-semantics.mjs'
@@ -48,7 +49,7 @@ async function inventory() {
   index.probes = {
     workspaceAuthorizationDiagnostic: () => workspaceAuthorizationDiagnostic('probe', { grants: [], unresolved: [] }),
     // The declared composer of the missing-review exit must really carry it.
-    reviewPathExit: () => /swarm_propose[\s\S]{0,400}reviewOf/.test(read('src/notices.ts')),
+    reviewPathExit: () => [ADMIT_REVIEW, WITHDRAW_SOURCE].every(exit => callExitViolations(exit, index).length === 0),
   }
   const sitesByFile = IN_SCOPE_SOURCES.map(file => refusalSites(read(file), file))
   index.diagnosticProducers = diagnosticProducers(sitesByFile)

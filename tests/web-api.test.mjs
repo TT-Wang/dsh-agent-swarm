@@ -567,7 +567,7 @@ test('mission authority, lifecycle and budget refusals reach the browser by thei
   }
   await refused('cancel', { missionId: 'mission-missing', taskId: 'x', reason: 'x' }, 'Unknown mission', 'mission_unknown', 'validation_error')
   await refused('propose', { missionId: mission.id, input: { ...propose, workstreamId: 'stream-missing' } }, 'Unknown workstream', 'workstream_unknown', 'validation_error')
-  await refused('add-member', { missionId: mission.id, input: { name: 'Second', role: 'implementation' } }, 'Mission worker budget exhausted', 'mission_worker_budget_exhausted', 'budget_error')
+  await refused('add-member', { missionId: mission.id, input: { name: 'Second', role: 'implementation' } }, '[mission_worker_budget_exhausted] Mission worker budget exhausted: raise maxWorkers with swarm_budget(budget, reason), then add the member again', 'mission_worker_budget_exhausted', 'budget_error')
   f.runtime.control(owner, mission.id, 'pause', 'Hold')
   await refused('propose', { missionId: mission.id, input: propose }, 'Mission is paused', 'mission_not_active', 'tool_error')
   f.runtime.control(owner, mission.id, 'stop', 'Done')
