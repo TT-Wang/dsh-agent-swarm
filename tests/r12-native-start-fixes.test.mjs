@@ -4,6 +4,7 @@ import { mkdtemp, readFile, rm } from 'node:fs/promises'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { HarnessWorkers } from '../lib/harness-workers.js'
+import { Workspaces } from '../lib/workspaces.js'
 
 const deferred = () => { let resolve, reject; const promise = new Promise((yes, no) => { resolve = yes; reject = no }); return { promise, resolve, reject } }
 const flush = () => new Promise(resolve => setImmediate(resolve))
@@ -34,7 +35,7 @@ async function fixture(t, create) {
     agent.inbox = { get nextTurn() { return gone() }, get nextStep() { return gone() }, remove: gone }
     for (const dispose of effects.splice(0)) dispose()
   }
-  return { adapter, spec, member, calls, hooks, nativeHooks, agent, handle, retire, guard: () => guard }
+  return { root, adapter, spec, member, calls, hooks, nativeHooks, agent, handle, retire, guard: () => guard }
 }
 
 test('cancelled unpublished setup fences tool guards, steps, execution and provider streams before a late handle is released', async t => {
@@ -189,6 +190,42 @@ test('a host teardown during startup fails that start, and the next start opens 
   assert.equal(f.calls.create, 2, 'the next start opens a fresh agent')
   await f.adapter.deliver(f.member, { id: 'after', missionId: 'm', from: 'owner', to: f.member.id, kind: 'finding', content: 'after', createdAt: 1 })
   assert.equal(f.calls.sent, 1)
+})
+
+test('a host teardown leaves the member\'s workspace operations running and the next start opens a fresh agent; the runtime\'s stop cancels them', async t => {
+  const f = await fixture(t)
+  // The member's operations as Workspaces runs them: registered under the member id, cancelled by cancel(memberId) or by their caller's signal.
+  const operations = new Workspaces({ workspacesRoot: f.root, checkTimeoutMs: 1000, maxCheckOutputBytes: 1000 })
+  t.after(() => operations.dispose())
+  let arrived
+  const hold = (kind, memberId, signal) => operations.operation(memberId, own => new Promise((resolve, reject) => {
+    own.addEventListener('abort', () => { reject(own.reason) }, { once: true })
+    arrived[kind].resolve(resolve)
+  }), signal)
+  Object.assign(f.adapter.workspaces, { workspacePath: () => f.root, cancel: memberId => { operations.cancel(memberId) },
+    verifyArtifact: (member, _task, _artifact, signal) => hold('verification', member.id, signal), prepareTask: member => hold('preparation', member.id) })
+  const begin = async () => {
+    arrived = { verification: deferred(), preparation: deferred() }
+    // A verification under a caller's live signal, and a preparation the runtime runs before a dispatch.
+    const outcomes = Promise.allSettled([f.adapter.verifyArtifact(f.member, {}, {}, new AbortController().signal), f.adapter.prepareTask(f.member, {}, [])])
+    const [verified, prepared] = await Promise.all([arrived.verification.promise, arrived.preparation.promise])
+    return { release() { verified('checked'); prepared('prepared') }, settled: async () => (await outcomes).map(outcome => outcome.status === 'fulfilled' ? outcome.value : String(outcome.reason)) }
+  }
+  await f.adapter.start(f.spec)
+  const resident = f.adapter.residents.get(f.member.id)
+  const during = await begin()
+  f.retire() // the host ends the agent: an agent-loop reload
+  await resident.stopping
+  assert.equal(f.adapter.residents.has(f.member.id), false, 'the resident ended with the agent')
+  f.agent.inbox = { nextTurn: [], nextStep: [], remove() {} }
+  await f.adapter.start(f.spec)
+  assert.equal(f.calls.create, 2, 'the next start opens a fresh agent')
+  during.release()
+  assert.deepEqual(await during.settled(), ['checked', 'prepared'], 'neither operation was aborted')
+  // Pair: the runtime's stop of the member cancels its workspace operations.
+  const stopped = await begin()
+  await f.adapter.stop(f.member.id)
+  assert.deepEqual(await stopped.settled(), ['member stopped', 'member stopped'])
 })
 
 test('a stop the host overtakes reads neither the retired inbox nor its session, and journals the resident record', async t => {

@@ -1116,10 +1116,7 @@ export class HarnessWorkers implements WorkerAdapter {
   checkEnvelope(): CheckEnvelope { return this.workspaces.checkEnvelope() }
   async verifyArtifact(member: Member, task: Task, artifact: Artifact, signal?: AbortSignal): ReturnType<WorkerAdapter['verifyArtifact']> {
     const resident = this.residents.get(member.id)
-    if (resident) {
-      resident.abort.signal.throwIfAborted()
-      signal = signal === undefined ? resident.abort.signal : AbortSignal.any([signal, resident.abort.signal])
-    }
+    resident?.abort.signal.throwIfAborted()
     const activity = resident === undefined ? undefined : this.beginActivity(resident, { kind: 'verification' }, signal)
     try {
       // F3: the declared check runs under this member's own scratch root, so two
