@@ -476,7 +476,7 @@ test('R17-G2g: the review-blocked notice beside running work is the template too
   const claimed = await f.runtime.claim({ sessionId: author.sessionId }, f.mission.id, source.id)
   await f.runtime.submit({ sessionId: author.sessionId }, f.mission.id, { taskId: source.id, attemptId: claimed.attempt.id, output: 'candidate' })
   // Unrelated work keeps running, so the runtime admits no automatic review and
-  // the witness path is the one that names the unreviewable submission.
+  // its admission pass names the unreviewable submission with the running board.
   const running = f.propose('Unrelated work', { assigneeId: other.id, kind: 'research', checks: [] })
   await f.runtime.claim({ sessionId: other.sessionId }, f.mission.id, running.id)
   await f.pass()
