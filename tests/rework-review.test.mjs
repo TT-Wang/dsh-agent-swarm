@@ -8,7 +8,8 @@
  * rework, a busy board does not hold it back, a deferred review of the rejected
  * commit cannot block completion, and an automatic review of an earlier
  * submission is never read as withdrawn from this one (automatic reviews are
- * keyed on the submission, so an unchanged resubmission cannot collide).
+ * keyed on the review need, which every resubmission opens afresh, so an
+ * unchanged resubmission cannot collide).
  */
 import test from 'node:test'
 import assert from 'node:assert/strict'
@@ -260,7 +261,7 @@ test('an automatic review of the rejected submission is never read as withdrawn 
   const fresh = f.live(source)
   assert.equal(fresh.length, 1)
   assert.match(fresh[0].id, /^task_auto_review_/)
-  assert.notEqual(fresh[0].id, automatic.id, 'an automatic review is keyed on the submission, not the commit alone')
+  assert.notEqual(fresh[0].id, automatic.id, 'an automatic review is keyed on the review need, not the commit alone')
   assert.deepEqual(f.events('task/review-blocked'), [])
   assert.deepEqual(f.ownerNotices(/was withdrawn/), [])
 })
