@@ -24,8 +24,9 @@
  * recorded nor counted; a wall clock that steps back mid-command throws a
  * TraceContractError; a malformed stored span id becomes a parent and throws
  * (and e6b8cfa, which dropped the row from the index, reports a clean metrics
- * window over it); an agent with an empty id passes the session guard; a
- * snapshot failure after a committed command records a second, error span.
+ * window over it; dfc0825 still drops a row whose id is not a string); an agent
+ * with an empty id passes the session guard; a snapshot failure after a
+ * committed command records a second, error span.
  */
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
@@ -197,6 +198,23 @@ test('beyond the span window, a malformed stored parent is ignored too', () => {
     assert.equal(span.parentSpanId, undefined, 'the recorded span treats it as absent')
     assert.equal(spanContractViolation(span), undefined)
   }
+})
+
+test('a stored span row whose id is not a string is judged like any malformed row: in the metrics window, never a parent', async t => {
+  const f = await fixture(t)
+  f.runtime.store.transaction(() => f.runtime.store.event(f.mission.id, 'trace/span', 'legacy', { step: 'swarm_create' }))
+  await f.call('swarm_workstream', { missionId: f.mission.id, ...stream })
+  assert.equal(f.spans().find(span => span.step === 'swarm_workstream').parentSpanId, undefined)
+  const report = (await f.call('swarm_observe', { missionId: f.mission.id, trace: true })).result.trace
+  assert.deepEqual([report.spans, report.window.spans], [2, 2], 'the row stays in the metrics window')
+  assert.deepEqual(report.violations.map(violation => [violation.step, violation.reason]), [['swarm_create', 'trace_id must be 32 lowercase hex characters']])
+  // Parent choice reads it as it reads a malformed string id: the newest row
+  // has no valid id, so the next span is a root, not a child of an older span.
+  const rows = [{ type: 'trace/span', data: { spanId: '0123456789abcdef', step: 'swarm_create' } }, { type: 'trace/span', data: { step: 'swarm_launch' } }]
+  const recorder = new TraceRecorder({ events: () => rows, event() {}, transaction: body => body() })
+  const span = recorder.record('swarm_workstream', () => ({ missionId: 'm', actor: 'owner', input: {}, output: {}, status: 'ok', startedAt: 0, durationMs: 0 }))
+  assert.equal(span.parentSpanId, undefined)
+  assert.deepEqual(recorder.spansFor('m').map(row => row.step), ['swarm_create', 'swarm_launch', 'swarm_workstream'])
 })
 
 test('an agent without an id is refused at the session guard, so a span actor is never empty', async t => {

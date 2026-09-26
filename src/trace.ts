@@ -76,6 +76,8 @@ export function errorTypeFor(error: unknown): TraceErrorType {
 const TRACE_ID = /^[0-9a-f]{32}$/
 const SPAN_ID = /^[0-9a-f]{16}$/
 const isSpanId = (value: unknown): value is string => typeof value === 'string' && SPAN_ID.test(value)
+/** A stored span row as the recorder reads it back: any object row, its id unchecked, so the metrics window keeps a malformed row. */
+const storedSpan = (event: SwarmEvent | undefined): TraceSpan | undefined => event?.type === 'trace/span' && event.data !== null && typeof event.data === 'object' ? event.data as TraceSpan : undefined
 const DIGEST = /^sha256:[0-9a-f]{64}$/
 
 /** Named trace/replay failures; callers branch on the class, never on message text. */
@@ -318,12 +320,7 @@ export class TraceRecorder {
     const source = this.store.traceEvents ? 'trace-spans' : 'events'
     const events = this.store.traceEvents?.(missionId, SEED_LIMIT + 1) ?? this.store.events(missionId, SEED_LIMIT + 1, 0)
     const index: SpanIndex = { byTask: new Map(), byAttempt: new Map(), all: [], source, truncated: events.length > SEED_LIMIT }
-    for (const event of events.slice(-SEED_LIMIT)) {
-      if (event.type !== 'trace/span') continue
-      const span = event.data as TraceSpan | undefined
-      if (span === null || typeof span !== 'object' || typeof span.spanId !== 'string') continue
-      this.remember(index, span)
-    }
+    for (const span of events.slice(-SEED_LIMIT).map(storedSpan)) if (span !== undefined) this.remember(index, span)
     this.indexes.set(missionId, index)
     return index
   }
@@ -366,11 +363,7 @@ export class TraceRecorder {
     // Once history exceeds the cache, resolve scoped parents directly in the
     // durable span rows. Activity/tool events cannot hide a claim or submission,
     // and a missing scoped parent must not attach this task to an unrelated one.
-    const stored = (filter: { taskId?: string; attemptId?: string; step?: string }): TraceSpan | undefined => {
-      const event = this.store.traceEvents?.(context.missionId, 1, filter)?.at(-1)
-      const span = event?.data as TraceSpan | undefined
-      return span && typeof span.spanId === 'string' ? span : undefined
-    }
+    const stored = (filter: { taskId?: string; attemptId?: string; step?: string }): TraceSpan | undefined => storedSpan(this.store.traceEvents?.(context.missionId, 1, filter)?.at(-1))
     const lookup = (filter: { taskId?: string; attemptId?: string; step?: string }, spans: TraceSpan[] | undefined) =>
       index.truncated && this.store.traceEvents ? stored(filter)
         : latest(spans, span => filter.step === undefined || span.step === filter.step)
