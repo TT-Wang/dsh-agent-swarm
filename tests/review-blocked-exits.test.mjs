@@ -72,7 +72,7 @@ async function fixture(t, { members = ['Author', 'Reviewer'], budget: overrides,
   const propose = (extra = {}) => runtime.propose(owner, mission.id, { outputs: [], workstreamId: stream.id, title: 'Implement', objective: 'Implement the scoped change',
     kind: 'implementation', scope: ['**'], acceptance: MISSION_ACCEPTANCE, checks: ['test -d .'], assigneeId: author.id, ...extra })
   return {
-    ...f, actor, propose, tool: await ownerTools(f),
+    ...f, actor, propose, tool: await ownerTools(f), refused: [],
     submit: async source => {
       const claimed = await runtime.claim(actor(author), mission.id, source.id)
       await runtime.submit(actor(author), mission.id, { taskId: source.id, attemptId: claimed.attempt.id, output: 'candidate' })
@@ -120,7 +120,9 @@ const namedCalls = text => [...text.matchAll(/(swarm_\w+)\(([^()]*)\)/g)].map(([
  * Perform one call a decision names, as named: the parameters it names (a
  * value it gives as given) and those its published schema requires, each with
  * this board's value, and no other. A call that needs a parameter it does not
- * name is refused here, as it would be for the owner.
+ * name is refused here, as it would be for the owner. A refusal names its own
+ * exit: its calls are checked and performed the same way, then the refused
+ * call is made again, once.
  */
 async function perform(f, source, reason, tool, named) {
   const value = {
@@ -142,7 +144,13 @@ async function perform(f, source, reason, tool, named) {
     scope: () => ['**'],
   }
   const params = new Set([...Object.keys(named), ...definitions.get(tool).parameters.required.filter(param => param !== 'missionId')])
-  return f.tool(tool, Object.fromEntries([...params].map(param => [param, named[param] ?? value[param]()])))
+  const args = Object.fromEntries([...params].map(param => [param, named[param] ?? value[param]()]))
+  return f.tool(tool, args).catch(async refusal => {
+    f.refused.push(refusal.message)
+    await assertNamedCalls(refusal.message, namedCalls(refusal.message).map(([exit]) => exit))
+    for (const [exit, params] of namedCalls(refusal.message)) await perform(f, source, refusal.message, exit, params)
+    return f.tool(tool, args)
+  })
 }
 
 /**
@@ -151,9 +159,10 @@ async function perform(f, source, reason, tool, named) {
  * call it names but the withdrawal is performed in order, then one tick runs;
  * the decision is then no longer outstanding, so no reminder repeats a cause
  * its exit removed. The last step's exits must leave the source with a live
- * review, with no action a decision did not name.
+ * review, with no action a decision did not name, meeting exactly the
+ * refusals the family lists (each followed through the exit it names).
  */
-async function followExits(f, { source }, { steps }) {
+async function followExits(f, { source }, { steps, refused = [] }) {
   for (const [cause, calls] of steps) {
     assert.equal(f.live(source), false, `the source has no live review before ${cause}`)
     const notice = blockedNotice(f, source, cause)
@@ -163,6 +172,8 @@ async function followExits(f, { source }, { steps }) {
     assert.equal(f.runtime.ownerDeliveryRelevant(f.runtime.mission(f.mission.id), f.runtime.store.get('deliveries', notice.id)), false, `the exit retires its decision: ${notice.content}`)
   }
   assert.equal(f.live(source), true, 'the exits named give the source a live review')
+  assert.equal(f.refused.length, refused.length, `the refusals met: ${JSON.stringify(f.refused)}`)
+  refused.forEach((pattern, index) => assert.match(f.refused[index], pattern))
 }
 
 /** Submit a source and let the review grace pass, beside `running`'s unrelated work when given. */
@@ -204,7 +215,6 @@ const author = f => f.author
 const reviewer = f => f.reviewer
 const BUDGET = n => new RegExp(`^the mission task budget is exhausted \\(${n}/${n} admitted tasks\\), so no verification task can be admitted: `)
 const NO_MEMBER = /^no live member other than the author \(member_[\w-]+\) can review this artifact independently: add /
-const NO_SLOT = /^no live member other than the author \(member_[\w-]+\) can review this artifact independently: every worker slot is taken \(1\/1 live members\), so raise maxWorkers with /
 const WITHDRAWN = /^the automatically admitted review task_auto_review_\w+ was withdrawn: /
 const DEFERRED = /^review task_[\w-]+ deferred its verdict on this artifact: the host could not execute a check: /
 const RUNNING = /^it has no live independent review path and cannot reach a verdict while the rest of the board keeps running: /
@@ -231,7 +241,9 @@ const FAMILIES = [
     name: 'no live member other than the author can review, and every worker slot is taken',
     options: { members: ['Author'], budget: { maxWorkers: 1 } },
     block: f => submitted(f),
-    steps: [[NO_SLOT, ['swarm_budget', 'swarm_add_member', 'swarm_cancel']]],
+    // The add meets the worker ceiling, whose refusal names the raise.
+    steps: [[NO_MEMBER, ['swarm_add_member', 'swarm_cancel']]],
+    refused: [/^\[mission_worker_budget_exhausted\] Mission worker budget exhausted: raise maxWorkers with swarm_budget\(budget, reason\), then /],
   },
   {
     name: 'on a launched mission, no live member other than the author can review its planned deliverable',

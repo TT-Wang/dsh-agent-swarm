@@ -1127,7 +1127,7 @@ export class SwarmRuntime {
         return prior
       }
       const members = this.store.list('members', missionId)
-      if (members.filter(m => memberPhaseOf(m) !== 'stopped').length >= mission.budget.maxWorkers) throw new PolicyError('mission_worker_budget_exhausted', 'budget_error', 'Mission worker budget exhausted')
+      if (members.filter(m => memberPhaseOf(m) !== 'stopped').length >= mission.budget.maxWorkers) throw new PolicyError('mission_worker_budget_exhausted', 'budget_error', '[mission_worker_budget_exhausted] Mission worker budget exhausted: raise maxWorkers with swarm_budget(budget, reason), then add the member again')
       // R17-G12: a name-less admission takes the next unused pool name in
       // assignment order; the pool is the bound, and its exhaustion is a named
       // refusal that names the caller's own exit rather than an anonymous failure.
@@ -2487,8 +2487,8 @@ export class SwarmRuntime {
     const deferred = tasks.find(task => task.status === 'blocked' && task.reviewOf === source.id && task.verificationRecovery !== undefined && task.verificationRecovery.commit === source.artifact?.commit)
     if (deferred !== undefined) return `review ${deferred.id} deferred its verdict on this artifact: ${this.declaredChecks.recoveryExit(this.store.toolRuns(mission.id, { taskId: deferred.id }).filter(run => run.tool === 'swarm.host_verification').map(run => run.result as CheckResult))}`
     if (tasks.length >= mission.budget.maxTasks) return `the mission task budget is exhausted (${tasks.length}/${mission.budget.maxTasks} admitted tasks), so no verification task can be admitted: raise maxTasks with swarm_budget(budget, reason), or ${WITHDRAW_SOURCE}`
-    const authors = [...authorIdsOf(source)], live = members.filter(member => memberPhaseOf(member) !== 'stopped')
-    if (!live.some(member => canOwnReview(source, member.id))) return `no live member other than the author (${authors.join(', ') || 'unknown'}) can review this artifact independently: ${live.length < mission.budget.maxWorkers ? '' : `every worker slot is taken (${live.length}/${mission.budget.maxWorkers} live members), so raise maxWorkers with swarm_budget(budget, reason), then `}add an independent member with swarm_add_member(role, maxOutputTokens), or ${WITHDRAW_SOURCE}`
+    const authors = [...authorIdsOf(source)]
+    if (!members.some(member => memberPhaseOf(member) !== 'stopped' && canOwnReview(source, member.id))) return `no live member other than the author (${authors.join(', ') || 'unknown'}) can review this artifact independently: add an independent member with swarm_add_member(role, maxOutputTokens), or ${WITHDRAW_SOURCE}`
     const withdrawn = tasks.find(review => review.reviewOf === source.id && review.status === 'cancelled'
       && review.id.startsWith(AUTOMATIC_REVIEW_PREFIX) && (this.store.latestTaskEvent(mission.id, review.id, 'task/cancelled')?.seq ?? 0) > need.seq)
     if (withdrawn !== undefined) return `the automatically admitted review ${withdrawn.id} was withdrawn: ${ADMIT_REVIEW}, or ${WITHDRAW_SOURCE}`
