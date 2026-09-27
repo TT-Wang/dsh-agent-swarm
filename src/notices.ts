@@ -549,6 +549,8 @@ const id = (prefix: string) => `${prefix}_${randomUUID()}`
 
 /** A review-blocked decision's identity: one per blocker reason of one review need (`SwarmRuntime.reviewNeed`) of a source. */
 const reviewBlockedKey = (missionId: string, sourceId: string, need: string, reason: string): string => `review-blocked:${missionId}:${sourceId}:${need}:${reason}`
+/** Whether a task is an unreviewable submission or a review of one: that review path is the review admission's decision (`SwarmRuntime.admitMissingReviews`), which no board naming restates. */
+const onUnreviewedPath = (view: MissionInterpretation, task: Task): boolean => view.unreviewed.some(source => task.id === source.id || task.reviewOf === source.id)
 /** The board's own facts: the W3 stall and an owner-assembled mission's coverage-complete (R10-14). */
 const BOARD_FAMILIES = ['board-stall', 'coverage-complete'] as const
 type BoardFamily = typeof BOARD_FAMILIES[number]
@@ -1105,11 +1107,11 @@ export class Notices {
 
   /**
    * One board fact while its condition holds, with the body and the identity
-   * it is told under. The W3 stall holds while the active board is stalled,
-   * completion is refused and no submission waits on the review admission,
-   * whose own decision owns it (`SwarmRuntime.admitMissingReviews`); it is keyed
-   * by the stuck work (the unschedulable tasks, else every unfinished one) and
-   * the completion diagnostic. Coverage-complete holds while an owner-assembled
+   * it is told under. The W3 stall holds while the active board is stalled and
+   * completion is refused, keyed by the completion diagnostic and the stuck
+   * work (the unschedulable tasks, else every unfinished one) the review
+   * admission does not speak for (`onUnreviewedPath`); a board with no other
+   * is that admission's alone. Coverage-complete holds while an owner-assembled
    * mission (no start request) may be completed, keyed by its terminal work.
    */
   private boardFact(view: MissionInterpretation, family: BoardFamily): { key: string; subjects: string[]; reason: string; content: string; statement: NoticeStatement } | undefined {
@@ -1118,8 +1120,10 @@ export class Notices {
     const fact = (body: { content: string; statement: NoticeStatement }, subjects: string[], reason: string) =>
       ({ ...body, subjects, reason, key: factKey(view.missionId, { trigger: NOTICE_TEMPLATES[family].trigger, reason, subjects, statement: body.statement }) })
     if (family === 'board-stall') {
-      if (refusal === undefined || !view.stalled || view.unreviewed.length > 0) return undefined
-      const subjects = view.subjectsOf(view.unschedulable.length ? view.unschedulable : view.nonTerminal)
+      const rest = view.nonTerminal.filter(task => !onUnreviewedPath(view, task))
+      const dead = view.unschedulable.filter(task => rest.includes(task))
+      if (refusal === undefined || !view.stalled || (view.nonTerminal.length > 0 && rest.length === 0)) return undefined
+      const subjects = view.subjectsOf(dead.length ? dead : rest)
       return fact(renderNotice('board-stall', { reason: refusal, unschedulable: view.unschedulable, subjects }), subjects, refusal)
     }
     if (refusal !== undefined || this.rt.store.list('starts', view.missionId).length > 0) return undefined
@@ -1322,8 +1326,8 @@ export class Notices {
 
   /**
    * The classifiers past the witness dedup. Returns false when the board is
-   * left to a later judgement (the dispatcher's own pass, the review grace),
-   * true once it is judged, whether or not a notice was owed.
+   * left to a later judgement (the dispatcher's own pass), true once it is
+   * judged, whether or not a notice was owed.
    */
   private judgeBoard(view: MissionInterpretation, options: { offPass?: boolean; wedged?: boolean }, stallRootNotices: number): boolean {
     const missionId = view.missionId
@@ -1380,24 +1384,16 @@ export class Notices {
       })
       return true
     }
-    if (view.unreviewed.length) {
-      // A submitted artifact no live review can accept is an owner decision,
-      // named even behind unrelated live work, which `stalled` would not report
-      // (verifier-1 challenge, evidence_a454a771). The runtime's own review
-      // admission owns every submitted artifact: each pass admits the review or
-      // names the current blocker, so this branch never races it. It names what
-      // that admission skips, a legacy submission without an artifact, once past
-      // the review grace (`ReviewNeed.ripe`); and, when a wedged pass keeps that
-      // admission from running, a need it has already recorded
-      // (`ReviewNeed.recorded`), never one still ripening towards it.
-      const named = view.unreviewed.flatMap(task => {
-        const need = this.rt.reviewNeed(task)
-        return (task.artifact === undefined ? need.ripe : options.wedged === true && need.recorded) ? [{ task, need }] : []
-      })
-      if (!named.length) return false
-      // The runtime admission's one emitter and blocker: a decision per source and review need.
-      for (const { task, need } of named) this.notifyReviewBlocked(view.mission, task, need.id, this.rt.reviewPathBlocker(task, need) ?? BOARD_RUNNING)
-      return true
+    // A submitted artifact no live review can accept is an owner decision, named
+    // even behind unrelated live work (verifier-1 challenge, evidence_a454a771)
+    // by the runtime's own review admission: each pass admits the review or
+    // names the current blocker. This names, through that admission's emitter,
+    // only what it skips: a legacy submission without an artifact past the
+    // review grace (`ReviewNeed.ripe`) and, while a wedged pass keeps the
+    // admission from running, a need it recorded (`ReviewNeed.recorded`).
+    for (const task of view.unreviewed) {
+      const need = this.rt.reviewNeed(task)
+      if (task.artifact === undefined ? need.ripe : options.wedged === true && need.recorded) this.notifyReviewBlocked(view.mission, task, need.id, this.rt.reviewPathBlocker(task, need) ?? BOARD_RUNNING)
     }
     // Row 3 (documented scope): a board whose *every* non-terminal task is
     // running under a live lease is exempt outright. Running work plus a pending
@@ -1419,10 +1415,11 @@ export class Notices {
     // legitimately waiting, the runtime stays silent; otherwise it escalates
     // UNCONDITIONALLY and names every task its classifier did not recognise, so
     // no state can be silent and unnamed at the same time.
-    // A task the root classifier already named is recognised: the fall-through
-    // names only what no other witness speaks for.
+    // A task the root classifier already named, or the review admission speaks
+    // for (`onUnreviewedPath`), is recognised: the fall-through names only what
+    // no other witness speaks for.
     const roots = new Set(view.stallRoots.map(task => task.id))
-    const unrecognised = nonTerminal.filter(task => !roots.has(task.id) && !this.waitsLegitimately(task, tasks))
+    const unrecognised = nonTerminal.filter(task => !roots.has(task.id) && !onUnreviewedPath(view, task) && !this.waitsLegitimately(task, tasks))
     if (!unrecognised.length) {
       // The stall-root notices above were emitted WITHOUT claiming the board witness,
       // so the W3 stall path (fault F19 row 7) still owns the board when it applies.
