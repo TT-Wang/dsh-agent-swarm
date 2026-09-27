@@ -145,8 +145,10 @@ test('the completion reason\'s exit, performed as it names it through the regist
   assert.equal(f.runtime.completionError(f.runtime.mission(f.mission.id)), 'Accepted tasks do not cover every mission acceptance criterion: c2 "is documented". Propose a deliverable that names them in `covers` with `swarm_propose`; an accepted task cannot gain covers')
   const definitions = new Map()
   registerTools({ tools: { register: definition => definitions.set(definition.name, definition) } }, f.runtime, f.mission.budget)
-  const { result: named } = await definitions.get('swarm_propose').execute({ missionId: f.mission.id, workstreamId: f.stream.id, title: 'Document it', objective: 'Document the change',
-    kind: 'integration', dependencies: [first.id], scope: ['**'], covers: ['c2'], outputs: [], checks: ['test -d .'] }, { signal: new AbortController().signal, agent: { id: f.owner.sessionId } })
+  const propose = async args => (await definitions.get('swarm_propose').execute({ missionId: f.mission.id, workstreamId: f.stream.id, scope: ['**'], outputs: [], ...args }, { signal: new AbortController().signal, agent: { id: f.owner.sessionId } })).result
+  // A review cannot take the criterion on; its refusal names the same exit.
+  await assert.rejects(propose({ title: 'Review again', objective: 'Review', kind: 'verification', reviewOf: first.id, covers: ['c2'] }), /^Error: \[covers_invalid\] .*name the criterion in `covers` of a deliverable/)
+  const named = await propose({ title: 'Document it', objective: 'Document the change', kind: 'integration', dependencies: [first.id], covers: ['c2'], checks: ['test -d .'] })
   assert.deepEqual([named.acceptance, named.covers], [[], ['c2']], 'the exit needs no criterion text')
   await acceptThroughReview(f, named)
   assert.equal(f.runtime.completionError(f.runtime.mission(f.mission.id)), undefined)
