@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState, useSyncExternalStore } from 'react'
-import type { Budget, DraftPlan, PlanInput, PlanMember, PlanTask, Snapshot } from '../types.ts'
+import { criterionId, type Budget, type DraftPlan, type PlanInput, type PlanMember, type PlanTask, type Snapshot } from '../types.ts'
 import type { ModelDirectory } from '@deepseek-ai/dsh-client-ui-model-selection/client'
 import type { Request } from './monitor.ts'
 import { useCopy } from './locale.tsx'
@@ -9,7 +9,12 @@ const lines = (value: string) => value.split('\n')
 const cleanLines = (value: string[]) => value.map(item => item.trim()).filter(Boolean)
 const localDeadline = (value?: number) => value === undefined ? '' : new Date(value).toLocaleString('sv-SE').replace(' ', 'T').slice(0, 16)
 export function cleanPlan(input: PlanInput): PlanInput {
-  return { ...input, scope: cleanLines(input.scope), acceptance: cleanLines(input.acceptance), tasks: input.tasks.map(task => ({ ...task, scope: cleanLines(task.scope), acceptance: cleanLines(task.acceptance), outputs: task.outputs ? cleanLines(task.outputs) : undefined, checks: task.checks ? cleanLines(task.checks) : undefined })) }
+  return { ...input, scope: cleanLines(input.scope), acceptance: input.acceptance.map(item => item.trim()), tasks: input.tasks.map(task => ({ ...task, scope: cleanLines(task.scope), acceptance: cleanLines(task.acceptance), outputs: task.outputs ? cleanLines(task.outputs) : undefined, checks: task.checks ? cleanLines(task.checks) : undefined })) }
+}
+/** Remove one mission criterion: every task's covers keep naming the same criteria, renumbered past the removed one. */
+export function removeCriterion(input: PlanInput, index: number): PlanInput {
+  const renumber = (covers: string[]) => covers.flatMap(id => { const at = input.acceptance.findIndex((_, position) => criterionId(position) === id); return at === index ? [] : [criterionId(at > index ? at - 1 : at)] })
+  return { ...input, acceptance: input.acceptance.filter((_, position) => position !== index), tasks: input.tasks.map(task => task.covers ? { ...task, covers: renumber(task.covers) } : task) }
 }
 /**
  * Remove one task and every verification row that reviews it (the review the
@@ -24,14 +29,13 @@ const freshKey = (prefix: string) => `${prefix}-${Date.now().toString(36)}-${Mat
 /** Read-only subset of the native model directory's advertised route metadata. */
 interface CatalogGroup { id: string; name: string; models: Array<{ id: string; name: string; reasoning?: { efforts: Array<{ id: string; name: string }>; defaultEffort?: string } }> }
 export function newPlan(workspace: string, budget: Budget): PlanInput {
-  const acceptance = ['The delivered change satisfies the objective and passes independent verification.']
   return {
-    workspace, title: '', objective: '', scope: ['**'], acceptance: [...acceptance], budget: { ...budget },
+    workspace, title: '', objective: '', scope: ['**'], acceptance: ['The delivered change satisfies the objective and passes independent verification.'], budget: { ...budget },
     members: [{ key: 'builder', name: 'Builder', role: 'Implement and integrate the mission deliverable.' }, { key: 'reviewer', name: 'Reviewer', role: 'Independently check the immutable artifact against acceptance criteria.' }],
     workstreams: [{ key: 'delivery', title: 'Delivery', objective: 'Deliver and independently verify the mission objective.' }],
     tasks: [
-      { key: 'deliver', workstreamKey: 'delivery', title: 'Deliver the mission', objective: 'Implement the mission objective, run relevant checks, publish evidence, and submit an immutable artifact.', kind: 'integration', scope: ['**'], acceptance: [...acceptance], covers: ['c1'], checks: ['npm test'], assigneeKey: 'builder', dependencies: [] },
-      { key: 'review', workstreamKey: 'delivery', title: 'Independent verification', objective: 'Check the delivered immutable artifact against the mission acceptance criteria and report evidence.', kind: 'verification', scope: ['**'], acceptance: [...acceptance], assigneeKey: 'reviewer', dependencies: [], reviewOf: 'deliver' },
+      { key: 'deliver', workstreamKey: 'delivery', title: 'Deliver the mission', objective: 'Implement the mission objective, run relevant checks, publish evidence, and submit an immutable artifact.', kind: 'integration', scope: ['**'], acceptance: [], covers: ['c1'], checks: ['npm test'], assigneeKey: 'builder', dependencies: [] },
+      { key: 'review', workstreamKey: 'delivery', title: 'Independent verification', objective: 'Check the delivered immutable artifact against the mission acceptance criteria and report evidence.', kind: 'verification', scope: ['**'], acceptance: [], assigneeKey: 'reviewer', dependencies: [], reviewOf: 'deliver' },
     ],
   }
 }
@@ -117,9 +121,10 @@ export function DraftEditor({ sessionId, workspace, budget, draft, directory, re
       <label>{t('Objective')}<textarea data-testid="draft-objective" value={input.objective} required rows={3} onChange={event => update({ objective: event.currentTarget.value })} /></label>
       <label>{t('Workspace')}<input data-testid="draft-workspace" value={workspace} readOnly /></label>
       <p className="sw-small">{t('Choose a conversation in the repository you want to work on.')}</p>
-      <div className="sw-fields"><label>{t('Scope')}<textarea aria-label={t('Scope')} value={input.scope.join('\n')} required placeholder="src/\ntests/" onChange={event => update({ scope: lines(event.currentTarget.value) })} /></label>
-        <label>{t('Acceptance')}<textarea aria-label={t('Acceptance')} value={input.acceptance.join('\n')} required onChange={event => update({ acceptance: lines(event.currentTarget.value) })} /></label></div>
+      <label>{t('Scope')}<textarea aria-label={t('Scope')} value={input.scope.join('\n')} required placeholder="src/\ntests/" onChange={event => update({ scope: lines(event.currentTarget.value) })} /></label>
       <p className="sw-small">{t('One item per line')} · {t('Scope uses exact files, directory prefixes ending in /, or ** for the workspace.')}</p>
+      <fieldset className="sw-prereqs sw-criteria" disabled={Boolean(saved?.missionId)}><span>{t('Acceptance')}</span>{input.acceptance.map((criterion, index) => <div key={index}><code>{criterionId(index)}</code><input aria-label={`${t('Acceptance')} ${criterionId(index)}`} value={criterion} required onChange={event => update({ acceptance: input.acceptance.map((item, position) => position === index ? event.currentTarget.value : item) })} /><button type="button" disabled={input.acceptance.length === 1} onClick={() => setInput(removeCriterion(input, index))}>{t('Remove')}</button></div>)}
+        <button type="button" onClick={() => update({ acceptance: [...input.acceptance, ''] })}>{t('Add criterion')}</button></fieldset>
       <details open><summary>{t('Budget')}</summary><div className="sw-budget-fields">{([
         ['maxTokens', 'Tokens'], ['maxSteps', 'Steps'], ['maxWorkers', 'Workers'], ['maxDurationMs', 'Minutes'], ['maxTasks', 'Task limit'], ['maxExperiments', 'Experiment limit'],
       ] as const).map(([key, label]) => <label key={key}>{t(label)}<input type="number" min={1} step={1} required value={key === 'maxDurationMs' ? input.budget[key] / 60_000 : input.budget[key]} onChange={event => update({ budget: { ...input.budget, [key]: Number(event.currentTarget.value) * (key === 'maxDurationMs' ? 60_000 : 1) } })} /></label>)}
@@ -140,23 +145,24 @@ export function DraftEditor({ sessionId, workspace, budget, draft, directory, re
           <label>{t('Objective')}<input value={stream.objective} required onChange={event => update({ workstreams: input.workstreams.map(item => item.key === stream.key ? { ...item, objective: event.currentTarget.value } : item) })} /></label>
         </div></div>)}
       </section>
-      <section className="sw-section"><div className="sw-row"><h3>{t('Tasks')}</h3><button type="button" onClick={() => update({ tasks: [...input.tasks, { key: freshKey('task'), workstreamKey: input.workstreams[0]?.key ?? '', title: '', objective: '', kind: 'research', scope: [...input.scope], acceptance: [...input.acceptance], dependencies: [] }] })}>{t('Add task')}</button></div>
+      <section className="sw-section"><div className="sw-row"><h3>{t('Tasks')}</h3><button type="button" onClick={() => update({ tasks: [...input.tasks, { key: freshKey('task'), workstreamKey: input.workstreams[0]?.key ?? '', title: '', objective: '', kind: 'research', scope: [...input.scope], acceptance: [], dependencies: [] }] })}>{t('Add task')}</button></div>
         {input.tasks.map(task => <details className="sw-edit-item" key={task.key} open><summary>{task.title || task.key} · {task.kind}</summary>
           <div className="sw-row"><code>{task.key}</code><button type="button" onClick={() => update({ tasks: removeTask(input, task.key).tasks })}>{t('Remove')}</button></div>
           <label>{t('Title')}<input value={task.title} required onChange={event => updateTask(task.key, { title: event.currentTarget.value })} /></label>
           <label>{t('Objective')}<textarea value={task.objective} required onChange={event => updateTask(task.key, { objective: event.currentTarget.value })} /></label>
-          <div className="sw-fields"><label>{t('Kind')}<select value={task.kind} onChange={event => updateTask(task.key, { kind: event.currentTarget.value as PlanTask['kind'], reviewOf: undefined })}>{['research', 'implementation', 'integration', 'verification'].map(kind => <option key={kind}>{kind}</option>)}</select></label>
+          <div className="sw-fields"><label>{t('Kind')}<select value={task.kind} onChange={event => updateTask(task.key, { kind: event.currentTarget.value as PlanTask['kind'], reviewOf: undefined, covers: event.currentTarget.value === 'verification' ? undefined : task.covers })}>{['research', 'implementation', 'integration', 'verification'].map(kind => <option key={kind}>{kind}</option>)}</select></label>
             <label>{t('Assignee')}<select value={task.assigneeKey ?? ''} onChange={event => updateTask(task.key, { assigneeKey: event.currentTarget.value || undefined, assignmentMode: event.currentTarget.value ? 'pinned' : undefined })}><option value="">{t('Unassigned')}</option>{input.members.map(member => <option key={member.key} value={member.key}>{member.name}</option>)}</select></label>
             <label>{t('Workstreams')}<select value={task.workstreamKey} required onChange={event => updateTask(task.key, { workstreamKey: event.currentTarget.value })}>{input.workstreams.map(stream => <option key={stream.key} value={stream.key}>{stream.title}</option>)}</select></label>
             <label>{t('Priority')}<input type="number" min={0} max={100} step={1} value={task.priority ?? 50} onChange={event => updateTask(task.key, { priority: Number(event.currentTarget.value) })} /></label>
             {task.kind === 'verification' && <label>{t('Review source')}<select value={task.reviewOf ?? ''} required onChange={event => updateTask(task.key, { reviewOf: event.currentTarget.value || undefined, dependencies: task.dependencies?.filter(key => key !== event.currentTarget.value) })}><option value="">{t('None')}</option>{input.tasks.filter(item => item.key !== task.key && item.kind !== 'verification').map(item => <option key={item.key} value={item.key}>{item.title}</option>)}</select></label>}
           </div>
           <div className="sw-prereqs"><label><input type="checkbox" checked={task.experiment ?? false} onChange={event => updateTask(task.key, { experiment: event.currentTarget.checked })} />{t('Optional experiment')}</label></div>
+          {task.kind !== 'verification' && <div className="sw-prereqs"><span>{t('Covers')}</span>{input.acceptance.map((criterion, index) => <label key={index}><input type="checkbox" checked={task.covers?.includes(criterionId(index)) ?? false} onChange={event => updateTask(task.key, { covers: input.acceptance.map((_, position) => criterionId(position)).filter(id => id === criterionId(index) ? event.currentTarget.checked : task.covers?.includes(id)) })} />{criterionId(index)} {criterion}</label>)}</div>}
           <div className="sw-prereqs"><span>{t('Prerequisites')}</span>{input.tasks.filter(item => item.key !== task.key && item.key !== task.reviewOf).map(item => <label key={item.key}><input type="checkbox" checked={task.dependencies?.includes(item.key) ?? false} onChange={event => updateTask(task.key, { dependencies: event.currentTarget.checked ? [...(task.dependencies ?? []), item.key] : task.dependencies?.filter(key => key !== item.key) })} />{item.title}</label>)}</div>
-          <div className="sw-fields"><label>{t('Scope')}<textarea value={task.scope.join('\n')} required onChange={event => updateTask(task.key, { scope: lines(event.currentTarget.value) })} /></label><label>{t('Acceptance')}<textarea value={task.acceptance.join('\n')} required onChange={event => updateTask(task.key, { acceptance: lines(event.currentTarget.value) })} /></label></div>
+          <div className="sw-fields"><label>{t('Scope')}<textarea value={task.scope.join('\n')} required onChange={event => updateTask(task.key, { scope: lines(event.currentTarget.value) })} /></label><label>{t('Acceptance')}<textarea value={task.acceptance.join('\n')} required={task.kind !== 'verification' && !task.covers?.length} onChange={event => updateTask(task.key, { acceptance: lines(event.currentTarget.value) })} /></label></div>
           <label>{t('Outputs')}<textarea value={task.outputs?.join('\n') ?? ''} onChange={event => updateTask(task.key, { outputs: lines(event.currentTarget.value) })} /></label>
           <label>{t('Checks')}<textarea value={task.kind === 'verification' ? taskByKey.get(task.reviewOf ?? '')?.checks?.join('\n') ?? '' : task.checks?.join('\n') ?? ''} readOnly={task.kind === 'verification'} required={['implementation', 'integration'].includes(task.kind)} placeholder={t('One command per line')} onChange={event => updateTask(task.key, { checks: lines(event.currentTarget.value) })} /></label>
-          {task.kind === 'verification' ? <p className="sw-small">{t('Verification runs the selected source task’s checks on its immutable artifact.')}</p> : ['implementation', 'integration'].includes(task.kind) && <><p className="sw-small">{t('Replace the default check with commands that prove your acceptance criteria.')}</p>
+          {task.kind === 'verification' ? <p className="sw-small">{t('Verification runs the selected source task’s checks on its immutable artifact.')} {t('It checks what the source covers and its acceptance, then any acceptance entered here.')}</p> : ['implementation', 'integration'].includes(task.kind) && <><p className="sw-small">{t('Replace the default check with commands that prove your acceptance criteria.')}</p>
             <p className="sw-small" data-swarm-checks-hint="">{t('Checks run inside the isolated worker sandbox; a command that needs a nested sandbox or host-only tool may fail before your code runs.')}</p></>}
         </details>)}
       </section>

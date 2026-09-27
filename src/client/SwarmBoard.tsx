@@ -1,5 +1,5 @@
 import { createContext, memo, useContext, useMemo, useState, type ReactNode } from 'react'
-import type { Snapshot, Task, Evidence, Member, UsageBuckets } from '../types.ts'
+import { criterionId, type Snapshot, type Task, type Evidence, type Member, type UsageBuckets } from '../types.ts'
 import { LANES, activityGroups, boardIndex, cancellationNotes, compactNumber, durableVerdicts, evidenceCounts, eventSummary, remainingPercent, retiredReviewsBySource, shortId, type BoardIndex, type BoardLane, type CancellationKind, type CancellationNote, type DurableVerdict, type RetiredReview } from './projection.ts'
 import { leaseExpired, useVisibleClock } from './clock.ts'
 import { DependencyGraph } from './DependencyGraph.tsx'
@@ -243,7 +243,7 @@ export function SwarmBoard({ snapshot, initialView, onOpenWorker, onCancelTask, 
         </section>
       })}</div></VisibleTaskLeases>
         <details className="sw-section"><summary>{t('Mission contract and limits')}</summary><div className="sw-contract">
-          <div><h3>{t('Acceptance')}</h3><ul>{mission.acceptance.map((criterion, index) => <li key={index}>{criterion}</li>)}</ul></div>
+          <div><h3>{t('Acceptance')}</h3><ul>{mission.acceptance.map((criterion, index) => <li key={index}><code>{criterionId(index)}</code> {criterion}</li>)}</ul></div>
           <div><h3>{t('Scope')}</h3><ul>{mission.scope.map((path, index) => <li key={index}>{path}</li>)}</ul>
             <p>At most {mission.budget.maxTasks} tasks and {mission.budget.maxExperiments} experiments.</p></div>
         </div></details>
