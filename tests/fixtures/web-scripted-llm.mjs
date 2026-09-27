@@ -33,6 +33,8 @@ function mergeObservationWindows(observations) {
 }
 
 const acceptance = ['value.cjs exports two and node check.cjs passes']
+/** The deliverable's own criterion; it cites the mission criterion as c1 and copies no text, and its review carries neither. */
+const ownAcceptance = ['check.cjs is unchanged']
 /** The two-member delivery both owner scripts propose. */
 const stagedPlan = {
   title: 'Browser staged delivery', objective: 'Deliver an independently checked value of two.',
@@ -44,8 +46,8 @@ const stagedPlan = {
   ],
   workstreams: [{ key: 'delivery', title: 'Value delivery', objective: 'Change and independently verify the exported value.' }],
   tasks: [
-    { key: 'implement', workstreamKey: 'delivery', title: 'Deliver value two', objective: 'Change value.cjs to export two and record host evidence.', kind: 'integration', outputs: [], scope: ['value.cjs'], acceptance, covers: ['c1'], checks: ['node check.cjs'], assigneeKey: 'builder' },
-    { key: 'review', workstreamKey: 'delivery', title: 'Independent review', objective: 'Verify the exact submitted artifact using swarm_verify.', kind: 'verification', outputs: [], reviewOf: 'implement', scope: ['value.cjs'], acceptance, assigneeKey: 'reviewer' },
+    { key: 'implement', workstreamKey: 'delivery', title: 'Deliver value two', objective: 'Change value.cjs to export two and record host evidence.', kind: 'integration', outputs: [], scope: ['value.cjs'], acceptance: ownAcceptance, covers: ['c1'], checks: ['node check.cjs'], assigneeKey: 'builder' },
+    { key: 'review', workstreamKey: 'delivery', title: 'Independent review', objective: 'Verify the exact submitted artifact using swarm_verify.', kind: 'verification', outputs: [], reviewOf: 'implement', scope: ['value.cjs'], assigneeKey: 'reviewer' },
   ],
 }
 
@@ -173,6 +175,9 @@ export async function apply(ctx, config) {
     await released(options.signal)
     const text = texts(assignmentMessage).join('\n')
     const assignment = JSON.parse(text.slice(text.indexOf('\n') + 1))
+    // A worker reads criterion text, never ids: the criterion its task (or its review source) covers, then the deliverable's own.
+    assert.deepEqual(assignment.task.acceptance, [...acceptance, ...ownAcceptance])
+    assert.equal(assignment.task.covers, undefined)
     const key = `${options.sessionId}:${assignment.task.attempt.id}`
     const previous = blocks(options.messages).at(-1)
     if (previous?.isError) return toolFailure(options, previous)

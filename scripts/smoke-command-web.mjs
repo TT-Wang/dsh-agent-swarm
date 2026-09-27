@@ -186,6 +186,11 @@ await runWebSmoke({
     const artifact = completed.tasks.find(task => task.kind === 'integration').artifact
     assert.equal(await git('show', `${artifact.commit}:value.cjs`), 'module.exports = 2\n')
     assert.equal(await readFile(join(workspace, 'value.cjs'), 'utf8'), 'module.exports = 1\n')
+    // The generated plan cites its mission criterion by id and copies no text:
+    // the deliverable stores its own criterion and `covers`, its review neither.
+    assert.deepEqual(completed.tasks.map(({ kind, covers, acceptance }) => ({ kind, covers, acceptance })), [
+      { kind: 'integration', covers: ['c1'], acceptance: ['check.cjs is unchanged'] }, { kind: 'verification', covers: undefined, acceptance: [] }])
+    checks.push('the mission completes on the criterion its deliverable cites by id, and no task stores a copy of criterion text')
     await panel.locator('[data-swarm-status="completed"]').waitFor()
     await page.locator('[data-swarm-command]').scrollIntoViewIfNeeded()
     await page.screenshot({ path: join(artifacts, 'completed.png'), fullPage: true })
@@ -245,10 +250,9 @@ await runWebSmoke({
       assert.equal(repaired[0].requestId, ctx.state.starts[0].id)
       assert.deepEqual(repaired[0].plan.budget, invalid[0].plan.budget, 'the model repair preserves all originally selected allowances')
       assert.deepEqual(repaired[0].plan.acceptance, invalid[0].plan.acceptance)
-      assert.deepEqual(repaired[0].plan.tasks.map(task => task.acceptance), invalid[0].plan.tasks.map(task => task.acceptance))
+      assert.deepEqual(repaired[0].plan.tasks.map(task => [task.covers, task.acceptance]), invalid[0].plan.tasks.map(task => [task.covers, task.acceptance]))
       assert.deepEqual(completed.mission.budget, invalid[0].plan.budget)
       assert.deepEqual(completed.mission.acceptance, invalid[0].plan.acceptance)
-      assert(completed.tasks.every(task => JSON.stringify(task.acceptance) === JSON.stringify(invalid[0].plan.acceptance)), 'host admission must preserve the generated acceptance criteria')
       assert.deepEqual(repaired[0].plan.tasks[1].dependencies, ['implement'], 'the scripted retry retains the redundant edge to test the actual host canonicalizer')
       assert(trace.some(event => event.type === 'tool/call' && event.name === 'bash' && event.sessionId === ownerId), 'the owner inspects real repository paths and check contents before repairing')
       assert.equal(ctx.state.snapshots.length, 1)
