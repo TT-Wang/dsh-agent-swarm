@@ -42,13 +42,18 @@ async function fixture(t) {
 
 test('M2-1: a repeated wedge naming on the same board records once', () => {
   const mission = { id: 'mission', status: 'active' }, records = []
-  const rt = makeRuntimeStub({ store: { get: () => structuredClone(mission), list: () => [], put: (_table, row) => Object.assign(mission, row), event: (_m, _t, _a, data) => records.push(data) },
-    isMissionTerminal: () => false, commit: (_id, fn) => fn(), expectWedgedRelease() {}, notify() {}, pumpOutbox() {} })
+  const rt = makeRuntimeStub({ store: { get: () => structuredClone(mission), list: () => [], put: (_table, row) => Object.assign(mission, row), event: (_m, _t, _a, data) => records.push(data), revision: () => 0 },
+    stallPassTimeoutMs: 1000, fingerprint: () => 'same', commit: (_id, fn) => fn(), expectWedgedRelease() {}, notify() {}, pumpOutbox() {}, passSettled() {} })
   const scheduling = new Scheduling(rt)
-  const info = { pass: { id: 'pass', operationId: 'one', startedAt: 0, fingerprintBefore: 'same', revisionBefore: 0 }, unschedulable: [], boundMs: 1000, revisionNow: 0, fingerprintNow: 'same',
-    releaseBoundMs: 1000, heldByLiveWork: false, wedge: { releasedAt: 1000, gapMs: 1000, liveSubjects: [] }, liveHolders: [] }
-  for (let naming = 0; naming < 2; naming += 1) scheduling.escalateSchedulingStall('mission', info)
-  assert.deepEqual(records.map(row => row.wedged), [true])
+  // Two bodies wedge in turn on one unchanged board. The first naming's notice
+  // was suppressed (`notify` recorded nothing), so its wedge key outlives it.
+  for (const operationId of ['one', 'two']) {
+    const pass = { id: 'pass', operationId, missionId: mission.id, startedAt: 0, fingerprintBefore: 'same', revisionBefore: 0 }
+    scheduling.passes.set(mission.id, pass)
+    scheduling.checkSchedulingPasses()
+    scheduling.closePass(mission.id, pass)
+  }
+  assert.deepEqual(records.map(row => [row.runId, row.wedged]), [['one', true]])
 })
 
 test('M2-2: submission grace survives newer unrelated events without aging a new submission', async t => {

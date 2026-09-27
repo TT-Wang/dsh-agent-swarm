@@ -212,8 +212,8 @@ const CENSUS = [
   ["src/scheduling.ts",1,"Map","readonly passes = new Map<string, SchedulingPass>()","gate","in-flight","the scheduling body queued or running on a mission's serial queue, removed only when that body settles; every await in the body is bounded and the tick watchdog names a body past its bound, and losing the record can only queue a second body that the mission queue refuses while the first is in flight (probe below)"],
   ["src/scheduling.ts",2,"Set","const dead = new Set(tasks.filter(task => task.status === 'blocked' && !this.quiescencePending(task)).map(task => task.id))","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
   ["src/scheduling.ts",3,"Set","const covers = (task: Task, sourceId: string, seen = new Set<string>()): boolean => {","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
-  // R16-D: the inline dedup of `escalateSchedulingStall`, built from the
-  // durable rows inside one synchronous, read-only call and discarded with it;
+  // R16-D: the inline dedup of `escalateWedge`, built from the
+  // durable rows inside one synchronous call and discarded with it;
   // it is not retained, not read by a later call and cannot gate one.
   ["src/scheduling.ts",4,"Set","const subjects = [...new Set([...subjectsOfTasks(unreached, mission), ...holders.map(holder => holder.subject)])]","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
   ["src/store.ts",1,"Set","private readonly listeners = new Set<() => void>()","gate","cache-only","observer fan-out for committed changes; the durable revision and change cursor carry the state"],
