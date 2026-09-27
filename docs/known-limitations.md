@@ -143,7 +143,7 @@ This page lists the limitations that are true of the current tree, one section p
 - Delivery, consumption and resolution are three facts. Transport state (`sent`/`queued`/`claimed`) is derived from `deliveredAt` and never asserts consumption; consumption is `consumedAt`, recorded from the host's inbound `user/message` after native pre-step admission. No host signal shows a notice was acted on, so "handled" is untestable; resolutions are task or mission transitions. `NoticeEnvelope.claimedAt` (`src/types.ts`) is dead, declared only for rows older builds wrote.
 - Outbox failures keep their message identity and a durable diagnostic, but there is no per-route failure counter or backoff policy, and offline-owner notifications can remain pending. Each delivery attempt is bounded by `stallPassTimeoutMs`; one the adapter never settles is abandoned, recorded (`outboxStarved`) and retried by a later pump, so adapter acceptance must be idempotent.
 - `completeAutomatic` commits the completion and its `automatic/completed` event plus owner notice in two transactions; a crash between them loses the notice.
-- An owner-assembled mission (no saved start request) never completes automatically: at full coverage it sends one coverage-complete decision per board state and stays active until the owner completes it.
+- An owner-assembled mission (no saved start request) never completes automatically: at full coverage it sends one coverage-complete decision per coverage state (its terminal tasks at their epochs), reminds the owner of it at most twice, and stays active until the owner completes it.
 
 ## Refusals and diagnostics
 

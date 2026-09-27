@@ -230,8 +230,6 @@ export interface Mission {
   workerUsage?: UsageBuckets
   /** Owner-session usage attributed by time window (planning and coordination). Outside the worker pool budget. */
   ownerUsage?: UsageBuckets
-  /** Fingerprint of the last stalled state the owner was notified about; suppresses repeats. */
-  stallNotice?: string
   /**
    * S1: fingerprint of the board a wedged scheduling pass (one that never
    * returned) was last named on, so a retried naming of one unchanged board is
@@ -247,8 +245,6 @@ export interface Mission {
    * changes and changes back does. Wall-clock `at` is never part of `F(S)`.
    */
   witness?: { fingerprint: string; kind: 'W2' | 'W3'; at: number }
-  /** R10-14: fingerprint of the coverage-complete state the owner was told about. */
-  coverageNotice?: string
   /** Highest approaching-limit threshold already warned per budget dimension. */
   budgetReviewedAt?: number
   budgetWarned?: Record<string, number>

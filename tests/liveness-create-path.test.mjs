@@ -7,7 +7,9 @@
  * so the owner was not woken when the board parked
  * forever. `stalled()` also counted any submitted task as progress, so a
  * submission whose review was never admitted (or was retired) was reported as a
- * live board instead of a stalled one. Finally, a ceiling-parked member only
+ * live board instead of a stalled one; such a submission is now the host's
+ * review admission's to repair or to name (tests/review-path.test.mjs), and the
+ * W3 stall leaves it to that admission. Finally, a ceiling-parked member only
  * wakes when a follow-up task is admitted; these tests prove that admission
  * wakes it.
  *
@@ -46,13 +48,7 @@ async function fixture(t) {
   const current = task => runtime.store.get('tasks', typeof task === 'string' ? task : task.id)
   const events = type => runtime.store.events(mission.id, 500).filter(event => event.type === type)
   const control = pattern => workers.deliveries.filter(item => item.delivery.kind === 'control' && pattern.test(item.delivery.content))
-  // An automatic journal row isolates the stall classifier from the create-path
-  // completion gate: it is the state a launch-path mission would already have.
-  const markAutomatic = () => runtime.store.transaction(() => runtime.store.put('starts', {
-    id: 'start_liveness', ownerSessionId: owner.sessionId, commandId: 'liveness', goal: 'isolate the stall classifier',
-    workspace: directory, status: 'running', createdAt: Date.now(), updatedAt: Date.now(), missionId: mission.id,
-  }))
-  return { runtime, workers, owner, mission, stream, author, reviewer, actor, propose, current, events, control, markAutomatic }
+  return { runtime, workers, owner, mission, stream, author, reviewer, actor, propose, current, events, control }
 }
 
 test('a covered swarm_create mission retains blocked work until the owner explicitly withdraws it', async t => {
@@ -89,20 +85,19 @@ test('a covered swarm_create mission retains blocked work until the owner explic
   assert.match(f.current(blocked.id).output, /Cancelled by the mission owner/)
 })
 
-test('a submitted task with no live review is reported stalled with its exact task id', async t => {
+test('a submitted task with no live review is given the host\'s review, and the owner is not woken', async t => {
   const f = await fixture(t)
   const source = f.propose()
   const claimed = await f.runtime.claim(f.actor(f.author), f.mission.id, source.id)
   await f.runtime.submit(f.actor(f.author), f.mission.id, { taskId: source.id, attemptId: claimed.attempt.id, output: 'candidate' })
-  // No review is ever admitted: the submission is unreviewable forever.
-  f.markAutomatic()
-  const stall = await eventually(() => f.control(/Mission stalled/)[0], 'an unreviewable submission must be reported stalled', 2500)
-  assert.match(stall.delivery.content, new RegExp(source.id))
-  const event = f.events('mission/stalled').at(-1)
-  assert.ok(event, 'the stall is durable')
-  assert.match(event.data.reason, new RegExp(source.id))
-  assert.equal(f.current(source.id).status, 'submitted', 'the unreviewable submission stays repairable')
-  assert.equal(f.runtime.store.get('missions', f.mission.id).status, 'active')
+  // No review was proposed. The idle independent Reviewer can own one, so the
+  // host's review admission repairs the gap: no stall and no decision are owed.
+  const review = await eventually(() => f.runtime.store.list('tasks', f.mission.id).find(task => task.reviewOf === source.id),
+    'the host admits a review of the unreviewable submission', 2500)
+  assert.match(review.id, /^task_auto_review_/, 'the review is the host\'s own')
+  assert.equal(f.current(source.id).status, 'submitted', 'the submission stays under review')
+  assert.deepEqual(f.events('mission/stalled'), [], 'the board was never reported stalled')
+  assert.deepEqual(f.control(/Mission stalled|review_path_missing/), [], 'and the owner was not woken')
 })
 
 test('a create-path stall notice names the parked work, and admitting the follow-up wakes its member', async t => {

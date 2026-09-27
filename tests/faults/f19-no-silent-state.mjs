@@ -376,7 +376,7 @@ await runScenario({
           'row 8: a coverage-complete owner-assembled mission must announce readiness')
         const mission = f.runtime.store.get('missions', f.mission.id)
         assert.equal(mission.status, 'active', 'row 8: the owner keeps the completion decision')
-        assert.equal(mission.coverageNotice, f.runtime.fingerprint(f.mission.id), 'row 8: the durable coverage marker is keyed by F(S)')
+        assert.equal(f.runtime.ownerDeliveryRelevant(mission, notice), true, 'row 8: the coverage-complete decision is outstanding while the owner has not decided')
         assertWitness(f, 'W2', 'row 8')
         await sleep(80)
         assert.equal(ownerNotices(f).filter(delivery => /ready to complete/.test(delivery.content)).length, 1, 'row 8: an unchanged state must not spam')

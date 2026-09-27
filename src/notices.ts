@@ -558,6 +558,10 @@ const id = (prefix: string) => `${prefix}_${randomUUID()}`
 
 /** A review-blocked decision's identity: one per blocker reason of one review need (`SwarmRuntime.reviewNeed`) of a source. */
 const reviewBlockedKey = (missionId: string, sourceId: string, need: string, reason: string): string => `review-blocked:${missionId}:${sourceId}:${need}:${reason}`
+/** The board's own facts: the W3 stall and an owner-assembled mission's coverage-complete (R10-14). */
+const BOARD_FAMILIES = ['board-stall', 'coverage-complete'] as const
+type BoardFamily = typeof BOARD_FAMILIES[number]
+const COVERAGE_REASON = 'every acceptance criterion is independently covered'
 
 export class Notices {
   /**
@@ -988,8 +992,12 @@ export class Notices {
     if (stopFailures !== undefined) return stopFailures
     // A stall-root decision is outstanding exactly while its root still is one;
     // the dependents it lists (a rejecting review) never keep it open.
-    if (noticeFamily(delivery) === 'stall-root') return this.openStallRoot(mission.id, delivery, view.tasks)
-    if (noticeFamily(delivery) === 'review-blocked') return this.openReviewBlock(mission.id, delivery, view.tasks)
+    const family = noticeFamily(delivery)
+    if (family === 'stall-root') return this.openStallRoot(mission.id, delivery, view.tasks)
+    if (family === 'review-blocked') return this.openReviewBlock(mission.id, delivery, view.tasks)
+    if ((family === 'board-stall' || family === 'coverage-complete') && !this.boardFactOpen(view, family, delivery)) return []
+    // Coverage-complete names its terminal deliverable: the completion it asks for is what stays outstanding.
+    if (family === 'coverage-complete') return delivery.subjects ?? []
     return (delivery.subjects ?? [missionSubject(mission)]).filter(subject => {
       if (subject === missionSubject(mission)) {
         if (delivery.notice?.class === 'budget') return (mission.budgetReviewedAt ?? 0) <= delivery.createdAt
@@ -1040,6 +1048,7 @@ export class Notices {
       const original = fact.reason === undefined ? undefined : this.rt.store.get('deliveries', fact.reason)
       return this.unresolvedSubjects(this.interpretation(mission.id), original ?? delivery).length > 0
     }
+    if (family === 'board-stall' || family === 'coverage-complete') return this.boardFactOpen(this.interpretation(mission.id), family, delivery)
     if (family === 'review-blocked' || family === 'fallthrough' || family === 'stall-root'
       || family === 'dispatch-question' || family === 'parked') {
       const tasks = this.rt.store.list('tasks', mission.id)
@@ -1102,6 +1111,34 @@ export class Notices {
 
   /** The newest review blocker recorded for a source; it follows each derived one, whether or not that one woke the owner. */
   private recordedBlocker(missionId: string, sourceId: string): string | undefined { return (this.rt.store.latestTaskEvent(missionId, sourceId, 'task/review-blocked')?.data as { reason?: string } | undefined)?.reason }
+
+  /**
+   * One board fact while its condition holds, with the body and the identity
+   * it is told under. The W3 stall holds while the active board is stalled,
+   * completion is refused and no submission waits on the review admission,
+   * whose own decision owns it (`SwarmRuntime.admitMissingReviews`); it is keyed
+   * by the stuck work (the unschedulable tasks, else every unfinished one) and
+   * the completion diagnostic. Coverage-complete holds while an owner-assembled
+   * mission (no start request) may be completed, keyed by its terminal work.
+   */
+  private boardFact(view: MissionInterpretation, family: BoardFamily): { key: string; subjects: string[]; reason: string; content: string; statement: NoticeStatement } | undefined {
+    if (view.mission.status !== 'active') return undefined
+    const refusal = this.rt.completionError(view.mission)
+    const fact = (body: { content: string; statement: NoticeStatement }, subjects: string[], reason: string) =>
+      ({ ...body, subjects, reason, key: factKey(view.missionId, { trigger: NOTICE_TEMPLATES[family].trigger, reason, subjects, statement: body.statement }) })
+    if (family === 'board-stall') {
+      if (refusal === undefined || !view.stalled || view.unreviewed.length > 0) return undefined
+      const subjects = view.subjectsOf(view.unschedulable.length ? view.unschedulable : view.nonTerminal)
+      return fact(renderNotice('board-stall', { reason: refusal, unschedulable: view.unschedulable, subjects }), subjects, refusal)
+    }
+    if (refusal !== undefined || this.rt.store.list('starts', view.missionId).length > 0) return undefined
+    return fact(renderNotice('coverage-complete', { missionTitle: view.mission.title }), view.subjectsOf(view.tasks.filter(task => TERMINAL_STATES.has(task.status))), COVERAGE_REASON)
+  }
+
+  /** A W3 stall or coverage-complete decision is outstanding while its condition holds under the identity it was told with. */
+  private boardFactOpen(view: MissionInterpretation, family: BoardFamily, delivery: Pick<Delivery, 'notice'>): boolean {
+    return this.boardFact(view, family)?.key === delivery.notice?.dedupKey
+  }
 
   /** A cancelled task can still owe preservation; its exact stop fault ends when cleanup succeeds. */
   private stopFailureSubjects(missionId: string, delivery: Delivery): string[] | undefined {
@@ -1387,7 +1424,9 @@ export class Notices {
     const nonTerminal = view.nonTerminal
     if (nonTerminal.length && nonTerminal.every(task => task.status === 'running' && task.attempt !== undefined && task.attempt.leaseUntil >= this.rt.now())) return true
     if (view.stalled) {
-      this.notifyStall(view, this.rt.completionError(mission) ?? 'no task can make progress')
+      // The W3 stall while completion is refused, coverage-complete while an
+      // owner-assembled mission may complete; an automatic one completes on its pass.
+      this.notifyBoard(view)
       return true
     }
     // R14-F2(c): the unnamed fallback is replaced. While every unfinished task is
@@ -1555,52 +1594,29 @@ export class Notices {
     return waitsLegitimately(this.rt, task, tasks)
   }
 
-  /** Wake the owner once per distinct stalled state; idle workers cannot resolve it themselves. */
-  notifyStall(view: MissionInterpretation, reason: string): void {
-    const mission = view.mission
-    const leftover = view.unschedulable
-    // The stall dedup key is the same owner-observable fingerprint as every
-    // other witness, so a stall is fresh exactly when the board changed.
-    const fingerprint = this.rt.fingerprint(mission.id)
-    if (mission.stallNotice === fingerprint) return
-    mission.stallNotice = fingerprint; mission.updatedAt = this.rt.now()
-    this.rt.commit(mission.id, () => {
-      this.rt.store.put('missions', mission)
-      this.rt.store.event(mission.id, 'mission/stalled', 'runtime', { reason, fingerprint, unschedulable: leftover.map(task => task.id) })
-      // R15-A1: the W3 stall notice names the tasks it is about (the unschedulable
-      // leftovers, or every non-terminal task when the stall class is an empty
-      // leftover list), with the mission root as the honest fallback. Guard pair:
-      // W3 stall x stall-root classifier — a root the classifier named does not
-      // stop the board-level notice, and this notice no longer depends on prose
-      // to say which subject is stuck.
-      const stuck = leftover.length ? leftover : view.nonTerminal
-      const { content, statement } = renderNotice('board-stall', { reason, unschedulable: leftover, subjects: view.subjectsOf(stuck) })
-      this.notify(mission.id, content, view.subjectsOf(stuck), { trigger: NOTICE_TEMPLATES['board-stall'].trigger, reason, statement })
-      // W3: the stall notice is the no-silent-state witness for this state.
-      mission.witness = { fingerprint, kind: 'W3', at: this.rt.now() }
-      this.rt.store.put('missions', mission)
-    })
-  }
-
   /**
-   * R10-14: the board is coverage-complete but the mission is still active
-   * (owner-assembled plans do not auto-complete). Emit exactly one durable
-   * owner-decision notice per distinct coverage-complete state so the owner
-   * knows the deliverable is ready without the runtime taking the decision.
+   * Tell the owner each board fact that holds (`boardFact`: the W3 stall, and
+   * R10-14's coverage-complete, since owner-assembled plans do not
+   * auto-complete) once per identity. The deliveries ledger is the record: a
+   * fact already on it writes nothing, and the W3 stall's event, which carries
+   * the row's key, exists only with its row.
    */
-  notifyCoverageComplete(mission: Mission): void {
-    const view = this.interpretation(mission.id)
-    const fingerprint = this.rt.fingerprint(mission.id)
-    if (mission.coverageNotice === fingerprint) return
-    mission.coverageNotice = fingerprint
-    this.rt.commit(mission.id, () => {
-      this.rt.store.put('missions', mission)
-      // R15-A1: the deliverable's lineage is the subject (every accepted task),
-      // never an anonymous mission-scoped sentence.
-      const { content, statement } = renderNotice('coverage-complete', { missionTitle: view.mission.title })
-      this.notify(mission.id, content, view.subjectsOf(view.tasks.filter(task => TERMINAL_STATES.has(task.status))),
-        { trigger: NOTICE_TEMPLATES['coverage-complete'].trigger, reason: 'every acceptance criterion is independently covered', statement })
-    })
+  notifyBoard(view: MissionInterpretation): void {
+    const missionId = view.missionId
+    for (const family of BOARD_FAMILIES) {
+      const fact = this.boardFact(view, family)
+      if (fact === undefined || hasNotice(this.rt.store.list('deliveries', missionId), { class: 'decision', dedupKey: fact.key, from: 'runtime' })) continue
+      this.rt.commit(missionId, () => {
+        const { content, subjects, key, reason, statement } = fact
+        if (!this.notify(missionId, content, subjects, { dedupKey: key, trigger: NOTICE_TEMPLATES[family].trigger, reason, statement }) || family !== 'board-stall') return
+        const fingerprint = this.rt.fingerprint(missionId)
+        this.rt.store.event(missionId, 'mission/stalled', 'runtime', { reason, fingerprint, unschedulable: view.unschedulable.map(task => task.id), noticeKey: key })
+        // W3: the stall notice is the no-silent-state witness for this state.
+        const mission = this.rt.mission(missionId)
+        mission.witness = { fingerprint, kind: 'W3', at: this.rt.now() }
+        this.rt.store.put('missions', mission)
+      })
+    }
   }
 
   /**

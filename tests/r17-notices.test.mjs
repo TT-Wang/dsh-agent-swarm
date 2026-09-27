@@ -303,15 +303,17 @@ test('R17-G2a: the stall-root body replays from the blocked row alone', async t 
 test('R17-G2b: the W3 stall body replays from the unschedulable rows alone', async t => {
   const f = await fixture(t)
   const member = await f.addMember('Ada')
-  f.propose('Waiting work')
+  const waiting = f.propose('Waiting work'), prerequisite = f.propose('Prerequisite')
+  dependOn(f, waiting, prerequisite)
+  dependOn(f, prerequisite, waiting)
   const stall = () => {
     const view = f.runtime.interpretation(f.mission.id)
-    const reason = f.runtime.completionError(view.mission) ?? 'no task can make progress'
-    f.runtime.notices.notifyStall(view, reason)
-    return { view, reason, notice: f.ownerNotices().filter(delivery => delivery.notice.dedupKey.startsWith('board-stall:')).at(-1) }
+    f.runtime.notices.notifyBoard(view)
+    return { view, reason: f.runtime.completionError(view.mission), notice: f.ownerNotices().filter(delivery => delivery.notice.dedupKey.startsWith('board-stall:')).at(-1) }
   }
-  // First nothing is unschedulable (the body names every non-terminal row);
-  // then a blocked row and its dependent are, so the body counts and names them.
+  // First nothing is unschedulable: two pending rows wait on each other, so the
+  // body names every non-terminal row; then a blocked row and its dependent
+  // are unschedulable, so the body counts and names them.
   const stalls = [stall()]
   const dead = blockTask(f, f.propose('Dead end', { assigneeId: member.id }))
   dependOn(f, f.propose('Waits on the dead end'), dead)
@@ -374,15 +376,19 @@ test('R17-G2d: the integration-gap and coverage-complete bodies replay from the 
   for (const task of implementations) assert.ok(gap.content.includes(task.id), `the gap body names ${task.id}`)
   assertDecision(gap, 'integration-gap')
 
-  // Coverage-complete: accept the only task and report with the mission still active.
+  // Coverage-complete: accept one implementation's artifact, withdraw the other,
+  // and report with the mission still active.
   const accepted = f.runtime.store.get('tasks', implementations[0].id)
-  accepted.status = 'accepted'
-  f.runtime.store.put('tasks', accepted)
-  f.runtime.notices.notifyCoverageComplete(f.runtime.store.get('missions', f.mission.id))
+  const withdrawn = f.runtime.store.get('tasks', implementations[1].id)
+  f.runtime.commit(f.mission.id, () => {
+    f.runtime.store.put('tasks', { ...accepted, status: 'accepted', artifact: { commit: 'c', baseCommit: 'b', workspace: '/isolated', changedPaths: [] } })
+    f.runtime.store.put('tasks', { ...withdrawn, status: 'cancelled' })
+  })
+  f.runtime.notices.notifyBoard(f.runtime.interpretation(f.mission.id))
   const coverage = ownerNotice(f, 'coverage-complete:')
   assert.ok(coverage, 'the coverage-complete notice was reported')
   assert.deepEqual(coverage.notice.statement, { family: 'coverage-complete', counts: {} }, 'the body is the coverage-complete template and states no count')
-  assert.deepEqual(coverage.notice.subjects, [subjectOf(accepted)], 'the subject is the accepted deliverable')
+  assert.deepEqual(coverage.notice.subjects, [subjectOf(accepted), subjectOf(withdrawn)], 'the subjects are the terminal work: the accepted deliverable and the withdrawn branch')
   assert.equal(coverage.content, NOTICE_TEMPLATES['coverage-complete'].build({ missionTitle: f.mission.title }), 'the body is the template rebuilt from the mission row')
   assert.ok(coverage.content.includes(f.mission.title), 'the body names the mission')
   assertDecision(coverage, 'coverage-complete')

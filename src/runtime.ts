@@ -396,7 +396,6 @@ export class SwarmRuntime {
   noticeLedger(actor: Actor, missionId: string, query: { limit?: number } = {}): unknown { return this.notices.noticeLedger(actor, missionId, query) }
   private bounded(text: string): string { return this.notices.bounded(text) }
   private ensureWitness(missionId: string, options: { offPass?: boolean; wedged?: boolean } = {}): void { return this.notices.ensureWitness(missionId, options) }
-  notifyStall(mission: Mission, reason: string): void { return this.notices.notifyStall(this.interpretation(mission.id), reason) }
   /**
    * R17-G1: the shared interpretation of one mission's durable state, forwarded
    * so the dispatcher and every generator read the same derived view.
@@ -408,7 +407,6 @@ export class SwarmRuntime {
   passState(missionId: string): { passLive: boolean; wedged: boolean } { return this.scheduling.passState(missionId) }
   /** R17-G5: a settled pass is a transition; it publishes what its live window left unpublished. */
   passSettled(missionId: string): void { this.notices.transition(missionId) }
-  notifyCoverageComplete(mission: Mission): void { return this.notices.notifyCoverageComplete(mission) }
   notifyParkedHolder(mission: Mission, task: Task): void { return this.notices.notifyParkedHolder(mission, task) }
   private warnIntegrationGap(mission: Mission, admitted: Task): void { return this.notices.warnIntegrationGap(mission, admitted) }
   private notifyReviewBlocked(mission: Mission, source: Task, need: ReviewNeed, reason: string): void { return this.notices.notifyReviewBlocked(mission, source, need.id, reason) }
@@ -3448,29 +3446,17 @@ export class SwarmRuntime {
     return undefined
   }
   /** Automatic completion consumes accepted obligations; it never withdraws unfinished work.
-   * Owner-assembled missions retain explicit completion, and every stalled board
-   * notifies the owner so dependencies, assignments or allocations can be repaired.
+   * Owner-assembled missions retain explicit completion (R10-14: an owner-assembled
+   * mission may still be extending its plan), and the board's own facts tell the
+   * owner of a stalled board or a coverage-complete owner-assembled mission.
    */
   private completeAutomatic(missionId: string): boolean {
     const mission = this.mission(missionId)
     if (mission.status !== 'active') return false
-    const automatic = this.store.list('starts', missionId).length > 0
-    const tasks = this.store.list('tasks', missionId), members = this.store.list('members', missionId)
-    const strict = this.completionError(mission)
-    const isStalled = strict !== undefined && this.stalled(tasks, members)
-    // Spec §2: a notice is fresh only for the state it described. Once the board
-    // leaves the stalled / coverage-complete class, forget the dedup key so a
-    // later return to the same fingerprint re-notifies instead of staying silent.
-    if (!isStalled && mission.stallNotice !== undefined) { delete mission.stallNotice; this.commit(missionId, () => this.store.put('missions', mission)) }
-    if (strict !== undefined && mission.coverageNotice !== undefined) { delete mission.coverageNotice; this.commit(missionId, () => this.store.put('missions', mission)) }
-    if (strict !== undefined) {
-      if (isStalled) this.notifyStall(mission, strict)
+    if (this.completionError(mission) !== undefined || this.store.list('starts', missionId).length === 0) {
+      this.notices.notifyBoard(this.interpretation(missionId))
       return false
     }
-    // R10-14: coverage complete, no stall, mission still active. An owner-assembled
-    // mission may still be extending its plan, so it does not auto-complete — but
-    // it must not be silent either. One durable owner-decision notice per board state.
-    if (!automatic) { this.notifyCoverageComplete(mission); return false }
     this.control({ sessionId: mission.ownerSessionId }, missionId, 'complete', 'Automatically completed after independent verification satisfied all mission acceptance criteria')
     this.commit(missionId, () => {
       this.store.event(missionId, 'automatic/completed', 'runtime', {})
