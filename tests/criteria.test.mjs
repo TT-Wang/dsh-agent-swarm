@@ -40,6 +40,8 @@ test('a deliverable checks its covered criteria in mission order, then the own c
     row('repair', { covers: ['c1'], acceptance: ['adds a test', 'keeps the API'], replaces: ['a'] }),
   ])
   assert.deepEqual(graph.checklist('repair', criteria), ['value is two', 'no other file changes', 'adds a test', 'keeps the API'])
+  // A plan's fold appends a review's ids after its source's, so covers need not be in mission order.
+  assert.deepEqual(taskGraphIndex([row('folded', { covers: ['c3', 'c1'] })]).checklist('folded', criteria), ['value is two', 'no other file changes'])
 })
 
 test('a review checks its source\'s checklist, then its own review-only criteria', () => {
@@ -210,6 +212,7 @@ test('a staged mission\'s criteria are fixed: a repair may change covers and tas
   const launched = await runtime.launchDraft(owner, repaired.id, repaired.revision)
   const code = launched.tasks.find(task => task.kind === 'implementation')
   assert.deepEqual([code.covers, code.acceptance], [['c2', 'c1'], ['keeps the API']], 'the staged row takes the repaired covers and criteria')
+  assert.deepEqual(runtime.observe(owner, launched.mission.id, { taskId: code.id }).task.acceptance, ['works', 'is documented', 'keeps the API'], 'its checklist lists them in mission order')
   assert.deepEqual(launched.mission.acceptance, ['works', 'is documented'])
 })
 
