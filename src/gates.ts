@@ -128,7 +128,7 @@ export class RuntimeGates {
 
   constructor(private readonly rt: SwarmRuntime) {}
 
-  /** Current `F(S)`; the dedup key every owner notice and stall notice is emitted under. */
+  /** Current `F(S)`: the board digest the no-silent-state witness and the owner instruments carry. */
   fingerprint(missionId: string): string {
     // Cache per store revision: F(S) is pure over durable state, so a tick that
     // changed nothing cannot change it, and the scheduler's per-tick witness

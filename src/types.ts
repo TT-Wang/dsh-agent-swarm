@@ -1116,9 +1116,8 @@ export interface RuntimeConfig {
   statePath: string
   leaseMs: number
   /**
-   * Tick timer period, and the unit of every tick-derived window (the
-   * unreviewed-submission grace, the no-progress window, the back-off bound,
-   * the start retry).
+   * Tick timer period, and the unit of every tick-derived window (the review
+   * grace, the back-off bound, the start retry).
    */
   tickMs: number
   /**
