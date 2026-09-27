@@ -3,7 +3,7 @@ import test from 'node:test'
 import React from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { uiSnapshot } from './fixtures/ui-snapshot.mjs'
-import { currentProgress, recentProgress, acceptanceSummary, activityDuration } from '../lib/types/client/progress.js'
+import { currentProgress, recentProgress, acceptanceSummary, activityDuration, sidebarState } from '../lib/types/client/progress.js'
 import { MissionOverview } from '../lib/types/client/LiveWorkPanel.js'
 import { SwarmBoard } from '../lib/types/client/SwarmBoard.js'
 import { activityGroups } from '../lib/types/client/projection.js'
@@ -295,6 +295,27 @@ test('OWNER PASS 2026-09-11 (second pass, item 3): a long durable reason is one 
   assert.doesNotMatch(inline, /data-swarm-reason="full"/, 'with no second disclosure to open')
 })
 
+test('the review decision is the newest recorded blocker in full, queued when it was recorded, and a resubmission after it records none yet', () => {
+  const at = uiSnapshot().mission.updatedAt
+  const decided = events => {
+    const snapshot = uiSnapshot()
+    snapshot.events.push(...events.map((event, index) => ({ seq: 40 + index, missionId: snapshot.mission.id, actor: 'runtime', ...event })))
+    return { markup: render(SwarmBoard, { snapshot }), decision: sidebarState(snapshot, 'connected', at).decision }
+  }
+  // A deadline deferral: its repair exit ends past 400 characters.
+  const reason = 'review task_r deferred its verdict on this artifact: a check reached its deadline: raise the source\'s checkTimeoutMs with swarm_budget(taskId, taskBudget: { checkTimeoutMs }, reason), then resume the review with swarm_control(action: "resume", taskId, reason); or, if a command is wrong, cancel the source with swarm_cancel(taskId, reason) and repair its checks with swarm_propose(replaces, checks, maxRecoveryAttempts, checkTimeoutMs)'
+  assert.ok(reason.length > 400, `the reason is ${reason.length} characters`)
+  const submitted = { type: 'task/submitted', data: { taskId: 't4' }, createdAt: at - 5_000 }
+  const blocked = { type: 'task/review-blocked', data: { taskId: 't4', kind: 'research', reason }, createdAt: at - 2_000 }
+  const recorded = decided([submitted, blocked])
+  assert.equal(recorded.decision.content, reason, 'the decision keeps the exit its reason ends with')
+  assert.match(recorded.markup, /data-swarm-decision-content="">[^<]*maxRecoveryAttempts, checkTimeoutMs\)</, 'and so does the sidebar')
+  assert.equal(recorded.decision.queuedAt, at - 2_000, 'queued when the blocker was recorded')
+  const resubmitted = decided([submitted, blocked, { type: 'task/submitted', data: { taskId: 't4' }, createdAt: at - 1_000 }])
+  assert.equal(resubmitted.decision.content, 'No live independent review yet.', 'a resubmission retires the blocker recorded before it')
+  assert.equal(resubmitted.decision.queuedAt, at - 1_000, 'and is queued when it was submitted')
+})
+
 test('OWNER PASS 2026-09-11 (second pass, item 5): the focus line states what its phase was derived from', () => {
   // The fixture has a submitted artifact with no live review, so the projection
   // waits for the owner and the disclosure shows exactly that fact.
@@ -303,7 +324,13 @@ test('OWNER PASS 2026-09-11 (second pass, item 5): the focus line states what it
   assert.match(markup, /data-swarm-owner-label="">Waiting for your decision<\/p>/, 'and the projection’s own label')
   assert.match(markup, /data-swarm-owner-note="">A submitted artifact has no live independent review path\.<\/p>/)
   assert.match(markup, /data-swarm-owner-evidence="">task t4 status=submitted without a live review<\/span>/, 'the durable fact behind the phase is printed')
-  assert.match(markup, /data-swarm-decision-content="">Admit an independent review or cancel the submission\./, 'and the decision says what to do about it')
+  // No blocker is recorded for it yet (the review grace), so the decision names none.
+  assert.match(markup, /data-swarm-decision-content="">No live independent review yet\./, 'and the decision invents no exit')
+  // Once the runtime records why no review is live, the decision is that reason, which names its own exit.
+  const blockedReview = uiSnapshot()
+  const reason = 'the mission task budget is exhausted (5/5 admitted tasks), so no verification task can be admitted: raise maxTasks with swarm_budget(budget, reason), or withdraw the source with swarm_cancel(taskId, reason)'
+  blockedReview.events.push({ seq: 40, missionId: blockedReview.mission.id, type: 'task/review-blocked', actor: 'runtime', data: { taskId: 't4', kind: 'implementation', reason }, createdAt: blockedReview.mission.updatedAt })
+  assert.ok(render(SwarmBoard, { snapshot: blockedReview }).includes(`data-swarm-decision-content="">${reason}`), 'the decision is the recorded blocker')
   // A running task is the working phase, with the same derivation available.
   const running = uiSnapshot()
   running.tasks[3] = { ...running.tasks[3], status: 'accepted' }

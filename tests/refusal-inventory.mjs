@@ -37,6 +37,7 @@
  * to a local coded producer. The schema guard's rendered text is held to the
  * full `assessText` contract by tests/tool-output.test.mjs.
  */
+import assert from 'node:assert/strict'
 import { pathToFileURL } from 'node:url'
 import { codeProperties, refusalNodes } from './source-semantics.mjs'
 
@@ -145,6 +146,36 @@ export async function toolSchemaIndex(budget) {
   return { definitions, toolNames, propertyNames, ownProperties, names: [...SWARM_TOOLS] }
 }
 
+/** The owner's registered tools on a fixture's real runtime (`setup`'s shape): every call is checked against its published schema. */
+export async function ownerTools(f) {
+  const { registerTools } = await import('../lib/tools.js')
+  const definitions = new Map()
+  registerTools({ tools: { register: definition => definitions.set(definition.name, definition) } }, f.runtime, f.mission.budget)
+  return async (name, args) => (await definitions.get(name).execute({ missionId: f.mission.id, ...args }, { signal: new AbortController().signal, agent: { id: f.owner.sessionId } })).result
+}
+
+/** The `swarm_*(...)` calls a text names, in order, each with the parameter names it gives (a given value is dropped). */
+const namedCallParams = text => [...text.matchAll(/(swarm_\w+)\(([^()]*)\)/g)].map(([, tool, args]) => [tool, args.replace(/"[^"]*"/g, '').match(/[A-Za-z]\w*/g) ?? []])
+
+/** The contract of an exit written as calls: an imperative verb, and at least one `swarm_*(...)` call, each a registered tool whose own schema declares every parameter it names. */
+export function callExitViolations(text, index) {
+  const calls = namedCallParams(text)
+  const violations = []
+  if (!IMPERATIVE_ACTIONS.test(text)) violations.push('no imperative next step (action verb)')
+  if (!calls.length) violations.push('names no swarm_*(...) call')
+  for (const [tool, params] of calls) {
+    if (!index.toolNames.has(tool)) violations.push(`names unknown tool ${tool}`)
+    else for (const param of params) if (!index.ownProperties.get(tool).has(param)) violations.push(`${tool} does not declare ${param}`)
+  }
+  return violations
+}
+
+/** Every `swarm_*(...)` call a text names is one of `expected`, and the text holds the call-exit contract. */
+export async function assertNamedCalls(text, expected) {
+  assert.deepEqual(namedCallParams(text).map(([tool]) => tool).sort(), [...expected].sort(), `the exits named: ${text}`)
+  assert.deepEqual(callExitViolations(text, await toolSchemaIndex()), [], text)
+}
+
 /**
  * A refusal that delegates its message to another module's diagnostic. The
  * delegate must be declared with the source that authors the message and the
@@ -171,9 +202,9 @@ export const CALLER_COMPOSED_MESSAGES = [
   {
     file: 'src/admission.ts',
     code: 'review_path_missing',
-    authoredIn: 'src/notices.ts',
+    authoredIn: 'src/runtime.ts',
     probe: 'reviewPathExit',
-    note: 'Notices.notifyReviewBlocked (src/notices.ts since the M1a split) renders formatDiagnostic(missingReviewDiagnostic(...)) and appends the swarm_propose/reviewOf exit; tests/review-path-admission.test.mjs pins the diagnostic render itself.',
+    note: 'Each review-blocked reason names its own exit: SwarmRuntime.reviewPathBlocker and the automatic-review admission failure compose it in src/runtime.ts, the transition classifier\'s running-board fallback in src/notices.ts. The probe holds the exits they share (ADMIT_REVIEW, WITHDRAW_SOURCE) to callExitViolations; tests/review-blocked-exits.test.mjs performs every exit a reason names.',
   },
 ]
 
@@ -307,7 +338,7 @@ if (process.argv[1] !== undefined && import.meta.url === pathToFileURL(process.a
   const { readFileSync } = await import('node:fs')
   const index = await toolSchemaIndex()
   const { workspaceAuthorizationDiagnostic } = await import('../lib/authorization.js')
-  index.probes = { workspaceAuthorizationDiagnostic: () => workspaceAuthorizationDiagnostic('probe', { grants: [], loadedAt: 0, unresolved: [] }) }
+  index.probes = { workspaceAuthorizationDiagnostic: () => workspaceAuthorizationDiagnostic('probe', { grants: [], unresolved: [] }) }
   for (const file of process.argv.slice(2)) {
     const sites = refusalSites(readFileSync(file, 'utf8'), file)
     const producers = diagnosticProducers([sites])

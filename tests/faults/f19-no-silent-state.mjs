@@ -70,8 +70,9 @@ await runScenario({
         const running = await eventually(() => taskOf(f.runtime, task.id).status === 'running' ? taskOf(f.runtime, task.id) : undefined,
           'row 2: a task ready only for a waiting member must still be dispatched')
         assert.equal(running.attempt.ownerId, f.author.id)
-        const assignment = f.workers.deliveries.find(item => item.kind === 'assignment' && item.taskId === task.id)
-        assert.ok(assignment, 'row 2: the wake is a durable assignment delivery')
+        // The pass flushes the outbox after dispatch commits, so the wake is awaited, not read at once.
+        const assignment = await eventually(() => f.workers.deliveries.find(item => item.kind === 'assignment' && item.taskId === task.id),
+          'row 2: the wake is a durable assignment delivery')
         assert.equal(assignment.memberId, f.author.id)
         assert.equal(await f.workers.callbacks.beforeStep(f.author.id, true), undefined, 'row 2: fresh input lets the parked member take its next step')
         rows.row2 = { witness: 'W1', taskId: task.id, woken: true }
@@ -133,8 +134,8 @@ await runScenario({
 
     // Row 5b/5c — verifier-1 challenge (evidence_a454a771): an unreviewable
     // submitted artifact must be witnessed even while unrelated work runs.
-    // `stalled`/`admitMissingReviews` only notify when the whole board would
-    // otherwise stall, so without this the state stays silent behind live work.
+    // `stalled` only reports a board that would otherwise stall, so the
+    // runtime's review admission names the blocker on every pass.
     // Proven for an implementation artifact and a research artifact.
     for (const kind of ['implementation', 'research']) {
       const f = await setup()
@@ -157,14 +158,15 @@ await runScenario({
         await sleep(200)
         assert.equal(ownerNotices(f).some(delivery => delivery.content.includes(source.id)), false,
           `row 5 ${kind}: the bounded missing-review grace is honored before the notice`)
-        const notice = await eventually(() => ownerNotices(f).find(delivery => delivery.content.includes(source.id) && /no live independent review path/.test(delivery.content)),
+        // The witness names the runtime's own blocker: no independent member is live.
+        const notice = await eventually(() => ownerNotices(f).find(delivery => delivery.content.includes(source.id) && /no live member other than the author/.test(delivery.content)),
           `row 5 ${kind}: an unreviewable submission must be witnessed while unrelated work runs`)
         assert.match(notice.content, new RegExp(source.id))
         assertWitness(f, 'W2', `row 5 ${kind}`)
         await eventually(() => events(f.runtime, f.mission.id, 'task/review-missing').some(event => event.data.taskId === source.id),
           `row 5 ${kind}: the missing review is recorded durably`)
         await sleep(150)
-        assert.equal(ownerNotices(f).filter(delivery => delivery.content.includes(source.id) && /no live independent review path/.test(delivery.content)).length, 1,
+        assert.equal(ownerNotices(f).filter(delivery => delivery.content.includes(source.id) && /no live member other than the author/.test(delivery.content)).length, 1,
           `row 5 ${kind}: an unchanged mixed board does not spam`)
         rows[`row5_${kind}`] = { witness: 'W2', taskId: source.id }
       } finally { await f.cleanup() }
@@ -187,7 +189,7 @@ await runScenario({
         assert.equal(f.runtime.store.get('members', f.reviewer.id).status, 'idle', 'the independent reviewer is live and capable')
         const notice = await eventually(() => ownerNotices(f).find(delivery => delivery.content.includes(source.id) && /no live independent review path/.test(delivery.content)),
           'row 5d: a capable idle reviewer behind live work must still produce a witness')
-        assert.match(notice.content, new RegExp(`reviewOf ${source.id}`), 'the notice tells the owner exactly what to admit')
+        assert.ok(notice.content.startsWith(`[review_path_missing] task ${JSON.stringify(source.id)}: `) && notice.content.includes('admit a review with swarm_propose(kind: "verification", reviewOf, acceptance, outputs: [], maxRecoveryAttempts)'), 'the notice tells the owner exactly what to admit')
         assertWitness(f, 'W2', 'row 5d')
         assert.equal(reviewsOf(f, source.id).length, 0, 'the deliberate rule is kept: no automatic review while the board can still progress')
         rows.row5_capable_reviewer = { witness: 'W2', taskId: source.id }

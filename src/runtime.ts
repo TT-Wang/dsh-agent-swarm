@@ -7,7 +7,7 @@ import { PolicyError } from './policy-error.ts'
 export { WorkspaceRevokedError } from './authorization.ts'
 import { recordedClaim, type WorkspaceClaim } from './authorization.ts'
 import { WorkspaceAdmission, gitWriteDeniedMessage, TEMP_RENDEZVOUS_WINDOW_MS, type TempMention } from './workspace-admission.ts'
-import { Notices, AUTO_REVIEW_GRACE_MS, NOTICE_TEMPLATES, REJECTION_DECISION_TRIGGER, TERMINAL_STATES, missionSubject, renderNotice, subjectsOfTasks, taskSubject, type NotifyOptions } from './notices.ts'
+import { Notices, NOTICE_TEMPLATES, REJECTION_DECISION_TRIGGER, TERMINAL_STATES, ADMIT_REVIEW, BOARD_RUNNING, WITHDRAW_SOURCE, missionSubject, renderNotice, reviewGraceMs, subjectsOfTasks, taskSubject, type NotifyOptions } from './notices.ts'
 import { RefusalRegistry, emitGuardTerminal, queueWriterBusy, requireStrings, requireText, sameChecks, unsupportedEffort, validatedBudget } from './refusals.ts'
 import { Scheduling, progressed, type SchedulingPass } from './scheduling.ts'
 // R17-G6/G7: the one derivation of mission derived state and its host projection.
@@ -59,7 +59,6 @@ const BOARD_PAGE_DEFAULT = 20
 const PROVIDER_OUTAGE_WINDOW_MS = 5 * 60_000
 /** R11-01: bound the durable outage log to one row per member and class per window. */
 const PROVIDER_OUTAGE_EVENT_WINDOW_MS = 30_000
-/** Idle close-out nudges before an open attempt is checkpointed and re-pended. */
 
 /**
  * S1: consecutive scheduling passes that advance no durable mission state and
@@ -249,7 +248,6 @@ interface OwnerCursor {
  */
 interface MemberStartFailureFields { startFailures?: number; startError?: string }
 const startFailureFields = (member: Member): Member & MemberStartFailureFields => member as Member & MemberStartFailureFields
-/** A single runtime owns scheduling, admission, state transitions and a durable outbox. */
 /**
  * L3: an owner-facing question is delivered with the exact call that answers it.
  * The owner's prose is not part of this store and never reaches the asker, so the
@@ -265,6 +263,7 @@ function ownerQuestionContent(missionId: string, deliveryId: string, from: strin
     `Or close it deliberately: swarm_message({ missionId: "${missionId}", to: "${from}", kind: "question", content: "<why not>", replyTo: "${deliveryId}", dismiss: true })`,
   ].join('\n')
 }
+/** A single runtime owns scheduling, admission, state transitions and a durable outbox. */
 export class SwarmRuntime {
   /**
    * S5 inventory of every in-memory `Set`/`Map` reachable from the scheduling
@@ -314,12 +313,6 @@ export class SwarmRuntime {
   private readonly workerStarts = new Map<string, { controller: AbortController; promise: Promise<void>; retryAfter?: number; nativePending?: boolean; admissionSignal?: AbortSignal; bodies?: SchedulingPass[] }>()
   private disposal?: Promise<void>
 
-  /**
-   * Members that ended a turn while still owning an attempt; drives the bounded
-   * close-out. S5 cache: the durable signal is `Task.idleSignal`, written by
-   * `onIdle` and re-read by the scheduling pass, so losing this map only delays
-   * the close-out until lease expiry.
-   */
   /** Consecutive `workers.start` failures per member; a successful start clears the count (R5-02). */
   readonly startFailures = new Map<string, number>()
   /**
@@ -336,9 +329,6 @@ export class SwarmRuntime {
   shuttingDown = false
   /** Open runtime transactions; a cached F(S) is not trusted inside one. */
   commitDepth = 0
-  /** R11-15: bounded per-path shared-temp mentions, newest last. */
-  
-  /** R11-15: `path|memberA|memberB` pairs already reported inside the window. */
 
   /** M1a seam 6/7: workspace and admission surface. */
   private readonly workspaceAdmission = new WorkspaceAdmission(this)
@@ -434,7 +424,7 @@ export class SwarmRuntime {
   ready(task: Task, member: Member, tasks?: Task[]): boolean { return this.scheduling.ready(task, member, tasks) }
   unschedulable(mission: Mission, tasks: Task[], members: Member[]): Task[] { return this.scheduling.unschedulable(mission, tasks, members) }
   reviewable(task: Task, tasks: Task[], members?: Member[]): boolean { return this.scheduling.reviewable(task, tasks, members) }
-  stalled(mission: Mission, tasks: Task[], members: Member[]): boolean { return this.scheduling.stalled(mission, tasks, members) }
+  stalled(tasks: Task[], members: Member[]): boolean { return this.scheduling.stalled(tasks, members) }
   private quiescencePending(task: Task): boolean { return this.scheduling.quiescencePending(task) }
   private selectDeliveryTarget(missionId: string, tasks: Task[]): Task { return this.scheduling.selectDeliveryTarget(missionId, tasks) }
   private deliveryTarget(actor: Actor, missionId: string): { mission: Mission; task: Task } { return this.scheduling.deliveryTarget(actor, missionId) }
@@ -696,21 +686,6 @@ export class SwarmRuntime {
       try { if (!this.closed) process.stderr.write(`[agent-swarm] ${name} tick failed: ${String(error)}\n`) } catch { /* next tick retries durable state */ }
     }
   }
-  /**
-   * R15-F2, deleted by R17-G7: `reconcileMemberStatus` used to upgrade a stale
-   * `idle` member row to `working` whenever the row fell behind the live attempt,
-   * and its upgrade-only rule existed because the member row was part of the
-   * board fingerprint (a spurious downgrade re-armed the coverage/stall notices).
-   * The status is now derived on every read from the durable phase and the live
-   * attempts (`src/projection.ts`), so there is no mirror to reconcile and no
-   * write that could churn F(S): the seam is impossible by construction. The
-   * guards it used to co-fire with are now the readers of the same derivation:
-   * the W6 idle close-out (which owns the attempt until it fences it), the
-   * parked-member hatch (`memberPhaseOf === 'parked'`, which wins over work in
-   * flight) and the coverage / stall notices (whose F(S) key no status write can
-   * move any more).
-   */
-
   /**
    * R15-A2: decision generation that does not depend on a scheduling pass
    * finishing. For every active mission whose pass is not live — no pass body
@@ -1055,15 +1030,6 @@ export class SwarmRuntime {
       taskIds: chain,
     }
   }
-  /**
-   * Read-only owner instruments (docs/no-silent-state-spec.md §6): the current
-   * fingerprint, the last witness class and time, the pending-dispatchable
-   * count, the notice-delivery ledger and durable escalations. `full` adds the
-   * per-member arena rows and the ledger page; the compact form keeps the
-   * owner's routine observe response small. A pure projection of durable
-   * records; it writes nothing.
-   */
-
   /** Create a mission with explicitly bounded resources and scope, recording the authorization its entry point claimed. */
   create(actor: Actor, input: CreateMissionInput, claim: WorkspaceClaim, initial: { id?: string; status?: 'active' | 'staged' } = {}): Mission {
     if (this.shuttingDown) throw new PolicyError('runtime_shutting_down', 'conflict_error', 'Swarm runtime is shutting down')
@@ -1127,7 +1093,7 @@ export class SwarmRuntime {
         return prior
       }
       const members = this.store.list('members', missionId)
-      if (members.filter(m => memberPhaseOf(m) !== 'stopped').length >= mission.budget.maxWorkers) throw new PolicyError('mission_worker_budget_exhausted', 'budget_error', 'Mission worker budget exhausted')
+      if (members.filter(m => memberPhaseOf(m) !== 'stopped').length >= mission.budget.maxWorkers) throw new PolicyError('mission_worker_budget_exhausted', 'budget_error', '[mission_worker_budget_exhausted] Mission worker budget exhausted: raise maxWorkers with swarm_budget(budget, reason), then add the member again')
       // R17-G12: a name-less admission takes the next unused pool name in
       // assignment order; the pool is the bound, and its exhaustion is a named
       // refusal that names the caller's own exit rather than an anonymous failure.
@@ -1340,7 +1306,7 @@ export class SwarmRuntime {
       // the refusal a recorded decision with the executable exits (raise the
       // ceiling with swarm_budget, or withdraw work with swarm_cancel).
       emitGuardTerminal(this, missionId, 'task_ceiling', { detail: `mission task budget exhausted (${tasks.length}/${mission.budget.maxTasks} tasks admitted)` })
-      throw new PolicyError('mission_task_budget_exhausted', 'budget_error', 'Mission task budget exhausted')
+      throw new PolicyError('mission_task_budget_exhausted', 'budget_error', '[mission_task_budget_exhausted] Mission task budget exhausted: raise maxTasks with swarm_budget(budget, reason), then propose the task again')
     }
     if (input.experiment && tasks.filter(t => t.experiment).length >= mission.budget.maxExperiments) {
       const used = tasks.filter(t => t.experiment).length
@@ -1869,8 +1835,6 @@ export class SwarmRuntime {
     this.store.event('swarm/install', 'store/restore-requested', 'runtime', { ...staged })
     return staged
   }
-  
-  /** Authenticated directed messages and selective topic broadcasts. */
   /**
    * Deliver one message, and — when the caller names the question it answers —
    * settle that question's receipt in the same transaction. L1: an answer is a
@@ -2419,30 +2383,25 @@ export class SwarmRuntime {
   /**
    * F2: a submitted code deliverable no live review can accept is never
    * silently parked. After a grace period (one scheduler period, floor 1s) the
-   * runtime records the missing review durably; once the board would otherwise
-   * make no progress it admits a bounded independent verification, or wakes the
-   * owner once with the exact task id and the concrete blocker. The grace keeps
-   * the runtime from racing a review the author is proposing in the same turn
-   * and keeps the durable log free of redundant events.
+   * runtime records the missing review durably; each pass then admits a
+   * bounded independent verification or names the source's current blocker,
+   * the stall judged once as the pass found the board, each source's own causes
+   * after the earlier sources' admissions. The grace keeps the runtime from racing a
+   * review the author is proposing in the same turn and keeps the durable log free of redundant events.
    */
   private admitMissingReviews(mission: Mission): void {
     const tasks = this.store.list('tasks', mission.id)
     const members = this.store.list('members', mission.id)
-    const grace = Math.max(this.config.tickMs, AUTO_REVIEW_GRACE_MS)
-    const unreviewable: Array<[Task, ReviewNeed]> = []
+    const stalled = this.reviewPathStalled(tasks, members)
     for (const source of tasks) {
       if (source.status !== 'submitted' || source.artifact === undefined) continue
       if (this.reviewable(source, tasks, members)) continue
       const need = this.reviewNeed(source)
-      if (need.age !== undefined && need.age < grace) continue
+      if (need.age !== undefined && need.age < reviewGraceMs(this.config)) continue
       this.reportMissingReview(mission, source, need)
-      unreviewable.push([source, need])
-    }
-    if (!unreviewable.length || !this.reviewPathStalled(tasks, members)) return
-    for (const [source, need] of unreviewable) {
-      const blocked = this.withdrawnAutomaticReview(source, need) ?? this.reviewPathBlocker(mission, source, members)
-      if (blocked !== undefined) { this.notifyReviewBlocked(mission, source, need, blocked); continue }
-      this.admitAutomaticReview(mission, source, need)
+      const blocked = this.reviewPathBlocker(source, need, stalled)
+      if (blocked !== undefined) this.notifyReviewBlocked(mission, source, need, blocked)
+      else this.admitAutomaticReview(mission, source, need)
     }
   }
   /**
@@ -2469,38 +2428,31 @@ export class SwarmRuntime {
     // S5: a durable `task/review-missing` row newer than the row that opened the need is the gate.
     if ((this.store.latestTaskEvent(mission.id, source.id, 'task/review-missing')?.seq ?? 0) > need.seq) return false
     const reason = this.missingReviewPath(source) ?? `no live independent verification task reviews this submitted ${source.kind} artifact`
-    const submissionSeq = this.store.latestTaskEvent(mission.id, source.id, 'task/submitted')?.seq ?? 0
-    this.commit(mission.id, () => this.store.event(mission.id, 'task/review-missing', 'runtime', { taskId: source.id, kind: source.kind, submissionSeq, reason }))
+    this.commit(mission.id, () => this.store.event(mission.id, 'task/review-missing', 'runtime', { taskId: source.id, kind: source.kind, reason }))
     return true
   }
   /**
-   * The automatic review the owner withdrew from this review need: one the
-   * owner cancelled after the need opened while it was the need's review,
-   * whether the host admitted it for this need or a rework re-opened it for
-   * it. Control facts never use the presentation event window: the
-   * cancellation is its own durable `task/cancelled` row, written in the
-   * cancel's transaction, and an automatic review is known by its host-minted
-   * identity, which survives a failed post-admission event write and a
-   * restart. A review retired by a verdict's sibling retirement, a rework or a
-   * challenge was never cancelled by the owner, and one cancelled before this
-   * need opened was not withdrawn from it.
+   * Why the host cannot give this unreviewable source a live review under this
+   * need, each cause with the exit that removes it, or undefined when it
+   * admits one now. A review the owner admits needs a task slot and an
+   * independent member, so the owner's withdrawal of the automatic review is
+   * named after those, and the host's own waits for a board with nothing else
+   * to do (`stalled`, as the admission pass judged it). That withdrawal is the automatic
+   * review (host-minted id) with a durable `task/cancelled` row newer than the row that
+   * opened the need; a review a verdict, rework or challenge retired was never cancelled by the owner.
    */
-  private withdrawnAutomaticReview(source: Task, need: ReviewNeed): string | undefined {
-    const withdrawn = this.store.list('tasks', source.missionId).find(review => review.reviewOf === source.id && review.status === 'cancelled'
-      && review.id.startsWith(AUTOMATIC_REVIEW_PREFIX) && (this.store.latestTaskEvent(source.missionId, review.id, 'task/cancelled')?.seq ?? 0) > need.seq)
-    if (withdrawn === undefined) return undefined
-    return `the automatically admitted review ${withdrawn.id} was withdrawn; admit a replacement review (kind verification, reviewOf ${source.id}) or cancel the source task`
-  }
-  /** The concrete reason the runtime cannot admit an independent review right now. */
-  private reviewPathBlocker(mission: Mission, source: Task, members: Member[]): string | undefined {
-    const tasks = this.store.list('tasks', mission.id)
-    const deferred = tasks.find(task => task.status === 'blocked' && task.reviewOf === source.id && task.verificationRecovery?.commit === source.artifact?.commit)
+  reviewPathBlocker(source: Task, need: ReviewNeed, stalled?: boolean): string | undefined {
+    const mission = this.mission(source.missionId)
+    const tasks = this.store.list('tasks', mission.id), members = this.store.list('members', mission.id)
+    const deferred = tasks.find(task => task.status === 'blocked' && task.reviewOf === source.id && task.verificationRecovery !== undefined && task.verificationRecovery.commit === source.artifact?.commit)
     if (deferred !== undefined) return `review ${deferred.id} deferred its verdict on this artifact: ${this.declaredChecks.recoveryExit(this.store.toolRuns(mission.id, { taskId: deferred.id }).filter(run => run.tool === 'swarm.host_verification').map(run => run.result as CheckResult))}`
-    if (mission.status !== 'active') return `the mission is ${mission.status}; a review can only start while the mission is active`
-    if (tasks.length >= mission.budget.maxTasks) return `the mission task budget is exhausted (${tasks.length}/${mission.budget.maxTasks} admitted tasks), so no verification task can be admitted`
+    if (tasks.length >= mission.budget.maxTasks) return `the mission task budget is exhausted (${tasks.length}/${mission.budget.maxTasks} admitted tasks), so no verification task can be admitted: raise maxTasks with swarm_budget(budget, reason), or ${WITHDRAW_SOURCE}`
     const authors = [...authorIdsOf(source)]
-    if (!members.some(member => memberPhaseOf(member) !== 'stopped' && canOwnReview(source, member.id))) return `no live member other than the author (${authors.join(', ') || 'unknown'}) can review this artifact independently; add an independent member and admit a verification task`
-    return undefined
+    if (!members.some(member => memberPhaseOf(member) !== 'stopped' && canOwnReview(source, member.id))) return `no live member other than the author (${authors.join(', ') || 'unknown'}) can review this artifact independently: add an independent member with swarm_add_member(role, maxOutputTokens), or ${WITHDRAW_SOURCE}`
+    const withdrawn = tasks.find(review => review.reviewOf === source.id && review.status === 'cancelled'
+      && review.id.startsWith(AUTOMATIC_REVIEW_PREFIX) && (this.store.latestTaskEvent(mission.id, review.id, 'task/cancelled')?.seq ?? 0) > need.seq)
+    if (withdrawn !== undefined) return `the automatically admitted review ${withdrawn.id} was withdrawn: ${ADMIT_REVIEW}, or ${WITHDRAW_SOURCE}`
+    return (stalled ?? this.reviewPathStalled(tasks, members)) ? undefined : BOARD_RUNNING
   }
   /** Admit the bounded independent review for one unreviewable submitted deliverable once: its id is keyed on the review need, so an existing row is that review. */
   private admitAutomaticReview(mission: Mission, source: Task, need: ReviewNeed): void {
@@ -2518,9 +2470,9 @@ export class SwarmRuntime {
         ...(source.checkTimeoutMs === undefined ? {} : { checkTimeoutMs: source.checkTimeoutMs }),
       }, reviewId)
     } catch (error) {
-      // Admission can still refuse (a budget race). The submission stands;
-      // the owner is told exactly what to admit instead.
-      this.notifyReviewBlocked(mission, source, need, `automatic review admission failed: ${error instanceof Error ? error.message : String(error)}`)
+      // Admission can still refuse a field copied from the source. The
+      // submission stands; the owner is told exactly what to admit instead.
+      this.notifyReviewBlocked(mission, source, need, `automatic review admission failed: ${ADMIT_REVIEW} correcting what its refusal names, or ${WITHDRAW_SOURCE}. The refusal: ${error instanceof Error ? error.message : String(error)}`)
       return
     }
     // The review already exists and its task/proposed event is durable; a busy
@@ -3508,7 +3460,7 @@ export class SwarmRuntime {
     const automatic = this.store.list('starts', missionId).length > 0
     const tasks = this.store.list('tasks', missionId), members = this.store.list('members', missionId)
     const strict = this.completionError(mission)
-    const isStalled = strict !== undefined && this.stalled(mission, tasks, members)
+    const isStalled = strict !== undefined && this.stalled(tasks, members)
     // Spec §2: a notice is fresh only for the state it described. Once the board
     // leaves the stalled / coverage-complete class, forget the dedup key so a
     // later return to the same fingerprint re-notifies instead of staying silent.

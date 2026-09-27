@@ -2,6 +2,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { formatDiagnostic, liveReviewFor, missingReviewDiagnostic } from '../lib/admission.js'
+import { NOTICE_TEMPLATES } from '../lib/notices.js'
 
 const pending = extra => ({ id: 'review-1', kind: 'verification', status: 'pending', reviewOf: 'source-1', ...extra })
 /** A source authored by `assigneeId`; independence is decided by `canOwnReview` over its whole author set. */
@@ -31,4 +32,9 @@ test('the missing-review diagnostic is machine-checkable and names the task', ()
   assert.equal(diagnostic.code, 'review_path_missing')
   assert.equal(diagnostic.location, 'task "task_1"')
   assert.equal(formatDiagnostic(diagnostic), '[review_path_missing] task "task_1": no live review')
+})
+
+test('the review-blocked notice is the diagnostic alone: the reason carries its own exit and the template appends none', () => {
+  const reason = 'no live member other than the author (member_1) can review this artifact independently: add an independent member with swarm_add_member(role, maxOutputTokens), or withdraw the source with swarm_cancel(taskId, reason)'
+  assert.equal(NOTICE_TEMPLATES['review-blocked'].build({ sourceId: 'task_1', reason }), `[review_path_missing] task "task_1": ${reason}`)
 })

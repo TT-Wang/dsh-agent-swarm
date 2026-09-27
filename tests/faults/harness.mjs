@@ -217,7 +217,7 @@ export class WorkspaceWorkers extends FakeWorkers {
  * own directory is authorized. Every fixture runtime carries it unless a test
  * wires its own snapshot.
  */
-export const NO_GRANTS = Object.freeze({ grants: Object.freeze([]), loadedAt: 0, unresolved: Object.freeze([]) })
+export const NO_GRANTS = Object.freeze({ grants: Object.freeze([]), unresolved: Object.freeze([]) })
 
 /**
  * The RuntimeConfig every fixture runtime starts from; `overrides` wins. With a

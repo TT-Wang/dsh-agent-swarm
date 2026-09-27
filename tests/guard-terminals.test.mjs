@@ -5,8 +5,8 @@
  * element escalates unconditionally, so a dead end is structurally impossible.
  * The chain is the ordered set of predicates a control path evaluates before it
  * can act — budget, workspace state, the attempt/lease lifecycle, per-task
- * ceilings, review admission and dispatch preconditions (the owner-reply receipt
- * chain is tests/owner-reply.test.mjs's). When every earlier element answers "no",
+ * ceilings and dispatch preconditions (the owner-reply receipt chain is
+ * tests/owner-reply.test.mjs's). When every earlier element answers "no",
  * `terminalEscalation` names the chain and `guardTerminal` renders the coded
  * decision request that `Scheduling.escalateGuardTerminal` records durably.
  *
@@ -206,7 +206,6 @@ test('R14: the terminal classification names the first chain that cannot progres
     [{ mission: { status: 'active', workspace: 'revoked' }, tasks: [{ id: 't', status: 'pending' }], members: [{ id: 'm', status: 'idle' }] }, 'workspace'],
     [{ mission: { status: 'active', workspace: 'authorized' }, tasks: [{ id: 't', status: 'running', attempt: { leaseLive: false } }], members: [{ id: 'm', status: 'idle' }] }, 'attempt_lease'],
     [{ mission: { status: 'active', workspace: 'authorized' }, tasks: [{ id: 't', status: 'pending', ceilingExhausted: true }], members: [{ id: 'm', status: 'idle' }] }, 'task_ceiling'],
-    [{ mission: { status: 'active', workspace: 'authorized' }, tasks: [{ id: 't', status: 'submitted', reviewSourceLive: false }], members: [{ id: 'm', status: 'idle' }] }, 'review_admission'],
     [{ mission: { status: 'active', workspace: 'authorized' }, tasks: [{ id: 't', status: 'pending', dependenciesDead: true }], members: [{ id: 'm', status: 'idle' }] }, 'dispatch_preconditions'],
   ]
   for (const [board, expected] of cases) {
@@ -539,7 +538,6 @@ test('S4r-D4: guardBoard reports review liveness from the same predicate the sch
     const schedulerSays = f.runtime.scheduling.reviewable(f.runtime.store.get('tasks', task.id), f.runtime.store.list('tasks', f.mission.id))
     assert.equal(schedulerSays, false, 'the scheduler sees no live review')
     assert.equal(source.reviewSourceLive, schedulerSays, 'the board view and the scheduler agree')
-    assert.equal(guardTerminalChain(board), 'review_admission', 'and the canonical case classifies as the review-admission terminal')
     assert.equal(guardActions(board).filter(action => action.kind === 'progress' && action.taskId === task.id).length, 0,
       'an unreviewable source is not reported as work in flight')
     assert.equal(guardProgressActions(board).filter(action => action.taskId === task.id).length, 0)

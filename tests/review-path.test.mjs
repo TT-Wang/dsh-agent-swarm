@@ -171,7 +171,7 @@ test('an unreviewable submission wakes the owner once with the task id when no i
   assert.equal(f.reviewsOf(source).length, 0, 'no review is admitted without an independent member')
   const notice = await eventually(() => f.reviewPathNotices().find(delivery => delivery.content.includes(source.id)), 'the owner notice must name the task id', 3000)
   assert.match(notice.content, /\[review_path_missing\]/)
-  assert.match(notice.content, new RegExp(`reviewOf ${source.id}`))
+  assert.match(notice.content, /add an independent member with swarm_add_member\(role, maxOutputTokens\), or withdraw the source with swarm_cancel\(taskId, reason\)$/, 'the exit is the one that works for this cause')
   await new Promise(resolve => setTimeout(resolve, 80))
   assert.equal(f.reviewPathNotices().length, 1, 'a persistent blocker wakes the owner exactly once')
 })

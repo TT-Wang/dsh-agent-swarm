@@ -44,6 +44,9 @@ export function stopPending(task: Pick<Task, 'epoch' | 'resumeAfterStop'>): bool
   return task.resumeAfterStop?.epoch === task.epoch
 }
 
+/** The local key of a stop fault's decision request: one per task, stop epoch, member and failure text. */
+export const stopFaultKey = (taskId: string, marker: { epoch: number; memberId?: string }, message: string): string => `stop:${taskId}:${marker.epoch}:${marker.memberId ?? 'unresolved'}:${createHash('sha256').update(message).digest('hex')}`
+
 /** A fenced handle must finish stopping before that member can own new work. */
 export function pendingStopOwner(tasks: readonly Task[], memberId: string): boolean {
   return tasks.some(task => {
@@ -308,14 +311,13 @@ export class Attempts {
     const marker = task.resumeAfterStop
     if (!marker?.failure || this.rt.mission(missionId).status !== 'active') return
     const { message, deterministic } = marker.failure
-    const digest = createHash('sha256').update(message).digest('hex')
     // No row can ever confirm a missing owner's checkpoint, so for it a resume only repeats the refusal.
     const exit = !deterministic ? 'The member remains fenced. The host will retry this temporary failure with bounded backoff.'
       : /recorded stop owner is missing/.test(message)
         ? `A resume only repeats this refusal. Withdraw the task with swarm_cancel (taskId "${task.id}"); if its work is still needed, propose its repair with swarm_propose naming replaces: ["${task.id}"].`
         : `The member remains fenced. Repair the recorded workspace condition, then retry cleanup with swarm_control(action: "resume", taskId: "${task.id}"); its cancelled or blocked outcome is preserved.`
     emitGuardTerminal(this.rt, missionId, 'attempt_lease', { taskId: task.id, memberId: marker.memberId,
-      localKey: `stop:${task.id}:${marker.epoch}:${marker.memberId ?? 'unresolved'}:${digest}`,
+      localKey: stopFaultKey(task.id, marker, message),
       detail: `Stopping or preserving this attempt failed: ${message}. ${exit}` })
   }
 

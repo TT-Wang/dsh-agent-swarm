@@ -226,7 +226,7 @@ test('draft API persists editable plans, enforces revision ownership and canonic
  */
 test('browser drafts under the configured roots save, edit and launch with their own authorization', async t => {
   // One snapshot, filled once the fixture's directories exist; the runtime and the API read it live.
-  const grants = { grants: [], loadedAt: Date.now(), unresolved: [] }
+  const grants = { grants: [], unresolved: [] }
   const f = await fixture(t, { grants })
   const granted = path.join(f.directory, 'granted'), project = path.join(granted, 'project')
   await mkdir(project, { recursive: true })
@@ -265,7 +265,7 @@ test('browser drafts under the configured roots save, edit and launch with their
  * The browser now re-validates the recorded row the runtime launches under.
  */
 test('a browser launch re-validates the authorization its draft recorded, not the calling session', async t => {
-  const grants = { grants: [], loadedAt: Date.now(), unresolved: [] }
+  const grants = { grants: [], unresolved: [] }
   const f = await fixture(t, { grants })
   grants.grants.push(...(await loadWorkspaceGrants([{ path: f.directory }])).grants)
   const created = await f.rpc('create-draft', { sessionId: f.ownerId, input: f.input })
@@ -305,7 +305,7 @@ test('member state is visible without granting owner controls, and unrelated ses
 
 test('delivery routes require owner, completed acceptance and the exact session workspace', async t => {
   // The runtime re-validates the recorded workspace before the adapter reaches it; wired as src/index.ts wires it.
-  const f = await fixture(t, { grants: { grants: [], loadedAt: Date.now(), unresolved: [] } })
+  const f = await fixture(t, { grants: { grants: [], unresolved: [] } })
   const owner = { sessionId: f.ownerId }
   const mission = f.runtime.create(owner, f.input, { grantRoot: f.input.workspace, source: 'session' })
   const member = await f.runtime.addMember(owner, mission.id, { name: 'Builder', role: 'implementation' })
@@ -567,7 +567,7 @@ test('mission authority, lifecycle and budget refusals reach the browser by thei
   }
   await refused('cancel', { missionId: 'mission-missing', taskId: 'x', reason: 'x' }, 'Unknown mission', 'mission_unknown', 'validation_error')
   await refused('propose', { missionId: mission.id, input: { ...propose, workstreamId: 'stream-missing' } }, 'Unknown workstream', 'workstream_unknown', 'validation_error')
-  await refused('add-member', { missionId: mission.id, input: { name: 'Second', role: 'implementation' } }, 'Mission worker budget exhausted', 'mission_worker_budget_exhausted', 'budget_error')
+  await refused('add-member', { missionId: mission.id, input: { name: 'Second', role: 'implementation' } }, '[mission_worker_budget_exhausted] Mission worker budget exhausted: raise maxWorkers with swarm_budget(budget, reason), then add the member again', 'mission_worker_budget_exhausted', 'budget_error')
   f.runtime.control(owner, mission.id, 'pause', 'Hold')
   await refused('propose', { missionId: mission.id, input: propose }, 'Mission is paused', 'mission_not_active', 'tool_error')
   f.runtime.control(owner, mission.id, 'stop', 'Done')

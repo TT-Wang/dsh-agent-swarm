@@ -38,7 +38,6 @@ import { Context } from '@deepseek-ai/cordis'
 import ts from 'typescript'
 import { SwarmRuntime } from '../lib/runtime.js'
 import { NOTICE_TEMPLATES, noticeTemplateKey } from '../lib/notices.js'
-import { formatDiagnostic, missingReviewDiagnostic } from '../lib/admission.js'
 import { tempDirectory } from './temp-root.mjs'
 import { FakeClock, FakeWorkers, NO_GRANTS } from './faults/harness.mjs'
 
@@ -253,7 +252,7 @@ const DECISIONS = {
   parked: ['held by a parked member', 'without spending a recovery attempt'],
   'integration-gap': ['integration task depending on every branch'],
   'coverage-complete': ['stays active until you decide', 'swarm_control complete', 'more work with swarm_propose'],
-  'review-blocked': ['verification task with swarm_propose', 'cannot complete while it is unreviewable'],
+  'review-blocked': ['admit a review with swarm_propose(kind: "verification", reviewOf, acceptance, outputs: [], maxRecoveryAttempts)', 'withdraw the source with swarm_cancel(taskId, reason)'],
 }
 function assertDecision(notice, family) {
   for (const anchor of DECISIONS[family]) assert.ok(notice.content.includes(anchor), `the ${family} body keeps "${anchor}"`)
@@ -444,10 +443,9 @@ test('R17-G2f: the review-blocked body replays from the submitted source row and
   assert.deepEqual(notice.notice.statement, { family: 'review-blocked', counts: {} }, 'the body is the review-blocked template and states no count')
   assert.deepEqual(notice.notice.subjects, [subjectOf(f.runtime.store.get('tasks', source.id))], 'the subject is the submitted source row')
   assert.equal(notice.notice.reason, recorded.data.reason, 'the recorded reason is the durable event payload, not a test constant')
-  // The body leads with the admission diagnostic built from the durable reason.
-  assert.ok(notice.content.includes(recorded.data.reason), 'the body states the recorded reason')
-  assert.ok(notice.content.includes('[review_path_missing]'), 'the body carries the typed diagnostic code')
-  assert.ok(notice.content.includes(`reviewOf ${source.id}`), 'the verification advice names the source task')
+  // The body is the admission diagnostic built from the durable reason, which names its own exit.
+  assert.equal(notice.content, NOTICE_TEMPLATES['review-blocked'].build({ sourceId: source.id, reason: recorded.data.reason }), 'the body is the template rebuilt from the source row and the recorded reason')
+  assert.ok(notice.content.startsWith(`[review_path_missing] task ${JSON.stringify(source.id)}: `), 'the body carries the typed diagnostic code and names the source task')
   assertDecision(notice, 'review-blocked')
 })
 
@@ -478,7 +476,7 @@ test('R17-G2g: the review-blocked notice beside running work is the template too
   const claimed = await f.runtime.claim({ sessionId: author.sessionId }, f.mission.id, source.id)
   await f.runtime.submit({ sessionId: author.sessionId }, f.mission.id, { taskId: source.id, attemptId: claimed.attempt.id, output: 'candidate' })
   // Unrelated work keeps running, so the runtime admits no automatic review and
-  // the witness path is the one that names the unreviewable submission.
+  // its admission pass names the unreviewable submission with the running board.
   const running = f.propose('Unrelated work', { assigneeId: other.id, kind: 'research', checks: [] })
   await f.runtime.claim({ sessionId: other.sessionId }, f.mission.id, running.id)
   await f.pass()
@@ -489,7 +487,7 @@ test('R17-G2g: the review-blocked notice beside running work is the template too
   assert.deepEqual(notice.notice.subjects, [subjectOf(row)])
   assert.match(notice.notice.reason, /has no live independent review path/)
   // The one review-blocked emitter: the recorded reason under the review_path_missing code.
-  assert.equal(notice.content, NOTICE_TEMPLATES['review-blocked'].build({ diagnostic: formatDiagnostic(missingReviewDiagnostic(row.id, notice.notice.reason)), sourceId: row.id }), 'the body is the template rebuilt from the recorded reason and the source row')
+  assert.equal(notice.content, NOTICE_TEMPLATES['review-blocked'].build({ sourceId: row.id, reason: notice.notice.reason }), 'the body is the template rebuilt from the recorded reason and the source row')
   assertDecision(notice, 'review-blocked')
 })
 

@@ -1198,4 +1198,4 @@ export interface RuntimeConfig {
  * that did not resolve or had already expired at start.
  */
 export interface WorkspaceGrant { path: string; note?: string; expiresAt?: number }
-export interface WorkspaceGrantSnapshot { grants: readonly WorkspaceGrant[]; loadedAt: number; unresolved: readonly string[] }
+export interface WorkspaceGrantSnapshot { grants: readonly WorkspaceGrant[]; unresolved: readonly string[] }
