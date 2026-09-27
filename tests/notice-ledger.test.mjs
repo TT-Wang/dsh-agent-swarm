@@ -11,7 +11,8 @@
  */
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { FakeClock, acceptThroughReview, blockThroughReview, events, setup, taskOf } from './faults/harness.mjs'
+import { FakeClock, MISSION_ACCEPTANCE, acceptThroughReview, blockThroughReview, events, setup, taskOf } from './faults/harness.mjs'
+import { ownerTools } from './refusal-inventory.mjs'
 import { noticeFamily, noticeTemplateKey } from '../lib/notices.js'
 
 const ownerRows = f => f.runtime.store.list('deliveries', f.mission.id).filter(delivery => delivery.to === 'owner' && delivery.notice !== undefined)
@@ -20,6 +21,16 @@ const coverageRow = f => ownerRows(f).find(delivery => /is ready to complete/.te
 /** The W3 stall's own events: the board classifier's `mission/stalled`, which carries no cause. */
 const boardStallEvents = f => events(f.runtime, f.mission.id, 'mission/stalled').filter(event => event.data.cause === undefined)
 const ticks = async (f, count) => { for (let tick = 0; tick < count; tick += 1) { f.clock.advance(f.runtime.config.tickMs); await f.runtime.tick() } }
+/** A board stalled on work only the reviewer may take, dead once the reviewer is gone: its one stuck subject. */
+const deadAssigneeBoard = async t => {
+  const f = await setup({ clock: new FakeClock() })
+  t.after(f.cleanup)
+  const dead = f.propose({ title: 'Reviewer-only work', kind: 'research', checks: [], assigneeId: f.reviewer.id })
+  f.runtime.commit(f.mission.id, () => f.runtime.store.put('members', { ...f.runtime.store.get('members', f.reviewer.id), phase: 'stopped' }))
+  await f.runtime.settle(f.mission.id)
+  await ticks(f, 1)
+  return { f, dead }
+}
 const relevant = (f, delivery) => f.runtime.ownerDeliveryRelevant(f.runtime.mission(f.mission.id), f.runtime.store.get('deliveries', delivery.id))
 /** The one field: key prefix, family and, for a templated body, its template and statement. */
 const names = delivery => ({ prefix: delivery.notice.dedupKey.split(':')[0], family: noticeFamily(delivery),
@@ -66,18 +77,36 @@ test('L-21: the W3 stall, coverage-complete, duplicate-carrier and wedged-pass r
   assert.deepEqual(names(coverage), { prefix: 'coverage-complete', family: 'coverage-complete', template: 'coverage-complete', statement: 'coverage-complete' })
 })
 
-test('a queued coverage-complete decision is withheld once the mission completes', async t => {
+test('queued board decisions are withheld once the mission completes: coverage-complete, a duplicate carrier and a wedged pass\'s naming', async t => {
   const clock = new FakeClock()
   const f = await setup({ clock })
   t.after(f.cleanup)
-  await acceptThroughReview(f, f.propose())
+  const builder = await f.runtime.addMember(f.owner, f.mission.id, { name: 'Builder', role: 'implementation', maxOutputTokens: 5_000 })
+  // A replaced task still running when its repair is accepted: a duplicate carrier.
+  const live = f.propose({ title: 'Live original', assigneeId: builder.id })
+  await f.runtime.claim(f.actor(builder), f.mission.id, live.id)
+  const repair = f.propose({ title: 'Repair' })
+  f.runtime.commit(f.mission.id, () => f.runtime.store.put('tasks', { ...taskOf(f.runtime, repair.id), replaces: [live.id] }))
+  await acceptThroughReview(f, repair)
+  const duplicate = ownerRows(f).find(delivery => delivery.notice.statement?.family === 'duplicate-carrier')
+  assert.ok(duplicate, 'the duplicate carrier told the owner')
+  // A body past its bound on this board, past the live-work bound the running original holds it to, is named.
+  const scheduling = f.runtime.scheduling
+  const pass = { id: scheduling.passKey(f.mission.id), operationId: 'operation_ledger_completed', missionId: f.mission.id, startedAt: clock.now() - f.runtime.stallPassReleaseBoundMs,
+    revisionBefore: f.runtime.store.revision(), fingerprintBefore: f.runtime.fingerprint(f.mission.id) }
+  scheduling.passes.set(f.mission.id, pass)
+  scheduling.checkSchedulingPasses()
+  scheduling.closePass(f.mission.id, pass)
+  const naming = ownerRows(f).find(delivery => noticeFamily(delivery) === 'scheduling-pass')
+  assert.ok(naming, 'the wedged pass was named')
+  f.runtime.cancel(f.owner, f.mission.id, { taskId: live.id, reason: 'The accepted repair carries it' })
   await f.runtime.settle(f.mission.id)
   await f.runtime.tick()
   const coverage = coverageRow(f)
   assert.ok(coverage, 'the coverage-complete board told the owner')
   assert.equal(relevant(f, coverage), true, 'outstanding while the owner has not decided')
   assert.equal(f.runtime.control(f.owner, f.mission.id, 'complete', 'The deliverable is accepted').status, 'completed')
-  assert.equal(relevant(f, coverage), false, 'the completed mission withholds it, like every decision family')
+  for (const row of [coverage, duplicate, naming]) assert.equal(relevant(f, row), false, `the completed mission withholds ${noticeFamily(row)}, like every decision family`)
 })
 
 test('a board that stalls while a pass runs is judged by the board classifier alone: no pass-count watchdog names it', async t => {
@@ -102,6 +131,37 @@ test('a board that stalls while a pass runs is judged by the board classifier al
   }
   assert.deepEqual(events(f.runtime, f.mission.id, 'mission/stalled').filter(event => event.data.cause === 'scheduling-pass'), [], 'no pass-count watchdog records the board')
   assert.deepEqual(ownerRows(f).filter(delivery => /consecutive scheduling passes/.test(delivery.content)), [], 'nor wakes the owner')
+  // The submission is the review admission's: the next real pass names it.
+  await ticks(f, 1)
+  const [decision] = ownerRows(f).filter(delivery => delivery.notice.dedupKey.startsWith(`review-blocked:${f.mission.id}:${task.id}:`))
+  assert.match(decision?.content ?? 'none', /no live member other than the author/, 'the admission names the stalled board\'s one subject')
+  assert.equal(stallRow(f), undefined, 'and nothing restates it')
+})
+
+test('the board classifier tells what a live pass left unpublished: the pass end publishes the board, and a wedged judgement tells its board facts, with no tick', async t => {
+  for (const board of ['stall', 'coverage']) {
+    for (const end of ['pass end', 'wedged judgement']) {
+      const f = await setup({ clock: new FakeClock() })
+      t.after(f.cleanup)
+      // A live pass owns generation: the transitions inside it are published at its end.
+      const scheduling = f.runtime.scheduling
+      const pass = scheduling.openPass(f.mission.id)
+      t.after(() => scheduling.closePass(f.mission.id, pass))
+      if (board === 'stall') await blockThroughReview(f, f.propose({ title: 'Dead end' }))
+      else await acceptThroughReview(f, f.propose())
+      await Promise.resolve()
+      const told = () => ownerRows(f).filter(delivery => ['board-stall', 'coverage-complete', 'stall-root'].includes(noticeFamily(delivery))).map(delivery => noticeFamily(delivery)).sort()
+      assert.deepEqual(told(), [], `${board}, ${end}: nothing is told while the pass is live`)
+      if (end === 'pass end') {
+        scheduling.closePass(f.mission.id, pass)
+        await Promise.resolve()
+        assert.ok(told().includes(board === 'stall' ? 'stall-root' : 'coverage-complete'), `${board}: the pass end judged the board`)
+      } else {
+        f.runtime.notices.ensureWitness(f.mission.id, { offPass: true, wedged: true })
+        assert.deepEqual(told(), board === 'stall' ? ['board-stall', 'stall-root'] : ['coverage-complete'], `${board}: the wedged judgement told the board facts`)
+      }
+    }
+  }
 })
 
 test('a W3 stall is told once per identity: a board that changes and returns to it writes no second row and no second event, and its row is outstanding again', async t => {
@@ -124,6 +184,88 @@ test('a W3 stall is told once per identity: a board that changes and returns to 
   assert.equal(relevant(f, stall), true, 'the return re-opens the same decision')
   assert.deepEqual(ownerRows(f).filter(delivery => delivery.notice.dedupKey.startsWith('board-stall:')).map(delivery => delivery.id), [stall.id], 'the same stall is one row')
   assert.equal(boardStallEvents(f).length, 1, 'and one event')
+})
+
+test('a board fact is told under its own identity: the W3 stall\'s stuck work at its epochs and its diagnostic, coverage-complete\'s terminal work; a new identity is a new row, and the old one is no longer outstanding', async t => {
+  const { f, dead } = await deadAssigneeBoard(t)
+  const stalls = () => ownerRows(f).filter(delivery => noticeFamily(delivery) === 'board-stall')
+  const [first] = stalls()
+  assert.deepEqual(first?.subjects, [`${dead.id}@${taskOf(f.runtime, dead.id).epoch}`], 'the stalled board named its stuck work')
+  // A structural amendment fences the stuck work at a new epoch; it stays stuck under the same diagnostic.
+  f.runtime.controlTask(f.owner, f.mission.id, dead.id, 'amend', { scope: ['src/**'] }, 'Narrow the scope')
+  await f.runtime.settle(f.mission.id)
+  await ticks(f, 1)
+  const [, fenced] = stalls()
+  assert.deepEqual(fenced?.subjects, [`${dead.id}@${taskOf(f.runtime, dead.id).epoch}`], 'the stuck work at its new epoch is a new stall')
+  assert.notDeepEqual(fenced.subjects, first.subjects)
+  assert.equal(fenced.notice.reason, first.notice.reason, 'under the same diagnostic')
+  assert.deepEqual([relevant(f, first), relevant(f, fenced)], [false, true], 'the earlier identity is no longer outstanding')
+  // An unreviewable submission joins the unfinished work: the same stuck work under a new diagnostic.
+  const source = f.propose()
+  const claimed = await f.runtime.claim(f.actor(f.author), f.mission.id, source.id)
+  await f.runtime.submit(f.actor(f.author), f.mission.id, { taskId: source.id, attemptId: claimed.attempt.id, output: 'candidate' })
+  await f.runtime.settle(f.mission.id)
+  await ticks(f, 150)
+  const [, , diagnosed] = stalls()
+  assert.deepEqual(diagnosed?.subjects, fenced.subjects, 'the same stuck work')
+  assert.notEqual(diagnosed.notice.reason, fenced.notice.reason, 'under a new diagnostic is a new stall')
+  assert.deepEqual([relevant(f, fenced), relevant(f, diagnosed)], [false, true])
+  assert.deepEqual(boardStallEvents(f).map(event => event.data.noticeKey), stalls().map(delivery => delivery.notice.dedupKey), 'each stall has its one event')
+
+  const c = await setup({ clock: new FakeClock() })
+  t.after(c.cleanup)
+  await acceptThroughReview(c, c.propose())
+  await c.runtime.settle(c.mission.id)
+  await ticks(c, 1)
+  const coverages = () => ownerRows(c).filter(delivery => noticeFamily(delivery) === 'coverage-complete')
+  const [covered] = coverages()
+  assert.ok(covered, 'the coverage-complete board told the owner')
+  const extra = c.propose({ title: 'Extra work', kind: 'research', checks: [] })
+  assert.equal(relevant(c, covered), false, 'unfinished work ends the coverage')
+  c.runtime.cancel(c.owner, c.mission.id, { taskId: extra.id, reason: 'Not needed after all' })
+  await c.runtime.settle(c.mission.id)
+  await ticks(c, 1)
+  const [, recovered] = coverages()
+  assert.ok(recovered?.subjects.includes(`${extra.id}@${taskOf(c.runtime, extra.id).epoch}`), 'coverage with new terminal work is a new coverage state')
+  assert.deepEqual([relevant(c, covered), relevant(c, recovered)], [false, true])
+})
+
+test('every exit a W3 stall and a coverage-complete decision name, performed through the owner\'s registered tools, retires that decision', async t => {
+  const toolsNamed = text => [...new Set(text.match(/\bswarm_\w+/g))].sort()
+  const proposal = f => ({ workstreamId: f.stream.id, title: 'More work', objective: 'Do the work the decision asks for', kind: 'research', scope: ['**'], outputs: [], acceptance: MISSION_ACCEPTANCE, checks: [] })
+  // The stall names the stuck work's amendment, a repair, a withdrawal and the mission stop (and a budget change, which names no tool).
+  const stallExits = {
+    'amend the existing task dependencies or assignee with swarm_control': ({ f, dead, tool }) => tool('swarm_control', { taskId: dead.id, action: 'amend', changes: { assigneeId: f.author.id }, reason: 'Reassign to a live member' }),
+    'admit a repair or review with swarm_propose': ({ f, tool }) => tool('swarm_propose', proposal(f)),
+    'withdraw it explicitly with swarm_cancel': ({ dead, tool }) => tool('swarm_cancel', { taskId: dead.id, reason: 'No longer required' }),
+    'Use swarm_control stop': ({ tool }) => tool('swarm_control', { action: 'stop', reason: 'Stop the mission' }),
+  }
+  for (const [exit, perform] of Object.entries(stallExits)) {
+    const { f, dead } = await deadAssigneeBoard(t)
+    const stall = ownerRows(f).find(delivery => noticeFamily(delivery) === 'board-stall')
+    assert.deepEqual(toolsNamed(stall.content), ['swarm_cancel', 'swarm_control', 'swarm_propose'], 'the stall names these tools')
+    assert.ok(stall.content.includes(exit), `the stall names: ${exit}`)
+    assert.equal(relevant(f, stall), true)
+    await perform({ f, dead, tool: await ownerTools(f) })
+    assert.equal(relevant(f, stall), false, `${exit} retires the stall`)
+  }
+  const coverageExits = {
+    'Use swarm_control complete': ({ tool }) => tool('swarm_control', { action: 'complete', reason: 'The deliverable is accepted' }),
+    'admit more work with swarm_propose': ({ f, tool }) => tool('swarm_propose', proposal(f)),
+  }
+  for (const [exit, perform] of Object.entries(coverageExits)) {
+    const f = await setup({ clock: new FakeClock() })
+    t.after(f.cleanup)
+    await acceptThroughReview(f, f.propose())
+    await f.runtime.settle(f.mission.id)
+    await ticks(f, 1)
+    const coverage = coverageRow(f)
+    assert.deepEqual(toolsNamed(coverage.content), ['swarm_control', 'swarm_propose'], 'coverage-complete names these tools')
+    assert.ok(coverage.content.includes(exit), `coverage-complete names: ${exit}`)
+    assert.equal(relevant(f, coverage), true)
+    await perform({ f, tool: await ownerTools(f) })
+    assert.equal(relevant(f, coverage), false, `${exit} retires coverage-complete`)
+  }
 })
 
 test('a coverage-complete board is never reported as a stall: an owner-assembled mission is told it may complete, an automatic one completes', async t => {
@@ -207,7 +349,8 @@ test('the review admission speaks only for its own source: other stuck work besi
   const source = running.propose()
   const claimed = await running.runtime.claim(running.actor(running.author), running.mission.id, source.id)
   await running.runtime.submit(running.actor(running.author), running.mission.id, { taskId: source.id, attemptId: claimed.attempt.id, output: 'candidate' })
-  await running.runtime.claim(running.actor(running.author), running.mission.id, running.propose({ title: 'Unrelated work', kind: 'research', checks: [] }).id)
+  const unrelated = running.propose({ title: 'Unrelated work', kind: 'research', checks: [] })
+  await running.runtime.claim(running.actor(running.author), running.mission.id, unrelated.id)
   running.runtime.commit(running.mission.id, () => running.runtime.store.put('members', { ...running.runtime.store.get('members', running.reviewer.id), phase: 'stopped' }))
   await running.runtime.settle(running.mission.id)
   await ticks(running, 150)
@@ -216,6 +359,10 @@ test('the review admission speaks only for its own source: other stuck work besi
   assert.ok(fallthrough, 'the dead work is named behind the running work while the source\'s decision is open')
   assert.deepEqual(fallthrough.subjects, [`${dependent.id}@${taskOf(running.runtime, dependent.id).epoch}`], 'and the naming leaves the source to its admission')
   assert.equal(relevant(running, fallthrough), true, 'the naming is outstanding')
+  // A later board change is judged again, and the source stays the admission's alone.
+  running.propose({ title: 'Follow-up', kind: 'research', checks: [], dependencies: [unrelated.id] })
+  await running.runtime.settle(running.mission.id)
+  assert.deepEqual(ownerRows(running).filter(delivery => noticeFamily(delivery) !== 'review-blocked' && (delivery.subjects ?? []).some(subject => subject.startsWith(`${source.id}@`))).map(delivery => delivery.content), [], 'no other naming restates the source')
 })
 
 test('a queued W3 stall is withheld once its board can progress, and coverage-complete reminds the owner until the mission completes', async t => {
@@ -227,8 +374,16 @@ test('a queued W3 stall is withheld once its board can progress, and coverage-co
   const stall = stallRow(stalled)
   assert.ok(stall, 'the stalled board told the owner')
   assert.equal(relevant(stalled, stall), true, 'outstanding while the board stays stalled')
+  await stalled.runtime.flushOutbox(stalled.mission.id)
+  const stallReminder = ordinal => ownerRows(stalled).find(delivery => delivery.notice.dedupKey === `obligation-followup:${stall.id}:${ordinal}`)
+  stalled.clock.advance(stalled.runtime.notices.obligationFollowupMs)
+  stalled.runtime.notices.absenceNet(stalled.mission.id)
+  assert.ok(stallReminder(1), 'the delivered stall is reminded while the board stays stalled')
   stalled.propose({ title: 'Ready work' })
   assert.equal(relevant(stalled, stall), false, 'ready work ends the stall, so the queued decision is withheld')
+  stalled.clock.advance(stalled.runtime.notices.obligationFollowupMs)
+  stalled.runtime.notices.absenceNet(stalled.mission.id)
+  assert.equal(stallReminder(2), undefined, 'and its reminders end with it')
 
   const f = await setup({ clock: new FakeClock() })
   t.after(f.cleanup)
