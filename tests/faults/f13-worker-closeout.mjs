@@ -27,8 +27,9 @@ await runScenario({
       assert.equal(afterNudge.attempt.id, claimed.attempt.id)
       assert.equal(afterNudge.closeout.nudges, 1)
       assert.equal(f.workers.captured.length, 0, 'no checkpoint before the bound is exhausted')
-      const nudgeDelivery = f.workers.deliveries.find(item => item.kind === 'control' && /still open but your turn ended/.test(item.content))
-      assert(nudgeDelivery, 'the worker is re-woken with a durable control delivery')
+      // The outbox is flushed after the nudge commits, so the wake is awaited, not read at once.
+      const nudgeDelivery = await eventually(() => f.workers.deliveries.find(item => item.kind === 'control' && /still open but your turn ended/.test(item.content)),
+        'the worker is re-woken with a durable control delivery')
       assert.match(nudgeDelivery.content, /swarm_submit/)
       assert.match(nudgeDelivery.content, new RegExp(claimed.attempt.id))
       // Injection 2: the worker still does not act; the bound is reached.

@@ -70,8 +70,9 @@ await runScenario({
         const running = await eventually(() => taskOf(f.runtime, task.id).status === 'running' ? taskOf(f.runtime, task.id) : undefined,
           'row 2: a task ready only for a waiting member must still be dispatched')
         assert.equal(running.attempt.ownerId, f.author.id)
-        const assignment = f.workers.deliveries.find(item => item.kind === 'assignment' && item.taskId === task.id)
-        assert.ok(assignment, 'row 2: the wake is a durable assignment delivery')
+        // The pass flushes the outbox after dispatch commits, so the wake is awaited, not read at once.
+        const assignment = await eventually(() => f.workers.deliveries.find(item => item.kind === 'assignment' && item.taskId === task.id),
+          'row 2: the wake is a durable assignment delivery')
         assert.equal(assignment.memberId, f.author.id)
         assert.equal(await f.workers.callbacks.beforeStep(f.author.id, true), undefined, 'row 2: fresh input lets the parked member take its next step')
         rows.row2 = { witness: 'W1', taskId: task.id, woken: true }
