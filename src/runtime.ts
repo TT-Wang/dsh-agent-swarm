@@ -1269,8 +1269,6 @@ export class SwarmRuntime {
       if (input.kind !== 'verification' && input.checks?.length && input.checkTimeoutMs === undefined) throw new PolicyError('task_check_timeout_required', 'validation_error', '[task_check_timeout_required] Automatic task checks require a timeout chosen by the primary agent. Pass `checkTimeoutMs` in milliseconds on this task with `swarm_propose` (or `swarm_launch` for a new plan), then retry the same task.')
     }
     requireText(input.title, 'title'); requireText(input.objective, 'objective')
-    // A task stores only its own criteria: what it covers, and what the tasks it
-    // replaces answer for, reach its worker and reviewers through `checklist`.
     const acceptance = input.acceptance ?? []
     if (!Array.isArray(acceptance) || acceptance.length) requireStrings(acceptance, 'acceptance')
     if (input.covers !== undefined) assertCovers(input.covers, mission.acceptance.length, 'covers')

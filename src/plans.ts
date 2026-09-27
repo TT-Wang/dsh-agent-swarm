@@ -223,7 +223,6 @@ export function validatePlan(value: unknown, options: PlanValidationOptions = {}
         if (source.kind === 'verification') throw new AdmissionError('plan_review_source_invalid', 'tool_error', `${at}.reviewOf cannot name another verification task`, `${at}.reviewOf`)
         // A planned source's only author is its assignee.
         if (task.assigneeKey && !canOwnReview({ assigneeId: source.assigneeKey as string | undefined }, String(task.assigneeKey))) throw new AdmissionError('plan_review_independence_required', 'tool_error', `${at}.assigneeKey must differ from the reviewed source's assignee ${JSON.stringify(source.assigneeKey)}`, `${at}.assigneeKey`)
-        // A review's covers count for its source: they move onto it, so a stored review carries none.
         if (Array.isArray(task.covers)) { source.covers = [...new Set([...(source.covers as string[] | undefined ?? []), ...task.covers])]; delete task.covers }
       } else if (task.reviewOf !== undefined) throw new AdmissionError('plan_review_not_verification', 'tool_error', `${at}.reviewOf is only valid on verification tasks`, `${at}.reviewOf`)
     })
