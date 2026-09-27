@@ -16,6 +16,8 @@ import { validatePlan } from '../lib/plans.js'
 import { SwarmStore } from '../lib/store.js'
 import { OWNER_PROMPT, registerTools } from '../lib/tools.js'
 import { FakeClock, FakeWorkers, SwarmRuntime, acceptThroughReview, blockThroughReview, budget, makeRuntime, makeRuntimeStub, setup } from './faults/harness.mjs'
+import { guardActions, guardBoard, guardTerminalChain } from './guard-model.mjs'
+import { assessText, toolSchemaIndex } from './refusal-inventory.mjs'
 
 const criteria = ['value is two', 'docs mention two', 'no other file changes']
 const row = (id, extra = {}) => ({ id, missionId: 'm', workstreamId: 's', title: id, objective: id, kind: 'implementation', status: 'pending', dependencies: [], scope: ['src/'], acceptance: [], checks: [], priority: 50, experiment: false, epoch: 0, evidenceIds: [], createdAt: 1, ...extra })
@@ -154,6 +156,26 @@ test('the completion reason\'s exit, performed as it names it through the regist
   assert.deepEqual([named.acceptance, named.covers], [[], ['c2']], 'the exit needs no criterion text')
   await acceptThroughReview(f, named)
   assert.equal(f.runtime.completionError(f.runtime.mission(f.mission.id)), undefined)
+})
+
+test('the review-admission terminal names the fields a review needs, and its exit performed through the registered swarm_propose admits a review with no acceptance', async t => {
+  const f = await setup({ clock: new FakeClock() })
+  t.after(f.cleanup)
+  const source = f.propose({ title: 'Submitted source' })
+  const claimed = await f.runtime.claim(f.actor(f.author), f.mission.id, source.id)
+  await f.runtime.submit(f.actor(f.author), f.mission.id, { taskId: source.id, attemptId: claimed.attempt.id, output: 'candidate' })
+  for (const review of f.runtime.store.list('tasks', f.mission.id).filter(task => task.reviewOf === source.id)) f.runtime.cancel(f.owner, f.mission.id, { taskId: review.id, reason: 'Withdraw the review path' })
+  const [terminal, ...others] = guardActions(guardBoard(f.runtime, f.mission.id))
+  assert.deepEqual([terminal.chain, others], ['review_admission', []])
+  assert.equal(terminal.message, `[review_admission_terminal] Submitted work ${source.id} has no live independent review path, so no verdict can ever land. Admit a review with \`swarm_propose\` by passing \`kind\`, \`reviewOf\`, \`scope\` and \`outputs\` ([] for a review), or withdraw the source with \`swarm_cancel\` and its \`taskId\`.`)
+  assert.deepEqual(assessText(terminal.message, await toolSchemaIndex()), [], 'it names only tools and parameters the published schemas declare')
+  const definitions = new Map()
+  registerTools({ tools: { register: definition => definitions.set(definition.name, definition) } }, f.runtime, f.mission.budget)
+  // Exactly the fields it names, beside the ones every proposal carries; no criteria of its own.
+  const review = (await definitions.get('swarm_propose').execute({ missionId: f.mission.id, workstreamId: f.stream.id, title: 'Review', objective: 'Independent review',
+    kind: 'verification', reviewOf: source.id, scope: ['**'], outputs: [] }, { signal: new AbortController().signal, agent: { id: f.owner.sessionId } })).result
+  assert.deepEqual([review.reviewOf, review.acceptance, review.status], [source.id, [], 'pending'])
+  assert.notEqual(guardTerminalChain(guardBoard(f.runtime, f.mission.id)), 'review_admission', 'the source has a live review path again')
 })
 
 test('a repair answers for the ids its lineage cites, and a withdrawn deliverable\'s ids count for nothing', async t => {
