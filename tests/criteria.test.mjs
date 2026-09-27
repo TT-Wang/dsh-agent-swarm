@@ -169,7 +169,7 @@ test('a repair answers for the ids its lineage cites, and a withdrawn deliverabl
   assert.match(g.runtime.completionError(g.runtime.mission(g.mission.id)), /criterion: c2 "is documented"\. /)
 })
 
-test('workers see criterion text, never bare ids; the owner\'s fresh overview maps each id to its criterion', async t => {
+test('workers see criterion text, never bare ids; the owner also reads each task\'s covers and a fresh overview maps each id to its criterion', async t => {
   const f = await setup({ clock: new FakeClock(), acceptance: ['works', 'is documented'] })
   t.after(f.cleanup)
   const task = f.propose({ acceptance: ['has a test'], covers: ['c2'] })
@@ -180,6 +180,8 @@ test('workers see criterion text, never bare ids; the owner\'s fresh overview ma
   for (const record of [f.runtime.observe(f.actor(f.author), f.mission.id).current.task, f.runtime.observe(f.actor(f.author), f.mission.id, { taskId: task.id }).task]) {
     assert.deepEqual(record.acceptance, ['is documented', 'has a test']); assert.equal('covers' in record, false)
   }
+  const owned = [f.runtime.observe(f.owner, f.mission.id, { taskId: task.id }).task, f.runtime.observe(f.owner, f.mission.id, { detail: 'full' }).board.find(row => row.id === task.id)]
+  for (const record of owned) assert.deepEqual([record.acceptance, record.covers], [['is documented', 'has a test'], ['c2']], 'the owner who cites ids reads them beside their text')
   const overview = f.runtime.observe(f.owner, f.mission.id)
   assert.deepEqual(overview.mission.criteria, { c1: 'works', c2: 'is documented' })
   assert.equal(f.runtime.observe(f.owner, f.mission.id, { cursor: overview.nextCursor }).mission.criteria, undefined, 'a delta omits the unchanging criteria')
