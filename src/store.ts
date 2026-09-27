@@ -452,21 +452,16 @@ export class SwarmStore {
     if (result === null || typeof result !== 'object' || !('id' in result) || typeof result.id !== 'string' || (id !== undefined && result.id !== id)) throw new Error('Corrupt swarm record identity')
     return result as Tables[T]
   }
-  /**
-   * The v4 upgrade, run once in the opening transaction: no v4 decision reads criterion
-   * text, so a deliverable (or draft plan task) that copied a mission criterion cites its
-   * id in `covers`, keeping the verdict the copy decided, instead of a compatibility
-   * branch reading text. Reviews never covered anything; history stays as recorded.
-   */
+  /** The v4 upgrade, once at open: each deliverable and draft plan task cites by id, instead of holding, the mission criteria it copied; a staged mission takes its saved draft's criteria, as its v3 relaunch would have. */
   private citeCriteria(): void {
-    const cite = (task: Task | PlanTask, texts: unknown): void => {
-      const covers = task.kind === 'verification' || !Array.isArray(texts) || !Array.isArray(task.acceptance) ? [] : texts.flatMap((text, index) => task.acceptance.includes(text) ? [criterionId(index)] : [])
-      if (covers.length) task.covers = covers
+    const cite = (task: Task | PlanTask, texts: unknown) => {
+      if (task.kind === 'verification' || !Array.isArray(texts) || !Array.isArray(task.acceptance)) return
+      const covers = texts.flatMap((text, index) => task.acceptance.includes(text) ? [criterionId(index)] : [])
+      if (covers.length) Object.assign(task, { covers, acceptance: task.acceptance.filter(item => !texts.includes(item)) })
     }
     for (const draft of this.list('drafts')) {
-      // A staged mission takes its saved draft's criteria, as the v3 relaunch would have: a v4 repair resends them unchanged.
-      const staged = this.list('missions').find(mission => mission.id === draft.missionId && mission.status === 'staged')
-      if (staged) this.upsert('missions', { ...staged, acceptance: draft.input.acceptance })
+      const mission = this.get('missions', draft.missionId ?? '')
+      if (mission?.status === 'staged') this.upsert('missions', { ...mission, acceptance: draft.input.acceptance })
       draft.input.tasks.forEach(task => cite(task, draft.input.acceptance)); this.upsert('drafts', draft)
     }
     for (const task of this.list('tasks')) { cite(task, this.get('missions', task.missionId)?.acceptance); this.upsert('tasks', task) }

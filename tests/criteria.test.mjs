@@ -229,18 +229,21 @@ test('model-visible schemas name criteria by id, and covers is declared but neve
 })
 
 // Rows as a v3 build wrote them: each deliverable copied the criteria it covered as text.
+const PRIOR = 'The parser from the prior work is already in the worktree and still passes'
 const v3Mission = (id, acceptance) => ({ id, ownerSessionId: 'owner', workspace: '/repo', title: id, objective: id, scope: ['**'], acceptance, status: 'active', budget, usedTokens: 0, usedSteps: 0, createdAt: 1, updatedAt: 1, deadline: 9e15 })
 const v3Task = (id, missionId, kind, status, acceptance, extra = {}) => ({ id, missionId, workstreamId: 's', title: id, objective: id, kind, status, dependencies: [], scope: ['**'], acceptance, checks: [], priority: 50, experiment: false, epoch: 0, evidenceIds: [], createdAt: 1, ...extra })
 function writeV3(path, version = 3) {
   const db = new DatabaseSync(path)
   const insert = (table, row) => db.prepare(`INSERT INTO ${table}(id,mission_id,value) VALUES(?,?,?)`).run(row.id, row.missionId ?? row.id, JSON.stringify(row))
-  for (const row of [v3Mission('done', ['a1', 'a2']), v3Mission('stalled', ['b1', 'b2']), v3Mission('repaired', ['p1', 'p2'])]) insert('missions', row)
+  for (const row of [v3Mission('done', ['a1', 'a2']), v3Mission('stalled', ['b1', 'b2']), v3Mission('repaired', ['p1', 'p2']), v3Mission('guarded', [PRIOR])]) insert('missions', row)
   for (const row of [
     v3Task('t1', 'done', 'research', 'accepted', ['a1', 'own']), v3Task('t2', 'done', 'research', 'accepted', ['a2']),
     v3Task('r1', 'done', 'verification', 'accepted', ['a1', 'own'], { reviewOf: 't1' }),
     v3Task('u1', 'stalled', 'research', 'accepted', ['b1']), v3Task('ru', 'stalled', 'verification', 'accepted', ['b1', 'b2'], { reviewOf: 'u1' }),
     // A repair admitted before acceptance inheritance: it stored only its own list.
     v3Task('p', 'repaired', 'research', 'cancelled', ['p1', 'p2']), v3Task('q', 'repaired', 'research', 'accepted', ['p1'], { replaces: ['p'] }),
+    // A pending deliverable that copied a criterion assuming prior work, and the task that carries that work.
+    v3Task('carrier', 'guarded', 'research', 'accepted', ['own']), v3Task('g', 'guarded', 'implementation', 'pending', [PRIOR], { dependencies: ['carrier'] }),
   ]) insert('tasks', row)
   insert('drafts', { id: 'draft', ownerSessionId: 'owner', revision: 1, status: 'draft', createdAt: 1, updatedAt: 1,
     input: { ...plan('/repo'), acceptance: ['x1', 'x2'], tasks: [{ ...plan('/repo').tasks[0], acceptance: ['x2', 'own'], covers: undefined }, { ...plan('/repo').tasks[1], acceptance: ['x1', 'x2'], covers: undefined }] } })
@@ -257,9 +260,12 @@ test('a v3 store cites the criteria its deliverables copied, once at open, and k
   t.after(() => opened.dispose())
   const covers = id => opened.store.get('tasks', id).covers
   assert.deepEqual(['t1', 't2', 'r1', 'u1', 'ru', 'p', 'q'].map(covers), [['c1'], ['c2'], undefined, ['c1'], undefined, ['c1', 'c2'], ['c1']])
-  assert.deepEqual(opened.store.get('tasks', 't1').acceptance, ['a1', 'own'], 'the own list is left as recorded')
+  assert.deepEqual(['t1', 'r1', 'q', 'g'].map(id => opened.store.get('tasks', id).acceptance), [['own'], ['a1', 'own'], [], []], 'a cited criterion leaves the own list; a review keeps its text')
+  assert.deepEqual(taskGraphIndex(opened.store.list('tasks', 'done')).checklist('t1', ['a1', 'a2']), ['a1', 'own'], 'what its worker and reviewers check is unchanged')
+  // The amend guard reads the migrated row's own criteria, as it reads a v4 row that cites the same id.
+  assert.deepEqual(opened.controlTask({ sessionId: 'owner' }, 'guarded', 'g', 'amend', { dependencies: [] }, 'the criterion is cited, not copied').dependencies, [])
   assert.equal(opened.store.get('tasks', 't1').revision, undefined, 'the upgrade is not a task write')
-  assert.deepEqual(opened.store.get('drafts', 'draft').input.tasks.map(task => task.covers), [['c2'], undefined])
+  assert.deepEqual(opened.store.get('drafts', 'draft').input.tasks.map(task => [task.covers, task.acceptance]), [[['c2'], ['own']], [undefined, ['x1', 'x2']]])
   const reason = id => opened.completionError(opened.store.get('missions', id))
   assert.equal(reason('done'), undefined, 'covered before, covered after')
   assert.match(reason('stalled'), /criterion: c2 "b2"\. /, 'uncovered before, uncovered after; a review\'s text still covers nothing')
@@ -313,8 +319,11 @@ test('a staged mission a v3 build left behind a longer saved draft takes that dr
   t.after(() => opened.dispose())
   assert.deepEqual(opened.store.get('missions', saved.missionId).acceptance, ['works', 'is documented'], 'the staged mission takes the criteria its relaunch would have written')
   const upgraded = opened.drafts(owner)[0]
-  assert.deepEqual(upgraded.input.tasks.map(task => task.covers), [['c1', 'c2'], undefined])
+  assert.deepEqual(upgraded.input.tasks.map(task => [task.covers, task.acceptance]), [[['c1', 'c2'], []], [undefined, ['reads the diff']]])
   const launched = await opened.launchDraft(owner, upgraded.id, upgraded.revision)
   assert.deepEqual([launched.mission.status, launched.mission.acceptance], ['active', ['works', 'is documented']])
   assert.deepEqual(launched.tasks.find(task => task.kind === 'implementation').covers, ['c1', 'c2'])
+  // Without the mission write the relaunch went through silently on the shorter list, and c2 named no criterion.
+  const minted = launched.mission.acceptance.map((_, index) => criterionId(index))
+  assert.deepEqual(launched.tasks.flatMap(task => task.covers ?? []).filter(id => !minted.includes(id)), [], 'every cited id names a mission criterion')
 })
