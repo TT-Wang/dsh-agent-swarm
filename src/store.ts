@@ -463,8 +463,13 @@ export class SwarmStore {
       const covers = task.kind === 'verification' || !Array.isArray(texts) || !Array.isArray(task.acceptance) ? [] : texts.flatMap((text, index) => task.acceptance.includes(text) ? [criterionId(index)] : [])
       if (covers.length) task.covers = covers
     }
+    for (const draft of this.list('drafts')) {
+      // A staged mission takes its saved draft's criteria, as the v3 relaunch would have: a v4 repair resends them unchanged.
+      const staged = this.list('missions').find(mission => mission.id === draft.missionId && mission.status === 'staged')
+      if (staged) this.upsert('missions', { ...staged, acceptance: draft.input.acceptance })
+      draft.input.tasks.forEach(task => cite(task, draft.input.acceptance)); this.upsert('drafts', draft)
+    }
     for (const task of this.list('tasks')) { cite(task, this.get('missions', task.missionId)?.acceptance); this.upsert('tasks', task) }
-    for (const draft of this.list('drafts')) { draft.input.tasks.forEach(task => cite(task, draft.input.acceptance)); this.upsert('drafts', draft) }
   }
   /** Read a mission's records, or all records for host recovery. */
   list<T extends Table>(table: T, missionId?: string): Tables[T][] {

@@ -286,3 +286,33 @@ test('a v3 store cites the criteria its deliverables copied, once at open, and k
   const future = new DatabaseSync(config.statePath); future.exec('PRAGMA user_version=5'); future.close()
   assert.throws(() => new SwarmRuntime(config, new FakeWorkers()), /Unsupported swarm schema 5; expected 4/)
 })
+
+test('a staged mission a v3 build left behind a longer saved draft takes that draft\'s criteria at the upgrade, so its relaunch goes through', async t => {
+  const { dir, config, runtime } = await makeRuntime(t, { config: { tickMs: 60000, checkTimeoutMs: undefined } })
+  const owner = { sessionId: 'owner' }, claim = { grantRoot: dir, source: 'session' }
+  const propose = runtime.propose.bind(runtime)
+  runtime.propose = (...args) => { const task = propose(...args); if (task.kind === 'verification') throw new Error('assembly fixture failure'); return task }
+  const input = plan(dir); input.acceptance = ['works']; input.tasks[0].covers = ['c1']; delete input.tasks[1].covers
+  const draft = runtime.createDraft(owner, input, claim)
+  await assert.rejects(runtime.launchDraft(owner, draft.id, draft.revision), /assembly fixture failure/)
+  runtime.propose = propose
+  await runtime.dispose()
+  // What a v3 build saved next: a repair appended a criterion the deliverable copied, and no row cites an id.
+  // Its relaunch would have written the draft's criteria onto the staged mission.
+  const db = new DatabaseSync(config.statePath)
+  const rows = table => db.prepare(`SELECT value FROM ${table}`).all().map(row => JSON.parse(row.value))
+  const [saved] = rows('drafts')
+  saved.input.acceptance = ['works', 'is documented']
+  saved.input.tasks = saved.input.tasks.map(({ covers: _cited, ...task }) => task.kind === 'verification' ? task : { ...task, acceptance: ['works', 'is documented'] })
+  db.prepare('UPDATE drafts SET value=? WHERE id=?').run(JSON.stringify(saved), saved.id)
+  for (const { covers: _cited, ...task } of rows('tasks')) db.prepare('UPDATE tasks SET value=? WHERE id=?').run(JSON.stringify(task), task.id)
+  db.exec('PRAGMA user_version=3'); db.close()
+  const opened = new SwarmRuntime(config, new FakeWorkers())
+  t.after(() => opened.dispose())
+  assert.deepEqual(opened.store.get('missions', saved.missionId).acceptance, ['works', 'is documented'], 'the staged mission takes the criteria its relaunch would have written')
+  const upgraded = opened.drafts(owner)[0]
+  assert.deepEqual(upgraded.input.tasks.map(task => task.covers), [['c1', 'c2'], undefined])
+  const launched = await opened.launchDraft(owner, upgraded.id, upgraded.revision)
+  assert.deepEqual([launched.mission.status, launched.mission.acceptance], ['active', ['works', 'is documented']])
+  assert.deepEqual(launched.tasks.find(task => task.kind === 'implementation').covers, ['c1', 'c2'])
+})
