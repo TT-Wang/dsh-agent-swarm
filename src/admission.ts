@@ -37,16 +37,6 @@ export function assertCovers(covers: unknown, count: number, location: string): 
   if (!Array.isArray(covers) || !covers.every((id, index) => valid.includes(id) && covers.indexOf(id) === index)) throw new AdmissionError('covers_invalid', 'validation_error', `[covers_invalid] ${location} must list distinct ids of the mission acceptance criteria, c1 for the first through ${valid.at(-1)} for the last; it has ${JSON.stringify(covers)}. Pass \`covers\` with each id this task satisfies once, never the criterion text, and retry the same task/request.`, location)
 }
 
-/**
- * The criteria a repair's stored `acceptance` holds beyond the list its
- * proposal supplied: what the host inherited from the replaced tasks. An
- * omitted or malformed proposal list supplied nothing.
- */
-export function inheritedAcceptance(acceptance: readonly string[], proposed: unknown): string[] {
-  const supplied: readonly unknown[] = Array.isArray(proposed) ? proposed : []
-  return acceptance.filter(criterion => !supplied.includes(criterion))
-}
-
 /** reviewOf already waits for submission; an ordinary edge would wait for acceptance. */
 export function normalizeReviewDependencies(kind: string, reviewOf: string | undefined, dependencies: readonly string[] = []): string[] {
   return dependencies.filter(dependency => kind !== 'verification' || dependency !== reviewOf)

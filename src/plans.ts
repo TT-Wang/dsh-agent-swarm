@@ -167,7 +167,8 @@ export function validatePlan(value: unknown, options: PlanValidationOptions = {}
       task.scope = normalizeScopeSelectors(task.scope as string[])
       assertScopeSelectors(task.scope as string[], `tasks[${index}].scope`, value.scope as string[])
     })
-    inspectAdmission(() => strings(task.acceptance, `${at}.acceptance`))
+    task.acceptance ??= []
+    inspectAdmission(() => strings(task.acceptance, `${at}.acceptance`, true))
     if (task.covers !== undefined) inspectAdmission(() => assertCovers(task.covers, (value.acceptance as string[]).length, `${at}.covers`))
     // A plan states its deliverables: `outputs` is the only record of the files
     // a task writes, so a launched task must carry it. Empty is legal and means
@@ -229,6 +230,8 @@ export function validatePlan(value: unknown, options: PlanValidationOptions = {}
     if (task.review !== undefined) inspectAdmission(() => reviewOverride(task, `${at}.review`, members, tasks, Number((value.budget as Record<string, unknown>).maxSteps)))
   }
   if (undeclared.length) admissionIssues.push(outputsRequired(undeclared))
+  // After every review's covers moved onto its source: a deliverable needs criteria of its own or cited ones.
+  for (const [index, task] of [...tasks.values()].entries()) if (task.kind !== 'verification' && Array.isArray(task.acceptance) && !task.acceptance.length && !(task.covers as unknown[] | undefined)?.length) inspectAdmission(() => { throw new AdmissionError('plan_task_acceptance_required', 'validation_error', `[plan_task_acceptance_required] tasks[${index}] (${String(task.key)}) has neither covers nor acceptance. Add to \`covers\` the mission criterion ids it satisfies, or give it its own \`acceptance\`, and relaunch the complete plan.`, `tasks[${index}]`) })
   if (experiments > Number(value.budget.maxExperiments)) inspectAdmission(() => { throw new AdmissionError('plan_experiments_exceed_budget', 'budget_error', 'Plan exceeds experiment budget', 'tasks') })
   if (admissionIssues.length) {
     // One refusal carrying every diagnostic; its message is the issues' text,
@@ -305,10 +308,10 @@ function reviewKey(sourceKey: string, taken: Set<string>): string {
  * The host owns review pairing: every deliverable (a non-verification task)
  * that no verification task names in `reviewOf` gets exactly one independent
  * review, inserted after it: unassigned, with the source's workstream, scope,
- * acceptance, priority, check timeout and recovery limit, and `outputs: []`.
- * Like an authored review it names no checks: verification runs the source's.
- * The source's `review` override supplies assigneeKey, objective, acceptance,
- * maxSteps and maxRecoveryAttempts, and is consumed. Like an authored review,
+ * priority, check timeout and recovery limit, and `outputs: []`. Like an
+ * authored review it copies no checks or criteria: it checks the source's.
+ * The source's `review` override supplies assigneeKey, objective, review-only
+ * acceptance, maxSteps and maxRecoveryAttempts, and is consumed. Like an authored review,
  * its step ceiling and finding estimate are the task defaults, not the
  * source's. An authored review
  * suppresses the synthesis, so a plan that pairs every deliverable is returned
@@ -328,7 +331,7 @@ export function pairReviews(plan: PlanInput): PlanInput {
     const row: PlanTask = {
       key: reviewKey(source.key, taken), workstreamKey: source.workstreamKey, title: `Independent review of ${source.title}`,
       objective: review?.objective ?? `Independently verify the submitted artifact of ${source.key} (${source.title}) against its acceptance criteria.`,
-      kind: 'verification', scope: [...source.scope], acceptance: [...(review?.acceptance ?? source.acceptance)], outputs: [], reviewOf: source.key,
+      kind: 'verification', scope: [...source.scope], acceptance: [...(review?.acceptance ?? [])], outputs: [], reviewOf: source.key,
       ...(review?.assigneeKey === undefined ? {} : { assigneeKey: review.assigneeKey }),
       ...(review?.maxSteps === undefined ? {} : { maxSteps: review.maxSteps }),
       ...(maxRecoveryAttempts === undefined ? {} : { maxRecoveryAttempts }),

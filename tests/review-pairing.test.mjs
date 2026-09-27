@@ -62,7 +62,8 @@ test('a launched plan with a deliverable and no review gets exactly one synthesi
   assert.match(review.id, /_deliver-review$/)
   assert.equal(review.assigneeId, undefined, 'unassigned: any independent member may take it')
   assert.deepEqual(review.scope, source.scope)
-  assert.deepEqual(review.acceptance, source.acceptance)
+  const checklist = task => f.runtime.observe({ sessionId: snapshot.mission.ownerSessionId }, snapshot.mission.id, { taskId: task.id }).task.acceptance
+  assert.deepEqual([review.acceptance, checklist(review)], [[], checklist(source)], 'nothing is copied: the review checks its source\'s checklist')
   assert.equal(review.checkTimeoutMs, source.checkTimeoutMs)
   assert.equal(review.maxRecoveryAttempts, source.maxRecoveryAttempts)
   assert.equal(review.priority, source.priority)
@@ -221,13 +222,13 @@ test('the review override schema states the defaults the added review really tak
   const source = deliverable({ maxSteps: 20, maxFindings: 3 })
   const review = pairReviews(validatePlan(plan('/workspace', { tasks: [source] }), { launch: true })).tasks.find(task => task.kind === 'verification')
   assert.equal(review.maxRecoveryAttempts, source.maxRecoveryAttempts, 'the recovery limit is the source\'s')
-  assert.deepEqual(review.acceptance, source.acceptance, 'so is the acceptance')
+  assert.deepEqual(review.acceptance, [], 'no criterion is copied: the review checks its source\'s')
   assert.equal(review.ceilingProvenance.maxSteps.source, 'default', 'the step ceiling is the task default')
   assert.notEqual(review.maxSteps, source.maxSteps)
   for (const name of ['swarm_stage', 'swarm_launch']) {
     const { description } = definitions.get(name).parameters.properties.tasks.items.properties.review
     assert.doesNotMatch(description, /acceptance and limits/, `${name}: the step ceiling is not this task's`)
-    assert.match(description, /this task's acceptance and maxRecoveryAttempts, and the default maxSteps/, name)
+    assert.match(description, /It checks what this task must satisfy; acceptance here adds review-only criteria\. Omitted fields default to unassigned, the host's review objective, no extra criteria, this task's maxRecoveryAttempts, and the default maxSteps/, name)
   }
 })
 

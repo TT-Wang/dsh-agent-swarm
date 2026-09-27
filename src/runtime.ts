@@ -21,7 +21,7 @@ export { TEMP_RENDEZVOUS_WINDOW_MS, sharedTempPaths, tempRendezvousDecision, typ
 import { awaitsDelivery } from './arena.ts'
 import { AdmissionRefusedError, classifyProviderOutage, LIMIT_LEVELS, scopeKeysOverlap, TASK_CLASSES, type AdmissionCandidate, type AdmissionDecision, type AdmissionReason, type AdmissionRecord, type LimitLevel, type LimitRule } from './scheduler.ts'
 import { validScope, scopeSubset } from './scope.ts'
-import { AdmissionError, assertCovers, assertDeclaredOutputs, assertScopeSelectors, dependencyAssumptions, formatDiagnostic, inheritedAcceptance, isNoopCheck, loadPackageScripts, normalizeReviewDependencies, normalizeScopeSelectors, normalizeTaskCeilings, reconcileTaskAdmission, requireHostChecks, taskCeilingBlock, taskGraphDefects, TaskGraphAdmissionError, type TaskGraphNode } from './admission.ts'
+import { AdmissionError, assertCovers, assertDeclaredOutputs, assertScopeSelectors, dependencyAssumptions, formatDiagnostic, isNoopCheck, loadPackageScripts, normalizeReviewDependencies, normalizeScopeSelectors, normalizeTaskCeilings, reconcileTaskAdmission, requireHostChecks, taskCeilingBlock, taskGraphDefects, TaskGraphAdmissionError, type TaskGraphNode } from './admission.ts'
 import { authorIdsOf, canBorrowTask, canOwnReview, strandedReview } from './assignment.ts'
 import { executionClock, executionElapsed } from './resource-time.ts'
 import { completionExempt, taskGraphIndex, uncoveredCriteria } from './task-graph.ts'
@@ -1245,7 +1245,7 @@ export class SwarmRuntime {
       return prior
     }
     // A worker repair's policy origin indexes `replaces` before any field is
-    // checked, and the inherited acceptance iterates it: a malformed list is
+    // checked, and the inherited outputs iterate it: a malformed list is
     // refused here, typed, before either reads it.
     if (input.replaces != null && (!Array.isArray(input.replaces) || !input.replaces.every(previousId => typeof previousId === 'string' && previousId.trim() !== ''))) throw new PolicyError('task_replaces_invalid', 'validation_error', '[task_replaces_invalid] `replaces` must list task ids. Pass `replaces` as an array of the blocked or cancelled task ids this repair replaces with `swarm_propose`, or omit it for new work, then retry.')
     if (this.store.list('starts', missionId).length) {
@@ -1267,13 +1267,13 @@ export class SwarmRuntime {
       if (input.kind !== 'verification' && input.checks?.length && input.checkTimeoutMs === undefined) throw new PolicyError('task_check_timeout_required', 'validation_error', '[task_check_timeout_required] Automatic task checks require a timeout chosen by the primary agent. Pass `checkTimeoutMs` in milliseconds on this task with `swarm_propose` (or `swarm_launch` for a new plan), then retry the same task.')
     }
     requireText(input.title, 'title'); requireText(input.objective, 'objective')
-    if (input.acceptance === undefined && !input.replaces?.length) throw new PolicyError('task_acceptance_required', 'validation_error', '[task_acceptance_required] A new task needs its own acceptance criteria. Pass `acceptance` as nonempty strings with `swarm_propose`, or name the rejected task in `replaces` to inherit its criteria, then retry.')
-    // The proposal's own criteria are checked before any replaced task is read;
-    // a repair may supply none.
-    const proposed = input.acceptance ?? []
-    if (!input.replaces?.length || !Array.isArray(proposed) || proposed.length > 0) requireStrings(proposed, 'acceptance')
+    // A task stores only its own criteria: what it covers, and what the tasks it
+    // replaces answer for, reach its worker and reviewers through `checklist`.
+    const acceptance = input.acceptance ?? []
+    if (!Array.isArray(acceptance) || acceptance.length) requireStrings(acceptance, 'acceptance')
     if (input.covers !== undefined) assertCovers(input.covers, mission.acceptance.length, 'covers')
     if (input.covers?.length && input.kind === 'verification') throw new PolicyError('covers_invalid', 'validation_error', '[covers_invalid] A verification task checks what its source covers and cannot cover a criterion itself. Omit `covers` on the review; name the criterion in `covers` of a deliverable, or of a repair naming `replaces`, with `swarm_propose`, then retry.')
+    if (!acceptance.length && !input.covers?.length && !input.replaces?.length && input.kind !== 'verification') throw new PolicyError('task_acceptance_required', 'validation_error', '[task_acceptance_required] A new deliverable needs criteria. Pass `covers` with the ids of the mission criteria it satisfies (c1 is the mission\'s first acceptance item), or `acceptance` as its own nonempty criteria, with `swarm_propose`; or name the rejected task in `replaces` to inherit its criteria, then retry.')
     if (!['research', 'implementation', 'verification', 'integration'].includes(input.kind)) throw new PolicyError('task_kind_invalid', 'validation_error', 'Unknown task kind')
     // The tool path's schema types these first; the browser propose RPC and the
     // exported runtime API reach here without it, and a stored string priority
@@ -1291,17 +1291,10 @@ export class SwarmRuntime {
     // declarations, which are read below once those tasks are known to exist.
     if (input.outputs === undefined && !input.replaces?.length) throw new PolicyError('outputs_required', 'validation_error', '[outputs_required] `outputs` is required: a new task must declare the files it writes. Pass `outputs` with `swarm_propose` as the repository-relative files this task writes inside its `scope`, or [] for analysis-only work, then retry.')
     if (input.outputs !== undefined) input = { ...input, outputs: assertDeclaredOutputs(input.outputs, input.scope, 'task', { dependencyDirs: this.config.verificationDependencyDirs }) }
-    // A repair inherits the acceptance of every task it replaces: the host holds
-    // those obligations, so the proposal never has to copy them. The stored list
-    // is each replaced task's criteria in order, then any criteria the proposal
-    // adds, without duplicates; the admission guard below reads the same list.
-    // The replaced tasks are read only after this proposal's own fields passed,
-    // so an unknown `replaces` id never hides a field error.
-    const acceptance = input.replaces?.length ? [...new Set([...input.replaces.flatMap(previousId => this.task(missionId, previousId).acceptance), ...proposed])] : proposed
-    requireStrings(acceptance, 'acceptance')
     // A repair carries the obligations it replaces: omitting `outputs` inherits
-    // every replaced task's declaration, in order and without duplicates like
-    // the acceptance above, so a replacement cannot quietly drop a deliverable
+    // every replaced task's declaration, in order and without duplicates, read
+    // only after this proposal's own fields passed so an unknown `replaces` id
+    // never hides a field error, and a replacement cannot quietly drop a deliverable
     // an original promised. Explicit `outputs` replace the inherited list. The
     // union is still checked against this task's own scope, because a repair
     // may narrow that scope. A repair whose replaced tasks declared nothing has
@@ -1311,10 +1304,6 @@ export class SwarmRuntime {
       if (!declared.length) throw new PolicyError('outputs_required', 'validation_error', '[outputs_required] `outputs` is required: no task in `replaces` declared outputs for this repair to inherit. Pass `outputs` with `swarm_propose` as the repository-relative files this repair writes inside its `scope`, or [] for analysis-only work, then retry.')
       input = { ...input, outputs: assertDeclaredOutputs([...new Set(declared.flat())], input.scope, 'task', { dependencyDirs: this.config.verificationDependencyDirs }) }
     }
-    // What the host added beyond the proposal's own list is recorded on the
-    // admission event and named in the swarm_propose result, so a criterion the
-    // proposal left out is carried visibly, never silently.
-    const inheritedCriteria = input.replaces?.length ? inheritedAcceptance(acceptance, input.acceptance) : []
     // D1: the admission refusals (an assumed dependency, a dangling graph edge)
     // at the production admission point, so a plan error is rejected here
     // instead of at submit. The check preflight hints are advisory and belong
@@ -1369,7 +1358,7 @@ export class SwarmRuntime {
       if (input.assigneeId !== undefined && !canOwnReview(source, input.assigneeId)) throw new PolicyError('review_assignee_not_independent', 'validation_error', `assigneeId ${input.assigneeId} authored ${source.id}; an independent review must be assigned to a member who never owned it, or left unassigned`)
     } else if (input.reviewOf) throw new PolicyError('review_source_not_verification', 'tool_error', 'Only verification tasks may set reviewOf')
     // Round 9-C: a repair may keep the original acceptance while changing the
-    // declared check. Acceptance is already inherited above; a check
+    // declared check. Acceptance is inherited through the lineage; a check
     // change is recorded durably so an owner can see that the new check no
     // longer matches the original obligation. A repair that merely supplies
     // checks the replaced task never declared is not a change.
@@ -1430,7 +1419,7 @@ export class SwarmRuntime {
     this.assertEffectiveTaskGraph(missionId, task, tasks)
     this.commit(missionId, () => {
       this.store.put('tasks', task)
-      this.store.event(missionId, 'task/proposed', key, inheritedCriteria.length ? { ...task, inheritedAcceptance: inheritedCriteria } : task)
+      this.store.event(missionId, 'task/proposed', key, task)
       for (const change of checkChanges) this.store.event(missionId, 'task/check-changed', key, { taskId: task.id, reason: 'replacement', ...change })
     })
     this.warnBudget(this.mission(missionId))
@@ -2513,7 +2502,7 @@ export class SwarmRuntime {
       this.propose({ sessionId: mission.ownerSessionId }, mission.id, {
         workstreamId: source.workstreamId, title: `Independent review of ${source.title}`,
         objective: `Independently verify the submitted artifact of ${source.id} (${source.title}) against its acceptance criteria.`,
-        kind: 'verification', scope: [...source.scope], acceptance: [...source.acceptance], checks: [...source.checks],
+        kind: 'verification', scope: [...source.scope], acceptance: [], checks: [...source.checks],
         // The host-admitted review reads an artifact and records a verdict; it
         // owes no file.
         outputs: [],

@@ -63,10 +63,11 @@ test('a copy-era row without covers checks exactly its stored list, and so does 
   assert.deepEqual(graph.checklist('review', criteria), stored)
 })
 
-test('an authored review is assigned, shown and registered with everything its source must satisfy, then its own criteria', async t => {
+test('an authored review is assigned and shown everything its source must satisfy, then its own criteria, and the registry lists each checklist', async t => {
   const f = await setup({ clock: new FakeClock(), acceptance: ['value is two'] })
   t.after(f.cleanup)
-  const source = f.propose({ acceptance: ['value is two', 'adds a test'] })
+  // The source cites c1 and stores only its own criterion, so its checklist is not its stored list.
+  const source = f.propose({ acceptance: ['adds a test'] })
   const claimed = await f.runtime.claim(f.actor(f.author), f.mission.id, source.id)
   await f.runtime.submit(f.actor(f.author), f.mission.id, { taskId: source.id, attemptId: claimed.attempt.id, output: 'candidate' })
   const review = f.runtime.propose(f.owner, f.mission.id, { outputs: [], workstreamId: f.stream.id, title: 'Review', objective: 'Independent review',
@@ -78,6 +79,8 @@ test('an authored review is assigned, shown and registered with everything its s
   assert.deepEqual(f.runtime.observe(f.actor(f.reviewer), f.mission.id).current.task.acceptance, checklist, 'and observes them')
   assert.deepEqual(f.runtime.observe(f.owner, f.mission.id, { taskId: review.id }).task.acceptance, checklist, 'and the owner reads them')
   assert.deepEqual(f.runtime.store.get('tasks', review.id).acceptance, ['reads the diff'], 'nothing is copied onto the stored review')
+  const registered = f.runtime.artifacts(f.owner, { missionId: f.mission.id }).artifacts.find(row => row.taskId === source.id)
+  assert.deepEqual([registered.acceptance, registered.missionAcceptance], [['value is two', 'adds a test'], ['value is two']], 'the registry row carries the source\'s checklist')
 })
 
 const plan = (workspace, tasks) => ({ title: 'Plan', objective: 'Deliver', workspace, scope: ['src/'], acceptance: ['works', 'is documented'], budget,
@@ -96,6 +99,15 @@ test('a plan cites criteria by distinct minted ids, on the stage and the launch 
         && error.message === `[covers_invalid] tasks[0] (code).covers must list distinct ids of the mission acceptance criteria, c1 for the first through c2 for the last; it has ${shown}. Pass \`covers\` with each id this task satisfies once, never the criterion text, and retry the same task/request.`, JSON.stringify(covers))
     }
   }
+})
+
+test('a plan deliverable needs covers or its own acceptance once its review\'s covers moved onto it; a review needs neither', () => {
+  const bare = plan('/repo').tasks.map(({ acceptance: _own, ...task }) => task)
+  const refused = validatePlan.bind(undefined, plan('/repo', bare.map(({ covers: _cited, ...task }) => task)), { launch: true })
+  assert.throws(refused, error => error.code === 'plan_task_acceptance_required' && error.category === 'validation_error'
+    && error.message === '[plan_task_acceptance_required] tasks[0] (code) has neither covers nor acceptance. Add to `covers` the mission criterion ids it satisfies, or give it its own `acceptance`, and relaunch the complete plan.')
+  const folded = validatePlan(plan('/repo', bare.map(task => task.kind === 'verification' ? task : { ...task, covers: undefined })), { launch: true })
+  assert.deepEqual(folded.tasks.map(task => [task.key, task.acceptance, task.covers]), [['code', [], ['c2']], ['review', [], undefined]], 'an omitted list is canonical []; the review\'s covers give its source criteria')
 })
 
 test('a review\'s covers move onto its source, once, so validating again and comparing a retry as JSON are stable', () => {
@@ -123,6 +135,21 @@ test('propose stores a deliverable\'s ids as given and refuses unknown ids and a
   assert.equal(f.runtime.store.list('tasks', f.mission.id).length, 2, 'nothing was admitted')
   await f.runtime.verify(f.actor(f.reviewer), f.mission.id, { taskId: review.id, attemptId: reviewing.attempt.id, verdict: 'accept', reason: 'Independent host checks pass' })
   assert.match(f.runtime.completionError(f.runtime.mission(f.mission.id)), /: c1 "works"\. Propose a deliverable/, 'the review\'s text never covered c1')
+})
+
+test('the completion reason\'s exit, performed as it names it through the registered swarm_propose, makes the mission completable', async t => {
+  const f = await setup({ clock: new FakeClock(), acceptance: ['works', 'is documented'] })
+  t.after(f.cleanup)
+  const first = f.propose({ acceptance: [], covers: ['c1'] })
+  await acceptThroughReview(f, first)
+  assert.equal(f.runtime.completionError(f.runtime.mission(f.mission.id)), 'Accepted tasks do not cover every mission acceptance criterion: c2 "is documented". Propose a deliverable that names them in `covers` with `swarm_propose`; an accepted task cannot gain covers')
+  const definitions = new Map()
+  registerTools({ tools: { register: definition => definitions.set(definition.name, definition) } }, f.runtime, f.mission.budget)
+  const { result: named } = await definitions.get('swarm_propose').execute({ missionId: f.mission.id, workstreamId: f.stream.id, title: 'Document it', objective: 'Document the change',
+    kind: 'integration', dependencies: [first.id], scope: ['**'], covers: ['c2'], outputs: [], checks: ['test -d .'] }, { signal: new AbortController().signal, agent: { id: f.owner.sessionId } })
+  assert.deepEqual([named.acceptance, named.covers], [[], ['c2']], 'the exit needs no criterion text')
+  await acceptThroughReview(f, named)
+  assert.equal(f.runtime.completionError(f.runtime.mission(f.mission.id)), undefined)
 })
 
 test('a repair answers for the ids its lineage cites, and a withdrawn deliverable\'s ids count for nothing', async t => {

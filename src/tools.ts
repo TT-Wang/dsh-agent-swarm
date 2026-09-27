@@ -2,7 +2,6 @@
 import type { Context } from '@deepseek-ai/cordis'
 import type { JsonSchemaNode, ToolDefinition, ToolExecution } from '@deepseek-ai/dsh-tools'
 import { authorizeWorkspace, type WorkspaceAuthorized } from './authorization.ts'
-import { inheritedAcceptance } from './admission.ts'
 import { PolicyError } from './policy-error.ts'
 import { validatePlan } from './plans.ts'
 import { runProcess } from './workspaces.ts'
@@ -360,7 +359,7 @@ export function registerTools(ctx: Context, runtime: SwarmRuntime, defaultBudget
     workstreams: { type: 'array', items: { type: 'object', additionalProperties: false, properties: { key: string, title: string, objective: string }, required: ['key', 'title', 'objective'] } },
     tasks: { type: 'array', items: { type: 'object', additionalProperties: false, properties: {
       key: string, workstreamKey: string, title: string, objective: string, kind: kindSchema,
-      scope: scopeSchema, acceptance: { ...strings, description: 'This task\'s own criteria; mission criteria go in covers.' }, covers: coversSchema, outputs: outputsSchema, checks: checksSchema, assigneeKey: string, assignmentMode: assignmentModeSchema, dependencies: dependenciesSchema, reviewOf: reviewSchema, priority: integer,
+      scope: scopeSchema, acceptance: { ...strings, description: 'Optional: this task\'s own criteria; mission criteria go in covers. A deliverable needs covers or acceptance; a review also checks what its source must satisfy.' }, covers: coversSchema, outputs: outputsSchema, checks: checksSchema, assigneeKey: string, assignmentMode: assignmentModeSchema, dependencies: dependenciesSchema, reviewOf: reviewSchema, priority: integer,
       // The runtime refuses an undefined recovery limit (and an undefined check
       // timeout for a task that declares checks) on any mission with a saved
       // start request, which includes every mission this session launched from
@@ -370,9 +369,9 @@ export function registerTools(ctx: Context, runtime: SwarmRuntime, defaultBudget
       maxSteps: taskCeilingSchema.maxSteps, maxFindings: taskCeilingSchema.maxFindings,
       checkTimeoutMs: { ...integer, description: 'Per-check timeout in milliseconds. Required when an automatic mission declares checks, because the runtime extends the verifier lease by it; reviews inherit their source\'s checks and timeout.' },
       experiment: { type: 'boolean' },
-      review: { type: 'object', additionalProperties: false, description: 'Deliverables only: overrides for the independent review the host adds for this task when no verification task names it in reviewOf. Omitted fields default to unassigned, the host\'s review objective, this task\'s acceptance and maxRecoveryAttempts, and the default maxSteps.',
+      review: { type: 'object', additionalProperties: false, description: 'Deliverables only: overrides for the independent review the host adds for this task when no verification task names it in reviewOf. It checks what this task must satisfy; acceptance here adds review-only criteria. Omitted fields default to unassigned, the host\'s review objective, no extra criteria, this task\'s maxRecoveryAttempts, and the default maxSteps.',
         properties: { assigneeKey: string, objective: string, acceptance: strings, maxSteps: positiveInteger, maxRecoveryAttempts: positiveInteger } },
-    }, required: ['key', 'workstreamKey', 'title', 'objective', 'kind', 'scope', 'acceptance'] } },
+    }, required: ['key', 'workstreamKey', 'title', 'objective', 'kind', 'scope'] } },
   }
   register('swarm_stage', 'Save an editable mission plan for the Agent Swarm panel; creates no workers or model calls. Use only when the user explicitly asks for an editable draft. Local keys link members, workstreams and tasks; the host adds one independent review per deliverable unless the plan names one. End your turn after staging.', planProperties, ['title', 'objective', 'workspace', 'scope', 'acceptance', 'budget', 'members', 'workstreams', 'tasks'],
     { bound: (a, actor, authorization) => runtime.createDraft(actor, a as unknown as PlanInput, authorization) })
@@ -387,7 +386,7 @@ export function registerTools(ctx: Context, runtime: SwarmRuntime, defaultBudget
   launchProperties.members!.items!.properties!.maxOutputTokens = { type: 'integer', description: 'Per-request output-token allowance for this worker’s role and model.' }
   // assigneeKey is conditional: the automatic plan requires it on every
   // deliverable, never on a review.
-  launchProperties.tasks!.items!.required = ['key', 'workstreamKey', 'title', 'objective', 'kind', 'scope', 'acceptance', 'outputs', 'maxRecoveryAttempts']
+  launchProperties.tasks!.items!.required = ['key', 'workstreamKey', 'title', 'objective', 'kind', 'scope', 'outputs', 'maxRecoveryAttempts']
   launchProperties.tasks!.items!.properties!.key = { type: 'string', description: 'Unique stable identifier such as task_1, required on every task including reviews; dependencies and reviewOf reference it.' }
   launchProperties.tasks!.items!.properties!.assigneeKey = { type: 'string', description: 'Preferred member key for a new automatic plan; required on every non-verification task. Use assignmentMode=pinned only when this task needs that specific member or model.' }
   launchProperties.tasks!.items!.properties!.checkTimeoutMs = { type: 'integer', description: 'Per-check timeout in milliseconds; required for non-verification tasks that declare checks, because the runtime extends the verifier lease by it. Reviews inherit their source’s checks and timeout.' }
@@ -443,22 +442,16 @@ export function registerTools(ctx: Context, runtime: SwarmRuntime, defaultBudget
     { ...mission, title: string, objective: string, coordinatorId: string }, ['missionId', 'title', 'objective'],
     (a, actor) => runtime.workstream(actor, text(a, 'missionId'), { title: text(a, 'title'), objective: text(a, 'objective'), coordinatorId: a.coordinatorId as string | undefined }))
   register('swarm_propose', 'Propose and admit a task within mission scope and budget. research for audits and synthesis; implementation/integration need real checks; verification names reviewOf. A rejected task is reworked in place with swarm_control action resume first; otherwise a repair names replaces, and the repair inherits their acceptance, covers and declared outputs, and explicit outputs replace the inherited ones. Raise an existing task\'s allocation with swarm_budget(taskId, taskBudget, reason); amend its unsubmitted scope, outputs, dependencies, checks or assignee with swarm_control(taskId, action: amend, changes, reason). Correct admission field errors and retry the proposal.',
-    // `acceptance` and `outputs` are required unless `replaces` is given. The
-    // Harness schema subset has no if/then, so the runtime enforces the
-    // condition ([task_acceptance_required], [outputs_required]) and the schema
-    // leaves both optional.
-    { ...mission, workstreamId: string, title: string, objective: string, kind: kindSchema, dependencies: dependenciesSchema, scope: scopeSchema, acceptance: { ...strings, description: 'Required unless replaces is given: a repair inherits the replaced tasks\' acceptance, and entries here are added after it.' }, covers: { ...strings, description: 'Deliverables only: ids of the mission acceptance criteria this task satisfies (c1 is the first). A repair also answers for the covers of the tasks in replaces. Refused on a verification task.' }, outputs: { ...outputsSchema, description: `${outputsSchema.description} Required unless replaces is given. On a repair, explicit outputs replace the outputs it would otherwise inherit from every task in replaces.` }, checks: checksSchema, priority: integer, maxRecoveryAttempts: integer, maxSteps: taskCeilingSchema.maxSteps, maxFindings: taskCeilingSchema.maxFindings, checkTimeoutMs: integer, experiment: { type: 'boolean' }, assigneeId: string, assignmentMode: assignmentModeSchema, reviewOf: reviewSchema, replaces: strings },
+    // A new deliverable needs `covers` or `acceptance`, and `outputs` unless
+    // `replaces` is given. The Harness schema subset has no if/then, so the
+    // runtime enforces both ([task_acceptance_required], [outputs_required]).
+    { ...mission, workstreamId: string, title: string, objective: string, kind: kindSchema, dependencies: dependenciesSchema, scope: scopeSchema, acceptance: { ...strings, description: 'This task\'s own criteria; cite mission criteria in covers, never their text. A new deliverable needs covers or acceptance, a review may omit it, and a repair also answers for the acceptance and covers of the tasks in replaces.' }, covers: { ...strings, description: 'Deliverables only: ids of the mission acceptance criteria this task satisfies (c1 is the first). A repair also answers for the covers of the tasks in replaces. Refused on a verification task.' }, outputs: { ...outputsSchema, description: `${outputsSchema.description} Required unless replaces is given. On a repair, explicit outputs replace the outputs it would otherwise inherit from every task in replaces.` }, checks: checksSchema, priority: integer, maxRecoveryAttempts: integer, maxSteps: taskCeilingSchema.maxSteps, maxFindings: taskCeilingSchema.maxFindings, checkTimeoutMs: integer, experiment: { type: 'boolean' }, assigneeId: string, assignmentMode: assignmentModeSchema, reviewOf: reviewSchema, replaces: strings },
     ['missionId', 'workstreamId', 'title', 'objective', 'kind', 'scope'],
     (a, actor) => {
       const task = runtime.propose(actor, text(a, 'missionId'), a as unknown as ProposeTaskInput)
-      // One line naming what a repair inherited: the criteria beyond its own
-      // `acceptance`, and the declared outputs when it passed none, so a
+      // A repair that passed no outputs is told the ones it inherited, so a
       // proposer whose repair writes other files sees the list to replace.
-      const notes: string[] = []
-      const inherited = task.replaces?.length ? inheritedAcceptance(task.acceptance, a.acceptance) : []
-      if (inherited.length) notes.push(`Acceptance inherited from ${task.replaces!.join(', ')} beyond the supplied list: ${inherited.map(criterion => JSON.stringify(criterion)).join(', ')}.`)
-      if (task.replaces?.length && a.outputs === undefined) notes.push(`Outputs inherited from ${task.replaces.join(', ')}: ${JSON.stringify(task.outputs ?? [])}; explicit outputs on a repair replace this list, and the owner can amend it with swarm_control changes.outputs.`)
-      return notes.length ? { ...task, note: notes.join(' ') } : task
+      return task.replaces?.length && a.outputs === undefined ? { ...task, note: `Outputs inherited from ${task.replaces.join(', ')}: ${JSON.stringify(task.outputs ?? [])}; explicit outputs on a repair replace this list, and the owner can amend it with swarm_control changes.outputs.` } : task
     })
   register('swarm_claim', 'Claim ready work as yourself; ownership is atomic and expires. Use the returned attemptId on every result. The scheduler also assigns idle workers automatically.',
     { ...mission, taskId: string }, ['missionId', 'taskId'], (a, actor) => runtime.claim(actor, text(a, 'missionId'), text(a, 'taskId')))

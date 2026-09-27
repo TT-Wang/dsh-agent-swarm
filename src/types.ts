@@ -415,6 +415,7 @@ export interface Task {
   kind: TaskKind
   dependencies: string[]
   scope: string[]
+  /** This task's own criteria; on a review, review-only ones. What its worker and reviewers check is derived (`checklist`). */
   acceptance: string[]
   /** Ids of the mission criteria this deliverable satisfies (see `criterionId`); absent means none. A repair also answers for the covers of the tasks it replaces. A plan's review may name them for its source; a stored review never carries them. */
   covers?: string[]
@@ -520,7 +521,7 @@ export interface Task {
   evidenceIds: string[]
   reviewOf?: string
   reviewedCommit?: string
-  /** Blocked tasks whose acceptance obligations this replacement covers. */
+  /** Blocked or cancelled tasks this repair replaces; their acceptance and covers apply to it through the lineage. */
   replaces?: string[]
   /**
    * Set on an accepted replacement once its replaced lineage was retired, in
@@ -903,6 +904,7 @@ export interface PlanTask extends Pick<Task, 'covers'> {
 export interface PlanReviewOverride {
   assigneeKey?: string
   objective?: string
+  /** Review-only criteria, checked after everything the source must satisfy. */
   acceptance?: string[]
   maxSteps?: number
   maxRecoveryAttempts?: number
@@ -983,7 +985,7 @@ export interface ProposeTaskInput extends Pick<Task, 'covers'> {
   kind: TaskKind
   dependencies?: string[]
   scope: string[]
-  /** Required unless `replaces` names a task: a repair inherits every replaced task's acceptance, and entries here are added after it. */
+  /** This task's own criteria. A new deliverable needs these or `covers`; a repair also answers for the criteria of the tasks it replaces. */
   acceptance?: string[]
   /** Declared deliverable files; see `Task.outputs`. Required, except that a repair omitting them inherits every replaced task's declaration (in order, de-duplicated); explicit outputs replace that list. */
   outputs?: string[]

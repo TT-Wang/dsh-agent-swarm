@@ -2,6 +2,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { join } from 'node:path'
+import { registerTools } from '../lib/tools.js'
 import { FakeWorkers, SwarmRuntime, budget as sharedBudget, eventually, makeRuntime } from './faults/harness.mjs'
 
 const budget = { ...sharedBudget, maxTokens: 100000, maxSteps: 100, maxTasks: 12, maxExperiments: 2 }
@@ -192,6 +193,28 @@ test('an uncovered criterion is named by id and text, copied text never covers i
     assert.deepEqual(snapshot.tasks.find(task => task.kind === 'integration').covers, ['c1', 'c2'], 'a review\'s covers move onto its source')
     assert.equal(snapshot.tasks.find(task => task.kind === 'verification').covers, undefined, 'a stored review cites nothing')
   }
+})
+
+test('the coverage and staged-criteria refusals are repaired as they say, through the registered swarm_launch', async t => {
+  const f = await fixture(t)
+  const definitions = new Map()
+  registerTools({ tools: { register: definition => definitions.set(definition.name, definition) } }, f.runtime, budget)
+  const request = f.runtime.requestStart(f.owner, f.requestInput, { grantRoot: f.requestInput.workspace, source: 'session' })
+  const launch = async plan => (await definitions.get('swarm_launch').execute({ requestId: request.id, ...plan }, { signal: new AbortController().signal, agent: { id: f.owner.sessionId } })).result
+  const input = { ...f.input, acceptance: ['works', 'is documented'] }
+  await assert.rejects(launch(input), error => error.message.includes('[plan_criterion_uncovered] No deliverable covers c2 "is documented". Add each id to `covers` of the deliverable that satisfies it'))
+  // As named: add the id to `covers` of the deliverable; the mission list is unchanged. The first
+  // start then fails, leaving the mission staged with its criteria fixed.
+  input.tasks = input.tasks.map(task => task.kind === 'verification' ? task : { ...task, covers: ['c1', 'c2'] })
+  let fail = true
+  f.workers.onStart = async () => { if (fail) throw new Error('Temporary launch failure') }
+  await assert.rejects(launch(input), /Temporary launch failure/)
+  fail = false
+  const staged = f.runtime.starts(f.owner)[0].missionId
+  await assert.rejects(launch({ ...input, acceptance: ['is documented', 'works'] }), error => error.code === 'draft_repair_criteria_changed'
+    && error.message.startsWith(`[draft_repair_criteria_changed] Mission ${staged} is staged, so its acceptance criteria are fixed: ["works","is documented"]. Resend \`acceptance\` unchanged`))
+  const snapshot = await launch(input)
+  assert.deepEqual([snapshot.mission.id, snapshot.mission.status, snapshot.mission.acceptance], [staged, 'active', ['works', 'is documented']])
 })
 
 test('failed assembly and retries retain one deterministic plan and worker roster', async t => {
