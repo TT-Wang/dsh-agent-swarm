@@ -462,7 +462,7 @@ test('a refused admission, then running work, then a stall: the refusal is again
   blockedNotice(f, source, REFUSED)
 })
 
-test('a wedged pass never reaches the host\'s admission: the classifier names every unreviewable source, a legacy one on any pass, with the runtime\'s own blocker', async t => {
+test('a wedged pass keeps the host\'s admission from running: the classifier names a legacy source on any pass, and a source with an artifact only once that admission recorded its need', async t => {
   const f = await fixture(t, { budget: { maxTasks: 2 } })
   const source = f.propose(), legacy = f.propose({ title: 'Implement the rest' })
   await f.submit(source)
@@ -482,8 +482,13 @@ test('a wedged pass never reaches the host\'s admission: the classifier names ev
   blockedNotice(f, legacy, BUDGET(2))
   assert.deepEqual(decisionsOn(source), [], 'an ordinary pass leaves a source with an artifact to the host\'s admission')
   await publish(true)
-  blockedNotice(f, source, BUDGET(2))
-  assert.deepEqual(events(f.runtime, f.mission.id, 'task/review-missing'), [], 'the host\'s admission never ran: the classifier named both')
+  assert.deepEqual(decisionsOn(source), [], 'a wedged pass never pre-empts an admission that has not recorded the need yet')
+  // The host's admission records the need and names its blocker; a wedged pass then restates nothing.
+  await f.pass()
+  assert.equal(events(f.runtime, f.mission.id, 'task/review-missing').filter(event => event.data.taskId === source.id).length, 1)
+  const told = blockedNotice(f, source, BUDGET(2))
+  await publish(true)
+  assert.deepEqual(decisionsOn(source).map(delivery => delivery.id), [told.id], 'the recorded need keeps its one decision')
   await followExits(f, { source }, { steps: [[BUDGET(2), ['swarm_budget', 'swarm_cancel']]] })
 })
 

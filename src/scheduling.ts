@@ -23,16 +23,6 @@ import { PolicyError } from './policy-error.ts'
 import type { SwarmRuntime } from './runtime.ts'
 import { type Actor, type Attempt, type Member, type Mission, type Task } from './types.ts'
 
-/**
- * Round-8 F1: scheduling passes an unreviewed submission must persist before
- * the board is reported stalled. The owner may be admitting the review it just
- * planned; a submission that stays unreviewable past this bounded grace is a
- * stall. The wall-clock bound keeps the notice prompt even with a slow tick.
- */
-const STALL_GRACE_PASSES = 30
-
-const STALL_GRACE_MAX_MS = 1000
-
 const id = (prefix: string) => `${prefix}_${randomUUID()}`
 
 /**
@@ -546,16 +536,15 @@ export class Scheduling {
 
   /**
    * A submission with no live review is a stall candidate, not a stall, until
-   * its review need has aged past the grace. S5: the grace is read from the
-   * durable row that opened each unreviewed task's review need (its submission,
-   * or a challenge that re-opened it), not from an in-memory timer — a restart
-   * (or a lost cache) can no longer restart the window, and the answer is
-   * identical for the same durable board. With no such row the grace cannot
-   * have elapsed yet.
+   * its review need is past the one review grace (`ReviewNeed.ripe`), the grace
+   * the review admission and the waiting classifier read. S5: the grace is
+   * read from the durable row that opened each unreviewed task's review need
+   * (its submission, or a challenge that re-opened it), not from an in-memory
+   * timer — a restart (or a lost cache) can no longer restart the window, and
+   * the answer is identical for the same durable board.
    */
   unreviewedStall(unreviewed: Task[]): boolean {
-    const grace = Math.min(this.rt.config.tickMs * STALL_GRACE_PASSES, STALL_GRACE_MAX_MS)
-    return unreviewed.every(task => { const { age } = this.rt.reviewNeed(task); return age !== undefined && age >= grace })
+    return unreviewed.every(task => this.rt.reviewNeed(task).ripe)
   }
 
   /**

@@ -7,7 +7,7 @@ import { PolicyError } from './policy-error.ts'
 export { WorkspaceRevokedError } from './authorization.ts'
 import { recordedClaim, type WorkspaceClaim } from './authorization.ts'
 import { WorkspaceAdmission, gitWriteDeniedMessage, TEMP_RENDEZVOUS_WINDOW_MS, type TempMention } from './workspace-admission.ts'
-import { Notices, NOTICE_TEMPLATES, REJECTION_DECISION_TRIGGER, TERMINAL_STATES, ADMIT_REVIEW, BOARD_RUNNING, WITHDRAW_SOURCE, missionSubject, renderNotice, reviewGraceMs, subjectsOfTasks, taskSubject, type NotifyOptions } from './notices.ts'
+import { Notices, NOTICE_TEMPLATES, REJECTION_DECISION_TRIGGER, TERMINAL_STATES, ADMIT_REVIEW, BOARD_RUNNING, WITHDRAW_SOURCE, missionSubject, renderNotice, subjectsOfTasks, taskSubject, type NotifyOptions } from './notices.ts'
 import { RefusalRegistry, emitGuardTerminal, queueWriterBusy, requireStrings, requireText, sameChecks, unsupportedEffort, validatedBudget } from './refusals.ts'
 import { Scheduling, progressed, type SchedulingPass } from './scheduling.ts'
 // R17-G6/G7: the one derivation of mission derived state and its host projection.
@@ -102,8 +102,16 @@ const START_FAILURE_REROUTE_LIMIT = 3
 const AUTO_REVIEW_RECOVERY_ATTEMPTS = 2
 /** Only `admitAutomaticReview` mints a task id with this prefix, followed by the review need's id. */
 const AUTOMATIC_REVIEW_PREFIX = 'task_auto_review_'
-/** F2: one review need of a submitted source (`SwarmRuntime.reviewNeed`). */
-interface ReviewNeed { id: string; seq: number; age: number | undefined }
+/**
+ * F2: one review need of a submitted source (`SwarmRuntime.reviewNeed`).
+ * `ripe` is the one review grace every reader asks: the need is older than one
+ * scheduler period, at least 1 s (the author may propose its own review in the
+ * turn it submitted; the floor keeps a fast tick from turning a same-turn
+ * proposal into a race), or has no dated row to show it is not. `recorded` is
+ * the admission's own record: a `task/review-missing` row newer than the row
+ * that opened the need.
+ */
+interface ReviewNeed { id: string; seq: number; ripe: boolean; recorded: boolean }
 /**
  * Owner re-opens of one rejected task (`maxRework` when the task sets none).
  * Past it the task stays blocked until the owner raises `maxRework` or
@@ -268,12 +276,12 @@ export class SwarmRuntime {
    * docs/known-limitations.md, "Round-13 control-path slices"):
    *
    *  derivable (the gate re-reads the store; the memory value is only a cache):
-   *   - the unreviewed-submission grace: age of the durable row that opened
-   *     the review need (`reviewNeed`; the old `unreviewedSince` timer is removed);
+   *   - the unreviewed-submission grace: whether the durable row that opened
+   *     the review need is past it (`reviewNeed`; the old `unreviewedSince` timer is removed);
    *   - a withdrawn automatic review: the durable `task/cancelled` event of a
    *     host-minted review identity (`withdrawnAutomaticReview`);
    *   - a recorded missing review: durable `task/review-missing` event per
-   *     review need (`reportMissingReview`).
+   *     review need (`ReviewNeed.recorded`).
    *  cache-only (loss changes no durable outcome; each is covered by a test that
    *  clears it and asserts the durable result is unchanged):
    *   - `idleSignals` (durable `Task.idleSignal`),
@@ -2392,8 +2400,8 @@ export class SwarmRuntime {
       if (source.status !== 'submitted' || source.artifact === undefined) continue
       if (this.reviewable(source, tasks, members)) continue
       const need = this.reviewNeed(source)
-      if (need.age !== undefined && need.age < reviewGraceMs(this.config)) continue
-      this.reportMissingReview(mission, source, need)
+      if (!need.ripe) continue
+      if (!need.recorded) this.reportMissingReview(mission, source)
       const blocked = this.reviewPathBlocker(source, need, stalled)
       if (blocked !== undefined) this.notifyReviewBlocked(mission, source, need, blocked)
       else this.admitAutomaticReview(mission, source, need)
@@ -2405,26 +2413,25 @@ export class SwarmRuntime {
    * fences every resubmission, even of an unchanged commit) and each review of
    * it a challenge took away (the one that accepted it or one in progress: its
    * `task/invalidated` row), which re-opens it. `id` keys its automatic review
-   * and its blocker decisions; `seq` and `age` are those of the newest row that
-   * opened it, from which its grace, its missing-review record and an owner
-   * withdrawal are dated. S5: derived from the log, so a restart or a lost
-   * cache re-derives the same need.
+   * and its blocker decisions; `seq` is that of the newest row that opened
+   * it, from which its grace (`ripe`, the one grace every reader asks), its
+   * missing-review record (`recorded`) and an owner withdrawal are dated. S5:
+   * derived from the log, so a restart or a lost cache re-derives the same need.
    */
   reviewNeed(source: Task): ReviewNeed {
     const submitted = this.store.latestTaskEvent(source.missionId, source.id, 'task/submitted')
     const reopened = this.store.list('tasks', source.missionId).filter(review => review.reviewOf === source.id)
       .flatMap(review => this.store.latestTaskEvent(source.missionId, review.id, 'task/invalidated') ?? []).filter(row => row.seq > (submitted?.seq ?? 0)).sort((a, b) => a.seq - b.seq)
     const opened = reopened.at(-1) ?? submitted
+    const seq = opened?.seq ?? 0
     return { id: createHash('sha256').update([source.missionId, source.id, source.epoch, source.artifact?.commit ?? '', ...reopened.map(row => row.seq)].join(':')).digest('hex').slice(0, 32),
-      seq: opened?.seq ?? 0, age: opened === undefined ? undefined : Math.max(0, this.now() - opened.createdAt) }
+      seq, ripe: opened === undefined || this.now() - opened.createdAt >= Math.max(this.config.tickMs, 1000),
+      recorded: (this.store.latestTaskEvent(source.missionId, source.id, 'task/review-missing')?.seq ?? 0) > seq }
   }
-  /** Record the missing review once per review need; false when it is already recorded. */
-  private reportMissingReview(mission: Mission, source: Task, need: ReviewNeed): boolean {
-    // S5: a durable `task/review-missing` row newer than the row that opened the need is the gate.
-    if ((this.store.latestTaskEvent(mission.id, source.id, 'task/review-missing')?.seq ?? 0) > need.seq) return false
+  /** Record the missing review of a need that is not yet recorded (`ReviewNeed.recorded`). */
+  private reportMissingReview(mission: Mission, source: Task): void {
     const reason = this.missingReviewPath(source) ?? `no live independent verification task reviews this submitted ${source.kind} artifact`
     this.commit(mission.id, () => this.store.event(mission.id, 'task/review-missing', 'runtime', { taskId: source.id, kind: source.kind, reason }))
-    return true
   }
   /**
    * Why the host cannot give this unreviewable source a live review under this

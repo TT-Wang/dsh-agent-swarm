@@ -195,3 +195,18 @@ test('a queued W3 stall is withheld once its board can progress, and coverage-co
   assert.deepEqual(reminder.subjects, coverage.subjects, 'the reminder names the terminal work the decision named')
   assert.ok(reminder.subjects.includes(`${task.id}@${taskOf(f.runtime, task.id).epoch}`), 'among it the accepted deliverable')
 })
+
+test('a wedged pass never pre-empts the review admission: a need that ripened since the last pass is left to it, and it admits the host review with no owner decision', async t => {
+  const f = await setup({ clock: new FakeClock() })
+  t.after(f.cleanup)
+  const task = f.propose()
+  const claimed = await f.runtime.claim(f.actor(f.author), f.mission.id, task.id)
+  await f.runtime.submit(f.actor(f.author), f.mission.id, { taskId: task.id, attemptId: claimed.attempt.id, output: 'candidate' })
+  await f.runtime.settle(f.mission.id)
+  // The need ripens with no pass since; a wedged publication judges the board first.
+  f.clock.advance(Math.max(f.runtime.config.tickMs, 1_000))
+  f.runtime.notices.ensureWitness(f.mission.id, { offPass: true, wedged: true })
+  await ticks(f, 1)
+  assert.match(f.runtime.store.list('tasks', f.mission.id).find(row => row.reviewOf === task.id)?.id ?? 'none', /^task_auto_review_/, 'the admission admitted the host review')
+  assert.deepEqual(ownerRows(f).filter(delivery => delivery.notice.dedupKey.startsWith('review-blocked:')).map(delivery => delivery.content), [], 'no owner decision raced it')
+})

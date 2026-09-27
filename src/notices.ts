@@ -377,13 +377,6 @@ export function taskFromSubject(subject: string, tasks: readonly Task[]): Task |
   return task !== undefined && task.epoch === Number(match[2]) ? task : undefined
 }
 
-/**
- * F2: how long a submitted code deliverable may stay without a live review
- * before the runtime concludes none is coming. One scheduler period gives the
- * author the turn in which it submitted to propose its own review; the floor
- * keeps a fast tick from turning a same-turn proposal into a race.
- */
-export const reviewGraceMs = (config: { tickMs: number }): number => Math.max(config.tickMs, 1000)
 /** The exits a review-path blocker may name beside its own cause's (admit the review, naming the recovery limit a launched mission's admission requires and every mission accepts; or withdraw the source), and the blocker while the host's own review waits for the board. */
 export const ADMIT_REVIEW = 'admit a review with swarm_propose(kind: "verification", reviewOf, acceptance, outputs: [], maxRecoveryAttempts)'
 export const WITHDRAW_SOURCE = 'withdraw the source with swarm_cancel(taskId, reason)'
@@ -400,7 +393,7 @@ interface LineageRuntime {
   readonly stallPassTimeoutMs: number
   /** The runtime clock (`SwarmRuntime.now`). */
   readonly now: () => number
-  reviewNeed(source: Task): { age: number | undefined }
+  reviewNeed(source: Task): { ripe: boolean }
   unfinishedDependencies(missionId: string, task: Task, tasks?: Task[]): Task[]
   reviewable(task: Task, tasks: Task[]): boolean
 }
@@ -496,9 +489,7 @@ export function waitsLegitimately(rt: LineageRuntime, task: Task, tasks: Task[])
     // Submission remains in this state for the entire independent review. Use
     // the dispatcher's live-review rule, including an admitted/parked review,
     // rather than mistaking the end of the admission grace for a stalled task.
-    if (rt.reviewable(task, tasks)) return true
-    const { age } = rt.reviewNeed(task)
-    return age === undefined || age < reviewGraceMs(rt.config)
+    return rt.reviewable(task, tasks) || !rt.reviewNeed(task).ripe
   }
   if (task.status === 'blocked') {
     // A blocked verdict record is not outstanding on its own while its source
@@ -1270,8 +1261,8 @@ export class Notices {
    * leave the owner with a witness. Exemptions are the documented ones — the
    * empty board the owner is still planning (row 17) and a board whose
    * non-terminal work is running under a live lease (row 3). The bounded
-   * missing-review grace is respected: the row-5 notice arrives after
-   * `reviewGraceMs`, not on the tick the artifact was submitted. A
+   * missing-review grace is respected: the row-5 notice arrives after the
+   * review need ripens (`ReviewNeed.ripe`), not on the tick the artifact was submitted. A
    * submitted artifact with no live review path is witnessed even while
    * unrelated work runs, because no other witness can ever advance it.
    *
@@ -1389,28 +1380,23 @@ export class Notices {
       })
       return true
     }
-    const unreviewed = view.unreviewed
-    if (unreviewed.length) {
-      // A submitted artifact no live review can accept is an owner decision. The
-      // documented `reviewGraceMs` floor is honored here, not only inside
-      // `stalled`, because `stalled` returns before its unreviewed check when
-      // any unrelated work is running; without this an unreviewable submission
-      // could stay silent behind live work forever (verifier-1 challenge,
-      // evidence_a454a771). The age comes from the durable row that opened the
-      // review need, so a restart cannot reset the grace.
-      const ripe = unreviewed.filter(task => { const { age } = this.rt.reviewNeed(task); return age === undefined || age >= reviewGraceMs(this.rt.config) })
-      // The runtime's own review admission owns every submitted artifact: each
-      // pass admits the review or names the current blocker, so a second fact
-      // here would only race it. This branch names the rest: everything when a
-      // wedged pass never reaches that admission, and a legacy submission
-      // without an artifact, which that admission skips.
-      const named = options.wedged === true ? ripe : ripe.filter(task => task.artifact === undefined)
+    if (view.unreviewed.length) {
+      // A submitted artifact no live review can accept is an owner decision,
+      // named even behind unrelated live work, which `stalled` would not report
+      // (verifier-1 challenge, evidence_a454a771). The runtime's own review
+      // admission owns every submitted artifact: each pass admits the review or
+      // names the current blocker, so this branch never races it. It names what
+      // that admission skips, a legacy submission without an artifact, once past
+      // the review grace (`ReviewNeed.ripe`); and, when a wedged pass keeps that
+      // admission from running, a need it has already recorded
+      // (`ReviewNeed.recorded`), never one still ripening towards it.
+      const named = view.unreviewed.flatMap(task => {
+        const need = this.rt.reviewNeed(task)
+        return (task.artifact === undefined ? need.ripe : options.wedged === true && need.recorded) ? [{ task, need }] : []
+      })
       if (!named.length) return false
       // The runtime admission's one emitter and blocker: a decision per source and review need.
-      for (const task of named) {
-        const need = this.rt.reviewNeed(task)
-        this.notifyReviewBlocked(view.mission, task, need.id, this.rt.reviewPathBlocker(task, need) ?? BOARD_RUNNING)
-      }
+      for (const { task, need } of named) this.notifyReviewBlocked(view.mission, task, need.id, this.rt.reviewPathBlocker(task, need) ?? BOARD_RUNNING)
       return true
     }
     // Row 3 (documented scope): a board whose *every* non-terminal task is
