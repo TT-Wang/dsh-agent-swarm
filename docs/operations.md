@@ -117,7 +117,7 @@ Settings belong to Loader row `dsh-external-agent-swarm`. The full schema is in 
 | `workerStartTimeoutMs` | `60000` | Native worker startup bound; recovery starts members independently and cancels abandoned startups. This is a host lifecycle limit, not a model step/token budget. |
 | `checkTimeoutMs` | `600000` | Fallback per-check timeout when the task supplies none. |
 | `leaseMs` | `120000` | Attempt lease, renewed while a real operation is observed. |
-| `tickMs` | `1000` | Scheduler tick interval (minimum 10), and the unit of the tick-derived windows: the unreviewed-submission grace (30 ticks, at most 1 s), the no-progress window (`stallPasses` ticks), and the preparation back-off bound and failed-start retry (one tick each). |
+| `tickMs` | `1000` | Scheduler tick interval (minimum 10), and the unit of the tick-derived windows: the unreviewed-submission grace (30 ticks, at most 1 s), and the preparation back-off bound and failed-start retry (one tick each). |
 
 **Changing `DSH_HOME` alone does not isolate the plugin's default storage.** For independent Harness processes, give each its own absolute `statePath` and `workspacesRoot` through a profile overlay, or use the bundle's explicit roots. A database owner lock rejects a second live runtime and identifies the holding process. A lock left by a dead process can be reclaimed; do not delete coordination state to resolve a live ownership conflict.
 

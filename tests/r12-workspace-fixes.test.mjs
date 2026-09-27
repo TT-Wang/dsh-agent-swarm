@@ -40,14 +40,15 @@ async function fixture(t) {
   return { root, source, baseline, options, workspaces, mission, member, task }
 }
 
-test('M2-1: no-progress and pass-timeout each record once on the same board', () => {
+test('M2-1: a repeated wedge naming on the same board records once', () => {
   const mission = { id: 'mission', status: 'active' }, records = []
   const rt = makeRuntimeStub({ store: { get: () => structuredClone(mission), list: () => [], put: (_table, row) => Object.assign(mission, row), event: (_m, _t, _a, data) => records.push(data) },
     isMissionTerminal: () => false, commit: (_id, fn) => fn(), expectWedgedRelease() {}, notify() {}, pumpOutbox() {} })
   const scheduling = new Scheduling(rt)
-  const info = { pass: { id: 'pass', operationId: 'one', startedAt: 0, fingerprintBefore: 'same', revisionBefore: 0, noProgressPasses: 3 }, unschedulable: [], reason: 'no-progress', boundMs: 1000, revisionNow: 0, fingerprintNow: 'same' }
-  for (const reason of ['no-progress', 'pass-timeout', 'no-progress', 'pass-timeout']) scheduling.escalateSchedulingStall('mission', { ...info, reason })
-  assert.deepEqual(records.map(row => row.wedged), [false, true])
+  const info = { pass: { id: 'pass', operationId: 'one', startedAt: 0, fingerprintBefore: 'same', revisionBefore: 0 }, unschedulable: [], boundMs: 1000, revisionNow: 0, fingerprintNow: 'same',
+    releaseBoundMs: 1000, heldByLiveWork: false, wedge: { releasedAt: 1000, gapMs: 1000, liveSubjects: [] }, liveHolders: [] }
+  for (let naming = 0; naming < 2; naming += 1) scheduling.escalateSchedulingStall('mission', info)
+  assert.deepEqual(records.map(row => row.wedged), [true])
 })
 
 test('M2-2: submission grace survives newer unrelated events without aging a new submission', async t => {

@@ -11,7 +11,7 @@
  */
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { FakeClock, acceptThroughReview, blockThroughReview, setup, taskOf } from './faults/harness.mjs'
+import { FakeClock, acceptThroughReview, blockThroughReview, events, setup, taskOf } from './faults/harness.mjs'
 import { noticeFamily, noticeTemplateKey } from '../lib/notices.js'
 
 const ownerRows = f => f.runtime.store.list('deliveries', f.mission.id).filter(delivery => delivery.to === 'owner' && delivery.notice !== undefined)
@@ -75,4 +75,28 @@ test('a queued coverage-complete decision is withheld once the mission completes
   assert.equal(relevant(f, coverage), true, 'outstanding while the owner has not decided')
   assert.equal(f.runtime.control(f.owner, f.mission.id, 'complete', 'The deliverable is accepted').status, 'completed')
   assert.equal(relevant(f, coverage), false, 'the completed mission withholds it, like every decision family')
+})
+
+test('a board that stalls while a pass runs is judged by the board classifier alone: no pass-count watchdog names it', async t => {
+  const clock = new FakeClock()
+  const f = await setup({ clock })
+  t.after(f.cleanup)
+  // The only independent member is gone, so the submission is never reviewed
+  // and the board stalls on the clock alone, when its review grace runs out.
+  f.runtime.commit(f.mission.id, () => f.runtime.store.put('members', { ...f.runtime.store.get('members', f.reviewer.id), phase: 'stopped' }))
+  const task = f.propose()
+  const claimed = await f.runtime.claim(f.actor(f.author), f.mission.id, task.id)
+  await f.runtime.submit(f.actor(f.author), f.mission.id, { taskId: task.id, attemptId: claimed.attempt.id, output: 'candidate' })
+  await f.runtime.settle(f.mission.id)
+  // Passes that change nothing, each spanning one tick of clock time, until
+  // well past every grace: the stall falls due inside one of them.
+  const scheduling = f.runtime.scheduling
+  for (let elapsed = 0; elapsed <= 1_100; elapsed += f.runtime.config.tickMs) {
+    const pass = scheduling.openPass(f.mission.id)
+    clock.advance(f.runtime.config.tickMs)
+    scheduling.closePass(f.mission.id, pass)
+    await Promise.resolve()
+  }
+  assert.deepEqual(events(f.runtime, f.mission.id, 'mission/stalled').filter(event => event.data.cause === 'scheduling-pass'), [], 'no pass-count watchdog records the board')
+  assert.deepEqual(ownerRows(f).filter(delivery => /consecutive scheduling passes/.test(delivery.content)), [], 'nor wakes the owner')
 })

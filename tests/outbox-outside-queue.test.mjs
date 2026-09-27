@@ -48,7 +48,7 @@ async function holdLock(f) {
 
 test('S2: a durable owner notice is delivered by the tick pump while the mission lock is held', async () => {
   const workers = new WedgeStartWorkers()
-  const f = await setup({ workers, config: { tickMs: 10, stallPassTimeoutMs: 60_000, stallPasses: 50 } })
+  const f = await setup({ workers, config: { tickMs: 10, stallPassTimeoutMs: 60_000 } })
   try {
     const held = await holdLock(f)
     // A durable notice exactly as `notify` records it: the store is the only channel.
@@ -69,7 +69,7 @@ test('S2: a durable owner notice is delivered by the tick pump while the mission
 test('S2: a stalled pass still delivers the owner escalation inside the declared bound', async () => {
   const workers = new WedgeStartWorkers()
   const boundMs = 60
-  const f = await setup({ workers, config: { tickMs: 10, stallPassTimeoutMs: boundMs, stallPasses: 50 } })
+  const f = await setup({ workers, config: { tickMs: 10, stallPassTimeoutMs: boundMs } })
   try {
     f.propose()
     // The body that dispatches the proposal re-validates the workspace on disk,
@@ -106,7 +106,7 @@ test('S2: a stalled pass still delivers the owner escalation inside the declared
 test('S2: one never-settling adapter deliver cannot starve a notice for another mission', async () => {
   const workers = new WedgeDeliverWorkers()
   const boundMs = 60
-  const f = await setup({ workers, config: { tickMs: 10, stallPassTimeoutMs: boundMs, stallPasses: 50 } })
+  const f = await setup({ workers, config: { tickMs: 10, stallPassTimeoutMs: boundMs } })
   try {
     // A second mission in the SAME runtime: the defect was one global pump
     // flag, so cross-mission delivery is what proves the bound.

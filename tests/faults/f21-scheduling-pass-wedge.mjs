@@ -92,7 +92,7 @@ async function namingCommitFailsOnce() {
   // fixture gap: makeRuntime takes a node:test context and a scenario has none, so its cleanup is collected here and run in finally.
   let cleanup
   const { dir, config: { statePath }, runtime } = await makeRuntime({ after: fn => { cleanup = fn } }, { workers,
-    config: { stallPassTimeoutMs: 60, stallPasses: 30, workerStartTimeoutMs: 1_500 }, storeOptions: { busyTimeoutMs: 5, writerAttempts: 1, writerDelayMs: 0 } })
+    config: { stallPassTimeoutMs: 60, workerStartTimeoutMs: 1_500 }, storeOptions: { busyTimeoutMs: 5, writerAttempts: 1, writerDelayMs: 0 } })
   const tickFailures = []
   const write = process.stderr.write.bind(process.stderr)
   process.stderr.write = (chunk, ...rest) => { if (/tick failed/.test(String(chunk))) { tickFailures.push(String(chunk)); return true } return write(chunk, ...rest) }
@@ -136,7 +136,7 @@ async function namingCommitFailsOnce() {
 async function pauseAndResumeAcrossTheBound() {
   const workers = new SlowPrepareWorkers(1_500)
   workers.autoIdle = true
-  const f = await setup({ workers, config: { tickMs: 10, stallPassTimeoutMs: 60, stallPasses: 30, workerStartTimeoutMs: 5_000 } })
+  const f = await setup({ workers, config: { tickMs: 10, stallPassTimeoutMs: 60, workerStartTimeoutMs: 5_000 } })
   try {
     const task = f.propose()
     await eventually(() => workers.enteredAt !== undefined ? true : undefined, 'I6: the pass body must enter its long preparation', 4_000)
@@ -165,7 +165,7 @@ await runScenario({
     // The wedged await's own bound: far past the pass bound, so I1 and I2 are
     // observed while the pass body is still wedged.
     const startBoundMs = 1_500
-    const f = await setup({ workers, config: { tickMs: 10, stallPassTimeoutMs: boundMs, stallPasses: 30, workerStartTimeoutMs: startBoundMs } })
+    const f = await setup({ workers, config: { tickMs: 10, stallPassTimeoutMs: boundMs, workerStartTimeoutMs: startBoundMs } })
     let evidence
     try {
       const task = f.propose()

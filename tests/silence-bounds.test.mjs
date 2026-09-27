@@ -198,7 +198,7 @@ test('R16-D3 pair: a control-path kick neither supersedes nor duplicates a wedge
   const wedged = {
     id: f.passKey, operationId: 'operation_wedged_probe', missionId: f.mission.id,
     startedAt: Date.now() - 5000, revisionBefore: f.runtime.store.revision(),
-    fingerprintBefore: f.runtime.fingerprint(f.mission.id), noProgressPasses: 0,
+    fingerprintBefore: f.runtime.fingerprint(f.mission.id),
   }
   f.runtime.scheduling.passes.set(f.mission.id, wedged)
   t.after(() => f.runtime.scheduling.closePass(f.mission.id, wedged))

@@ -153,8 +153,8 @@ export function reachableClosure() {
  *    and two tasks competing for one admission slot;
  *  - concurrency and interleaving: a lease that expires mid-await, a writer-busy
  *    transaction, a pass released by the watchdog, adapter start failures;
- *  - wall-clock behaviour: the review grace window and the no-progress window
- *    are inputs here, not durations;
+ *  - wall-clock behaviour: the review grace window is an input here, not a
+ *    duration;
  *  - the terminal task states accepted/cancelled with an attempt attached, which
  *    the transition relation cannot produce because no actor can attach one.
  *    (Mission status IS a generated dimension since S4r: active, blocked, paused,

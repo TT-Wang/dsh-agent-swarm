@@ -29,7 +29,7 @@ test('S7: generated member/task sets keep live workers within provisioned worktr
     const random = rng(seed)
     const memberCount = 2 + Math.floor(random() * 2) // the harness budget admits 3
     const taskCount = 3 + Math.floor(random() * 3)
-    const f = await setup({ config: { tickMs: 10, stallPassTimeoutMs: 60_000, stallPasses: 50 } })
+    const f = await setup({ config: { tickMs: 10, stallPassTimeoutMs: 60_000 } })
     try {
       while (f.runtime.store.list('members', f.mission.id).filter(member => member.status !== 'stopped').length < memberCount) {
         await f.runtime.addMember(f.owner, f.mission.id, { name: `Gen ${random().toFixed(6)}`, role: 'implementation', maxOutputTokens: 5_000 })
@@ -72,7 +72,7 @@ test('S7: generated member/task sets keep live workers within provisioned worktr
 })
 
 test('S7: a shared worktree is refused durably, never dispatched into, and clears after repair', async () => {
-  const f = await setup({ config: { tickMs: 10, stallPassTimeoutMs: 60_000, stallPasses: 50 } })
+  const f = await setup({ config: { tickMs: 10, stallPassTimeoutMs: 60_000 } })
   try {
     f.workers.autoIdle = true
     const authorWorkspace = f.runtime.store.get('members', f.author.id).workspace

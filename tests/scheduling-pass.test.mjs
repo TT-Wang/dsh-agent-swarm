@@ -96,7 +96,7 @@ test('S1/S5: a body wedged past its bound is named while it holds the mission, a
   const startBoundMs = 900
   const clock = new FakeClock()
   const workers = new WedgeStartWorkers({ clock })
-  const f = await setup({ workers, clock, config: { tickMs: 20, stallPassTimeoutMs: 200, stallPasses: 50 } })
+  const f = await setup({ workers, clock, config: { tickMs: 20, stallPassTimeoutMs: 200 } })
   try {
     const scheduling = f.runtime.scheduling
     await f.runtime.settle(f.mission.id)
@@ -146,7 +146,7 @@ test('S1: a wedged body is not followed by refused successor passes, so the owne
   const startBoundMs = 700
   const clock = new FakeClock()
   const workers = new WedgeStartWorkers({ clock })
-  const f = await setup({ workers, clock, config: { tickMs: 10, stallPassTimeoutMs: 60, stallPasses: 50 } })
+  const f = await setup({ workers, clock, config: { tickMs: 10, stallPassTimeoutMs: 60 } })
   try {
     await f.runtime.settle(f.mission.id)
     const wedge = workers.arm()
@@ -194,7 +194,7 @@ test('S1: every body that wedges is named once, also when an earlier named body 
   }
   const workers = new HangEveryStartWorkers()
   workers.autoIdle = true
-  const f = await setup({ workers, clock, budget: { maxWorkers: 8 }, config: { tickMs: 10, stallPassTimeoutMs: 100, stallPasses: 1_000 } })
+  const f = await setup({ workers, clock, budget: { maxWorkers: 8 }, config: { tickMs: 10, stallPassTimeoutMs: 100 } })
   try {
     const scheduling = f.runtime.scheduling
     const closed = []
@@ -256,7 +256,7 @@ test('S1: the renaming of bodies that wedge on an unchanged board stops at the f
   const workers = new HangEveryStartWorkers()
   workers.autoIdle = true
   const clock = new FakeClock()
-  const f = await setup({ workers, clock, budget: { maxWorkers: 8 }, config: { tickMs: 10, stallPassTimeoutMs: 100, stallPasses: 1_000 } })
+  const f = await setup({ workers, clock, budget: { maxWorkers: 8 }, config: { tickMs: 10, stallPassTimeoutMs: 100 } })
   try {
     const h = await f.runtime.addMember(f.owner, f.mission.id, { name: 'H', role: 'implementation', maxOutputTokens: 5_000 })
     workers.names.set(h.id, 'H')
@@ -299,7 +299,7 @@ test('S1: a naming whose commit fails once is retried by a later tick, and the w
   }
   // The writer gives up at once, so the one locked tick fails its commit instead of waiting it out.
   const { dir, runtime, workers, budget, config: { statePath } } = await makeRuntime(t, { workers: new HeldStartWorkers(), clock,
-    config: { stallPassTimeoutMs: bound, stallPasses: 1_000 }, storeOptions: { busyTimeoutMs: 5, writerAttempts: 1, writerDelayMs: 0 } })
+    config: { stallPassTimeoutMs: bound }, storeOptions: { busyTimeoutMs: 5, writerAttempts: 1, writerDelayMs: 0 } })
   const tickFailures = []
   const write = process.stderr.write.bind(process.stderr)
   process.stderr.write = (chunk, ...rest) => { if (/tick failed/.test(String(chunk))) { tickFailures.push(String(chunk)); return true } return write(chunk, ...rest) }
@@ -376,7 +376,7 @@ test('S1: a wedge that passes its bound while the owner has the mission paused i
   const workers = new SlowPrepareWorkers()
   workers.autoIdle = true
   const held = workers.held
-  const f = await setup({ workers, clock, config: { tickMs: 10, stallPassTimeoutMs: 100, stallPasses: 1_000 } })
+  const f = await setup({ workers, clock, config: { tickMs: 10, stallPassTimeoutMs: 100 } })
   try {
     await f.runtime.settle(f.mission.id)
     const task = f.propose()
@@ -423,7 +423,7 @@ test('S1/R17-G5: a named body\'s own commits never publish with the wedged branc
   }
   const workers = new SlowPrepareWorkers()
   workers.autoIdle = true
-  const f = await setup({ workers, clock: new FakeClock(), config: { tickMs: 10, stallPassTimeoutMs: 100, stallPasses: 1_000 } })
+  const f = await setup({ workers, clock: new FakeClock(), config: { tickMs: 10, stallPassTimeoutMs: 100 } })
   try {
     const builder = await f.runtime.addMember(f.owner, f.mission.id, { name: 'Builder', role: 'implementation', maxOutputTokens: 5_000 })
     for (const member of [f.author, f.reviewer, builder]) workers.names.set(member.id, member.name)
@@ -472,7 +472,7 @@ test('S1/R17-G5: a start that fails past the bound stamps the body before it com
     }
   }
   const workers = new HangOnceWorkers()
-  const f = await setup({ workers, clock, budget: { maxWorkers: 8 }, config: { tickMs: 10, stallPassTimeoutMs: 100, stallPassLiveGraceMs: 20_000, stallPasses: 1_000, attemptSilenceBoundMs: 0 } })
+  const f = await setup({ workers, clock, budget: { maxWorkers: 8 }, config: { tickMs: 10, stallPassTimeoutMs: 100, stallPassLiveGraceMs: 20_000, attemptSilenceBoundMs: 0 } })
   try {
     const h = await f.runtime.addMember(f.owner, f.mission.id, { name: 'H', role: 'implementation', maxOutputTokens: 5_000 })
     const b = await f.runtime.addMember(f.owner, f.mission.id, { name: 'B', role: 'implementation', maxOutputTokens: 5_000 })
@@ -532,7 +532,7 @@ test('S1/R17-G5: a recovery fallback reported from inside the body\'s preparatio
     }
   }
   const workers = new SlowRecoveryWorkers()
-  const f = await setup({ workers, clock: new FakeClock(), budget: { maxWorkers: 8 }, config: { tickMs: 10, stallPassTimeoutMs: 100, stallPassLiveGraceMs: 20_000, stallPasses: 1_000, attemptSilenceBoundMs: 0 } })
+  const f = await setup({ workers, clock: new FakeClock(), budget: { maxWorkers: 8 }, config: { tickMs: 10, stallPassTimeoutMs: 100, stallPassLiveGraceMs: 20_000, attemptSilenceBoundMs: 0 } })
   try {
     const b = await f.runtime.addMember(f.owner, f.mission.id, { name: 'B', role: 'implementation', maxOutputTokens: 5_000 })
     // Each start re-validates the workspace on disk: the admissions' bodies
@@ -580,7 +580,7 @@ test('S1/R17-G5: the body stamps each delivery of its own pass-end outbox flush,
     }
   }
   const workers = new SlowOwnerWorkers()
-  const f = await setup({ workers, clock, budget: { maxWorkers: 8 }, config: { stallPassTimeoutMs: 100, stallPassLiveGraceMs: 20_000, stallPasses: 1_000, attemptSilenceBoundMs: 0 } })
+  const f = await setup({ workers, clock, budget: { maxWorkers: 8 }, config: { stallPassTimeoutMs: 100, stallPassLiveGraceMs: 20_000, attemptSilenceBoundMs: 0 } })
   try {
     // Only the body delivers: the queue-external pump is off.
     f.runtime.notices.pumpOutbox = () => {}
@@ -672,7 +672,7 @@ test('S1/R17-G5: a worker turn the body woke inside an adapter call keeps commit
   const workers = new StrandedInboxWorkers()
   /** Tick through `ms` of clock, the woken turn beating every 40ms of it. */
   const beating = async ms => { for (let at = 0; at < ms; at += 40) { await ticks(f, 4); workers.beat(); await new Promise(resolve => setImmediate(resolve)) } }
-  const f = await setup({ workers, clock, budget: { maxWorkers: 8 }, config: { tickMs: 10, stallPassTimeoutMs: 100, stallPasses: 1_000 } })
+  const f = await setup({ workers, clock, budget: { maxWorkers: 8 }, config: { tickMs: 10, stallPassTimeoutMs: 100 } })
   try {
     const h = await f.runtime.addMember(f.owner, f.mission.id, { name: 'H', role: 'implementation', maxOutputTokens: 5_000 })
     const i = await f.runtime.addMember(f.owner, f.mission.id, { name: 'I', role: 'implementation', maxOutputTokens: 5_000 })
@@ -755,7 +755,7 @@ test('S1: a body past its bound stops at the next member boundary, so lease reco
   }
   const workers = new HangFirstStartWorkers()
   workers.autoIdle = true
-  const f = await setup({ workers, clock, budget: { maxWorkers: 8 }, config: { leaseMs, stallPassTimeoutMs: bound, stallPasses: 1_000 } })
+  const f = await setup({ workers, clock, budget: { maxWorkers: 8 }, config: { leaseMs, stallPassTimeoutMs: bound } })
   try {
     const hanging = []
     for (const name of ['A', 'B', 'C']) hanging.push(await f.runtime.addMember(f.owner, f.mission.id, { name, role: 'implementation', maxOutputTokens: 5_000 }))
@@ -830,7 +830,7 @@ test('S1: a body whose members each take less than a bound is not stopped early,
     isIdle() { return false }
   }
   const workers = new ComputingStartWorkers()
-  const f = await setup({ workers, clock, budget: { maxWorkers: 24 }, config: { stallPassTimeoutMs: 60, stallPasses: 1_000 } })
+  const f = await setup({ workers, clock, budget: { maxWorkers: 24 }, config: { stallPassTimeoutMs: 60 } })
   try {
     // Each start re-validates the workspace on disk, so the body each admission
     // kicks settles before the next admission queues and before the clock moves.
@@ -877,7 +877,7 @@ test('S1: a chain of early-stopped bodies covers one rotation, and the body that
     }
   }
   const workers = new SlowStartWorkers()
-  const f = await setup({ workers, clock, budget: { maxWorkers: 8 }, config: { stallPassTimeoutMs: 30, stallPasses: 1_000 } })
+  const f = await setup({ workers, clock, budget: { maxWorkers: 8 }, config: { stallPassTimeoutMs: 30 } })
   try {
     for (const name of ['C', 'D']) await f.runtime.addMember(f.owner, f.mission.id, { name, role: 'implementation', maxOutputTokens: 5_000 })
     const members = f.runtime.store.list('members', f.mission.id).length
@@ -913,7 +913,7 @@ test('S1: the watchdog, passWedged and livePass read one bound predicate, so the
   // naming tick run unlocked and commit. The runtime's clock stands still for
   // each instant: it moves only by hand.
   const clock = new FakeClock()
-  const f = await setup({ clock, config: { tickMs: 10, stallPassTimeoutMs: 100, stallPasses: 1_000 } })
+  const f = await setup({ clock, config: { tickMs: 10, stallPassTimeoutMs: 100 } })
   const scheduling = f.runtime.scheduling
   let pass
   try {
@@ -921,7 +921,7 @@ test('S1: the watchdog, passWedged and livePass read one bound predicate, so the
     assert.equal(scheduling.passes.get(f.mission.id), undefined, 'the setup passes settle')
     const fixed = clock.now()
     pass = { id: scheduling.passKey(f.mission.id), operationId: 'operation_test_boundary', missionId: f.mission.id, startedAt: fixed - 99,
-      revisionBefore: f.runtime.store.revision(), fingerprintBefore: f.runtime.fingerprint(f.mission.id), noProgressPasses: 0 }
+      revisionBefore: f.runtime.store.revision(), fingerprintBefore: f.runtime.fingerprint(f.mission.id) }
     scheduling.passes.set(f.mission.id, pass)
     const before = { wedged: scheduling.passWedged(f.mission.id), live: scheduling.livePass(f.mission.id) === pass }
     scheduling.checkSchedulingPasses()
@@ -946,7 +946,7 @@ test('S1/R16-D: a long pass inside its declared live-work bound is progress and 
   // inside an adapter await for 150ms of a declared 200ms live-work window.
   // The clock and the ticks are driven by hand.
   const clock = new FakeClock()
-  const f = await setup({ clock, config: { tickMs: 20, stallPassTimeoutMs: 100, stallPasses: 2 } })
+  const f = await setup({ clock, config: { tickMs: 20, stallPassTimeoutMs: 100 } })
   const scheduling = f.runtime.scheduling
   let long
   try {
@@ -957,7 +957,7 @@ test('S1/R16-D: a long pass inside its declared live-work bound is progress and 
     await f.runtime.settle(f.mission.id)
     assert.equal(scheduling.passes.get(f.mission.id), undefined, 'the passes the claim kicked must settle')
     long = { id: scheduling.passKey(f.mission.id), operationId: 'operation_test_live', missionId: f.mission.id, startedAt: clock.now() - 150,
-      revisionBefore: f.runtime.store.revision(), fingerprintBefore: f.runtime.fingerprint(f.mission.id), noProgressPasses: 0 }
+      revisionBefore: f.runtime.store.revision(), fingerprintBefore: f.runtime.fingerprint(f.mission.id) }
     scheduling.passes.set(f.mission.id, long)
     await ticks(f, 1)
     assert.equal(scheduling.livePass(f.mission.id), long, 'a pass inside its declared live-work bound stays live')
@@ -981,7 +981,7 @@ test('S1/R16-D: a long pass inside its declared live-work bound is progress and 
 
 test('S5: clearing every in-memory scheduling cache leaves the durable outcome unchanged', async () => {
   // The clock and the ticks are driven by hand.
-  const f = await setup({ clock: new FakeClock(), config: { tickMs: 10, stallPassTimeoutMs: 200, stallPasses: 50 } })
+  const f = await setup({ clock: new FakeClock(), config: { tickMs: 10, stallPassTimeoutMs: 200 } })
   try {
     f.workers.autoIdle = true
     // The cache-only entries enumerated on the scheduling path, cleared while
@@ -1073,7 +1073,7 @@ test('manualTick runs no timer while tickMs stays the tick unit: settle() return
   // tickMs 0 meant both "no timer" and "a tick unit of 0", so every fake-clock
   // runtime ran each tick-derived window at zero and no test could reach one.
   const clock = new FakeClock()
-  const f = await setup({ clock, config: { stallPasses: 1_000 } })
+  const f = await setup({ clock })
   const scheduling = f.runtime.scheduling
   try {
     assert.equal(f.runtime.timer, undefined, 'no tick timer is installed')

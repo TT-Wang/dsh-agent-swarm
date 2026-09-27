@@ -61,13 +61,10 @@ const PROVIDER_OUTAGE_WINDOW_MS = 5 * 60_000
 const PROVIDER_OUTAGE_EVENT_WINDOW_MS = 30_000
 
 /**
- * S1: consecutive scheduling passes that advance no durable mission state and
- * terminate nothing before the runtime escalates. Defaults are expressed as
- * integer multiples of `tickMs` and are configuration (RuntimeConfig.
- * `stallPasses` / `stallPassTimeoutMs`), never a constant a stalled board can be
- * trapped behind.
+ * S1: the bound on one scheduling pass before the runtime names it wedged, in
+ * `tickMs` (RuntimeConfig.`stallPassTimeoutMs`), never a constant a wedged pass
+ * can be trapped behind.
  */
-const DEFAULT_STALL_PASSES = 3
 const DEFAULT_STALL_PASS_TIMEOUT_TICKS = 30
 /**
  * R16-D: the declared bound on how long a live attempt may record no durable
@@ -4170,14 +4167,6 @@ export class SwarmRuntime {
     void operation.catch(error => { if (!this.closed) process.stderr.write(`[agent-swarm] ${String(error)}\n`) }).finally(() => this.operations.delete(operation))
   }
 
-  /**
-   * S1: the declared no-progress window, as an integer number of passes
-   * (default 3, i.e. 3 × `tickMs`). Configuration, never a constant.
-   */
-  get stallPasses(): number {
-    const value = Math.trunc(this.config.stallPasses ?? DEFAULT_STALL_PASSES)
-    return Number.isSafeInteger(value) && value >= 1 ? value : DEFAULT_STALL_PASSES
-  }
   /**
    * S1: the declared bound on one scheduling pass (default 30 × `tickMs`). A
    * pass still queued or running past this bound has produced no durable change

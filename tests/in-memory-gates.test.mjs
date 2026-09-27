@@ -210,13 +210,12 @@ const CENSUS = [
   ["src/runtime.ts",39,"Set","const leftover = options.cancelUnschedulable ? new Set(this.unschedulable(mission, tasks, this.store.list('members', mission.id)).map(task => task.id)) : new Set<string>()","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
   ["src/runtime.ts",40,"Set","const dead = new Set(tasks.filter(task => task.status === 'cancelled' || leftover.has(task.id)).map(task => task.id))","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
   ["src/scheduling.ts",1,"Map","readonly passes = new Map<string, SchedulingPass>()","gate","in-flight","the scheduling body queued or running on a mission's serial queue, removed only when that body settles; every await in the body is bounded and the tick watchdog names a body past its bound, and losing the record can only queue a second body that the mission queue refuses while the first is in flight (probe below)"],
-  ["src/scheduling.ts",2,"Map","private readonly noProgress = new Map<string, number>()","gate","cache-only","consecutive no-progress passes carried to the next pass; losing it restarts the declared window, and the escalation's dedup key is durable on the mission row (probe below)"],
-  ["src/scheduling.ts",3,"Set","const dead = new Set(tasks.filter(task => task.status === 'blocked' && !this.quiescencePending(task)).map(task => task.id))","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
-  ["src/scheduling.ts",4,"Set","const covers = (task: Task, sourceId: string, seen = new Set<string>()): boolean => {","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
+  ["src/scheduling.ts",2,"Set","const dead = new Set(tasks.filter(task => task.status === 'blocked' && !this.quiescencePending(task)).map(task => task.id))","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
+  ["src/scheduling.ts",3,"Set","const covers = (task: Task, sourceId: string, seen = new Set<string>()): boolean => {","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
   // R16-D: the inline dedup of `escalateSchedulingStall`, built from the
   // durable rows inside one synchronous, read-only call and discarded with it;
   // it is not retained, not read by a later call and cannot gate one.
-  ["src/scheduling.ts",5,"Set","const subjects = [...new Set([...subjectsOfTasks(unreached, mission), ...holders.map(holder => holder.subject)])]","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
+  ["src/scheduling.ts",4,"Set","const subjects = [...new Set([...subjectsOfTasks(unreached, mission), ...holders.map(holder => holder.subject)])]","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
   ["src/store.ts",1,"Set","private readonly listeners = new Set<() => void>()","gate","cache-only","observer fan-out for committed changes; the durable revision and change cursor carry the state"],
   ["src/store.ts",2,"Set","this.transactionScopes = new Set()","transient","","created and destroyed inside one store transaction; the revision-bump decision it feeds is re-derived on every call"],
   ["src/store.ts",3,"Set","let liveOwners = new Set<string>()","local","","R17-G7 function-local: the live-attempt owner ids for the member rows being hydrated, created and discarded inside one synchronous read, so it cannot gate a later call"],
@@ -635,29 +634,6 @@ const GATE_TESTS = {
         'once the in-flight body settles, a later pass dispatches the work')
       assert.equal(running.attempt.ownerId, f.author.id)
     } finally { gate.resolve(); await f.cleanup() }
-  },
-  'src/scheduling.ts:2': async t => {
-    // Cache-only: the carried no-progress count. Its loss restarts the declared
-    // window; the escalation still fires, once per unchanged board.
-    const f = await setup({ config: { tickMs: 3_600_000, stallPasses: 3 } })
-    try {
-      const scheduling = f.runtime.scheduling
-      await eventually(() => scheduling.passes.size === 0 ? true : undefined, 'the passes setup kicked must settle')
-      scheduling.boardCannotProgress = () => true
-      const stalls = () => events(f.runtime, f.mission.id, 'mission/stalled').filter(item => item.data.cause === 'scheduling-pass' && item.data.wedged === false)
-      const unchangedPass = () => { const pass = scheduling.openPass(f.mission.id); scheduling.closePass(f.mission.id, pass) }
-      unchangedPass(); unchangedPass()
-      assert.equal(scheduling.noProgress.get(f.mission.id), 2, 'two unchanged passes are counted')
-      assert.ok(scheduling.noProgress.size > 0, 'the loss must be exercised on a non-empty collection')
-      scheduling.noProgress.clear()   // the loss
-      unchangedPass(); unchangedPass()
-      assert.equal(stalls().length, 0, 'the lost count restarts the window instead of escalating early')
-      unchangedPass()
-      assert.equal(stalls().length, 1, 'the declared window of unchanged passes still escalates')
-      scheduling.noProgress.clear()
-      unchangedPass(); unchangedPass(); unchangedPass()
-      assert.equal(stalls().length, 1, 'and the durable dedup key on the mission row keeps one escalation per unchanged board')
-    } finally { await f.cleanup() }
   },
   'src/store.ts:1': async t => {
     const f = await setup()

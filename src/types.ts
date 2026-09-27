@@ -233,14 +233,11 @@ export interface Mission {
   /** Fingerprint of the last stalled state the owner was notified about; suppresses repeats. */
   stallNotice?: string
   /**
-   * S1: fingerprint of the last state the scheduling-pass watchdog escalated.
-   * Kept separate from `stallNotice` so the pass-level witness (a pass that
-   * neither advanced nor terminated, or one that never returned) does not
-   * silence the board-level stall notice, while still deduplicating repeats for
-   * one unchanged board. Cleared when a pass advances durable state.
+   * S1: fingerprint of the board a wedged scheduling pass (one that never
+   * returned) was last named on, so a retried naming of one unchanged board is
+   * not repeated. Cleared when a pass changes the board or its naming reached
+   * the owner.
    */
-  schedulingStallNotice?: string
-  /** Separate timeout witness: an earlier no-progress notice cannot suppress a wedge. */
   schedulingWedgeNotice?: string
   /**
    * No-silent-state witness (docs/no-silent-state-spec.md §2): the fingerprint
@@ -1155,13 +1152,6 @@ export interface RuntimeConfig {
   maxOwnerReplyNudges?: number
   /** Approaching-limit fractions per budget dimension; defaults to [0.7, 0.9]. */
   budgetWarnAt?: number[]
-  /**
-   * S1: consecutive scheduling passes that advance no durable mission state and
-   * terminate nothing before the mission escalates. Defaults to 3, i.e. a
-   * window of 3 × `tickMs`; the count and the window are configuration, never a
-   * constant a stalled board can be trapped behind.
-   */
-  stallPasses?: number
   /**
    * S1: bound on one scheduling pass before the runtime declares it wedged and
    * escalates it. Defaults to 30 × `tickMs`. While the mission has a live lease

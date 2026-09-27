@@ -59,8 +59,7 @@ interface DispatchQuestion {
  * It is in-memory on purpose: it describes an operation this process owns, and
  * a restarted process owns none. The durable row it replaces never gated or
  * named anything after a restart either (it carried the dead process's
- * instance id); it only carried the no-progress count, which now restarts with
- * the process.
+ * instance id).
  *
  * Why no release and no fence: the queue is strictly serial and a waiter past
  * its bound is refused, never run (`boundedQueueWait`), so a successor body
@@ -82,8 +81,6 @@ export interface SchedulingPass {
   /** Store revision and mission digest when the pass was opened. */
   revisionBefore: number
   fingerprintBefore: string
-  /** Consecutive earlier passes that changed no durable mission state. */
-  noProgressPasses: number
   /** Set once the watchdog's naming of this body past its bound has committed; it is then wedged, not live. */
   escalatedAt?: number
   /**
@@ -195,12 +192,6 @@ export class Scheduling {
    * `startedAt` to name a body past its bound.
    */
   readonly passes = new Map<string, SchedulingPass>()
-  /**
-   * Consecutive no-progress passes per mission, carried from one pass to the
-   * next for the S1 no-progress escalation. Its loss only restarts the count;
-   * the escalation's dedup key is durable on the mission row.
-   */
-  private readonly noProgress = new Map<string, number>()
   /**
    * Identity of this runtime process in durable claims (the budget stop claim
    * in src/gates.ts). A claim written by a different instance is a crashed
@@ -708,7 +699,6 @@ export class Scheduling {
     const pass: SchedulingPass = {
       id: this.passKey(missionId), operationId: id('operation'), missionId, startedAt: this.rt.now(),
       revisionBefore: this.rt.store.revision(), fingerprintBefore: this.rt.fingerprint(missionId),
-      noProgressPasses: this.noProgress.get(missionId) ?? 0,
     }
     this.passes.set(missionId, pass)
     return pass
@@ -744,7 +734,7 @@ export class Scheduling {
     const unschedulable = this.unschedulable(this.rt.mission(missionId), this.rt.store.list('tasks', missionId), this.rt.store.list('members', missionId)).map(task => `${task.id} (${task.status})`)
     const wedge: WedgeRecord = { releasedAt: now, gapMs: Math.max(0, now - pass.startedAt), liveSubjects: holders.map(holder => holder.subject) }
     const naming = this.escalateSchedulingStall(missionId, {
-      pass, reason: 'pass-timeout', boundMs: this.rt.stallPassTimeoutMs, revisionNow: this.rt.store.revision(), fingerprintNow,
+      pass, boundMs: this.rt.stallPassTimeoutMs, revisionNow: this.rt.store.revision(), fingerprintNow,
       unschedulable, releaseBoundMs: boundMs, heldByLiveWork, wedge, liveHolders: holders,
     })
     if (naming === undefined) return false
@@ -755,40 +745,28 @@ export class Scheduling {
 
   /**
    * Close a pass when its body settles: remove the in-memory record first (so
-   * the next kick may queue a successor), then compare the mission digest with
-   * the one it opened on, count consecutive passes that advanced nothing and
-   * terminated nothing, and escalate once the declared window of such passes
-   * has been reached. Never throws: pass bookkeeping must not break scheduling.
+   * the next kick may queue a successor), publish the pass end, and release the
+   * wedge key once it is spent. Never throws: pass bookkeeping must not break
+   * scheduling.
    */
   closePass(missionId: string, pass: SchedulingPass): void {
     if (this.passes.get(missionId) === pass) this.passes.delete(missionId)
     try {
       if (this.rt.closed) return
       // R17-G5: the close is a transition. While the pass was live, notices left
-      // its mid-pass commits unpublished for the pass end to publish.
+      // its mid-pass commits unpublished for the pass end to publish; that
+      // publication judges the board, the one emitter of "it cannot progress".
       this.rt.passSettled(missionId)
-      const revisionAfter = this.rt.store.revision()
-      const fingerprintAfter = this.rt.fingerprint(missionId)
-      const progressed = fingerprintAfter !== pass.fingerprintBefore
-      const noProgressPasses = progressed ? 0 : pass.noProgressPasses + 1
-      this.noProgress.set(missionId, noProgressPasses)
-      // Change-and-return: the board left the no-progress class, so a later
-      // return to it re-notifies instead of staying silent behind a stale key.
-      // A named body whose naming reached the owner has spent its wedge key
-      // too: the key dedups the retried naming of that one body (`escalatedAt`
-      // keeps one naming per body), so a later body that wedges on this same
-      // board is named once. A naming the notice dedup suppressed told the
-      // owner nothing new, so its key stays and ends the renaming.
+      // A board this body changed, or a named body whose naming reached the
+      // owner, has spent its wedge key: the key dedups the retried naming of
+      // that one body (`escalatedAt` keeps one naming per body), so a later body
+      // that wedges on this same board is named once. A naming the notice dedup
+      // suppressed told the owner nothing new, so its key stays and ends the
+      // renaming.
       const mission = this.rt.store.get('missions', missionId)
-      const clearStall = progressed && mission?.schedulingStallNotice !== undefined
-      const clearWedge = (progressed || pass.wedgeNotified === true) && mission?.schedulingWedgeNotice !== undefined
-      if (mission !== undefined && (clearStall || clearWedge)) {
-        if (clearStall) delete mission.schedulingStallNotice
-        if (clearWedge) delete mission.schedulingWedgeNotice
+      if (mission?.schedulingWedgeNotice !== undefined && (pass.wedgeNotified === true || this.rt.fingerprint(missionId) !== pass.fingerprintBefore)) {
+        delete mission.schedulingWedgeNotice
         this.rt.commit(missionId, () => this.rt.store.put('missions', mission))
-      }
-      if (!progressed && noProgressPasses >= this.rt.stallPasses && this.boardCannotProgress(missionId)) {
-        this.escalateSchedulingStall(missionId, { pass: { ...pass, noProgressPasses }, reason: 'no-progress', boundMs: this.rt.config.tickMs * this.rt.stallPasses, revisionNow: revisionAfter, fingerprintNow: fingerprintAfter })
       }
     } catch { /* A closed store or a concurrent owner transition must not break scheduling. */ }
   }
@@ -833,52 +811,39 @@ export class Scheduling {
   }
 
   /**
-   * Commit the durable stall event and, when the state is otherwise silent,
-   * deliver the owner notice. Dedup is the existing fingerprint semantics: the
-   * same unchanged board never escalates twice (the durable
-   * `schedulingStallNotice` key), and a board that changes and returns does. A
-   * fresh witness another path already emitted for this exact fingerprint
-   * (`mission.witness`, the board-level stall notice or the coverage notice)
-   * suppresses the escalation entirely: that state is already escalated, so a
-   * second durable event for it would be duplicate evidence, not new evidence.
-   * Returns undefined when nothing was committed; otherwise whether the owner
-   * notice was recorded, which the event states as `ownerNotified`.
+   * Commit the durable stall event of a wedged pass and its owner notice. The
+   * same unchanged board never names twice (the durable `schedulingWedgeNotice`
+   * key). Returns undefined when nothing was committed; otherwise whether the
+   * owner notice was recorded, which the event states as `ownerNotified`.
    */
   escalateSchedulingStall(missionId: string, info: {
     pass: SchedulingPass
-    reason: 'pass-timeout' | 'no-progress'
     boundMs: number
     revisionNow: number
     fingerprintNow: string
-    /** What was unschedulable when the wedge was named; computed here when absent. */
-    unschedulable?: string[]
+    /** What was unschedulable when the wedge was named. */
+    unschedulable: string[]
     /** R16-D: the bound the wedge was measured against (the live-work window when one applied). */
-    releaseBoundMs?: number
+    releaseBoundMs: number
     /** R16-D: true when live work held the naming to its second bound. */
-    heldByLiveWork?: boolean
+    heldByLiveWork: boolean
     /** R16-D: what the watchdog measured when it named the wedge, carried by the event. */
-    wedge?: WedgeRecord
+    wedge: WedgeRecord
     /** R16-D: the live work the naming preserved, as subjects and members. */
-    liveHolders?: Array<{ subject: string; memberId?: string }>
+    liveHolders: Array<{ subject: string; memberId?: string }>
   }): { ownerNotified: boolean } | undefined {
     const mission = this.rt.store.get('missions', missionId)
     if (mission === undefined || this.rt.isMissionTerminal(mission) || mission.status !== 'active') return undefined
     const fingerprint = info.fingerprintNow
-    const noticeKey = info.reason === 'pass-timeout' ? 'schedulingWedgeNotice' : 'schedulingStallNotice'
-    if (mission[noticeKey] === fingerprint) return undefined
-    // A pass-timeout wedge is its own subject: the pass body is past its bound
-    // and the dispatch question it owes is unasked. A board-level witness (another notice that announced the
-    // same fingerprint) must not suppress it — that cross-subject conflation is
-    // exactly what round 15 removes, and fault F21 requires the wedge to be named
-    // inside the declared bound whether or not the board was already announced.
-    // The no-progress variant is a statement about the board, so a fresh witness
-    // for that board does suppress it, as before.
-    const witnessed = info.reason === 'pass-timeout'
-      ? false
-      : mission.stallNotice === fingerprint || mission.coverageNotice === fingerprint || mission.witness?.fingerprint === fingerprint
-    if (witnessed) return undefined
-    const unschedulable = info.unschedulable ?? this.unschedulable(mission, this.rt.store.list('tasks', missionId), this.rt.store.list('members', missionId)).map(task => `${task.id} (${task.status})`)
-    // R15-A1/A2: a wedged or no-progress pass names the work it never reached, so
+    // A wedge is its own subject: the pass body is past its bound and the
+    // dispatch question it owes is unasked. A board-level witness (another
+    // notice that announced the same fingerprint) must not suppress it — that
+    // cross-subject conflation is exactly what round 15 removes, and fault F21
+    // requires the wedge to be named inside the declared bound whether or not
+    // the board was already announced.
+    if (mission.schedulingWedgeNotice === fingerprint) return undefined
+    const { unschedulable, liveHolders: holders } = info
+    // R15-A1/A2: a wedged pass names the work it never reached, so
     // the notice carries subjects even though `unschedulable` is legitimately
     // empty (nothing is unschedulable: the pass simply never ran to a decision).
     // Guard pair: scheduling-pass stall x stall-root classifier — both can fire for
@@ -893,10 +858,9 @@ export class Scheduling {
     // names what no live path advances, this names what the wedged pass never
     // reached and what held it; both carry task@epoch and neither consumes the
     // other's dedup key.
-    const holders = info.liveHolders ?? []
     const subjects = [...new Set([...subjectsOfTasks(unreached, mission), ...holders.map(holder => holder.subject)])]
-    const heldText = info.heldByLiveWork === true && holders.length
-      ? ` The naming was held to its ${info.releaseBoundMs ?? info.boundMs}ms live-work bound by work that is preserved untouched: ${holders.map(holder => holder.memberId === undefined ? holder.subject : `${holder.subject} held by ${holder.memberId}`).join(', ')}.`
+    const heldText = info.heldByLiveWork && holders.length
+      ? ` The naming was held to its ${info.releaseBoundMs}ms live-work bound by work that is preserved untouched: ${holders.map(holder => holder.memberId === undefined ? holder.subject : `${holder.subject} held by ${holder.memberId}`).join(', ')}.`
       : ''
     const unreachedText = unreached.length ? unreached.map(task => `${task.id} (${task.status})`).join(', ') : 'none'
     // R15-D2: when a subject of this escalation is a blocked task whose stop is
@@ -911,18 +875,15 @@ export class Scheduling {
           : `${task.id} is blocked and its stop has been awaited for ${Math.max(0, this.rt.now() - stop.at)}ms, past its declared bound`
       })
     const stopText = stopFacts.length ? ` Stop state: ${stopFacts.join('; ')}.` : ''
-    const passes = info.pass.noProgressPasses
     const stateUnchanged = info.pass.fingerprintBefore === fingerprint
     // A wedge naming's fact: its subjects, and each member's counted
     // consecutive start failures. A wedge after a counted start failure is a
     // new fact (the member is one failure nearer retirement, which bounds the
     // renaming); a repeat on the same subjects with no failure counted (a
-    // provider outage counts none) is suppressed by the notice dedup. The
-    // no-progress notice keeps its generic identity.
+    // provider outage counts none) is suppressed by the notice dedup.
     const failures = this.rt.store.list('members', missionId)
       .flatMap(member => { const count = (member as Member & { startFailures?: number }).startFailures; return count === undefined ? [] : [`${member.id}:${count}`] })
-    const identity = info.reason === 'pass-timeout' ? { trigger: 'scheduling-pass', reason: [info.reason, ...failures].join(' ') } : {}
-    mission[noticeKey] = fingerprint
+    mission.schedulingWedgeNotice = fingerprint
     mission.updatedAt = this.rt.now()
     mission.witness = { fingerprint, kind: 'W3', at: this.rt.now() }
     let ownerNotified = false
@@ -930,9 +891,7 @@ export class Scheduling {
       this.rt.store.put('missions', mission)
       // The notice is recorded first, so the event states what it did: a
       // naming whose notice the dedup suppressed reached no owner.
-      ownerNotified = this.rt.notify(missionId, info.reason === 'pass-timeout'
-        ? `Scheduling pass ${info.pass.id} (run ${info.pass.operationId}) for mission ${missionId} did not return within ${info.boundMs}ms and produced no durable state change (fingerprint ${fingerprint.slice(0, 12)}). This pass keeps the mission's scheduling until the call it awaits returns at its own bound; the next pass then resumes from lease recovery. Unschedulable: ${unschedulable.join(', ') || 'none'}.${heldText} Work the pass never reached: ${unreachedText}.${stopText} Decide: inspect the named tasks, admit a repair with swarm_propose, or withdraw the blocking work with swarm_cancel.`
-        : `Mission ${missionId} left its durable state unchanged for ${passes} consecutive scheduling passes (window ${info.boundMs}ms, revision ${info.pass.revisionBefore} → ${info.revisionNow}, fingerprint ${fingerprint.slice(0, 12)}) and terminated nothing. Unschedulable: ${unschedulable.join(', ') || 'none'}. Work with no progress: ${unreachedText}. Decide: admit work with swarm_propose, adjust the budget, or complete/stop the mission.`, subjects,
+      ownerNotified = this.rt.notify(missionId, `Scheduling pass ${info.pass.id} (run ${info.pass.operationId}) for mission ${missionId} did not return within ${info.boundMs}ms and produced no durable state change (fingerprint ${fingerprint.slice(0, 12)}). This pass keeps the mission's scheduling until the call it awaits returns at its own bound; the next pass then resumes from lease recovery. Unschedulable: ${unschedulable.join(', ') || 'none'}.${heldText} Work the pass never reached: ${unreachedText}.${stopText} Decide: inspect the named tasks, admit a repair with swarm_propose, or withdraw the blocking work with swarm_cancel.`, subjects,
         // R17-G5: the pass naming is its own fact, not the board's witness. A
         // wedged-pass escalation must not consume the board's W2 witness for a
         // fingerprint whose decision the transition-driven classifier still owes
@@ -940,18 +899,16 @@ export class Scheduling {
         // trigger is its own too: under the generic `decision` identity an
         // unrelated notice with the same subjects (a member's start-failure
         // notice) suppressed it.
-        { stampWitness: false, ...identity })
+        { stampWitness: false, trigger: 'scheduling-pass', reason: ['pass-timeout', ...failures].join(' ') })
       // Reuse the registered board-stall event rather than inventing a new type:
       // `cause: 'scheduling-pass'` and `wedged` make the pass-level escalation
       // distinguishable in the durable log and in every existing read path.
       this.rt.store.event(missionId, 'mission/stalled', 'runtime', {
         cause: 'scheduling-pass',
         passId: info.pass.id, runId: info.pass.operationId,
-        reason: info.reason === 'pass-timeout'
-          ? `scheduling pass did not return within its ${info.boundMs}ms bound and advanced no durable state`
-          : `no durable state change for ${passes} consecutive scheduling passes`,
-        wedged: info.reason === 'pass-timeout',
-        passStartedAt: info.pass.startedAt, passes, boundMs: info.boundMs,
+        reason: `scheduling pass did not return within its ${info.boundMs}ms bound and advanced no durable state`,
+        wedged: true,
+        passStartedAt: info.pass.startedAt, boundMs: info.boundMs,
         revisionBefore: info.pass.revisionBefore, revisionAtStall: info.revisionNow,
         missionFingerprint: fingerprint, stateUnchanged, unschedulable, ownerNotified,
         // R16-D: what the wedge was measured against, whether live work held it,
@@ -962,15 +919,12 @@ export class Scheduling {
         // `releaseBoundMs` the bound the naming was measured against (the
         // live-work bound when live work held it) and `releasedWhileLive` whether
         // live work held it. `boundMs` keeps its original meaning (the pass's own
-        // stall bound); these facts are additive and only present on a wedge,
-        // never on the no-progress variant.
-        ...(info.wedge === undefined ? {} : {
-          releasedAt: info.wedge.releasedAt,
-          releaseBoundMs: info.releaseBoundMs ?? info.boundMs,
-          releaseGapMs: info.wedge.gapMs,
-          releasedWhileLive: info.heldByLiveWork === true,
-          liveSubjects: info.wedge.liveSubjects,
-        }),
+        // stall bound).
+        releasedAt: info.wedge.releasedAt,
+        releaseBoundMs: info.releaseBoundMs,
+        releaseGapMs: info.wedge.gapMs,
+        releasedWhileLive: info.heldByLiveWork,
+        liveSubjects: info.wedge.liveSubjects,
       })
     })
     // R17-G5: the naming is a transition that still owes the wedged pass's own
@@ -983,22 +937,6 @@ export class Scheduling {
     // it: the queue-external pump delivers it, never the wedged mission queue.
     this.rt.pumpOutbox()
     return { ownerNotified }
-  }
-
-  /**
-   * The no-progress escalation is a backstop for a pass that completed without
-   * advancing or terminating, so it may only fire for a board the runtime
-   * already classifies as unable to progress: `stalled` is the same predicate
-   * the board-level witness uses, and it returns false while any task runs under
-   * a live lease, while a stop acknowledgement is in flight, and while a
-   * submitted artifact is still inside the documented review grace. In
-   * particular a member the adapter reports busy is working, not stalled — a
-   * false stall notice is a defect of the same severity as a missing one.
-   */
-  boardCannotProgress(missionId: string): boolean {
-    const mission = this.rt.store.get('missions', missionId)
-    if (mission === undefined || mission.status !== 'active') return false
-    return this.stalled(this.rt.store.list('tasks', missionId), this.rt.store.list('members', missionId))
   }
 
   /**
