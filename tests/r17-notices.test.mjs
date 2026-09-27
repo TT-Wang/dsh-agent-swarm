@@ -80,7 +80,7 @@ test('R17-G3: repetition is keyed on the fact — same fact once, unrelated boar
   const f = await fixture(t)
   const task = f.propose('Fact task')
   const subject = `${task.id}@${task.epoch}`
-  const fact = { trigger: 'task/blocked', reason: 'blocked for repair', family: 'stall-root' }
+  const fact = { trigger: 'task/blocked', reason: 'blocked for repair', statement: { family: 'stall-root', counts: {} } }
   f.emit('fact body', [subject], fact)
   f.emit('fact body', [subject], fact)
   const afterFirst = f.ownerNotices().filter(delivery => delivery.notice.dedupKey.startsWith('stall-root:'))
@@ -118,8 +118,8 @@ test('one enforcement point: a no-live-path decision is withheld at delivery whi
   const repair = f.propose('Repair', { replaces: [original.id], assigneeId: builder.id })
   await f.runtime.claim({ sessionId: builder.sessionId }, f.mission.id, repair.id)
   const covered = `${original.id}@${original.epoch}`
-  f.emit('covered fall-through', [covered], { family: 'fallthrough', trigger: 'mission/stalled', reason: 'no live path advances it' })
-  f.emit('covered stall root', [covered], { family: 'stall-root', dedupKey: `stall-root:${f.mission.id}:${covered}`, stampWitness: false })
+  f.emit('covered fall-through', [covered], { statement: { family: 'fallthrough', counts: {} }, trigger: 'mission/stalled', reason: 'no live path advances it' })
+  f.emit('covered stall root', [covered], { dedupKey: `stall-root:${f.mission.id}:${covered}`, stampWitness: false })
   const fallthrough = f.ownerNotices().find(delivery => delivery.notice.dedupKey.startsWith('fallthrough:'))
   const coveredRoot = f.ownerNotices().find(delivery => delivery.notice.dedupKey === `stall-root:${f.mission.id}:${covered}`)
   assert.ok(fallthrough && coveredRoot, 'emission records the facts; it no longer judges them')
@@ -247,7 +247,7 @@ const subjectOf = task => `${task.id}@${task.epoch}`
 /** Every tool each reviewed body names, bound to the action it is named for, and the exit the body leaves open. */
 const DECISIONS = {
   'stall-root': ['allocation with swarm_budget', 'swarm_propose with replaces', 'swarm_cancel to withdraw'],
-  stall: ['assignee with swarm_control', 'review with swarm_propose', 'explicitly with swarm_cancel', 'swarm_control stop'],
+  'board-stall': ['assignee with swarm_control', 'review with swarm_propose', 'explicitly with swarm_cancel', 'swarm_control stop'],
   fallthrough: ['review with swarm_propose', 'decide with swarm_control'],
   parked: ['held by a parked member', 'without spending a recovery attempt'],
   'integration-gap': ['integration task depending on every branch'],
@@ -308,7 +308,7 @@ test('R17-G2b: the W3 stall body replays from the unschedulable rows alone', asy
     const view = f.runtime.interpretation(f.mission.id)
     const reason = f.runtime.completionError(view.mission) ?? 'no task can make progress'
     f.runtime.notices.notifyStall(view, reason)
-    return { view, reason, notice: f.ownerNotices().filter(delivery => delivery.notice.dedupKey.startsWith('mission/stalled')).at(-1) }
+    return { view, reason, notice: f.ownerNotices().filter(delivery => delivery.notice.dedupKey.startsWith('board-stall:')).at(-1) }
   }
   // First nothing is unschedulable (the body names every non-terminal row);
   // then a blocked row and its dependent are, so the body counts and names them.
@@ -321,14 +321,14 @@ test('R17-G2b: the W3 stall body replays from the unschedulable rows alone', asy
     assert.ok(notice, 'the W3 stall was reported')
     const stuck = view.unschedulable.length ? view.unschedulable : view.nonTerminal
     const subjects = stuck.map(subjectOf)
-    assert.deepEqual(notice.notice.statement, { family: 'stall', counts: { unschedulable: view.unschedulable.length } }, 'the body is the stall template and states the unschedulable count of the rows')
+    assert.deepEqual(notice.notice.statement, { family: 'board-stall', counts: { unschedulable: view.unschedulable.length } }, 'the body is the board-stall template and states the unschedulable count of the rows')
     assert.deepEqual(notice.notice.subjects, subjects, 'the subjects are the unschedulable rows, or every non-terminal row when none is')
     assert.equal(notice.notice.reason, reason, 'the recorded reason is the completion diagnostic')
-    assert.equal(notice.content, NOTICE_TEMPLATES.stall.build({ reason, unschedulable: view.unschedulable, subjects }), 'the body is the template rebuilt from the unschedulable rows')
+    assert.equal(notice.content, NOTICE_TEMPLATES['board-stall'].build({ reason, unschedulable: view.unschedulable, subjects }), 'the body is the template rebuilt from the unschedulable rows')
     assert.ok(notice.content.includes(reason), 'the body states the recorded completion diagnostic')
     for (const subject of subjects) assert.ok(notice.content.includes(subject), `the body names ${subject}`)
     for (const row of view.unschedulable) assert.ok(notice.content.includes(`${row.id} (${row.kind}, ${row.status}`), `the body counts ${row.id} as unschedulable`)
-    assertDecision(notice, 'stall')
+    assertDecision(notice, 'board-stall')
   }
 })
 
@@ -379,7 +379,7 @@ test('R17-G2d: the integration-gap and coverage-complete bodies replay from the 
   accepted.status = 'accepted'
   f.runtime.store.put('tasks', accepted)
   f.runtime.notices.notifyCoverageComplete(f.runtime.store.get('missions', f.mission.id))
-  const coverage = ownerNotice(f, 'task/accepted:')
+  const coverage = ownerNotice(f, 'coverage-complete:')
   assert.ok(coverage, 'the coverage-complete notice was reported')
   assert.deepEqual(coverage.notice.statement, { family: 'coverage-complete', counts: {} }, 'the body is the coverage-complete template and states no count')
   assert.deepEqual(coverage.notice.subjects, [subjectOf(accepted)], 'the subject is the accepted deliverable')

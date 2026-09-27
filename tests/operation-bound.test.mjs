@@ -29,6 +29,7 @@ import { Context } from '@deepseek-ai/cordis'
 import { HarnessWorkers, ScopedEnvironment, assertCompositionScratch } from '../lib/harness-workers.js'
 import { tempDirectory } from './temp-root.mjs'
 import { FakeWorkers, eventually, makeRepo, makeRuntime, makeWorkspaces } from './faults/harness.mjs'
+import { noticeFamily } from '../lib/notices.js'
 
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
 
@@ -106,6 +107,8 @@ test('F1: a silent in-flight operation escalates with a durable witness naming m
   assert.equal(escalation.from, 'runtime')
   assert.equal(escalation.to, 'owner')
   assert.equal(escalation.notice.class, 'stall')
+  assert.equal(noticeFamily(escalation), 'stall', 'its family is its class, never the W3 board stall (`board-stall`)')
+  assert.equal(runtime.ownerDeliveryRelevant(runtime.mission(mission.id), escalation), true, 'it stays relevant while the operation holds the attempt')
   assert.equal(escalation.notice.sentAt > 0, true)
   for (const needle of [member.name, member.id, task.id, task.title, 'job_output', 'without recording anything', 'operationBoundMs', 'swarm_cancel', 'swarm_observe']) {
     assert.ok(escalation.content.includes(needle), `the owner notice must name ${needle}: ${escalation.content}`)

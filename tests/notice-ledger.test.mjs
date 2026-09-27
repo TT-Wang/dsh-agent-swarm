@@ -1,0 +1,78 @@
+/**
+ * Batch 11: the deliveries ledger is the one record that the owner was told.
+ *
+ * A board fact the classifier tells the owner (the W3 stall, an owner-assembled
+ * mission's coverage-complete, a wedged pass's naming, a duplicate carrier) is
+ * named by ONE field: the prefix of its dedup key, which is also its
+ * `noticeFamily`, its reviewed template and its recorded statement. Its row is
+ * outstanding exactly while its own condition holds under the identity it was
+ * told with, so relevance and reminders judge the fact itself, never another
+ * family's rows. The runtime reads the fake clock and runs no tick timer.
+ */
+import test from 'node:test'
+import assert from 'node:assert/strict'
+import { FakeClock, acceptThroughReview, blockThroughReview, setup, taskOf } from './faults/harness.mjs'
+import { noticeFamily, noticeTemplateKey } from '../lib/notices.js'
+
+const ownerRows = f => f.runtime.store.list('deliveries', f.mission.id).filter(delivery => delivery.to === 'owner' && delivery.notice !== undefined)
+const stallRow = f => ownerRows(f).find(delivery => delivery.notice.trigger === 'mission/stalled' && delivery.content.startsWith('Mission stalled'))
+const coverageRow = f => ownerRows(f).find(delivery => /is ready to complete/.test(delivery.content))
+const relevant = (f, delivery) => f.runtime.ownerDeliveryRelevant(f.runtime.mission(f.mission.id), f.runtime.store.get('deliveries', delivery.id))
+/** The one field: key prefix, family and, for a templated body, its template and statement. */
+const names = delivery => ({ prefix: delivery.notice.dedupKey.split(':')[0], family: noticeFamily(delivery),
+  template: noticeTemplateKey(delivery), statement: delivery.notice.statement?.family })
+
+test('L-21: the W3 stall, coverage-complete, duplicate-carrier and wedged-pass rows are each named by one field', async t => {
+  const clock = new FakeClock()
+  const stalled = await setup({ clock })
+  t.after(stalled.cleanup)
+  await blockThroughReview(stalled, stalled.propose({ title: 'Dead end' }))
+  await stalled.runtime.settle(stalled.mission.id)
+  await stalled.runtime.tick()
+  const stall = stallRow(stalled)
+  assert.ok(stall, 'the stalled board told the owner')
+  assert.deepEqual(names(stall), { prefix: 'board-stall', family: 'board-stall', template: 'board-stall', statement: 'board-stall' })
+  // A wedged pass's naming is its own family, not the class a generic decision reads as.
+  const scheduling = stalled.runtime.scheduling
+  const pass = { id: scheduling.passKey(stalled.mission.id), operationId: 'operation_ledger_wedge', missionId: stalled.mission.id, startedAt: clock.now() - 60_000,
+    revisionBefore: stalled.runtime.store.revision(), fingerprintBefore: stalled.runtime.fingerprint(stalled.mission.id) }
+  scheduling.passes.set(stalled.mission.id, pass)
+  t.after(() => scheduling.closePass(stalled.mission.id, pass))
+  scheduling.checkSchedulingPasses()
+  const naming = ownerRows(stalled).find(delivery => delivery.notice.trigger === 'scheduling-pass')
+  assert.ok(naming, 'the wedged pass was named')
+  assert.deepEqual(names(naming), { prefix: 'scheduling-pass', family: 'scheduling-pass', template: undefined, statement: undefined })
+
+  const covered = await setup({ clock })
+  t.after(covered.cleanup)
+  const builder = await covered.runtime.addMember(covered.owner, covered.mission.id, { name: 'Builder', role: 'implementation', maxOutputTokens: 5_000 })
+  // A replaced task still running when its repair is accepted: a duplicate carrier.
+  const live = covered.propose({ title: 'Live original', assigneeId: builder.id })
+  await covered.runtime.claim(covered.actor(builder), covered.mission.id, live.id)
+  const repair = covered.propose({ title: 'Repair' })
+  covered.runtime.commit(covered.mission.id, () => covered.runtime.store.put('tasks', { ...taskOf(covered.runtime, repair.id), replaces: [live.id] }))
+  await acceptThroughReview(covered, repair)
+  const duplicate = ownerRows(covered).find(delivery => delivery.notice.statement?.family === 'duplicate-carrier')
+  assert.ok(duplicate, 'the duplicate carrier told the owner')
+  assert.deepEqual(names(duplicate), { prefix: 'duplicate-carrier', family: 'duplicate-carrier', template: 'duplicate-carrier', statement: 'duplicate-carrier' })
+  covered.runtime.cancel(covered.owner, covered.mission.id, { taskId: live.id, reason: 'The accepted repair carries it' })
+  await covered.runtime.settle(covered.mission.id)
+  await covered.runtime.tick()
+  const coverage = coverageRow(covered)
+  assert.ok(coverage, 'the coverage-complete board told the owner')
+  assert.deepEqual(names(coverage), { prefix: 'coverage-complete', family: 'coverage-complete', template: 'coverage-complete', statement: 'coverage-complete' })
+})
+
+test('a queued coverage-complete decision is withheld once the mission completes', async t => {
+  const clock = new FakeClock()
+  const f = await setup({ clock })
+  t.after(f.cleanup)
+  await acceptThroughReview(f, f.propose())
+  await f.runtime.settle(f.mission.id)
+  await f.runtime.tick()
+  const coverage = coverageRow(f)
+  assert.ok(coverage, 'the coverage-complete board told the owner')
+  assert.equal(relevant(f, coverage), true, 'outstanding while the owner has not decided')
+  assert.equal(f.runtime.control(f.owner, f.mission.id, 'complete', 'The deliverable is accepted').status, 'completed')
+  assert.equal(relevant(f, coverage), false, 'the completed mission withholds it, like every decision family')
+})

@@ -255,7 +255,7 @@ test('review admission retires only the reviewed source\'s decision; the other s
 test('completion suppresses old actions while delivering the final result and historical facts once', async t => {
   const f = await fixture(t)
   f.runtime.store.transaction(() => {
-    f.runtime.notify(f.mission.id, 'Old review action', ['old-source@1'], { family: 'review-blocked' })
+    f.runtime.notify(f.mission.id, 'Old review action', ['old-source@1'], { dedupKey: `review-blocked:${f.mission.id}:old-source:need:reason` })
     f.runtime.notify(f.mission.id, 'Old silence action', ['old-source@1'], { noticeClass: 'stall' })
     f.runtime.notify(f.mission.id, 'Old budget action', ['mission:' + f.mission.id], { noticeClass: 'budget' })
     f.runtime.notify(f.mission.id, 'Retained host fact', ['mission:' + f.mission.id], { noticeClass: 'progress' })
@@ -276,7 +276,7 @@ for (const includeCompletion of [false, true]) test(`wake summaries recheck indi
   f.runtime.notices.wakeBudget = 1
   f.runtime.store.transaction(() => {
     f.runtime.notify(f.mission.id, 'First fact occupies the individual wake', ['mission:' + f.mission.id], { noticeClass: 'progress' })
-    f.runtime.notify(f.mission.id, 'Obsolete review request', ['old-source@1'], { family: 'review-blocked' })
+    f.runtime.notify(f.mission.id, 'Obsolete review request', ['old-source@1'], { dedupKey: `review-blocked:${f.mission.id}:old-source:need:reason` })
     f.runtime.notify(f.mission.id, 'Obsolete silence request', ['old-source@1'], { noticeClass: 'stall' })
     if (includeCompletion) f.runtime.notify(f.mission.id, 'Final accepted deliverable', ['mission:' + f.mission.id], { noticeClass: 'completion' })
     const mission = f.runtime.mission(f.mission.id); mission.status = 'completed'; f.runtime.store.put('missions', mission)

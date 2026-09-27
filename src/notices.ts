@@ -83,12 +83,6 @@ export interface NotifyOptions {
   trigger?: string
   /** R17-G3: the recorded reason the fact's rows carry (never invented by the body). */
   reason?: string
-  /**
-   * R17-G3: the notice family the dedup key is prefixed with. Existing readers
-   * (`noticeFamily`, owner-side filters) read the family from the key prefix, so
-   * a fact-keyed notice keeps it.
-   */
-  family?: string
   /** Full facts and their original identities when one notice presents a batch. */
   facts?: string[]
   aggregatedIdentities?: NonNullable<Delivery['notice']>['aggregatedIdentities']
@@ -113,10 +107,10 @@ export interface NotifyOptions {
  * sentence, and the wording can change without changing a recorded fact. The
  * body's subjects and cause already travel on the same row as the fact identity
  * (`subjects`, `reason`); the statement adds what the row did not carry: the
- * template family that rendered the body (the dedup key prefix names a
- * different family for the stall and coverage-complete bodies) and the counts
- * the body states. A fact carried by a wake-budget summary is recorded in its
- * `aggregatedFacts` constituent, which has no statement.
+ * template family that rendered the body, which is also the family its dedup
+ * key is prefixed with (`factKey`), and the counts the body states. A fact
+ * carried by a wake-budget summary is recorded in its `aggregatedFacts`
+ * constituent, which has no statement.
  */
 interface NoticeStatement {
   family: keyof typeof NOTICE_TEMPLATES
@@ -144,8 +138,6 @@ interface NoticeFactRecord {
   reason: string
   questionId?: string
   deliveryFailureId?: string
-  /** R17-G3: the notice family the dedup key is prefixed with. */
-  family?: string
   /** R17-G8: the host's claimed signal, recorded once (CAS) per delivery. */
   consumedAt?: number
   consumptionSource?: string
@@ -204,17 +196,15 @@ function reasonDigest(reason: string): string {
  *   therefore the SAME fact and is suppressed — the round's "at most one notice
  *   per fact" rule. A changed reason, a changed subject epoch or a changed
  *   trigger is a new fact and is recorded.
- * - When a `family` is present (an explicit `NotifyOptions.family`, or the prefix
- *   of an explicit `dedupKey`), the key is prefixed with that family and the
- *   trigger does NOT participate: the family is the identity the retained family
- *   readers (`noticeFamily`) resolve, so two facts
- *   of one family with different triggers but the same subjects and recorded
- *   reason share one key. The per-site reviewed table in
- *   `tests/r17-notices.test.mjs` names every site that relies on this.
+ * - A body a reviewed template rendered is keyed by that template's family
+ *   (`NoticeStatement.family`), and the trigger does NOT participate: one field
+ *   names the family, so the key prefix, `noticeFamily`, `noticeTemplateKey` and
+ *   the statement agree, and two facts of one family with different triggers
+ *   but the same subjects and recorded reason share one key.
  */
-export function factKey(missionId: string, fact: { trigger: string; reason: string; subjects: readonly string[]; family?: string }): string {
+export function factKey(missionId: string, fact: { trigger: string; reason: string; subjects: readonly string[]; statement?: Pick<NoticeStatement, 'family'> }): string {
   const subjects = [...fact.subjects].sort().join('+')
-  return `${fact.family ?? fact.trigger}:${missionId}:${subjects}:${reasonDigest(fact.reason)}`
+  return `${fact.statement?.family ?? fact.trigger}:${missionId}:${subjects}:${reasonDigest(fact.reason)}`
 }
 
 /**
@@ -254,8 +244,8 @@ const DEFAULT_ABSENCE_BOUND_MS = 600_000
  * calls that function through `renderNotice` — so the machine replay check can
  * rebuild each emitted body from the store and fail a body that states a cause
  * no row supports. `counts` names the counts a body states, read from its input.
- * `trigger` is the durable event the family is keyed on; a family absent from
- * this table is listed with its reason in the test's reviewed-site table.
+ * `trigger` is the durable event a family's facts record; their key is the
+ * family itself (`factKey`).
  */
 export const NOTICE_TEMPLATES = {
   'stall-root': {
@@ -269,7 +259,7 @@ export const NOTICE_TEMPLATES = {
     build: (input: { missionTitle: string; subjects: ReadonlyArray<Pick<Task, 'id' | 'kind' | 'status' | 'epoch' | 'dependencies'>> }) =>
       `Mission ${input.missionTitle} made no progress this tick and has unfinished work that no live path will advance: ${input.subjects.map(task => `${task.id} (${task.kind}, ${task.status}, epoch ${task.epoch}${task.dependencies.length ? `, depends on ${task.dependencies.join('/')}` : ''})`).join('; ')}. Inspect the board, admit a repair or review with swarm_propose, or decide with swarm_control.`,
   },
-  stall: {
+  'board-stall': {
     trigger: 'mission/stalled',
     counts: (input: { unschedulable: readonly unknown[] }) => ({ unschedulable: input.unschedulable.length }),
     build: (input: { reason: string; unschedulable: ReadonlyArray<Pick<Task, 'id' | 'kind' | 'status' | 'reviewOf' | 'dependencies'>>; subjects: readonly string[] }) =>
@@ -354,9 +344,13 @@ export const TERMINAL_STATES: ReadonlySet<string> = new Set(['accepted', 'cancel
 /**
  * R16-A: the durable families of owner decisions. A family is read from the
  * dedup key the runtime itself writes (never from prose), because that key is the
- * identity the notice ledger and the dedup logic already use.
+ * identity the notice ledger and the dedup logic already use. Every reviewed
+ * template is one, so a templated body's family is its key prefix by
+ * construction. The W3 board stall is `board-stall`, outside the `NoticeClass`
+ * names: the operation- and attempt-silence escalations keep class `stall`, and
+ * `noticeFamily` falls back to the class for them.
  */
-const DECISION_FAMILIES = ['stall-root', 'fallthrough', 'dispatch-question', 'guard-terminal', 'integration-gap', 'parked', 'review-blocked', 'obligation-followup', 'absence', 'owner-reply-missing', 'owner-reply-blocked'] as const
+const DECISION_FAMILIES: readonly string[] = [...Object.keys(NOTICE_TEMPLATES), 'scheduling-pass', 'dispatch-question', 'guard-terminal', 'obligation-followup', 'absence', 'owner-reply-missing', 'owner-reply-blocked']
 /**
  * The families whose claim is "no live path will advance this subject". Only
  * these can be false wakes when the named subject's lineage is live. A
@@ -370,7 +364,7 @@ const FOLLOWUP_EXCLUDED_FAMILIES = new Set(['obligation-followup', 'absence', 'o
 export function noticeFamily(delivery: Pick<Delivery, 'notice' | 'kind'>): string {
   const key = delivery.notice?.dedupKey ?? ''
   const prefix = key.includes(':') ? key.slice(0, key.indexOf(':')) : ''
-  if ((DECISION_FAMILIES as readonly string[]).includes(prefix)) return prefix
+  if (DECISION_FAMILIES.includes(prefix)) return prefix
   if (delivery.kind === 'escalation' || delivery.notice?.class === 'escalation') return 'escalation'
   return delivery.notice?.class ?? 'unknown'
 }
@@ -638,8 +632,7 @@ export class Notices {
     // the fact (subject@epoch + triggering event + recorded reason), so an
     // unrelated board change cannot re-arm a notice and a new fact cannot be
     // suppressed by an old one. A caller can still opt out explicitly.
-    const family = options.family ?? (options.dedupKey === undefined ? undefined : options.dedupKey.split(':')[0])
-    const fact: NoticeFactRecord = { subjects: attributed, trigger: options.trigger ?? options.dedupKey?.split(':')[0] ?? noticeClass, reason: options.reason ?? '', questionId: options.questionId, deliveryFailureId: options.deliveryFailureId, ...(family === undefined ? {} : { family }),
+    const fact: NoticeFactRecord = { subjects: attributed, trigger: options.trigger ?? options.dedupKey?.split(':')[0] ?? noticeClass, reason: options.reason ?? '', questionId: options.questionId, deliveryFailureId: options.deliveryFailureId,
       ...(options.facts === undefined ? {} : { facts: options.facts }), ...(options.aggregatedIdentities === undefined ? {} : { aggregatedIdentities: options.aggregatedIdentities }),
       ...(options.coveredBy === undefined ? {} : { coveredBy: options.coveredBy }), ...(options.statement === undefined ? {} : { statement: options.statement }) }
     const dedupe = options.dedupe ?? true
@@ -1042,7 +1035,7 @@ export class Notices {
     if (fact.aggregatedFacts !== undefined) return this.relevantSummaryFacts(mission, delivery).length > 0
     const family = noticeFamily(delivery)
     if (mission.status === 'completed' && (['budget', 'stall', 'blocker'].includes(fact.class)
-      || ((DECISION_FAMILIES as readonly string[]).includes(family) && !family.startsWith('owner-reply-')))) return false
+      || (DECISION_FAMILIES.includes(family) && !family.startsWith('owner-reply-')))) return false
     if (family === 'obligation-followup') {
       const original = fact.reason === undefined ? undefined : this.rt.store.get('deliveries', fact.reason)
       return this.unresolvedSubjects(this.interpretation(mission.id), original ?? delivery).length > 0
@@ -1427,7 +1420,7 @@ export class Notices {
     const reason = `no live path advances ${subjects.slice().sort().join(', ')}`
     const { content, statement } = renderNotice('fallthrough', { missionTitle: mission.title, subjects: unrecognised })
     this.rt.commit(missionId, () => {
-      this.notify(missionId, content, view.subjectsOf(unrecognised), { dedupe: true, family: 'fallthrough', trigger: NOTICE_TEMPLATES.fallthrough.trigger, reason, statement })
+      this.notify(missionId, content, view.subjectsOf(unrecognised), { dedupe: true, trigger: NOTICE_TEMPLATES.fallthrough.trigger, reason, statement })
     })
     return true
   }
@@ -1581,8 +1574,8 @@ export class Notices {
       // stop the board-level notice, and this notice no longer depends on prose
       // to say which subject is stuck.
       const stuck = leftover.length ? leftover : view.nonTerminal
-      const { content, statement } = renderNotice('stall', { reason, unschedulable: leftover, subjects: view.subjectsOf(stuck) })
-      this.notify(mission.id, content, view.subjectsOf(stuck), { trigger: NOTICE_TEMPLATES.stall.trigger, reason, statement })
+      const { content, statement } = renderNotice('board-stall', { reason, unschedulable: leftover, subjects: view.subjectsOf(stuck) })
+      this.notify(mission.id, content, view.subjectsOf(stuck), { trigger: NOTICE_TEMPLATES['board-stall'].trigger, reason, statement })
       // W3: the stall notice is the no-silent-state witness for this state.
       mission.witness = { fingerprint, kind: 'W3', at: this.rt.now() }
       this.rt.store.put('missions', mission)

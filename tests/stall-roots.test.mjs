@@ -472,7 +472,7 @@ for (const repaired of [true, false]) {
     assert.ok(reminder !== undefined, 'the rejection decision\'s reminder reaches the owner')
     assert.deepEqual(reminder.subjects, [rootSubject], 'the reminder names the root, not the rejecting review')
     // The W3 board stall lists the review too; its reminders judge the same rule.
-    const stall = f.notices().find(delivery => delivery.notice?.dedupKey?.startsWith('mission/stalled:'))
+    const stall = f.notices().find(delivery => delivery.notice?.dedupKey?.startsWith('board-stall:'))
     assert.ok(stall?.subjects.includes(reviewSubject), 'the W3 stall lists the rejecting review')
     assert.equal(remindersOf(stall).length, f.runtime.notices.maxObligationFollowups, 'every W3 reminder is recorded')
     assert.deepEqual(remindersOf(stall).map(fact => fact.subjects), remindersOf(stall).map(() => [rootSubject]), 'the W3 reminders name the root only')
