@@ -56,16 +56,16 @@ export function unsupportedEffort(error: unknown): { requested?: string; message
 
 type WriterBusyRecovery = { at: number; attempts: number; detail: string } & (
   { candidate: AdmissionCandidate }
-  | { missionId: string; chain: GuardChainId; context: GuardTerminalContext }
+  | { missionId: string; key: string; chain: GuardChainId; context: GuardTerminalContext }
 )
 const writerRecoveries = new WeakMap<SwarmRuntime, Map<string, WriterBusyRecovery & { count: number }>>()
 
-/** Coalesce one failed origin, retaining distinct admissions and guard failures. */
+/** Coalesce one failed origin: an admission by its refusal row, a guard terminal by the request (`guardTerminalKey`) it could not write. */
 export function queueWriterBusy(rt: SwarmRuntime, recovery: WriterBusyRecovery): void {
   const pending = writerRecoveries.get(rt) ?? new Map<string, WriterBusyRecovery & { count: number }>()
   writerRecoveries.set(rt, pending)
   const key = 'candidate' in recovery ? `admission:${recovery.candidate.missionId}:${admissionRowId(recovery.candidate, 'writer_busy')}`
-    : `guard:${JSON.stringify([recovery.missionId, recovery.chain, recovery.context.taskId, recovery.context.memberId])}`
+    : `guard:${recovery.missionId}:${recovery.key}`
   const previous = pending.get(key)
   pending.set(key, { ...recovery, at: previous?.at ?? recovery.at, count: (previous?.count ?? 0) + 1 })
 }
@@ -188,9 +188,9 @@ export class RefusalRegistry {
             this.upsertAdmission(record)
           } else {
             // This was a failed escalation write, never an admission decision.
-            // Record the historical failure; normal guards re-evaluate today's state.
+            // Record the historical failure of the request `noticeKey` names; normal guards re-evaluate today's state.
             this.rt.store.event(missionId, 'mission/stalled', 'runtime', {
-              cause: 'guard-terminal-write-failed', chain: busy.chain,
+              cause: 'guard-terminal-write-failed', chain: busy.chain, noticeKey: busy.key,
               taskId: busy.context.taskId ?? null, memberId: busy.context.memberId ?? null,
               detail: busy.detail, attempts: busy.attempts, count: busy.count, firstAt: busy.at,
             })
@@ -418,7 +418,7 @@ export function emitGuardTerminal(rt: SwarmRuntime, missionId: string, chain: Gu
     // is recorded once the writer is free (`recordWriterBusyRecovery`), and the
     // chain re-derives its state on the next pass.
     if (error instanceof WriterBusyError) {
-      queueWriterBusy(rt, { at: rt.now(), attempts: error.attempts, missionId, chain, context, detail: error.message })
+      queueWriterBusy(rt, { at: rt.now(), attempts: error.attempts, missionId, key, chain, context, detail: error.message })
       return terminal
     }
     throw error

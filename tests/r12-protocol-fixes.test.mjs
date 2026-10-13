@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import { join } from 'node:path'
 import { OwnerReplyGuard } from '../lib/owner-reply.js'
 import { RoleScoper } from '../lib/roles.js'
-import { RefusalRegistry, emitGuardTerminal } from '../lib/refusals.js'
+import { RefusalRegistry, emitGuardTerminal, guardTerminalKey } from '../lib/refusals.js'
 import { WriterBusyError } from '../lib/store.js'
 import { pendingReadiness } from '../lib/arena.js'
 import { Attempts, pendingStopOwner } from '../lib/attempts.js'
@@ -117,7 +117,31 @@ test('R12: failed guard writes preserve their origin without manufacturing an ad
   assert.equal(f.events[0].data.cause, 'guard-terminal-write-failed')
   assert.equal(f.events[0].data.chain, 'attempt_lease')
   assert.equal(f.events[0].data.taskId, 'task')
-  assert.deepEqual(Object.keys(f.events[0].data).filter(key => /notif|notice/i.test(key)), [], 'the cause states the condition: no field restates what the ledger did')
+  assert.equal(f.events[0].data.noticeKey, guardTerminalKey('attempt_lease', 'stop:task'), 'the record names the request that was not written')
+  assert.equal(Object.hasOwn(f.events[0].data, 'ownerNotified'), false, 'the cause states the condition: no field restates what the ledger did')
+})
+
+test('a busy writer records each guard request it could not write: distinct openers of one chain are distinct records, and a repeat of one is counted on its record', () => {
+  const f = refusalFixture()
+  // One task and member, two facts that end the attempt chain; one ceiling chain under two limits.
+  const failures = [
+    ['attempt_lease', { taskId: 'task', memberId: 'member', detail: 'idle close-out abandoned attempt_1', localKey: 'closeout-abandoned:attempt_1' }],
+    ['attempt_lease', { taskId: 'task', memberId: 'member', detail: 'idle close-out reached the recovery limit', localKey: 'recovery-exhausted:task@2' }],
+    ['task_ceiling', { detail: 'mission task budget exhausted', localKey: 'task-budget:1' }],
+    ['task_ceiling', { detail: 'mission experiment budget exhausted', localKey: 'experiment-budget:0' }],
+    ['attempt_lease', { taskId: 'task', memberId: 'member', detail: 'idle close-out abandoned attempt_1', localKey: 'closeout-abandoned:attempt_1' }],
+  ]
+  for (const [chain, context] of failures) emitGuardTerminal(f.rt, 'mission', chain, context)
+  f.release()
+  f.registry.recordWriterBusyRecovery()
+  assert.deepEqual(f.events.map(event => [event.data.cause, event.data.noticeKey, event.data.count]), [
+    ['guard-terminal-write-failed', guardTerminalKey('attempt_lease', 'closeout-abandoned:attempt_1'), 2],
+    ['guard-terminal-write-failed', guardTerminalKey('attempt_lease', 'recovery-exhausted:task@2'), 1],
+    ['guard-terminal-write-failed', guardTerminalKey('task_ceiling', 'task-budget:1'), 1],
+    ['guard-terminal-write-failed', guardTerminalKey('task_ceiling', 'experiment-budget:0'), 1],
+  ])
+  f.registry.recordWriterBusyRecovery()
+  assert.equal(f.events.length, 4, 'a drained record is not written twice')
 })
 
 test('R12: pending readiness requires a submitted source and an idle independent reviewer', () => {
