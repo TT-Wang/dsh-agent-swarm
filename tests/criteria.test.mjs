@@ -123,6 +123,19 @@ test('a review\'s covers move onto its source, once, so validating again and com
   assert.deepEqual(validatePlan(reversed).tasks.map(task => [task.key, task.covers]), [['review', undefined], ['code', ['c1', 'c2']]], 'a review listed before its source folds the same way')
 })
 
+test('a criterion a deliverable and its review both cite is cited once on the deliverable, so the saved draft validates again and launches', async t => {
+  const shared = workspace => { const input = plan(workspace); for (const task of input.tasks) task.covers = ['c1', 'c2']; return input }
+  const folded = validatePlan(shared('/repo'))
+  assert.deepEqual(folded.tasks.map(task => [task.key, task.covers]), [['code', ['c1', 'c2']], ['review', undefined]])
+  assert.equal(JSON.stringify(validatePlan(folded)), JSON.stringify(folded), 'a second validation sees the folded plan')
+  const { dir, runtime } = await makeRuntime(t, { workers: new FakeWorkers(), config: { tickMs: 60000, checkTimeoutMs: undefined } })
+  const owner = { sessionId: 'owner' }
+  const draft = runtime.createDraft(owner, shared(dir), { grantRoot: dir, source: 'session' })
+  assert.deepEqual(draft.input.tasks.map(task => task.covers), [['c1', 'c2'], undefined], 'the saved draft holds each id once')
+  const launched = await runtime.launchDraft(owner, draft.id, draft.revision)
+  assert.deepEqual([launched.mission.status, launched.tasks.find(task => task.kind === 'implementation').covers], ['active', ['c1', 'c2']])
+})
+
 test('a review\'s covers are checked where the plan wrote them and move onto its source only afterwards, so a refusal names each field once and never one the plan did not write', () => {
   const located = error => error.diagnostics.map(diagnostic => [diagnostic.code, diagnostic.location])
   // The review is listed before its source and names an unknown id: one diagnostic, at the review.
