@@ -249,12 +249,6 @@ export interface Mission {
    * the hung call ever returning; cleared by the next successful delivery.
    */
   outboxStarved?: { deliveryId: string; attempts: number; at: number }
-  /**
-   * S7: the isolation invariant refusal already recorded for this mission
-   * (`<memberId>:<violation>`). Dedup only: an unchanged violation is not
-   * re-announced, and a changed one is.
-   */
-  isolationRefusal?: string
 }
 /** Host-observed operation; lifecycle timestamps are not a completion estimate. */
 export interface WorkerActivity {

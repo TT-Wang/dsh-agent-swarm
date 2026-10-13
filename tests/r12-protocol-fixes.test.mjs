@@ -109,7 +109,7 @@ test('R12: writer recovery retains distinct refusals and flushes them only under
 
 test('R12: failed guard writes preserve their origin without manufacturing an admission', () => {
   const f = refusalFixture()
-  emitGuardTerminal(f.rt, 'mission', 'attempt_lease', { taskId: 'task', memberId: 'member', detail: 'lease stop failed' })
+  emitGuardTerminal(f.rt, 'mission', 'attempt_lease', { taskId: 'task', memberId: 'member', detail: 'lease stop failed', localKey: 'stop:task' })
   f.release()
   f.registry.recordWriterBusyRecovery()
   assert.equal(f.admissions.size, 0)
@@ -117,7 +117,7 @@ test('R12: failed guard writes preserve their origin without manufacturing an ad
   assert.equal(f.events[0].data.cause, 'guard-terminal-write-failed')
   assert.equal(f.events[0].data.chain, 'attempt_lease')
   assert.equal(f.events[0].data.taskId, 'task')
-  assert.equal(f.events[0].data.ownerNotified, false)
+  assert.deepEqual(Object.keys(f.events[0].data).filter(key => /notif|notice/i.test(key)), [], 'the cause states the condition: no field restates what the ledger did')
 })
 
 test('R12: pending readiness requires a submitted source and an idle independent reviewer', () => {

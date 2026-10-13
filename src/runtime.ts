@@ -1308,13 +1308,13 @@ export class SwarmRuntime {
       // tool result carries the prose; the durable coded decision request makes
       // the refusal a recorded decision with the executable exits (raise the
       // ceiling with swarm_budget, or withdraw work with swarm_cancel).
-      emitGuardTerminal(this, missionId, 'task_ceiling', { detail: `mission task budget exhausted (${tasks.length}/${mission.budget.maxTasks} tasks admitted)` })
+      emitGuardTerminal(this, missionId, 'task_ceiling', { detail: `mission task budget exhausted (${tasks.length}/${mission.budget.maxTasks} tasks admitted)`, localKey: `task-budget:${mission.budget.maxTasks}` })
       throw new PolicyError('mission_task_budget_exhausted', 'budget_error', '[mission_task_budget_exhausted] Mission task budget exhausted: raise maxTasks with swarm_budget(budget, reason), then propose the task again')
     }
     if (input.experiment && tasks.filter(t => t.experiment).length >= mission.budget.maxExperiments) {
       const used = tasks.filter(t => t.experiment).length
       if (!owner) this.refuseProposal(mission, key, input.title, `mission experiment budget exhausted (${used}/${mission.budget.maxExperiments} experiments admitted)`, mission.budget.maxExperiments)
-      emitGuardTerminal(this, missionId, 'task_ceiling', { detail: `mission experiment budget exhausted (${used}/${mission.budget.maxExperiments} experiments admitted)` })
+      emitGuardTerminal(this, missionId, 'task_ceiling', { detail: `mission experiment budget exhausted (${used}/${mission.budget.maxExperiments} experiments admitted)`, localKey: `experiment-budget:${mission.budget.maxExperiments}` })
       throw new PolicyError('mission_experiment_budget_exhausted', 'budget_error', 'Mission experiment budget exhausted')
     }
     const dependencies = [...new Set(normalizeReviewDependencies(input.kind, input.reviewOf, input.dependencies))]
@@ -3844,7 +3844,8 @@ export class SwarmRuntime {
     })
     // S4b: the durable event carried the code, the owner notice did not. The
     // shared coded terminal names the task, the dimension and the exits.
-    emitGuardTerminal(this, mission.id, 'task_ceiling', { taskId: task.id, ...(ownerId === undefined ? {} : { memberId: ownerId }), detail: `${task.title} (${task.id}) exhausted its own ${ceiling.dimension} ceiling (${ceiling.used}/${ceiling.limit}) and blocked` })
+    emitGuardTerminal(this, mission.id, 'task_ceiling', { taskId: task.id, ...(ownerId === undefined ? {} : { memberId: ownerId }), localKey: `ceiling:${taskSubject(task)}:${ceiling.dimension}`,
+      detail: `${task.title} (${task.id}) exhausted its own ${ceiling.dimension} ceiling (${ceiling.used}/${ceiling.limit}) and blocked` })
     this.attempts.resumeStoppedAttempt(mission.id, task)
     this.kick(mission.id)
   }
@@ -4215,31 +4216,6 @@ export class SwarmRuntime {
     return left.some(a => right.some(b => scopeKeysOverlap(a, b)))
   }
   
-  /**
-   * A durable refusal, not a silent skip: the invariant is named, the offending
-   * member and worktree are recorded, and the owner is told the executable exit
-   * (each live member needs its own isolated worktree). Dedup is per distinct
-   * violation so a corrupted board does not wake the owner every tick.
-   */
-  refuseIsolation(missionId: string, member: Member, violation: string): void {
-    const mission = this.store.get('missions', missionId)
-    if (mission === undefined || terminal(mission)) return
-    const key = `${member.id}:${violation}`
-    if (mission.isolationRefusal === key) return
-    mission.isolationRefusal = key
-    mission.updatedAt = this.now()
-    this.commit(missionId, () => {
-      // The refusal is durable twice over: the mission row keeps the exact
-      // violation (so it is re-derivable and clears only when repaired) and the
-      // owner notice is a durable delivery with the executable exit.
-      this.store.put('missions', mission)
-    })
-    // S4b: the isolation refusal is the workspace chain's terminal for this
-    // dispatch. The violation is preserved verbatim as the detail and the owner
-    // gets the shared coded decision request instead of prose.
-    emitGuardTerminal(this, missionId, 'workspace', { memberId: member.id, detail: `isolation invariant refused a dispatch to ${member.name} (${member.id}): ${violation}` })
-  }
-
   /**
    * Queue one scheduling body on the mission's serial queue, unless one is
    * already queued or running there (`openPass`): that body re-reads the board

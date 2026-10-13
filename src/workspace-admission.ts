@@ -10,6 +10,7 @@
 import { tmpdir } from 'node:os'
 import { stopPending } from './attempts.ts'
 import { claimFor, isContained, reauthorizeWorkspace, WorkspaceRevokedError, WORKSPACE_AUTHORIZATION_CODE, type WorkspaceClaim } from './authorization.ts'
+import { reasonDigest } from './notices.ts'
 import { emitGuardTerminal, guardTerminalHeld, guardTerminalKey } from './refusals.ts'
 import type { SwarmRuntime } from './runtime.ts'
 import { progressed, type SchedulingPass } from './scheduling.ts'
@@ -493,18 +494,22 @@ export class WorkspaceAdmission {
     return report
   }
 
-  /** The isolation precondition for one dispatch: refuse the member and record why when it fails. */
+  /**
+   * The isolation precondition for one dispatch. A member a violation lists is
+   * refused, durably: the workspace chain's terminal, the one emitter of
+   * "isolation blocks dispatch", names the violation and its executable exit
+   * (each live member needs its own isolated worktree). The request is the
+   * violation's (`isolationOpener`), naming the unfinished work of every member
+   * it lists: one decision per distinct violation however many members it
+   * refuses and however often, outstanding while the invariant still lists it
+   * (`Notices.openGuardTerminal`), and a changed violation is a new one.
+   */
   isolationAllows(missionId: string, member: Member): boolean {
     const violation = this.isolationIssues(missionId).find(entry => entry.memberIds.includes(member.id))
-    if (violation !== undefined) { this.rt.refuseIsolation(missionId, member, violation.message); return false }
-    // Change-and-return: a repaired board forgets the refusal key, so the same
-    // violation recurring later wakes the owner again instead of staying silent.
-    const mission = this.rt.store.get('missions', missionId)
-    if (mission?.isolationRefusal !== undefined) {
-      delete mission.isolationRefusal
-      this.rt.commit(missionId, () => this.rt.store.put('missions', mission))
-    }
-    return true
+    if (violation === undefined) return true
+    emitGuardTerminal(this.rt, missionId, 'workspace', { memberIds: violation.memberIds, localKey: isolationOpener(violation.message),
+      detail: `the isolation invariant refuses dispatch: ${violation.message}` })
+    return false
   }
 
   /**
@@ -529,6 +534,9 @@ export class WorkspaceAdmission {
 }
 
 interface IsolationIssue { memberIds: string[]; message: string }
+
+/** The opener of the workspace terminal one isolation violation raises: the violation's own text. */
+export function isolationOpener(message: string): string { return `isolation:${reasonDigest(message)}` }
 
 /** Identity-bearing evidence shared by admission and its read-only explanation. */
 export function isolationIssues(allMembers: readonly Member[], tasks: readonly Task[], overlaps: (left: string[], right: string[]) => boolean): IsolationIssue[] {

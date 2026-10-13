@@ -13,7 +13,9 @@
  * (`isolationViolations`), not by inspecting code: a generated plan is scheduled
  * and every observation must be violation-free. The second test corrupts the
  * durable state (two live members in one worktree) and requires the dispatch
- * path to record a durable refusal instead of starting a worker there.
+ * path to record a durable refusal instead of starting a worker there: one
+ * decision per violation on the deliveries ledger, outstanding exactly while
+ * the invariant lists that violation.
  */
 import test from 'node:test'
 import assert from 'node:assert/strict'
@@ -71,7 +73,7 @@ test('S7: generated member/task sets keep live workers within provisioned worktr
   }
 })
 
-test('S7: a shared worktree is refused durably, never dispatched into, and clears after repair', async () => {
+test('S7: a shared worktree is refused durably, never dispatched into, and its decision ends with the repair', async () => {
   const f = await setup({ config: { tickMs: 10, stallPassTimeoutMs: 60_000 } })
   try {
     f.workers.autoIdle = true
@@ -84,14 +86,16 @@ test('S7: a shared worktree is refused durably, never dispatched into, and clear
       f.runtime.store.put('members', reviewer)
     })
     const task = f.propose({ assigneeId: f.reviewer.id })
-    const refused = await eventually(() => {
-      const notice = f.runtime.store.list('deliveries', f.mission.id)
-        .find(delivery => delivery.to === 'owner' && /\[workspace_terminal\]/.test(delivery.content))
-      const key = f.runtime.store.get('missions', f.mission.id).isolationRefusal
-      return notice !== undefined && key !== undefined ? { notice, key } : undefined
-    }, 'a shared worktree must produce a durable refusal', 6_000)
-    assert.match(refused.key, new RegExp(f.reviewer.id), 'the durable refusal names the member that was not started')
-    assert.match(refused.key, /share one provisioned worktree/, 'the durable refusal names the violation')
+    const terminals = () => f.runtime.store.list('deliveries', f.mission.id)
+      .filter(delivery => delivery.to === 'owner' && /\[workspace_terminal\]/.test(delivery.content))
+    const relevant = notice => f.runtime.ownerDeliveryRelevant(f.runtime.mission(f.mission.id), f.runtime.store.get('deliveries', notice.id))
+    const refused = { notice: await eventually(() => terminals()[0], 'a shared worktree must produce a durable refusal', 6_000) }
+    const [violation] = f.runtime.isolationViolations(f.mission.id)
+    assert.match(violation, new RegExp(`${f.author.id}.*${f.reviewer.id}|${f.reviewer.id}.*${f.author.id}`), 'the violation names both members that share the worktree')
+    assert.match(refused.notice.notice.dedupKey, /^guard-terminal:workspace:workspace_terminal:isolation:[0-9a-f]{16}$/, 'the refusal is keyed by the violation, not by a member or the board')
+    assert.equal(refused.notice.notice.reason, `the isolation invariant refuses dispatch: ${violation}`, 'and records the violation as its reason')
+    assert.deepEqual(refused.notice.subjects, [`${task.id}@${taskOf(f.runtime, task.id).epoch}`, `mission:${f.mission.id}`].sort(), 'it names the unfinished work of every member the violation lists: the reviewer\'s task, and the mission root for the author, who holds none')
+    assert.equal(relevant(refused.notice), true, 'the decision is outstanding while the invariant lists the violation')
     // S4b: the isolation notice is the shared coded workspace terminal now. The
     // assertion is the coded contract (stable code, the violation as the detail,
     // and the executable exits) instead of the removed prose-only wording.
@@ -103,6 +107,10 @@ test('S7: a shared worktree is refused durably, never dispatched into, and clear
     await sleep(120)
     assert.equal(f.workers.started.filter(id => id === f.reviewer.id).length, starts,
       'no worker handle is started for the refused member while the violation holds')
+    assert.equal(terminals().length, 1, 'one decision for the one violation, though dispatch refuses both members on every tick')
+    assert.deepEqual(f.runtime.store.list('deliveries', f.mission.id).filter(delivery => delivery.to === 'owner' && delivery.notice?.dedupKey.startsWith('dispatch-question:')), [],
+      'and the dispatch question adds no second wording: the workspace terminal is the one emitter of this cause')
+    assert.equal(Object.hasOwn(f.runtime.store.get('missions', f.mission.id), 'isolationRefusal'), false, 'nothing on the mission row records the refusal')
 
     // Repair the durable state: each live member gets its own isolated worktree.
     f.runtime.store.transaction(() => {
@@ -111,10 +119,17 @@ test('S7: a shared worktree is refused durably, never dispatched into, and clear
       f.runtime.store.put('members', reviewer)
     })
     assert.deepEqual(f.runtime.isolationViolations(f.mission.id), [], 'the repaired board satisfies the invariant')
-    await eventually(() => f.runtime.store.get('missions', f.mission.id).isolationRefusal === undefined,
-      'the repaired board forgets the refusal so a recurrence re-notifies', 4_000)
+    assert.equal(relevant(refused.notice), false, 'the repair ends the decision: a queued one is withheld')
     const running = await eventually(() => taskOf(f.runtime, task.id).status === 'running' ? taskOf(f.runtime, task.id) : undefined,
       'after the repair the pending task is dispatched normally', 6_000)
     assert.equal(running.attempt.ownerId, f.reviewer.id)
+
+    // A changed violation is a new decision: the author now has no worktree at all.
+    f.runtime.store.transaction(() => f.runtime.store.put('members', { ...f.runtime.store.get('members', f.author.id), workspace: '' }))
+    f.propose({ title: 'Work for the author' })
+    const second = await eventually(() => terminals()[1], 'a changed violation must wake the owner again', 6_000)
+    assert.notEqual(second.notice.dedupKey, refused.notice.notice.dedupKey)
+    assert.match(second.content, /has no provisioned isolated worktree/, 'the new decision names the new violation')
+    assert.deepEqual([relevant(second), relevant(refused.notice)], [true, false], 'and only the violation the invariant lists is outstanding')
   } finally { await f.cleanup() }
 })

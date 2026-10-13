@@ -431,7 +431,7 @@ export class RuntimeGates {
     // Co-firing guards: the budget guard fires with the attempt/lease chain (the
     // preserved attempts) and with the dispatch sweep (nothing new is admitted
     // while the pause holds).
-    emitGuardTerminal(this.rt, mission.id, 'budget', { detail: mission.reason! })
+    emitGuardTerminal(this.rt, mission.id, 'budget', { detail: mission.reason!, localKey: `budget-pause:${mission.budgetPause.id}` })
     this.beginBudgetStop(mission.id, mission.budgetPause.id)
   }
 

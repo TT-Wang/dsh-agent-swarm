@@ -653,3 +653,73 @@ test('a wedged pass\'s naming is outstanding exactly while its mission is wedged
   f.runtime.cancel(f.owner, f.mission.id, { taskId: task.id, reason: 'No longer needed' })
   assert.equal(relevant(f, naming), false, 'nor is it outstanding once the work it named is withdrawn')
 })
+
+const terminalRows = (f, chain) => ownerRows(f).filter(delivery => delivery.notice.dedupKey.startsWith(`guard-terminal:${chain}:`))
+/** Each told fact's stall event names its row: the events of one cause, as the keys of the rows they were written with. */
+const stallEventKeys = (f, cause) => events(f.runtime, f.mission.id, 'mission/stalled').filter(event => event.data.cause === cause).map(event => event.data.noticeKey)
+
+test('L-25: a guard terminal is one request per fact that opened it: the task budget and the experiment budget refused on one board are two, and a repeat on another board is none', async t => {
+  const f = await setup({ clock: new FakeClock(), budget: { maxTasks: 1, maxExperiments: 0 } })
+  t.after(f.cleanup)
+  f.propose({ title: 'The one admitted task' })
+  await f.runtime.settle(f.mission.id)
+  const board = f.runtime.fingerprint(f.mission.id)
+  assert.throws(() => f.propose({ title: 'One too many' }), /mission_task_budget_exhausted/)
+  f.runtime.updateBudget(f.owner, f.mission.id, { ...f.runtime.mission(f.mission.id).budget, maxTasks: 5 }, 'room for more work')
+  await f.runtime.settle(f.mission.id)
+  assert.throws(() => f.propose({ title: 'An experiment', experiment: true }), /experiment budget exhausted/)
+  assert.equal(f.runtime.fingerprint(f.mission.id), board, 'both refusals met one board digest: a raised ceiling is no board change')
+  const keys = () => terminalRows(f, 'task_ceiling').map(delivery => delivery.notice.dedupKey)
+  assert.deepEqual(keys().map(key => key.split(':').slice(3).join(':')), ['task-budget:1', 'experiment-budget:0'], 'each refusal is its own request, keyed by the limit it met')
+  assert.deepEqual(terminalRows(f, 'task_ceiling').map(delivery => delivery.notice.reason),
+    ['mission task budget exhausted (1/1 tasks admitted)', 'mission experiment budget exhausted (0/0 experiments admitted)'], 'and its row records the refusal as its reason')
+  assert.deepEqual(stallEventKeys(f, 'guard-terminal'), keys(), 'one stall event per request, naming its row')
+  // The board changes; the same limit refuses the same admission again.
+  f.propose({ title: 'A second admitted task', assigneeId: f.reviewer.id, kind: 'research', checks: [] })
+  await f.runtime.settle(f.mission.id)
+  assert.notEqual(f.runtime.fingerprint(f.mission.id), board)
+  assert.throws(() => f.propose({ title: 'The experiment again', experiment: true }), /experiment budget exhausted/)
+  assert.deepEqual([keys().length, stallEventKeys(f, 'guard-terminal').length], [2, 2], 'the owner holds that request: a repeat writes no row and no event, whatever the board digest is')
+  // A raised limit that refuses again is a new fact (told in a new wake window, so as its own delivery).
+  f.clock.advance(f.runtime.notices.wakeBudgetWindowMs + 1)
+  f.runtime.updateBudget(f.owner, f.mission.id, { ...f.runtime.mission(f.mission.id).budget, maxExperiments: 1 }, 'one experiment')
+  f.propose({ title: 'The admitted experiment', experiment: true })
+  assert.throws(() => f.propose({ title: 'A second experiment', experiment: true }), /experiment budget exhausted/)
+  assert.equal(keys().at(-1).split(':').slice(3).join(':'), 'experiment-budget:1', 'the limit the owner raised refuses under its own request')
+  assert.deepEqual(stallEventKeys(f, 'guard-terminal'), keys())
+})
+
+test('L-25: a failed dispatch is one request per member and failure, and the dispatch question leaves the task it names to it', async t => {
+  const f = await setup({ clock: new FakeClock(), workers: new FakeWorkers({ autoIdle: true }) })
+  t.after(f.cleanup)
+  // A guard of the author's dispatch chain throws on every pass.
+  let failure = 'worktree probe failed: EIO'
+  const isolationAllows = f.runtime.isolationAllows.bind(f.runtime)
+  f.runtime.isolationAllows = (missionId, member) => { if (member.id === f.author.id) throw new Error(failure); return isolationAllows(missionId, member) }
+  const task = f.propose({ title: 'Work for the author' })
+  await f.runtime.settle(f.mission.id)
+  await ticks(f, 2)
+  const subject = `${task.id}@${taskOf(f.runtime, task.id).epoch}`
+  const terminals = () => terminalRows(f, 'attempt_lease')
+  const questions = () => ownerRows(f).filter(delivery => delivery.notice.dedupKey.startsWith('dispatch-question:'))
+  assert.equal(taskOf(f.runtime, task.id).status, 'pending', 'the author is never given its task')
+  assert.deepEqual(terminals().map(delivery => [delivery.notice.dedupKey.replace(/[0-9a-f]{16}$/, '<digest>'), delivery.notice.reason, delivery.subjects]),
+    [[`guard-terminal:attempt_lease:attempt_terminal:dispatch-failed:${f.author.id}:<digest>`, `Error: ${failure}`, [subject]]],
+    'the chain\'s terminal is keyed by the member and the failure, records the failure as its reason and names the member\'s unfinished work')
+  // The board changes under the same failure: the reviewer is given work.
+  const board = f.runtime.fingerprint(f.mission.id)
+  f.propose({ title: 'Work for the reviewer', assigneeId: f.reviewer.id, kind: 'research', checks: [] })
+  await f.runtime.settle(f.mission.id)
+  await ticks(f, 3)
+  assert.notEqual(f.runtime.fingerprint(f.mission.id), board)
+  assert.equal(terminals().length, 1, 'the same failure on another board digest is the request the owner holds')
+  assert.deepEqual(questions(), [], 'and the dispatch question does not word that task\'s one cause a second time, on either board')
+  // Another failure of the same chain on this board is another request.
+  const changed = f.runtime.fingerprint(f.mission.id)
+  failure = 'worktree probe failed: ENOSPC'
+  await ticks(f, 2)
+  assert.equal(f.runtime.fingerprint(f.mission.id), changed)
+  assert.deepEqual(terminals().map(delivery => delivery.notice.reason), ['Error: worktree probe failed: EIO', `Error: ${failure}`], 'a different failure on an unchanged board is told')
+  assert.deepEqual(stallEventKeys(f, 'guard-terminal'), terminals().map(delivery => delivery.notice.dedupKey), 'one stall event per request, naming its row')
+  assert.deepEqual(questions(), [])
+})

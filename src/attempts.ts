@@ -277,7 +277,7 @@ export class Attempts {
               taskId: fresh.id, ...(state.memberId === undefined ? { memberIds: ownerIds } : { memberId: state.memberId }), reason, retries: state.retries,
             })
           })
-          if (recoveryExhausted && mission.status === 'active' && fresh.status !== 'cancelled') emitGuardTerminal(this.rt, missionId, 'attempt_lease', { taskId: fresh.id, memberId: state.memberId, detail: `${reason === 'lease-expired' ? 'lease expiry exhausted' : 'idle close-out reached'} the recovery limit (${fresh.recoveryCount ?? 0}/${fresh.maxRecoveryAttempts ?? this.rt.config.maxTasksPerMember}) and left the task blocked` })
+          if (recoveryExhausted && mission.status === 'active' && fresh.status !== 'cancelled') emitGuardTerminal(this.rt, missionId, 'attempt_lease', { taskId: fresh.id, memberId: state.memberId, localKey: `recovery-exhausted:${taskSubject(fresh)}`, detail: `${reason === 'lease-expired' ? 'lease expiry exhausted' : 'idle close-out reached'} the recovery limit (${fresh.recoveryCount ?? 0}/${fresh.maxRecoveryAttempts ?? this.rt.config.maxTasksPerMember}) and left the task blocked` })
         })
         if (this.stopRetries.get(task.id) === state) this.stopRetries.delete(task.id)
         if (state.memberId === undefined) for (const peer of this.rt.store.list('tasks', missionId)) if (peer.id !== task.id && stopPending(peer)) this.resumeStoppedAttempt(missionId, peer)
@@ -601,7 +601,7 @@ export class Attempts {
       // checkpoint guard (a dirty or unprovisioned worktree) and the close-out
       // guard co-fire here, so the owner gets the shared coded decision request
       // naming the task and the exits instead of a prose-only reason.
-      emitGuardTerminal(this.rt, mission.id, 'attempt_lease', { taskId: failed.id, memberId: member.id, detail: terminalDetail(failed.output!) })
+      emitGuardTerminal(this.rt, mission.id, 'attempt_lease', { taskId: failed.id, memberId: member.id, localKey: `closeout-failed:${taskSubject(failed)}`, detail: terminalDetail(failed.output!) })
       this.resumeStoppedAttempt(mission.id, failed)
       return
     }
@@ -628,7 +628,7 @@ export class Attempts {
     // chain fires with the workspace capture guard that produced the checkpoint,
     // with the dispatch sweep that re-pends the task, and (when the recovery
     // limit is already spent) with the close-out exhaustion terminal below.
-    emitGuardTerminal(this.rt, mission.id, 'attempt_lease', { taskId: current.id, memberId: member.id, detail: `idle close-out abandoned attempt ${task.attempt?.id ?? 'unknown'}: the workspace was checkpointed at ${checkpoint.commit} and the task was re-pended (recovery ${current.recoveryCount ?? 0})` })
+    emitGuardTerminal(this.rt, mission.id, 'attempt_lease', { taskId: current.id, memberId: member.id, localKey: `closeout-abandoned:${task.attempt?.id ?? 'unknown'}`, detail: `idle close-out abandoned attempt ${task.attempt?.id ?? 'unknown'}: the workspace was checkpointed at ${checkpoint.commit} and the task was re-pended (recovery ${current.recoveryCount ?? 0})` })
     this.idleSignals.delete(member.id)
     this.resumeStoppedAttempt(mission.id, current)
   }
@@ -707,7 +707,7 @@ export class Attempts {
                   // the attempt/lease chain for this attempt: the workspace guard
                   // refused the capture, so recovery will refuse a dirty
                   // workspace too. The coded decision request replaces the prose.
-                  emitGuardTerminal(this.rt, missionId, 'attempt_lease', { taskId: task.id, memberId: oldOwner, detail: terminalDetail(reason) })
+                  emitGuardTerminal(this.rt, missionId, 'attempt_lease', { taskId: task.id, memberId: oldOwner, localKey: `checkpoint-failed:${attemptId}`, detail: terminalDetail(reason) })
                 }
               }
             }

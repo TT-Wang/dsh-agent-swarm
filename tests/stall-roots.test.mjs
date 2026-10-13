@@ -66,6 +66,7 @@ test('R14-F2(b): a blocked root is named once per root@epoch while a healthy sib
   const event = f.runtime.store.events(f.mission.id, 200).filter(item => item.type === 'mission/stalled' && item.data?.cause === 'stall-root').at(-1)
   assert.ok(event, 'the stall root is durable with its own cause')
   assert.equal(event.data.taskId, root.id)
+  assert.equal(event.data.noticeKey, notice.notice.dedupKey, 'and it names the row it was written with')
   await ticks(f, 6)
   assert.equal(f.stallRoots().length, 1, 'the same root@epoch never repeats')
 })

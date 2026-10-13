@@ -192,7 +192,7 @@ export class RefusalRegistry {
             this.rt.store.event(missionId, 'mission/stalled', 'runtime', {
               cause: 'guard-terminal-write-failed', chain: busy.chain,
               taskId: busy.context.taskId ?? null, memberId: busy.context.memberId ?? null,
-              detail: busy.detail, attempts: busy.attempts, count: busy.count, firstAt: busy.at, ownerNotified: false,
+              detail: busy.detail, attempts: busy.attempts, count: busy.count, firstAt: busy.at,
             })
           }
         })
@@ -248,8 +248,8 @@ export class RefusalRegistry {
  * durable decision request naming the executable exits. It has no conditions of
  * its own — it cannot be skipped, deduplicated away into silence, or left
  * waiting for a later pass — and the only thing that may suppress a repeat is
- * the fact that the *same* decision request is already durable for the same
- * board fingerprint.
+ * the fact that the *same* decision request, its chain and the fact that opened
+ * it, is already on the deliveries ledger.
  *
  * `guardTerminal` is the single builder of those requests, so the dispatch path
  * that emits them, the test-side board model in `tests/guard-model.mjs` and the
@@ -283,15 +283,22 @@ export interface GuardTerminal {
   exits: DecisionExit[]
 }
 
-/** Free text a caller knows at emission time; never a condition on the escalation. */
-export interface GuardTerminalContext {
+/** What a caller knows at emission time; never a condition on the escalation. */
+interface GuardTerminalScope {
   taskId?: string
   memberId?: string
+  /** The members whose unfinished work the request names, when the terminal is not one member's. */
+  memberIds?: readonly string[]
   detail?: string
-  /** A receipt or local fault identity must not churn with unrelated board work. */
-  questionId?: string
-  localKey?: string
 }
+/**
+ * The scope and the durable fact that opened the terminal: the question it
+ * leaves unanswered, or the opener its call site declares (`localKey`: an
+ * attempt, a pause, a limit value, a task at its epoch, a violation). The
+ * request's identity is its chain and that opener, never the board digest, so
+ * distinct failures of one chain are distinct requests and a repeat is none.
+ */
+export type GuardTerminalContext = GuardTerminalScope & ({ questionId: string; localKey?: never } | { localKey: string; questionId?: never })
 
 const GUARD_TERMINAL_CODES: Record<GuardChainId, string> = {
   budget: 'budget_terminal',
@@ -304,7 +311,7 @@ const GUARD_TERMINAL_CODES: Record<GuardChainId, string> = {
   owner_reply: 'owner_reply_missing',
 }
 
-const described = (context: GuardTerminalContext, fallback: string): string => context.detail ?? fallback
+const described = (context: GuardTerminalScope, fallback: string): string => context.detail ?? fallback
 
 /**
  * Build the unconditional terminal escalation of one guard chain. Pure and
@@ -312,7 +319,7 @@ const described = (context: GuardTerminalContext, fallback: string): string => c
  * element of the chain can prevent it from existing. The dispatch path wraps
  * the result in a durable event and owner decision notice.
  */
-export function guardTerminal(chain: GuardChainId, context: GuardTerminalContext = {}): GuardTerminal {
+export function guardTerminal(chain: GuardChainId, context: GuardTerminalScope = {}): GuardTerminal {
   const task = context.taskId ?? 'the held work'
   const member = context.memberId ?? 'the member'
   const messages: Record<GuardChainId, string> = {
@@ -359,9 +366,9 @@ export function guardTerminal(chain: GuardChainId, context: GuardTerminalContext
   return { chain, code: GUARD_TERMINAL_CODES[chain], message: messages[chain], exits: exits[chain] }
 }
 
-/** The durable dedup key of one terminal decision request: one per chain and board state, `question:<id>` or `localKey`. */
-export function guardTerminalKey(chain: GuardChainId, fingerprint: string): string {
-  return `guard-terminal:${chain}:${GUARD_TERMINAL_CODES[chain]}:${fingerprint}`
+/** The identity of one terminal decision request on the deliveries ledger: its chain and the fact that opened it. */
+export function guardTerminalKey(chain: GuardChainId, opener: string): string {
+  return `guard-terminal:${chain}:${GUARD_TERMINAL_CODES[chain]}:${opener}`
 }
 
 /** The dedup `emitGuardTerminal` applies: the owner already holds the decision request `key` names. */
@@ -370,29 +377,20 @@ export function guardTerminalHeld(rt: SwarmRuntime, missionId: string, key: stri
 }
 
 /**
- * Emit one guard-chain terminal: the durable decision request and the owner
- * notice that make it unconditional.
+ * Emit one guard-chain terminal: the owner's durable decision request and the
+ * stall event that names its row. Any module ends a guard chain here; it names
+ * the chain and passes the scope it already has with the fact that opened it:
  *
- * This is the *mechanical opt-in* for every call site that still ends a guard
- * chain in prose or in silence, including the ones outside this branch's scope
- * (`src/attempts.ts`, `src/workspace-admission.ts`, `src/notices.ts`,
- * `src/runtime.ts`). Wiring a site is a two-line change:
+ *     emitGuardTerminal(this.rt, missionId, '<chain>', { taskId, memberId, detail, localKey: '<opener>' })
  *
- *     const terminal = guardTerminal('<chain>', { taskId, memberId, detail })
- *     emitGuardTerminal(this.rt, missionId, '<chain>', { taskId, memberId, detail })
- *
- * The helper takes the runtime as its first argument (not a method on one
- * class), so a caller in any module can reach it without importing the
- * scheduling seam or the runtime class; `Scheduling.escalateGuardTerminal`
- * delegates here and keeps the dispatch path's call shape unchanged.
- *
- * Behaviour, in one sentence: the terminal is always built, and a durable row is
- * written unless the *same* decision request for the *same* board fingerprint is
- * already on the delivery ledger. Nothing else can suppress it; a writer-busy
- * transaction is recorded on the runtime's writer-busy flag and the state is
- * re-derived by the next pass.
+ * The terminal is always built, and its request is written unless the same
+ * request is already on the deliveries ledger. Nothing else suppresses it: a
+ * failure of the chain under another opener is another request whatever the
+ * board looks like, and a busy writer is recorded (`queueWriterBusy`), never
+ * silent. The request names the task it was asked about, else each named
+ * member's unfinished work, else the mission root (`noticeSubjectsFor`).
  */
-export function emitGuardTerminal(rt: SwarmRuntime, missionId: string, chain: GuardChainId, context: GuardTerminalContext = {}): GuardTerminal | undefined {
+export function emitGuardTerminal(rt: SwarmRuntime, missionId: string, chain: GuardChainId, context: GuardTerminalContext): GuardTerminal | undefined {
   const mission = rt.store.get('missions', missionId)
   // S4r-D5: only a terminal mission (completed/stopped) ends the chain's duty to
   // speak. A mission that left `active` without reaching a terminal status —
@@ -400,30 +398,25 @@ export function emitGuardTerminal(rt: SwarmRuntime, missionId: string, chain: Gu
   // the executable exit most — still emits the terminal.
   if (mission === undefined || rt.isMissionTerminal(mission)) return undefined
   const terminal = guardTerminal(chain, context)
-  const fingerprint = context.questionId !== undefined ? `question:${context.questionId}` : context.localKey ?? rt.fingerprint(missionId)
-  const key = guardTerminalKey(chain, fingerprint)
+  const key = guardTerminalKey(chain, context.localKey ?? `question:${context.questionId}`)
   if (guardTerminalHeld(rt, missionId, key)) return terminal
   try {
     rt.commit(missionId, () => {
       // The board-stall event type is reused with `cause: 'guard-terminal'`, so
       // the durable log names the chain and the code without inventing an
       // unregistered event type (the vocabulary is a separate owner surface).
+      // It exists only with the row its `noticeKey` names.
       rt.store.event(missionId, 'mission/stalled', 'runtime', {
         cause: 'guard-terminal', chain: terminal.chain, code: terminal.code,
-        taskId: context.taskId ?? null, memberId: context.memberId ?? null, detail: context.detail ?? null,
-        fingerprint, ownerNotified: true,
+        taskId: context.taskId ?? null, memberId: context.memberId ?? null, detail: context.detail ?? null, noticeKey: key,
       })
-      // R15-A1: the guard chain names the subject it terminated for: the task it
-      // was asked about, else the member's own unfinished work, else the mission
-      // root. Guard pair: guard-terminal x writer-busy, x the board-level witness
-      // (both are recorded for the same fingerprint; the subject is what tells the
-      // two apart without reparsing prose).
-      rt.notify(missionId, terminal.message, rt.noticeSubjectsFor(missionId, { taskId: context.taskId, memberId: context.memberId }), { dedupe: true, dedupKey: key, questionId: context.questionId })
+      const subjects = (context.memberIds ?? [context.memberId]).flatMap(memberId => rt.noticeSubjectsFor(missionId, { taskId: context.taskId, memberId }))
+      rt.notify(missionId, terminal.message, [...new Set(subjects)], { dedupKey: key, reason: context.detail, questionId: context.questionId })
     })
   } catch (error) {
-    // A busy writer must not turn an escalation into an unhandled rejection.
-    // The state is re-derived on the next pass, and the board-level witness path
-    // still speaks for a stalled board, so no silence follows.
+    // A busy writer must not turn an escalation into an unhandled rejection: it
+    // is recorded once the writer is free (`recordWriterBusyRecovery`), and the
+    // chain re-derives its state on the next pass.
     if (error instanceof WriterBusyError) {
       queueWriterBusy(rt, { at: rt.now(), attempts: error.attempts, missionId, chain, context, detail: error.message })
       return terminal

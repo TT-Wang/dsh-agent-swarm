@@ -1009,7 +1009,7 @@ test('S5: clearing every in-memory scheduling cache leaves the durable outcome u
     await ticks(f, 12)
     const after = taskOf(f.runtime, task.id)
     assert.equal(after.attempt.id, running.attempt.id, 'no duplicate assignment after the cache is cleared')
-    assert.equal(f.runtime.store.get('missions', f.mission.id).isolationRefusal, undefined, 'isolation holds without caches')
+    assert.deepEqual(f.runtime.store.list('deliveries', f.mission.id).filter(item => item.to === 'owner' && /\[workspace_terminal\]/.test(item.content)), [], 'isolation holds without caches: no workspace terminal was raised')
   } finally { await f.cleanup() }
 })
 

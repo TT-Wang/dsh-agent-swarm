@@ -13,8 +13,8 @@ import { assignmentAllows, canBorrowTask, canOwnReview, strandedReview } from '.
 import { liveReviewFor } from './admission.ts'
 import { pendingStopOwner, stopPending } from './attempts.ts'
 import { hasNotice } from './arena.ts'
-import { factKey, subjectsOfTasks, taskSubject } from './notices.ts'
-import { emitGuardTerminal, type GuardChainId, type GuardTerminal, type GuardTerminalContext } from './refusals.ts'
+import { factKey, reasonDigest, subjectsOfTasks, taskSubject } from './notices.ts'
+import { emitGuardTerminal, guardTerminalKey } from './refusals.ts'
 import { AdmissionRefusedError } from './scheduler.ts'
 import { isolationIssues } from './workspace-admission.ts'
 // R17-G6/G7: the one derivation of the derived member status.
@@ -105,6 +105,8 @@ export interface SchedulingPass {
 
 /** R16-D: the dedup-key family of the attempt reporting-bound escalation. */
 const ATTEMPT_SILENCE_PREFIX = 'attempt-silent:'
+/** The opener family of the attempt terminal a member's failed dispatch chain ends in: `dispatch-failed:<member>:<digest of the failure>`. */
+const DISPATCH_FAILED = 'dispatch-failed:'
 
 /** R16-D: one live attempt whose durable progress is past its declared bound. */
 interface SilentAttempt {
@@ -323,7 +325,11 @@ export class Scheduling {
           }
           } catch (error) {
             if (this.rt.shuttingDown || this.rt.mission(missionId).status !== 'active') return false
-            this.escalateGuardTerminal(missionId, 'attempt_lease', { memberId: member.id, detail: String(error) })
+            // The terminal of this member's chain, opened by the failure itself: the
+            // same throw on a later pass is the request the owner already holds,
+            // and another failure of the chain is another request.
+            const detail = String(error)
+            emitGuardTerminal(this.rt, missionId, 'attempt_lease', { memberId: member.id, detail, localKey: `${DISPATCH_FAILED}${member.id}:${reasonDigest(detail)}` })
             continue
           }
         }
@@ -362,8 +368,15 @@ export class Scheduling {
    * - no eligible member exists at all (nothing is ready for a member; the board
    *   is someone else's witness, not this notice's).
    *
-   * Otherwise the notice names a handle holder, a current prerequisite failure,
-   * or an unexplained dispatch gap. An idle handle alone proves no budget refusal.
+   * - every startable eligible member is spoken for by its own terminal, the
+   *   one emitter of that cause: the isolation invariant refuses it (the
+   *   workspace terminal, `WorkspaceAdmission.isolationAllows`), or the owner
+   *   holds its failed dispatch naming this task at this epoch (`dispatch`'s
+   *   attempt terminal). A dead-end chain and this question never word one
+   *   subject's one cause twice.
+   *
+   * Otherwise the notice names a handle holder or an unexplained dispatch gap.
+   * An idle handle alone proves no budget refusal.
    * - `handle-busy`: every member eligible for the task is working by the
    *   adapter's contract. The named holder is the task's assignee when the task
    *   is pinned, else the first eligible member whose handle is busy;
@@ -377,15 +390,17 @@ export class Scheduling {
       if (!eligible.length) continue
       const subjects = [taskSubject(task)]
       const dedupKey = `dispatch-question:${missionId}:${task.id}@${task.epoch}`
-      if (eligible.some(member => this.startBlocker(member) === undefined)) {
+      const startable = eligible.filter(member => this.startBlocker(member) === undefined)
+      if (startable.length) {
         const issues = isolationIssues(members, tasks, (left, right) => this.rt.scopesOverlap(left, right))
-        const startable = eligible.filter(member => this.startBlocker(member) === undefined)
-        const isolated = startable.filter(member => !issues.some(issue => issue.memberIds.includes(member.id)))
-        const detail = isolated.length === 0
-          ? `Workspace isolation prevents dispatch: ${issues.filter(issue => startable.some(member => issue.memberIds.includes(member.id))).map(issue => issue.message).join(' ')} Inspect the named members and repair their isolated workspaces before retrying.`
-          : 'An idle handle alone does not identify the dispatch blocker. Inspect the task and recorded admission/preparation diagnostics with swarm_observe; repair the reported cause or withdraw the task with swarm_cancel.'
+        // The facts the owner holds, a wake summary's constituents included.
+        const held = this.rt.store.list('deliveries', missionId).flatMap(row => row.to !== 'owner' || row.notice === undefined ? []
+          : [{ dedupKey: row.notice.dedupKey, subjects: row.subjects ?? [] }, ...(row.notice.aggregatedFacts ?? [])])
+        const spokenFor = (member: Member) => issues.some(issue => issue.memberIds.includes(member.id))
+          || held.some(fact => fact.dedupKey.startsWith(guardTerminalKey('attempt_lease', `${DISPATCH_FAILED}${member.id}:`)) && fact.subjects.includes(subjects[0]!))
+        if (startable.every(spokenFor)) continue
         return { task, subjects, dedupKey,
-          message: `Task ${task.id} (${task.title}, epoch ${task.epoch}) has an eligible idle member but was not dispatched this tick. ${detail}` }
+          message: `Task ${task.id} (${task.title}, epoch ${task.epoch}) has an eligible idle member but was not dispatched this tick. An idle handle alone does not identify the dispatch blocker. Inspect the task and recorded admission/preparation diagnostics with swarm_observe; repair the reported cause or withdraw the task with swarm_cancel.` }
       }
       const pinned = task.assigneeId === undefined ? undefined : eligible.find(member => member.id === task.assigneeId)
       const holder = pinned ?? eligible[0]!
@@ -393,25 +408,6 @@ export class Scheduling {
         message: `Task ${task.id} (${task.title}, epoch ${task.epoch}) is ready for member ${holder.name} (${holder.id})${pinned === undefined ? ', one of its eligible members,' : ', the member it is assigned to,'} whose worker handle still holds an unfinished turn, so the dispatcher cannot start it: no admission limit and no budget refusal was recorded for this board. The task is not undispatched for lack of an eligible member. Wait for that turn to end (the close-out path re-pends or completes it), amend this task's assigneeId with swarm_control(taskId: "${task.id}", action: "amend", changes: { assigneeId: "member id" }, reason: "reassign"), or withdraw it with swarm_cancel.` }
     }
     return undefined
-  }
-
-  /**
-   * Round 14: the terminal element of a guard chain, made unconditional.
-   *
-   * A chain's earlier elements may each answer "no" for a good reason; when
-   * every one of them has, this method is what runs. It has no condition of its
-   * own: it always produces a `GuardTerminal` and always records a durable
-   * decision request unless the *same* request for the *same* board fingerprint
-   * is already durable. Dedup therefore means "this exact decision is already on
-   * the record", never "stay silent and hope a later pass speaks".
-   *
-   * The notice is recorded through `notify`, which stamps the mission's W2
-   * witness for this fingerprint: the board-level witness path cannot then emit
-   * a second, differently-worded decision for the same state, so two individually
-   * correct rules cannot multiply into a trap.
-   */
-  escalateGuardTerminal(missionId: string, chain: GuardChainId, context: GuardTerminalContext = {}): GuardTerminal | undefined {
-    return emitGuardTerminal(this.rt, missionId, chain, context)
   }
 
   ready(task: Task, member: Member, tasks?: Task[]): boolean {

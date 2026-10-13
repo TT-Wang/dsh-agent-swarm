@@ -8,7 +8,7 @@
  * ceilings and dispatch preconditions (the owner-reply receipt chain is
  * tests/owner-reply.test.mjs's). When every earlier element answers "no",
  * `terminalEscalation` names the chain and `guardTerminal` renders the coded
- * decision request that `Scheduling.escalateGuardTerminal` records durably.
+ * decision request that `emitGuardTerminal` records durably.
  *
  * Three things are checked here, and none of them is a hand-picked sample:
  *
@@ -431,17 +431,15 @@ test('R14 runtime (budget chain): a refused worker proposal escalates as a coded
   } finally { await f.cleanup() }
 })
 
-test('R14 hand-off mechanism: emitGuardTerminal lets any call site opt in mechanically, and deduplicates per board state', async () => {
-  // The remaining chain terminals live in files this branch may not edit
-  // (src/attempts.ts, src/workspace-admission.ts, src/notices.ts, src/runtime.ts).
+test('R14 hand-off mechanism: emitGuardTerminal lets any call site opt in mechanically, and deduplicates per opener', async () => {
   // The hand-off is this call: a site builds nothing, it names its chain and
-  // passes the context it already has. The test proves the path end to end from
-  // inside this branch, so the integration task can wire a site without guessing
+  // passes the scope it already has with the fact that opened the terminal. The
+  // test proves the path end to end, so a site can be wired without guessing
   // what the mechanism returns or how a repeat is suppressed.
   const f = await setup()
   try {
     const task = f.propose({ title: 'Held work' })
-    const context = { taskId: task.id, memberId: f.author.id, detail: 'the workspace guard refused the close-out (Member has uncommitted commits)' }
+    const context = { taskId: task.id, memberId: f.author.id, detail: 'the workspace guard refused the close-out (Member has uncommitted commits)', localKey: `closeout-refused:${task.id}@${task.epoch}` }
     const terminal = emitGuardTerminal(f.runtime, f.mission.id, 'attempt_lease', context)
     assert.ok(terminal, 'the call site always gets a terminal back')
     assert.equal(terminal.chain, 'attempt_lease')
@@ -455,14 +453,14 @@ test('R14 hand-off mechanism: emitGuardTerminal lets any call site opt in mechan
       'the opt-in call delivers the owner notice', 8_000)
     assert.match(notice.content, /swarm_control/)
     assert.doesNotMatch(notice.content, /swarm_handoff/)
-    // The same call for the same board is the same decision request: the repeat
-    // is suppressed because the request is durable, not because the caller chose
-    // to stay silent.
+    // The same call under the same opener is the same decision request: the
+    // repeat is suppressed because the request is durable, not because the
+    // caller chose to stay silent.
     assert.ok(emitGuardTerminal(f.runtime, f.mission.id, 'attempt_lease', context))
     await sleep(60)
     assert.equal(events(f.runtime, f.mission.id, 'mission/stalled')
       .filter(item => item.data.cause === 'guard-terminal' && item.data.chain === 'attempt_lease').length, 1,
-      'one durable request per (chain, code, board fingerprint)')
+      'one durable request per (chain, code, opener)')
     assert.equal(f.workers.deliveries.filter(delivery => /\[attempt_terminal\]/.test(delivery.content)).length, 1)
   } finally { await f.cleanup() }
 })
@@ -566,7 +564,7 @@ test('S4r-D5: a budget-blocked mission still escalates, and the terminal emissio
       'the budget block delivers the coded owner decision request', 8_000)
     assert.deepEqual(lintRefusal(notice.content), [])
     // The emission is still unconditional and idempotent for the same state.
-    const terminal = emitGuardTerminal(f.runtime, f.mission.id, 'budget', { detail: 'budget-blocked probe' })
+    const terminal = emitGuardTerminal(f.runtime, f.mission.id, 'budget', { detail: 'budget-blocked probe', localKey: 'budget-blocked-probe' })
     assert.ok(terminal, 'the terminal emission is unconditional for a blocked mission')
     assert.equal(terminal.code, 'budget_terminal')
   } finally { await f.cleanup() }
@@ -618,15 +616,15 @@ test('S4b (owner finding): an abandoned and an exhausted close-out both name the
     const exhausted = await eventually(() => events(f.runtime, f.mission.id, 'task/closeout-exhausted').at(-1),
       'the recovery limit is exhausted and the task is blocked', 8_000)
     assert.equal(exhausted.data.taskId, task.id)
-    // Both transitions now emit the shared terminal. They may share one board
-    // fingerprint, in which case the second is the SAME decision request and the
-    // per-fingerprint dedup keeps exactly one delivery; either way the owner is
-    // no longer silent about the task.
+    // Both transitions emit the shared terminal, each under its own opener (the
+    // abandoned attempt; the task at the epoch its recovery ran out), so they are
+    // two decision requests whatever the board digest is.
     const notices = await eventually(() => {
       const found = f.workers.deliveries.filter(delivery => delivery.memberId === 'owner'
         && /\[attempt_terminal\]/.test(delivery.content) && delivery.content.includes(task.id))
-      return found.length >= 1 ? found : undefined
+      return found.length >= 2 ? found : undefined
     }, 'both previously silent close-out transitions must name the task', 8_000)
+    assert.equal(notices.length, 2, 'one request per close-out transition')
     for (const notice of notices) assert.deepEqual(lintRefusal(notice.content), [])
   } finally { await f.cleanup() }
 })
@@ -709,15 +707,15 @@ test('S4b pair (isolation x workspace): a refused dispatch escalates with the vi
   const f = await setup()
   try {
     f.workers.autoIdle = true
-    // The isolation guard is the workspace chain's predicate; force the violation
-    // so `refuseIsolation` is reached exactly as a corrupted board reaches it.
-    f.runtime.isolationAllows = (missionId, member) => { f.runtime.refuseIsolation(missionId, member, 'two live members share one worktree'); return false }
+    // The isolation guard is the workspace chain's predicate; corrupt the board
+    // (the reviewer moved into the author's worktree) so dispatch refuses both.
+    f.runtime.store.transaction(() => f.runtime.store.put('members', { ...f.runtime.store.get('members', f.reviewer.id), workspace: f.runtime.store.get('members', f.author.id).workspace }))
     f.propose({ title: 'Isolated work' })
     const event = await eventually(() => events(f.runtime, f.mission.id, 'mission/stalled')
       .filter(item => item.data.cause === 'guard-terminal' && item.data.chain === 'workspace').at(-1),
       'the isolation refusal must escalate', 8_000)
     assert.equal(event.data.code, 'workspace_terminal')
-    assert.match(String(event.data.detail), /two live members share one worktree/)
+    assert.match(String(event.data.detail), /share one provisioned worktree/)
     const notice = await eventually(() => f.workers.deliveries
       .find(delivery => delivery.memberId === 'owner' && /\[workspace_terminal\]/.test(delivery.content)),
       'the owner decision request', 8_000)

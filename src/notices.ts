@@ -13,6 +13,7 @@ import { formatDiagnostic, missingReviewDiagnostic } from './admission.ts'
 import { guardTerminalKey, requireText } from './refusals.ts'
 import { taskGraphIndex } from './task-graph.ts'
 import { blockCauses, stopFaultKey } from './attempts.ts'
+import { isolationOpener } from './workspace-admission.ts'
 import { PolicyError } from './policy-error.ts'
 import type { SwarmRuntime } from './runtime.ts'
 import { awaited, type SchedulingPass } from './scheduling.ts'
@@ -180,7 +181,7 @@ function ownerDeliveryMoot(mission: Pick<Mission, 'status'>, delivery: Pick<Deli
 }
 
 /** R17-G3: the stable digest of a recorded reason, so a fact key stays bounded. */
-function reasonDigest(reason: string): string {
+export function reasonDigest(reason: string): string {
   return reason.length === 0 ? 'none' : createHash('sha256').update(reason).digest('hex').slice(0, 16)
 }
 /**
@@ -979,8 +980,8 @@ export class Notices {
     if (delivery.notice?.aggregatedFacts !== undefined) {
       return [...new Set(delivery.notice.aggregatedFacts.flatMap(fact => this.unresolvedSubjects(view, this.summaryFactDelivery(mission.id, delivery.id, fact))))]
     }
-    const stopFailures = this.stopFailureSubjects(mission.id, delivery)
-    if (stopFailures !== undefined) return stopFailures
+    const terminal = this.openGuardTerminal(mission.id, delivery)
+    if (terminal !== undefined) return terminal
     // A stall-root decision is outstanding exactly while its root still is one;
     // the dependents it lists (a rejecting review) never keep it open.
     const family = noticeFamily(delivery)
@@ -1013,8 +1014,8 @@ export class Notices {
     // the obligation, and that delivery's reminders carry it too.
     if (covered(delivery)) return false
     if (delivery.replyExpected === true && delivery.answeredBy !== undefined) return false
-    const stopFailures = this.stopFailureSubjects(mission.id, delivery)
-    if (stopFailures !== undefined) return mission.status !== 'completed' && stopFailures.length > 0
+    const terminal = this.openGuardTerminal(mission.id, delivery)
+    if (terminal !== undefined) return mission.status !== 'completed' && terminal.length > 0
     const fact = noticeRow(delivery)
     // A receipt-linked action expires when that exact question is settled;
     // task or mission progress is neither necessary nor sufficient to settle it.
@@ -1143,9 +1144,18 @@ export class Notices {
     return this.rt.passState(mission.id).wedged && subjects.every(subject => subject === missionSubject(mission) || unfinished(subject)) ? subjects : []
   }
 
-  /** A cancelled task can still owe preservation; its exact stop fault ends when cleanup succeeds. */
-  private stopFailureSubjects(missionId: string, delivery: Delivery): string[] | undefined {
+  /**
+   * The subjects a guard terminal still holds open, for the openers whose
+   * condition has its own end; undefined for every other request, judged by the
+   * subjects it names. An isolation violation is outstanding while the invariant
+   * still lists it. A cancelled task can still owe preservation; its exact stop
+   * fault ends when cleanup succeeds.
+   */
+  private openGuardTerminal(missionId: string, delivery: Delivery): string[] | undefined {
     const key = delivery.notice?.dedupKey
+    if (key?.startsWith(guardTerminalKey('workspace', 'isolation:'))) {
+      return this.rt.isolationViolations(missionId).some(violation => key === guardTerminalKey('workspace', isolationOpener(violation))) ? delivery.subjects ?? [] : []
+    }
     if (!key?.startsWith(guardTerminalKey('attempt_lease', 'stop:'))) return undefined
     const tasks = this.rt.store.list('tasks', missionId)
     return (delivery.subjects ?? []).filter(subject => {
@@ -1498,7 +1508,7 @@ export class Notices {
         // that was not written must not leave an event per tick behind it.
         if (!hasNotice(this.rt.store.list('deliveries', mission.id), { class: 'decision', dedupKey: key, from: 'runtime' })) return
         this.rt.store.event(mission.id, 'mission/stalled', 'runtime', {
-          cause: 'stall-root', taskId: root.id, epoch: root.epoch, reason: root.output ?? null,
+          cause: 'stall-root', taskId: root.id, epoch: root.epoch, reason: root.output ?? null, noticeKey: key,
           dependents: dependents.map(task => task.id), boundMs: this.rt.stallPassTimeoutMs,
           // R14-F2v D1: the W3 stall event carries `unschedulable` and readers
           // (fault F19 row 7) take it from the LATEST mission/stalled event; a
