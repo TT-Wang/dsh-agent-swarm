@@ -1467,19 +1467,21 @@ export class SwarmRuntime {
     return { envelope, selfRun: measured, source: 'host-check', at: this.now(), comparison: compareCheckEnvironments(envelope, measured) }
   }
   /**
-   * ENV: the check environment facts an assignment delivery carries. Public so
-   * every module that writes an assignment delivery (the claim path here and the
-   * budget-resume path in src/gates.ts) delivers the same envelope: one
-   * assignee that is not told the environment is the defect this closes.
+   * The one writer of an assignment delivery, at a claim and at a budget resume
+   * alike. Its worker reads the task as `memberTask` renders it, without the
+   * preparation record (this attempt's workspace was prepared), beside the facts
+   * the host runs its declared checks under (ENV). Returns the task as delivered.
    */
-  assignmentCheckEnvironment(): { checkEnvironment?: { note: string; environment: CheckEnvironment; selfRun?: CheckEnvironment } } {
-    const envelope = this.declaredCheckEnvelope()
-    if (envelope?.environment === undefined) return {}
-    return { checkEnvironment: {
+  deliverAssignment(task: Task, mission: Mission, instructions = ASSIGNMENT_INSTRUCTIONS): Task {
+    const { preparationFailure: _retried, ...assigned } = this.memberTask(task, mission), envelope = this.declaredCheckEnvelope()
+    const checkEnvironment = envelope?.environment === undefined ? undefined : {
       note: 'These are the facts the host runs this task\'s declared checks under. Acceptance compares the supporting host checks with this envelope; unrelated diagnostics do not determine the verdict. The scoped cache roots are provided inside the disposable verification checkout; the user cache roots and HOME are what a self-run inherits.',
       environment: envelope.environment,
       ...(envelope.selfRunEnvironment === undefined ? {} : { selfRun: envelope.selfRunEnvironment }),
-    } }
+    }
+    this.store.put('deliveries', { id: id('msg'), missionId: mission.id, from: 'runtime', to: task.attempt!.ownerId, kind: 'assignment', taskId: task.id, attemptId: task.attempt!.id,
+      content: JSON.stringify({ missionId: mission.id, task: assigned, checkEnvironment, instructions }), createdAt: this.now() })
+    return assigned
   }
   /** ENV: render a blocking mismatch as the refusal the member must act on. */
   private checkEnvironmentMismatchMessage(comparison: CheckEnvironmentComparison, source: string): string {
@@ -1524,11 +1526,8 @@ export class SwarmRuntime {
     try {
       return this.commit(task.missionId, () => {
         this.store.put('tasks', task); this.store.put('members', member)
-        // The worker reads its task without that record: this attempt's workspace was prepared.
-        const { preparationFailure: _retried, ...assigned } = this.memberTask(task, mission)
         this.store.recordAdmission(admitted)
-        this.store.put('deliveries', { id: id('msg'), missionId: task.missionId, from: 'runtime', to: member.id, kind: 'assignment', taskId: task.id, attemptId: task.attempt!.id,
-          content: JSON.stringify({ missionId: task.missionId, task: assigned, ...this.assignmentCheckEnvironment(), instructions: ASSIGNMENT_INSTRUCTIONS }), createdAt: this.now() })
+        const assigned = this.deliverAssignment(task, mission)
         this.store.event(task.missionId, 'task/claimed', member.id, { taskId: task.id, attempt: task.attempt })
         return assigned
       })

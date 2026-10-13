@@ -250,6 +250,36 @@ test('a worker reads its checklist in every result of its own calls: the registe
   assert.deepEqual([submitted.status, verified.status, f.runtime.store.get('tasks', source.id).covers], ['submitted', 'accepted', ['c1', 'c2']], 'the stored rows keep the ids')
 })
 
+test('a budget resume delivers the task as its first assignment did: a deliverable that only cites ids and a review with no criteria of its own read the criterion text again, never a bare id', async t => {
+  for (const reviewing of [false, true]) {
+    const clock = new FakeClock(), f = await setup({ clock, budget: { maxTokens: 40, maxSteps: 100 }, acceptance: ['works', 'is documented'] })
+    t.after(f.cleanup)
+    // Neither row stores a criterion's text.
+    const source = f.propose({ acceptance: [] })
+    const claimed = await f.runtime.claim(f.actor(f.author), f.mission.id, source.id)
+    let task = source, member = f.author
+    if (reviewing) {
+      await f.runtime.submit(f.actor(f.author), f.mission.id, { taskId: source.id, attemptId: claimed.attempt.id, output: 'candidate' })
+      task = f.propose({ kind: 'verification', reviewOf: source.id, checks: [], acceptance: [], assigneeId: f.reviewer.id }); member = f.reviewer
+      await f.runtime.claim(f.actor(member), f.mission.id, task.id)
+    }
+    const pass = async () => { await f.runtime.tick(); await f.runtime.settle(f.mission.id) }
+    // A usage report exhausts maxTokens and the mission quiesces; the owner raises the ceiling and resumes the same attempt.
+    await f.workers.callbacks.usage(member.id, 40)
+    await pass(); await pass()
+    assert.equal(f.runtime.mission(f.mission.id).budgetPause?.quiesced, true, 'the exhausted mission quiesced')
+    f.runtime.updateBudget(f.owner, f.mission.id, { ...budget, maxTokens: 100_000 }, 'Raise the exhausted ceiling')
+    f.runtime.control(f.owner, f.mission.id, 'resume', 'Budget raised')
+    await pass(); await pass()
+    const [first, resumed, ...others] = f.runtime.store.list('deliveries', f.mission.id).filter(delivery => delivery.kind === 'assignment' && delivery.taskId === task.id).map(delivery => JSON.parse(delivery.content))
+    assert.deepEqual([others, resumed.instructions.startsWith('Resume this same task and attempt'), resumed.task.attempt.id], [[], true, first.task.attempt.id], 'the same attempt is assigned again')
+    assert.deepEqual([first.task.acceptance, resumed.task.acceptance], [['works', 'is documented'], ['works', 'is documented']], `${task.kind}: the resume lists the text its first assignment listed`)
+    assert.deepEqual([Object.keys(resumed), Object.keys(resumed.task).sort()], [Object.keys(first), Object.keys(first.task).sort()], 'and is the same view of the task, with no bare id')
+    assert.equal('covers' in resumed.task, false)
+    assert.deepEqual(f.runtime.store.get('tasks', source.id).covers, ['c1', 'c2'], 'the stored deliverable keeps the ids')
+  }
+})
+
 test('the propose guard reads the proposal\'s own objective and acceptance: its own prior-work criterion needs a dependency, and a repair that only inherits that criterion is admitted without one', async t => {
   const f = await setup({ clock: new FakeClock() })
   t.after(f.cleanup)
