@@ -1,8 +1,9 @@
 /**
  * The draft editor's criteria controls, driven through a mounted React tree:
- * the handlers behind Add criterion, a criterion's text, the last criterion's
- * Remove, a deliverable's Covers boxes, its own acceptance's `required`, and the
- * kind change that drops covers from a review. Static markup cannot run them.
+ * the handlers behind Add criterion, a criterion's text, a criterion's Remove
+ * (disabled on the last one), a deliverable's Covers boxes, its own acceptance's
+ * `required`, and the kind change that drops covers from a review. Static
+ * markup cannot run them.
  */
 import assert from 'node:assert/strict'
 import test from 'node:test'
@@ -84,4 +85,12 @@ test('the draft editor adds, edits and guards criteria, cites them per deliverab
   assert.equal(endpoint, 'update-draft')
   assert.deepEqual(saved.acceptance, ['The delivered change satisfies the objective and passes independent verification.', 'The README documents the change.'])
   assert.deepEqual(saved.tasks.map(task => [task.kind, task.covers]), [['integration', ['c1', 'c2']], ['verification', undefined], ['research', undefined]])
+
+  // Removing the first criterion renumbers the second, and the deliverable that covered both keeps naming the one that remains.
+  await click(button(criteria()[0], 'Remove'))
+  assert.deepEqual(criteria().map(row => [row.querySelector('code').textContent, row.querySelector('input').value, button(row, 'Remove').disabled]), [['c1', 'The README documents the change.', true]])
+  assert.deepEqual(checked(tasks()[0]), [true])
+  await act(() => document.querySelector('form').dispatchEvent(new dom.window.Event('submit', { bubbles: true, cancelable: true })))
+  const { input: renumbered } = requests[1][1]
+  assert.deepEqual([renumbered.acceptance, renumbered.tasks.map(task => task.covers)], [['The README documents the change.'], [['c1'], undefined, undefined]])
 })
