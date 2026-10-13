@@ -217,6 +217,32 @@ test('the coverage and staged-criteria refusals are repaired as they say, throug
   assert.deepEqual([snapshot.mission.id, snapshot.mission.status, snapshot.mission.acceptance], [staged, 'active', ['works', 'is documented']])
 })
 
+test('a plan deliverable with neither covers nor acceptance is refused once, and each exit the refusal names is performed through the registered swarm_launch and swarm_stage', async t => {
+  const bare = ({ acceptance: _own, covers: _cited, ...task }) => task
+  const refused = (index, key) => error => error.message === `[plan_task_acceptance_required] tasks[${index}] (${key}) has neither covers nor acceptance. Add to \`covers\` the ids of the mission criteria it satisfies, or, when it satisfies none, give it its own \`acceptance\`, and relaunch the complete plan.`
+  // The plan's one deliverable must satisfy the mission criterion (covers); a second deliverable beside it satisfies none (its own acceptance).
+  const audit = { key: 'audit', workstreamKey: 'main', title: 'Audit', objective: 'List every caller of the changed function', kind: 'research', outputs: [], scope: ['src/'], assigneeKey: 'builder', maxRecoveryAttempts: 5 }
+  const exits = [
+    [input => ({ ...input, tasks: [bare(input.tasks[0]), input.tasks[1]] }), 'deliver', task => ({ ...task, covers: ['c1'] })],
+    [input => ({ ...input, tasks: [audit, ...input.tasks] }), 'audit', task => ({ ...task, acceptance: ['Every caller is listed with its file'] })],
+  ]
+  for (const [name, admitted] of [['swarm_launch', result => result.mission.status === 'active'], ['swarm_stage', result => result.status === 'draft']]) {
+    for (const [build, key, exit] of exits) {
+      const f = await fixture(t)
+      const definitions = new Map()
+      registerTools({ tools: { register: definition => definitions.set(definition.name, definition) } }, f.runtime, budget)
+      const request = f.runtime.requestStart(f.owner, f.requestInput, { grantRoot: f.requestInput.workspace, source: 'session' })
+      const call = async plan => (await definitions.get(name).execute(name === 'swarm_launch' ? { requestId: request.id, ...plan } : plan,
+        { signal: new AbortController().signal, agent: { id: f.owner.sessionId, session: { header: { cwd: f.directory } } } })).result
+      const input = build(f.input)
+      await assert.rejects(call(input), refused(0, key), `${name} ${key}`)
+      assert.equal(f.runtime.list(f.owner.sessionId).length + f.runtime.drafts(f.owner).length, 0, 'the refusal saved and launched nothing')
+      const result = await call({ ...input, tasks: input.tasks.map(task => task.key === key ? exit(task) : task) })
+      assert.ok(admitted(result), `${name} admits the plan after the ${key} exit`)
+    }
+  }
+})
+
 test('failed assembly and retries retain one deterministic plan and worker roster', async t => {
   const f = await fixture(t)
   let fail = true

@@ -109,7 +109,7 @@ test('a plan deliverable needs covers or its own acceptance once its review\'s c
   const bare = plan('/repo').tasks.map(({ acceptance: _own, ...task }) => task)
   const refused = validatePlan.bind(undefined, plan('/repo', bare.map(({ covers: _cited, ...task }) => task)), { launch: true })
   assert.throws(refused, error => error.code === 'plan_task_acceptance_required' && error.category === 'validation_error'
-    && error.message === '[plan_task_acceptance_required] tasks[0] (code) has neither covers nor acceptance. Add to `covers` the mission criterion ids it satisfies, or give it its own `acceptance`, and relaunch the complete plan.')
+    && error.message === '[plan_task_acceptance_required] tasks[0] (code) has neither covers nor acceptance. Add to `covers` the ids of the mission criteria it satisfies, or, when it satisfies none, give it its own `acceptance`, and relaunch the complete plan.')
   const folded = validatePlan(plan('/repo', bare.map(task => task.kind === 'verification' ? task : { ...task, covers: undefined })), { launch: true })
   assert.deepEqual(folded.tasks.map(task => [task.key, task.acceptance, task.covers]), [['code', [], ['c2']], ['review', [], undefined]], 'an omitted list is canonical []; the review\'s covers give its source criteria')
 })
