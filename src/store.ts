@@ -347,8 +347,8 @@ export class SwarmStore {
       this.db.exec(`PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA busy_timeout=${this.busyTimeoutMs}; PRAGMA wal_autocheckpoint=${WAL_AUTOCHECKPOINT_PAGES}; PRAGMA journal_size_limit=${WAL_JOURNAL_SIZE_LIMIT};`)
       const version = this.db.prepare('PRAGMA user_version').get()?.user_version
       if (typeof version !== 'number' || version < 0 || version > SCHEMA_VERSION) throw new Error(`Unsupported swarm schema ${String(version)}; expected ${SCHEMA_VERSION}`)
-      this.db.exec('BEGIN IMMEDIATE')
-      try {
+      // The schema and its upgrade commit like any other change: rows the upgrade rewrites move the state cursor for their scopes.
+      this.transaction(() => {
         for (const table of TABLES) {
           this.db.exec(`CREATE TABLE IF NOT EXISTS ${table} (id TEXT PRIMARY KEY, mission_id TEXT NOT NULL, value TEXT NOT NULL); CREATE INDEX IF NOT EXISTS ${table}_mission ON ${table}(mission_id);`)
         }
@@ -362,8 +362,8 @@ export class SwarmStore {
         this.db.exec("CREATE INDEX IF NOT EXISTS events_trace_attempt ON events(mission_id, json_extract(data,'$.attemptId'), json_extract(data,'$.step'), seq) WHERE type='trace/span';")
         this.db.exec('CREATE TABLE IF NOT EXISTS state_revision (id INTEGER PRIMARY KEY CHECK (id=1), revision INTEGER NOT NULL); INSERT OR IGNORE INTO state_revision(id,revision) VALUES(1,0); CREATE TABLE IF NOT EXISTS state_changes (revision INTEGER PRIMARY KEY, scopes TEXT NOT NULL);')
         if (version < SCHEMA_VERSION) this.citeCriteria()
-        this.db.exec(`PRAGMA user_version=${SCHEMA_VERSION}; COMMIT`)
-      } catch (error) { this.db.exec('ROLLBACK'); throw error }
+        this.db.exec(`PRAGMA user_version=${SCHEMA_VERSION}`)
+      })
     } catch (error) {
       this.releaseLock()
       if (isSqliteNotADatabase(error)) throw new StoreRecoveryError('store_corrupt',
@@ -452,19 +452,20 @@ export class SwarmStore {
     if (result === null || typeof result !== 'object' || !('id' in result) || typeof result.id !== 'string' || (id !== undefined && result.id !== id)) throw new Error('Corrupt swarm record identity')
     return result as Tables[T]
   }
-  /** The v4 upgrade, once at open: each deliverable and draft plan task cites by id, instead of holding, the mission criteria it copied; a staged mission takes its saved draft's criteria, as its v3 relaunch would have. */
+  /** The v4 upgrade, once at open: each deliverable and draft plan task cites by id, instead of holding, the mission criteria it copied, and a draft so rewritten moves to its next revision; a staged mission takes its saved draft's criteria, as its v3 relaunch would have. */
   private citeCriteria(): void {
-    const cite = (task: Task | PlanTask, texts: unknown) => {
-      if (task.kind === 'verification' || !Array.isArray(texts) || !Array.isArray(task.acceptance)) return
+    const cite = (task: Task | PlanTask, texts: unknown): boolean => {
+      if (task.kind === 'verification' || !Array.isArray(texts) || !Array.isArray(task.acceptance)) return false
       const covers = texts.flatMap((text, index) => task.acceptance.includes(text) ? [criterionId(index)] : [])
       if (covers.length) Object.assign(task, { covers, acceptance: task.acceptance.filter(item => !texts.includes(item)) })
+      return covers.length > 0
     }
     for (const draft of this.list('drafts')) {
       const mission = this.get('missions', draft.missionId ?? '')
       if (mission?.status === 'staged') this.upsert('missions', { ...mission, acceptance: draft.input.acceptance })
-      draft.input.tasks.forEach(task => cite(task, draft.input.acceptance)); this.upsert('drafts', draft)
+      if (draft.input.tasks.map(task => cite(task, draft.input.acceptance)).includes(true)) this.upsert('drafts', { ...draft, revision: draft.revision + 1, updatedAt: this.now() })
     }
-    for (const task of this.list('tasks')) { cite(task, this.get('missions', task.missionId)?.acceptance); this.upsert('tasks', task) }
+    for (const task of this.list('tasks')) if (cite(task, this.get('missions', task.missionId)?.acceptance)) this.upsert('tasks', task)
   }
   /** Read a mission's records, or all records for host recovery. */
   list<T extends Table>(table: T, missionId?: string): Tables[T][] {

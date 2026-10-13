@@ -344,6 +344,39 @@ test('a v3 store cites the criteria its deliverables copied, once at open, and k
   assert.throws(() => new SwarmRuntime(config, new FakeWorkers()), /Unsupported swarm schema 5; expected 4/)
 })
 
+test('the v4 upgrade commits like any other change: a draft it rewrites moves to its next revision, so a page that still holds the v3 draft cannot save over the cited ids, and the state cursor names what changed', async t => {
+  const clock = new FakeClock()
+  const { dir, config, runtime } = await makeRuntime(t, { clock })
+  await runtime.dispose()
+  writeV3(config.statePath)
+  // Beside the draft that copied a criterion: one whose tasks copied none, which the upgrade leaves as it is.
+  const db = new DatabaseSync(config.statePath)
+  const held = JSON.parse(db.prepare('SELECT value FROM drafts WHERE id=?').get('draft').value)
+  const plain = { ...held, id: 'plain', input: { ...held.input, tasks: held.input.tasks.map(task => ({ ...task, acceptance: ['own'] })) } }
+  db.prepare('INSERT INTO drafts(id,mission_id,value) VALUES(?,?,?)').run(plain.id, plain.id, JSON.stringify(plain))
+  const before = Number(db.prepare('SELECT revision FROM state_revision WHERE id=1').get().revision)
+  db.close()
+  clock.advance(5000)
+  const opened = new SwarmRuntime(config, new FakeWorkers())
+  t.after(() => opened.dispose())
+  const owner = { sessionId: 'owner' }, claim = { grantRoot: dir, source: 'session' }
+  const upgraded = opened.store.get('drafts', 'draft')
+  assert.deepEqual([upgraded.revision, upgraded.updatedAt, upgraded.input.tasks[0].covers], [held.revision + 1, clock.now(), ['c2']], 'the rewritten draft is a new revision, written at the upgrade')
+  assert.deepEqual(opened.store.get('drafts', 'plain'), plain, 'a draft that copied no criterion is not rewritten')
+  // What the open page sends: the revision and the plan it loaded before the restart.
+  assert.throws(() => opened.updateDraft(owner, held.id, held.revision, held.input, claim), error => error.code === 'draft_revision_conflict')
+  assert.deepEqual(opened.store.get('drafts', 'draft').input.tasks[0].covers, ['c2'], 'the cited ids survive the stale save')
+  // The page's watch cursor is the revision it last saw: the upgrade is one change after it, naming the owner and each mission whose rows it rewrote.
+  assert.equal(opened.store.revision(), before + 1)
+  const [change, ...more] = opened.store.changesSince(before)
+  assert.deepEqual([change.revision, [...change.scopes].sort(), more], [before + 1, ['done', 'draft', 'guarded', 'owner', 'repaired', 'stalled'], []])
+  await opened.dispose()
+  // Once: reopening the v4 store rewrites nothing and moves no cursor.
+  const reopened = new SwarmRuntime(config, new FakeWorkers())
+  t.after(() => reopened.dispose())
+  assert.deepEqual([reopened.store.revision(), reopened.store.get('drafts', 'draft').revision], [before + 1, held.revision + 1])
+})
+
 test('a staged mission a v3 build left behind a longer saved draft takes that draft\'s criteria at the upgrade, so its relaunch goes through', async t => {
   const { dir, config, runtime } = await makeRuntime(t, { config: { tickMs: 60000, checkTimeoutMs: undefined } })
   const owner = { sessionId: 'owner' }, claim = { grantRoot: dir, source: 'session' }
