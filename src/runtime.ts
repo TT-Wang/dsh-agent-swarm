@@ -3460,10 +3460,9 @@ export class SwarmRuntime {
     if (!tasks.length) return 'Mission still has unfinished or blocked required work'
     const unfinished = tasks.filter(task => !['accepted', 'cancelled'].includes(task.status) && !completionExempt(task, tasks))
     if (unfinished.length) return `Mission still has unfinished or blocked required work: ${unfinished.map(task => `${task.id} (${task.status})`).join(', ')}`
-    const accepted = tasks.filter(task => task.status === 'accepted'), graph = taskGraphIndex(tasks)
     // Only accepted deliverable work covers a mission criterion, by the ids its
     // replacement lineage cites; code deliverables need an artifact.
-    const deliverables = accepted.filter(task => task.kind !== 'verification' && (task.kind === 'research' || task.artifact !== undefined))
+    const graph = taskGraphIndex(tasks), deliverables = tasks.filter(task => task.status === 'accepted' && task.kind !== 'verification' && (task.kind === 'research' || task.artifact !== undefined))
     const uncovered = uncoveredCriteria(mission.acceptance, new Set(deliverables.flatMap(task => [...graph.criteriaOf(task.id)])))
     if (uncovered.length) return `Accepted tasks do not cover every mission acceptance criterion: ${uncovered.join(', ')}. Propose a deliverable that names them in \`covers\` with \`swarm_propose\`; an accepted task cannot gain covers`
     if (tasks.some(task => ['implementation', 'integration'].includes(task.kind) && task.status !== 'cancelled')) {
