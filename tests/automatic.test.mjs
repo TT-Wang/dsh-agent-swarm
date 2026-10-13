@@ -195,26 +195,39 @@ test('an uncovered criterion is named by id and text, copied text never covers i
   }
 })
 
-test('the coverage and staged-criteria refusals are repaired as they say, through the registered swarm_launch', async t => {
-  const f = await fixture(t)
-  const definitions = new Map()
-  registerTools({ tools: { register: definition => definitions.set(definition.name, definition) } }, f.runtime, budget)
-  const request = f.runtime.requestStart(f.owner, f.requestInput, { grantRoot: f.requestInput.workspace, source: 'session' })
-  const launch = async plan => (await definitions.get('swarm_launch').execute({ requestId: request.id, ...plan }, { signal: new AbortController().signal, agent: { id: f.owner.sessionId } })).result
-  const input = { ...f.input, acceptance: ['works', 'is documented'] }
-  await assert.rejects(launch(input), error => error.message.endsWith('\n[plan_criterion_uncovered] No deliverable covers c2 "is documented". Add each id to `covers` of the deliverable that satisfies it; keep the mission acceptance list unchanged.'))
-  // As named: add the id to `covers` of the deliverable; the mission list is unchanged. The first
-  // start then fails, leaving the mission staged with its criteria fixed.
-  input.tasks = input.tasks.map(task => task.kind === 'verification' ? task : { ...task, covers: ['c1', 'c2'] })
-  let fail = true
-  f.workers.onStart = async () => { if (fail) throw new Error('Temporary launch failure') }
-  await assert.rejects(launch(input), /Temporary launch failure/)
-  fail = false
-  const staged = f.runtime.starts(f.owner)[0].missionId
-  await assert.rejects(launch({ ...input, acceptance: ['is documented', 'works'] }), error => error.code === 'draft_repair_criteria_changed'
-    && error.message.startsWith(`[draft_repair_criteria_changed] Mission ${staged} is staged, so its acceptance criteria are fixed: ["works","is documented"]. Resend \`acceptance\` unchanged`))
-  const snapshot = await launch(input)
-  assert.deepEqual([snapshot.mission.id, snapshot.mission.status, snapshot.mission.acceptance], [staged, 'active', ['works', 'is documented']])
+test('the covers, coverage and staged-criteria refusals are repaired as they say, through the registered swarm_launch', async t => {
+  // The staged refusal names two exits: resend the plan unchanged, or change task `covers` and task `acceptance` and relaunch.
+  const exits = [
+    [input => input, [['c1', 'c2'], ['works']]],
+    [input => ({ ...input, tasks: input.tasks.map(task => task.kind === 'verification' ? { ...task, covers: ['c1'] } : { ...task, covers: ['c2'], acceptance: ['keeps the API'] }) }), [['c2', 'c1'], ['keeps the API']]],
+  ]
+  for (const [exit, stored] of exits) {
+    const f = await fixture(t)
+    const definitions = new Map()
+    registerTools({ tools: { register: definition => definitions.set(definition.name, definition) } }, f.runtime, budget)
+    const request = f.runtime.requestStart(f.owner, f.requestInput, { grantRoot: f.requestInput.workspace, source: 'session' })
+    const launch = async plan => (await definitions.get('swarm_launch').execute({ requestId: request.id, ...plan }, { signal: new AbortController().signal, agent: { id: f.owner.sessionId } })).result
+    const input = { ...f.input, acceptance: ['works', 'is documented'] }
+    const citing = covers => ({ ...input, tasks: input.tasks.map(task => task.kind === 'verification' ? task : { ...task, covers }) })
+    // An id that is repeated or unknown is refused where the plan wrote it; the exit is each id once.
+    for (const [covers, shown] of [[['c1', 'c1'], '["c1","c1"]'], [['c9'], '["c9"]']]) {
+      await assert.rejects(launch(citing(covers)), error => error.message.includes(`[covers_invalid] tasks[0] (deliver).covers must list distinct ids of the mission acceptance criteria, c1 for the first through c2 for the last; it has ${shown}. Pass \`covers\` with each id this task satisfies once, never the criterion text, and retry the same task/request.`), shown)
+    }
+    await assert.rejects(launch(input), error => error.message.endsWith('\n[plan_criterion_uncovered] No deliverable covers c2 "is documented". Add each id to `covers` of the deliverable that satisfies it; keep the mission acceptance list unchanged.'))
+    // As named: add the id to `covers` of the deliverable; the mission list is unchanged. The first
+    // start then fails, leaving the mission staged with its criteria fixed.
+    input.tasks = citing(['c1', 'c2']).tasks
+    let fail = true
+    f.workers.onStart = async () => { if (fail) throw new Error('Temporary launch failure') }
+    await assert.rejects(launch(input), /Temporary launch failure/)
+    fail = false
+    const staged = f.runtime.starts(f.owner)[0].missionId
+    await assert.rejects(launch({ ...input, acceptance: ['is documented', 'works'] }), error => error.code === 'draft_repair_criteria_changed'
+      && error.message === `[draft_repair_criteria_changed] Mission ${staged} is staged, so its acceptance criteria are fixed: ["works","is documented"]. Resend \`acceptance\` unchanged and in this order; change task \`covers\` or task \`acceptance\` instead, and relaunch.`)
+    const snapshot = await launch(exit(input)), deliver = snapshot.tasks.find(task => task.kind === 'integration')
+    assert.deepEqual([snapshot.mission.id, snapshot.mission.status, snapshot.mission.acceptance], [staged, 'active', ['works', 'is documented']])
+    assert.deepEqual([deliver.covers, deliver.acceptance], stored, 'the staged deliverable holds what the relaunched plan cites')
+  }
 })
 
 test('a plan deliverable with neither covers nor acceptance is refused once, and each exit the refusal names is performed through the registered swarm_launch and swarm_stage', async t => {

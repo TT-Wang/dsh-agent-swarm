@@ -184,6 +184,38 @@ test('the completion reason\'s exit, performed as it names it through the regist
   assert.equal(f.runtime.completionError(f.runtime.mission(f.mission.id)), undefined)
 })
 
+test('each exit the bare-deliverable and covers refusals name is performed through the registered swarm_propose', async t => {
+  const f = await setup({ clock: new FakeClock(), acceptance: ['works', 'is documented'] })
+  t.after(f.cleanup)
+  const definitions = new Map()
+  registerTools({ tools: { register: definition => definitions.set(definition.name, definition) } }, f.runtime, f.mission.budget)
+  const propose = async args => (await definitions.get('swarm_propose').execute({ missionId: f.mission.id, workstreamId: f.stream.id, objective: 'Implement the scoped change', kind: 'implementation', scope: ['**'], checks: ['test -d .'], ...args },
+    { signal: new AbortController().signal, agent: { id: f.owner.sessionId } })).result
+  const tasks = () => f.runtime.store.list('tasks', f.mission.id).length
+  const checklist = task => f.runtime.observe(f.owner, f.mission.id, { taskId: task.id }).task.acceptance
+  // A deliverable with no criteria at all: the refusal names three exits.
+  await assert.rejects(propose({ title: 'Bare', outputs: [] }), error => error.message === '[task_acceptance_required] A new deliverable needs criteria. Pass `covers` with the ids of the mission criteria it satisfies (c1 is the mission\'s first acceptance item), or `acceptance` as its own nonempty criteria, with `swarm_propose`; or name the rejected task in `replaces` to inherit its criteria, then retry.')
+  // An id that is unknown, repeated, or the criterion's text: one refusal, whose exit is each id once.
+  for (const [covers, shown] of [[['c9'], '["c9"]'], [['c1', 'c1'], '["c1","c1"]'], [['works'], '["works"]']]) {
+    await assert.rejects(propose({ title: 'Miscited', covers, outputs: [] }), error => error.message === `[covers_invalid] covers must list distinct ids of the mission acceptance criteria, c1 for the first through c2 for the last; it has ${shown}. Pass \`covers\` with each id this task satisfies once, never the criterion text, and retry the same task/request.`, shown)
+  }
+  assert.equal(tasks(), 0, 'no refusal admitted anything')
+  const cited = await propose({ title: 'Cited', covers: ['c1'], outputs: [] })
+  const own = await propose({ title: 'Own criteria', acceptance: ['keeps the API'], outputs: [] })
+  assert.deepEqual([cited, own].map(task => [task.status, task.acceptance, task.covers]), [['pending', [], ['c1']], ['pending', ['keeps the API'], undefined]], 'covers alone and acceptance alone each admit a deliverable')
+  // The third exit: a repair that names the rejected task needs no criteria of its own.
+  await blockThroughReview(f, cited)
+  const inheriting = await propose({ title: 'Repair', replaces: [cited.id] })
+  assert.deepEqual([inheriting.status, inheriting.acceptance, inheriting.covers, checklist(inheriting)], ['pending', [], undefined, ['works']], 'it answers for what the task it replaces cited')
+  // The review-covers refusal's other exit: the criterion no review may take on is cited by a repair naming `replaces`.
+  await blockThroughReview(f, own)
+  const citing = await propose({ title: 'Repair that also documents', replaces: [own.id], covers: ['c2'] })
+  assert.deepEqual([citing.covers, checklist(citing)], [['c2'], ['is documented', 'keeps the API']])
+  await acceptThroughReview(f, inheriting); await acceptThroughReview(f, citing)
+  await acceptThroughReview(f, await propose({ title: 'Integrate', kind: 'integration', dependencies: [inheriting.id, citing.id], acceptance: ['merges both repairs'], outputs: [] }))
+  assert.equal(f.runtime.completionError(f.runtime.mission(f.mission.id)), undefined, 'both criteria are covered by accepted repairs')
+})
+
 test('the review-admission terminal names the fields a review needs, and its exit performed through the registered swarm_propose admits a review with no acceptance', async t => {
   const f = await setup({ clock: new FakeClock() })
   t.after(f.cleanup)
