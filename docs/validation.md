@@ -72,6 +72,29 @@ on 169 of 315 authored reviews, in 50 of the 80 plans.
 - `2c6a5e7`, `c5aa308`: citing nothing is the absent field through a launch and through a staged repair alike, and a
   plan that writes `covers: []` validates to the plan that omits it; completion names one set.
 
+**Repair round 2** (`8e89565`, `dafbc4b`, `7825686`; tests only, `src` unchanged). A second mutation pass over the
+integrator round found three rules a test named without holding them. Each mutant passed the previous tests whole and
+now fails, proved on a scratch build.
+
+- `8e89565`: completion's filter without its status condition, so a withdrawn deliverable's ids count. The withdrawn
+  task of the existing test was an implementation without an artifact, which the artifact condition already excluded.
+  `tests/completion-eligibility.test.mjs` now holds one row per condition (an accepted review, an accepted
+  implementation without an artifact, a cancelled research task), and the task withdrawn through `swarm_cancel` in
+  `tests/criteria.test.mjs` is research.
+- `dafbc4b`: `swarm_propose` storing `covers: []` as written, and refusing a review that writes it. The leg named for
+  `swarm_propose` launched a plan, whose validation had already removed the empty list. The registered
+  `swarm_propose` is now handed `covers: []` for a deliverable and for its review; the returned tasks and the stored
+  rows are the launched ones, with no `covers` key.
+- `7825686`: the upgrade saving a draft only when a deliverable changed. `3e6a970` had edited the one fixture of that
+  shape. Both shapes now stand: a v3 draft whose review alone copied its source's own criterion is rewritten (the
+  review holds `[]`), moves to its next revision, refuses the page's stale save and is named in the change's scopes;
+  a draft whose tasks hold only their own criteria is left as it is.
+
+Gate at `7825686`: on 0.1.5-rc.3 typecheck, build, `test:harness`, `test:replay` (digest unchanged),
+`node scripts/faults/run.mjs` (24/24) and both web smokes (`passed: true`) passed; on 0.1.7-rc.1 typecheck, build,
+`test:harness` and the two touched test files (35/35) passed. Each touched file passed three rounds of two concurrent
+copies.
+
 **`src` against `dfc0825`: +160 −155, net +5.**
 
 | File | + | − | net |
