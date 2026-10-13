@@ -136,7 +136,7 @@ test('a criterion a deliverable and its review both cite is cited once on the de
   assert.deepEqual([launched.mission.status, launched.tasks.find(task => task.kind === 'implementation').covers], ['active', ['c1', 'c2']])
 })
 
-test('citing nothing has one representation, no covers at all: a plan that spells it [] validates to the plan that omits it, and the row is the same whether swarm_propose admits the task or a staged repair rewrites it', async t => {
+test('citing nothing has one representation, no covers at all: a plan that spells it [] validates to the plan that omits it, and the row is the same whether a launch proposes the task, swarm_propose is handed [] itself or a staged repair rewrites it', async t => {
   const citing = (workspace, covers) => { const input = plan(workspace); for (const task of input.tasks) task.covers = covers; return input }
   // The deliverable keeps its own criterion, so it is admissible with no covers.
   const omitted = validatePlan(citing('/repo', undefined))
@@ -149,9 +149,18 @@ test('citing nothing has one representation, no covers at all: a plan that spell
   const { dir, runtime } = await makeRuntime(t, { workers: new FakeWorkers(), config: { tickMs: 60000, checkTimeoutMs: undefined } })
   const owner = { sessionId: 'owner' }, claim = { grantRoot: dir, source: 'session' }
   const rows = snapshot => snapshot.tasks.map(task => [task.kind, task.acceptance, 'covers' in task ? task.covers : 'no covers'])
-  // Admitted by swarm_propose: a fresh launch of the plan that writes [].
+  // Launched: the plan writes [], and its validation has fixed the shape before swarm_propose sees the task.
   const fresh = runtime.createDraft(owner, citing(dir, []), claim)
   const proposed = await runtime.launchDraft(owner, fresh.id, fresh.revision)
+  // Proposed as written: the registered swarm_propose is handed [] itself, for the same deliverable and for its review.
+  const definitions = new Map()
+  registerTools({ tools: { register: definition => definitions.set(definition.name, definition) } }, runtime, budget)
+  const call = async args => (await definitions.get('swarm_propose').execute({ missionId: proposed.mission.id, workstreamId: proposed.workstreams[0].id, scope: ['src/'], outputs: [], covers: [], maxRecoveryAttempts: 1, ...args },
+    { signal: new AbortController().signal, agent: { id: owner.sessionId } })).result
+  const code = await call({ title: 'Code again', objective: 'Write it', kind: 'implementation', acceptance: ['has a test'], checks: ['node --test'], checkTimeoutMs: 1000 })
+  const returned = [code, await call({ title: 'Review again', objective: 'Review it', kind: 'verification', acceptance: ['reads the diff'], reviewOf: code.id })]
+  assert.deepEqual(rows({ tasks: returned }), rows(proposed), 'the task swarm_propose returns has no covers')
+  assert.deepEqual(rows({ tasks: returned.map(task => runtime.store.get('tasks', task.id)) }), rows(proposed), 'and neither has the row it stored')
   // Rewritten by the staged repair: the assembly fails once the deliverable exists citing c1, and the repaired plan writes [] for it.
   const propose = runtime.propose.bind(runtime)
   runtime.propose = (...args) => { const task = propose(...args); if (task.kind === 'verification') throw new Error('assembly fixture failure'); return task }
