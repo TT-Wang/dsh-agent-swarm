@@ -297,7 +297,7 @@ try {
   await waitUntil(() => ctx.swarm.snapshot({ sessionId: ownerId }, missionId).tasks.find(task => task.id === implementation.id)?.status === 'accepted', 'implementation and peer-proposed review')
   const integration = (await ownerCall('swarm_propose', {
     missionId, workstreamId: workstream.id, title: 'Integrate value two', objective: 'Integrate the accepted implementation and validate the deliverable.',
-    kind: 'integration', dependencies: [implementation.id], scope: ['value.cjs'], acceptance: ['value is two'], covers: ['c1'], outputs: ['value.cjs'], checks: ['node check.cjs'], assigneeId: builder.id,
+    kind: 'integration', dependencies: [implementation.id], scope: ['value.cjs'], covers: ['c1'], outputs: ['value.cjs'], checks: ['node check.cjs'], assigneeId: builder.id,
   })).result
   await waitUntil(() => ctx.swarm.snapshot({ sessionId: ownerId }, missionId).tasks.find(task => task.id === integration.id)?.status === 'accepted', 'integration and independent verification')
   const completion = await ownerCall('swarm_control', { missionId, action: 'complete', reason: 'The accepted integration artifact meets the mission acceptance criterion.' })
@@ -318,6 +318,13 @@ try {
   assert(transcript.some(call => call.sessionId === reviewer.sessionId && call.name === 'swarm_verify'), 'independent peer must actually verify')
   assert(transcript.some(call => call.sessionId === builder.sessionId && call.name === 'bash'), 'worker must run a real Harness tool')
   assert(userMessages.some(delivery => delivery.message.source.deliveryKind === 'assignment'))
+  // The integration cites its criterion by id alone, so the row it stores holds no criterion text. Every task
+  // a worker's own call returned (its submit, its verify, the review it proposed) still lists that text, as its
+  // assignment does, and never the bare id.
+  const workerTasks = requests.filter(request => request.sessionId !== ownerId).flatMap(request => toolBlocks(request.messages))
+    .flatMap(block => { try { return [JSON.parse(texts(block).join('\n')).result] } catch { return [] } }).filter(result => result?.workstreamId !== undefined && Array.isArray(result.acceptance))
+  for (const [kind, status] of [['integration', 'submitted'], ['verification', 'accepted']]) assert(workerTasks.some(task => task.kind === kind && task.status === status && task.reviewOf !== implementation.id), `a worker must read its ${kind} result`)
+  for (const task of workerTasks) assert.deepEqual([task.acceptance, 'covers' in task], [['value is two'], false], `the ${task.kind} task a worker's call returned must list the criterion text and no bare id`)
   for (const request of requests) {
     for (const message of request.messages.filter(message => message.source?.kind === 'swarm')) {
       assert(userMessages.some(delivery => delivery.sessionId === request.sessionId && delivery.message.id === message.id), 'every model-visible swarm delivery must have a real session-log event')

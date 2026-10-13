@@ -213,6 +213,30 @@ test('workers see criterion text, never bare ids; the owner also reads each task
   assert.equal(f.runtime.observe(f.owner, f.mission.id, { cursor: overview.nextCursor }).mission.criteria, undefined, 'a delta omits the unchanging criteria')
 })
 
+test('a worker reads its checklist in every result of its own calls: the registered swarm_claim, swarm_submit and swarm_verify return the task as its assignment delivers it', async t => {
+  const f = await setup({ clock: new FakeClock(), acceptance: ['works', 'is documented'] })
+  t.after(f.cleanup)
+  const definitions = new Map()
+  registerTools({ tools: { register: definition => definitions.set(definition.name, definition) } }, f.runtime, f.mission.budget)
+  const call = async (name, member, args) => (await definitions.get(name).execute({ missionId: f.mission.id, ...args }, { signal: new AbortController().signal, agent: { id: member.sessionId } })).result
+  // Neither row stores a criterion's text: the deliverable cites both ids, the review has no criteria of its own.
+  const source = f.propose({ acceptance: [] })
+  const review = f.propose({ kind: 'verification', reviewOf: source.id, checks: [], acceptance: [], assigneeId: f.reviewer.id })
+  assert.deepEqual([source, review].map(task => [f.runtime.store.get('tasks', task.id).acceptance, f.runtime.store.get('tasks', task.id).covers]), [[[], ['c1', 'c2']], [[], undefined]])
+  const assigned = taskId => JSON.parse(f.runtime.store.list('deliveries', f.mission.id).findLast(delivery => delivery.kind === 'assignment' && delivery.taskId === taskId).content).task
+  const claimed = await call('swarm_claim', f.author, { taskId: source.id })
+  assert.deepEqual(claimed, assigned(source.id), 'a claim returns the assignment it delivered')
+  const submitted = await call('swarm_submit', f.author, { taskId: source.id, attemptId: claimed.attempt.id, output: 'candidate' })
+  const reviewing = await call('swarm_claim', f.reviewer, { taskId: review.id })
+  assert.deepEqual(reviewing, assigned(review.id))
+  const verified = await call('swarm_verify', f.reviewer, { taskId: review.id, attemptId: reviewing.attempt.id, verdict: 'accept', reason: 'Independent host checks pass' })
+  for (const [name, result] of Object.entries({ claimed, submitted, reviewing, verified })) {
+    assert.deepEqual(result.acceptance, ['works', 'is documented'], `${name} lists the text of every criterion the task answers for`)
+    assert.equal('covers' in result, false, `${name} carries no bare id`)
+  }
+  assert.deepEqual([submitted.status, verified.status, f.runtime.store.get('tasks', source.id).covers], ['submitted', 'accepted', ['c1', 'c2']], 'the stored rows keep the ids')
+})
+
 test('a staged mission\'s criteria are fixed: a repair may change covers and task criteria, never the mission list', async t => {
   const workers = new FakeWorkers()
   const { dir, runtime } = await makeRuntime(t, { workers, config: { tickMs: 60000, checkTimeoutMs: undefined } })

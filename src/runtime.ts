@@ -24,7 +24,7 @@ import { validScope, scopeSubset } from './scope.ts'
 import { AdmissionError, assertCovers, assertDeclaredOutputs, assertScopeSelectors, dependencyAssumptions, formatDiagnostic, isNoopCheck, loadPackageScripts, normalizeReviewDependencies, normalizeScopeSelectors, normalizeTaskCeilings, reconcileTaskAdmission, requireHostChecks, taskCeilingBlock, taskGraphDefects, TaskGraphAdmissionError, type TaskGraphNode } from './admission.ts'
 import { authorIdsOf, canBorrowTask, canOwnReview, strandedReview } from './assignment.ts'
 import { executionClock, executionElapsed } from './resource-time.ts'
-import { completionExempt, taskGraphIndex, uncoveredCriteria, type TaskGraphIndex } from './task-graph.ts'
+import { completionExempt, taskGraphIndex, uncoveredCriteria } from './task-graph.ts'
 import { checkSyntaxDetail, declaredPlanChecks, orderedTasks, pairReviews, planAdvisories, validatePlan } from './plans.ts'
 import { OWNER_ONLY_TOOLS, type Actor, type AutoStart, BoardQuery, Budget, CheckAttribution, CheckEnvelope, CheckEnvironment, CheckResult, CreateMissionInput, CriticalPath, criterionId, Delivery, DraftPlan, Escalation, Evidence, EvidenceStatus, Member, MemberStatus, Mission, NoticeClass, nextWorkerName, ObserveQuery, MessageInput, PlanInput, Post, PostInput, PostKind, ProposeTaskInput, ProviderOutage, PublishInput, RecoveryFallback, RequestStartInput, RuntimeConfig, Snapshot, Task, TaskAmendment, TaskRejection, TaskCeiling, ToolRun, UsageBuckets, UsageSnapshotSource, VerificationCleanupFailure, WorkerAdapter, WorkerActivity, Workstream } from './types.ts'
 import { requireArtifactChecks } from './artifact-policy.ts'
@@ -114,8 +114,6 @@ interface ReviewNeed { id: string; seq: number; age: number | undefined }
  * repairs it another way, so a task the reviewers keep rejecting cannot loop.
  */
 export const DEFAULT_MAX_REWORK = 2
-/** A task as its worker and reviewers read it: `acceptance` is its derived checklist, which holds the text of every criterion it cites, never the bare ids. */
-const memberTask = ({ covers: _cited, ...task }: Task, graph: TaskGraphIndex, criteria: readonly string[]) => ({ ...task, acceptance: graph.checklist(task.id, criteria) })
 /**
  * The repair path the verify site's rejection decision names to the owner and
  * to the author: rework in place first, a replacement second. A rejected
@@ -887,6 +885,8 @@ export class SwarmRuntime {
     if (mission.executionTime !== undefined && !terminal(mission)) executionClock(mission, mission.executionTime.since !== undefined, this.now())
     return mission
   }
+  /** A task as its worker and reviewers read it, in its assignment, in `swarm_observe` and in the result of their own claim, submit and verify: `acceptance` is its derived checklist, which holds the text of every criterion it cites, never the bare ids. */
+  private memberTask({ covers: _cited, ...task }: Task, mission = this.mission(task.missionId), graph = taskGraphIndex(this.store.list('tasks', task.missionId))): Task { return { ...task, acceptance: graph.checklist(task.id, mission.acceptance) } }
   participant(actor: Actor, missionId: string): { mission: Mission; member?: Member; key: string; owner: boolean } {
     const mission = this.mission(missionId)
     if (mission.ownerSessionId === actor.sessionId) return { mission, key: 'owner', owner: true }
@@ -1522,14 +1522,15 @@ export class SwarmRuntime {
     // a block cause.
     const admitted = this.admissionRecord(candidate, decision, latencyMs)
     try {
-      this.commit(task.missionId, () => {
+      return this.commit(task.missionId, () => {
         this.store.put('tasks', task); this.store.put('members', member)
         // The worker reads its task without that record: this attempt's workspace was prepared.
-        const { preparationFailure: _retried, ...assigned } = memberTask(task, taskGraphIndex(this.store.list('tasks', task.missionId)), mission.acceptance)
+        const { preparationFailure: _retried, ...assigned } = this.memberTask(task, mission)
         this.store.recordAdmission(admitted)
         this.store.put('deliveries', { id: id('msg'), missionId: task.missionId, from: 'runtime', to: member.id, kind: 'assignment', taskId: task.id, attemptId: task.attempt!.id,
           content: JSON.stringify({ missionId: task.missionId, task: assigned, ...this.assignmentCheckEnvironment(), instructions: ASSIGNMENT_INSTRUCTIONS }), createdAt: this.now() })
         this.store.event(task.missionId, 'task/claimed', member.id, { taskId: task.id, attempt: task.attempt })
+        return assigned
       })
     } catch (error) {
       // A classified writer conflict is an admission refusal, not a task failure:
@@ -1540,7 +1541,6 @@ export class SwarmRuntime {
       }
       throw error
     }
-    return task
   }
   /** Explicit member self-claim; scheduling uses the same atomic transition. */
   async claim(actor: Actor, missionId: string, taskId: string): Promise<Task> {
@@ -1649,7 +1649,7 @@ export class SwarmRuntime {
           ...(missingReview === undefined ? {} : { reviewPath: { missing: true, reason: missingReview } }) })
       })
       this.kick(missionId)
-      return task
+      return this.memberTask(task)
     })
   }
   /**
@@ -1750,7 +1750,7 @@ export class SwarmRuntime {
           this.notify(missionId, reason, this.interpretation(missionId).subjectsOf([source, task]), { from: member.id })
         })
         this.kick(missionId)
-        return task
+        return this.memberTask(task)
       }
       const runIds: string[] = []
       const released = new Set<string>()
@@ -1840,7 +1840,7 @@ export class SwarmRuntime {
       // A verdict closes a unit of work for both sessions: let the adapter trim history it no longer needs.
       for (const memberId of new Set([source.attempt?.ownerId, member.id])) if (memberId) this.workers.compactAtBoundary(memberId)
       this.kick(missionId)
-      return task
+      return this.memberTask(task)
     })
   }
   /**
@@ -3268,7 +3268,7 @@ export class SwarmRuntime {
     const taskRef = (task: Task) => ({ id: task.id, title: task.title, kind: task.kind, status: task.status, ...(task.assigneeId ? { assigneeId: task.assigneeId } : {}), ...(task.assignmentMode ? { assignmentMode: task.assignmentMode } : {}), ...(task.attempt ? { attemptOwner: task.attempt.ownerId } : {}),
       ...(task.reviewOf ? { reviewOf: task.reviewOf } : {}), ...(task.dependencies.length ? { dependencies: task.dependencies } : {}), ...(task.replaces?.length ? { replaces: task.replaces } : {}), ...(task.artifact ? { artifact: task.artifact.commit } : {}), ...(task.reviewArtifact ? { reviewArtifact: task.reviewArtifact.commit } : {}),
       ...(task.recovery ? { recovery: task.recovery } : {}) })
-    const taskRecord = (task: Task, outputLimit: number) => ({ ...memberTask(task, graph, mission.acceptance), ...(member || !task.covers ? {} : { covers: task.covers }), ...(task.output !== undefined ? { output: excerpt(task.output, outputLimit) } : {}), ...(task.handoff !== undefined ? { handoff: excerpt(task.handoff, outputLimit) } : {}) })
+    const taskRecord = (task: Task, outputLimit: number) => ({ ...this.memberTask(task, mission, graph), ...(member || !task.covers ? {} : { covers: task.covers }), ...(task.output !== undefined ? { output: excerpt(task.output, outputLimit) } : {}), ...(task.handoff !== undefined ? { handoff: excerpt(task.handoff, outputLimit) } : {}) })
     const evidenceOf = (task: Task, full = false) => task.evidenceIds.map(evidenceId => this.store.get('evidence', evidenceId)).filter((item): item is Evidence => item !== undefined).map(item => evidenceRef(item, full))
     const runsWindow = (filter: { memberId?: string; taskId?: string; attemptId?: string }, limit: number, afterSeq?: number) => {
       const all = this.store.toolRuns(missionId, { ...filter, ...(afterSeq === undefined ? {} : { afterSeq }) })
