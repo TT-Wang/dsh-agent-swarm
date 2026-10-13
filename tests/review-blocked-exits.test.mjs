@@ -213,6 +213,27 @@ async function withdrawn(f, { running, stop } = {}) {
 }
 
 /**
+ * The host admits its review on a board with nothing else to do, and every
+ * attempt at it runs out its lease with no verdict until the review's recovery
+ * limit leaves it blocked: the one review the host admits for this need is dead.
+ */
+async function exhausted(f, { running } = {}) {
+  const { source } = await submitted(f)
+  const [automatic] = f.reviewsOf(source)
+  assert.match(automatic.id, /^task_auto_review_/, 'the host admitted its review first')
+  for (let round = 0; round < 6 && f.live(source); round++) {
+    if (taskOf(f.runtime, automatic.id).status === 'pending') await f.runtime.claim(f.actor(f.reviewer), f.mission.id, automatic.id)
+    f.clock.advance(f.runtime.config.leaseMs)
+    await f.pass()
+  }
+  const review = taskOf(f.runtime, automatic.id)
+  assert.deepEqual([review.status, review.recoveryCount, review.resumeAfterStop], ['blocked', review.maxRecoveryAttempts, undefined], 'the review is blocked at its recovery limit')
+  if (running !== undefined) await f.run(running(f))
+  await f.pass()
+  return { source }
+}
+
+/**
  * The host's own review of the source is refused: the source's check was
  * worker-runnable when it was admitted, and its script now resolves to a
  * nested sandbox, so the review that copies it is refused.
@@ -256,6 +277,7 @@ const unplanned = block => async f => {
 const BUDGET = n => new RegExp(`^the mission task budget is exhausted \\(${n}/${n} admitted tasks\\), so no verification task can be admitted: `)
 const NO_MEMBER = /^no live member other than the author \(member_[\w-]+\) can review this artifact independently: add /
 const WITHDRAWN = /^the automatically admitted review task_auto_review_\w+ was withdrawn: /
+const NOT_LIVE = /^the automatically admitted review task_auto_review_\w+ is blocked and cannot reach a verdict: /
 const DEFERRED = /^review task_[\w-]+ deferred its verdict on this artifact: the host could not execute a check: /
 const DEFERRED_TIMEOUT = /^review task_[\w-]+ deferred its verdict on this artifact: a check reached its deadline: /
 const DEFERRED_UNRUNNABLE = /^review task_[\w-]+ deferred its verdict on this artifact: a command could not run in the clean verification checkout: /
@@ -333,6 +355,30 @@ const FAMILIES = [
     options: { launched: true },
     block: unplanned(f => deferred(f, { kind: 'unrunnable' })),
     steps: [[DEFERRED_UNRUNNABLE, REPLACE]],
+  },
+  // The host admits one review per need: once that review cannot reach a verdict the owner decides, on a stalled board as beside running work.
+  {
+    name: 'the automatic review is blocked at its recovery limit',
+    block: f => exhausted(f),
+    steps: [[NOT_LIVE, PROPOSE_OR_CANCEL]],
+  },
+  {
+    name: 'on a launched mission, the automatic review is blocked at its recovery limit',
+    options: { launched: true },
+    block: unplanned(f => exhausted(f)),
+    steps: [[NOT_LIVE, PROPOSE_OR_CANCEL]],
+  },
+  {
+    name: 'beside running work, the automatic review is blocked at its recovery limit',
+    block: f => exhausted(f, { running: author }),
+    steps: [[NOT_LIVE, PROPOSE_OR_CANCEL]],
+  },
+  {
+    name: 'the automatic review is blocked at its recovery limit and the task budget is exhausted',
+    options: { budget: { maxTasks: 2 } },
+    block: f => exhausted(f),
+    // A review the owner admits needs a task slot, so the slot is named first.
+    steps: [[BUDGET(2), ['swarm_budget', 'swarm_cancel']], [NOT_LIVE, PROPOSE_OR_CANCEL]],
   },
   {
     name: 'the owner withdrew the automatic review and no independent member is live',

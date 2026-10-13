@@ -2437,11 +2437,11 @@ export class SwarmRuntime {
    * Why the host cannot give this unreviewable source a live review under this
    * need, each cause with the exit that removes it, or undefined when it
    * admits one now. A review the owner admits needs a task slot and an
-   * independent member, so the owner's withdrawal of the automatic review is
-   * named after those, and the host's own waits for a board with nothing else
-   * to do (`stalled`, as the admission pass judged it). That withdrawal is the automatic
-   * review (host-minted id) with a durable `task/cancelled` row newer than the row that
-   * opened the need; a review a verdict, rework or challenge retired was never cancelled by the owner.
+   * independent member, so the host's own review that cannot reach a verdict
+   * is named after those: the one it admitted for this need (it admits one), or
+   * one the owner withdrew, an automatic review (host-minted id) with a durable
+   * `task/cancelled` row newer than the row that opened the need (a verdict, rework or challenge retires a review without cancelling it).
+   * The host's own admission waits for a board with nothing else to do (`stalled`, as the admission pass judged it).
    */
   reviewPathBlocker(source: Task, need: ReviewNeed, stalled?: boolean): string | undefined {
     const mission = this.mission(source.missionId)
@@ -2451,15 +2451,14 @@ export class SwarmRuntime {
     if (tasks.length >= mission.budget.maxTasks) return `the mission task budget is exhausted (${tasks.length}/${mission.budget.maxTasks} admitted tasks), so no verification task can be admitted: raise maxTasks with swarm_budget(budget, reason), or ${WITHDRAW_SOURCE}`
     const authors = [...authorIdsOf(source)]
     if (!members.some(member => memberPhaseOf(member) !== 'stopped' && canOwnReview(source, member.id))) return `no live member other than the author (${authors.join(', ') || 'unknown'}) can review this artifact independently: add an independent member with swarm_add_member(role, maxOutputTokens), or ${WITHDRAW_SOURCE}`
-    const withdrawn = tasks.find(review => review.reviewOf === source.id && review.status === 'cancelled'
-      && review.id.startsWith(AUTOMATIC_REVIEW_PREFIX) && (this.store.latestTaskEvent(mission.id, review.id, 'task/cancelled')?.seq ?? 0) > need.seq)
-    if (withdrawn !== undefined) return `the automatically admitted review ${withdrawn.id} was withdrawn: ${ADMIT_REVIEW}, or ${WITHDRAW_SOURCE}`
+    const automatic = tasks.find(review => review.id === `${AUTOMATIC_REVIEW_PREFIX}${need.id}` || (review.reviewOf === source.id && review.status === 'cancelled'
+      && review.id.startsWith(AUTOMATIC_REVIEW_PREFIX) && (this.store.latestTaskEvent(mission.id, review.id, 'task/cancelled')?.seq ?? 0) > need.seq))
+    if (automatic !== undefined) return `the automatically admitted review ${automatic.id} ${automatic.status === 'cancelled' ? 'was withdrawn' : `is ${automatic.status} and cannot reach a verdict`}: ${ADMIT_REVIEW}, or ${WITHDRAW_SOURCE}`
     return (stalled ?? this.reviewPathStalled(tasks, members)) ? undefined : BOARD_RUNNING
   }
-  /** Admit the bounded independent review for one unreviewable submitted deliverable once: its id is keyed on the review need, so an existing row is that review. */
+  /** Admit the bounded independent review of one unreviewable submitted deliverable. Its id is keyed on the review need, and `reviewPathBlocker` names one that exists, so each need is admitted once. */
   private admitAutomaticReview(mission: Mission, source: Task, need: ReviewNeed): void {
     const reviewId = `${AUTOMATIC_REVIEW_PREFIX}${need.id}`
-    if (this.store.get('tasks', reviewId) !== undefined) return
     try {
       this.propose({ sessionId: mission.ownerSessionId }, mission.id, {
         workstreamId: source.workstreamId, title: `Independent review of ${source.title}`,

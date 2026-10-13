@@ -11,7 +11,7 @@
  */
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { FakeClock, MISSION_ACCEPTANCE, acceptThroughReview, blockThroughReview, events, setup, taskOf } from './faults/harness.mjs'
+import { FakeClock, FakeWorkers, MISSION_ACCEPTANCE, acceptThroughReview, blockThroughReview, events, setup, taskOf } from './faults/harness.mjs'
 import { ownerTools } from './refusal-inventory.mjs'
 import { noticeFamily, noticeTemplateKey } from '../lib/notices.js'
 
@@ -310,6 +310,57 @@ test('an unreviewable submission is the review admission\'s decision alone: the 
     assert.equal(stallRow(f), undefined, `review=${review}: no W3 stall restates it`)
     assert.deepEqual(boardStallEvents(f), [])
   }
+})
+
+test('a board whose only unfinished work is a submission and its dead host review is the admission\'s to name: it is told once, by that decision, even when no guard terminal was', async t => {
+  // A worker stop the test holds open, so the owner can pause the mission while the review's last lease expiry is settling.
+  let held
+  const workers = new FakeWorkers()
+  const stop = workers.stop.bind(workers)
+  workers.stop = async id => { await stop(id); if (held !== undefined) { held.entered(); await held.released } }
+  const f = await setup({ clock: new FakeClock(), workers })
+  t.after(f.cleanup)
+  const source = f.propose()
+  const claimed = await f.runtime.claim(f.actor(f.author), f.mission.id, source.id)
+  await f.runtime.submit(f.actor(f.author), f.mission.id, { taskId: source.id, attemptId: claimed.attempt.id, output: 'candidate' })
+  await f.runtime.settle(f.mission.id)
+  await ticks(f, 150)
+  const review = f.runtime.store.list('tasks', f.mission.id).find(row => row.reviewOf === source.id)
+  assert.match(review?.id ?? 'none', /^task_auto_review_/, 'the host admitted its review')
+  const row = () => taskOf(f.runtime, review.id)
+  const expire = async () => {
+    await f.runtime.claim(f.actor(f.reviewer), f.mission.id, review.id)
+    f.clock.advance(f.runtime.config.leaseMs + f.runtime.config.tickMs)
+  }
+  // Every lease but the last runs out and the review re-pends.
+  while ((row().recoveryCount ?? 0) < row().maxRecoveryAttempts - 1) {
+    await expire()
+    await ticks(f, 5)
+    await f.runtime.settle(f.mission.id)
+    assert.equal(row().status, 'pending', 'an expiry inside the recovery limit re-pends the review')
+  }
+  // The last expiry's stop is still settling when the owner pauses the mission, so the recovery limit raises no guard terminal.
+  await expire()
+  let release
+  const entered = new Promise(resolve => { held = { entered: resolve, released: new Promise(open => { release = open }) } })
+  f.runtime.runTick()
+  await entered
+  f.runtime.control(f.owner, f.mission.id, 'pause', 'Hold on')
+  held = undefined
+  release()
+  await f.runtime.settle(f.mission.id)
+  assert.deepEqual([row().status, row().recoveryCount, row().resumeAfterStop], ['blocked', row().maxRecoveryAttempts, undefined], 'the review is blocked at its recovery limit')
+  const before = ownerRows(f).map(delivery => delivery.id)
+  f.runtime.control(f.owner, f.mission.id, 'resume', 'Carry on')
+  await f.runtime.settle(f.mission.id)
+  await ticks(f, 150)
+  assert.equal(f.runtime.interpretation(f.mission.id).stalled, true, 'the board is stalled on the submission and its dead review')
+  const told = ownerRows(f).filter(delivery => !before.includes(delivery.id))
+  assert.deepEqual(told.map(delivery => noticeFamily(delivery)), ['review-blocked'], 'the owner is told once, by the admission')
+  assert.deepEqual(told[0].subjects, [`${source.id}@${taskOf(f.runtime, source.id).epoch}`])
+  assert.match(told[0].content, new RegExp(`the automatically admitted review ${review.id} is blocked and cannot reach a verdict: admit a review with swarm_propose\\(.*\\), or withdraw the source with swarm_cancel\\(taskId, reason\\)$`))
+  assert.equal(relevant(f, told[0]), true, 'and the decision is outstanding')
+  assert.deepEqual(boardStallEvents(f), [], 'no W3 stall restates it')
 })
 
 test('the review admission speaks only for its own source: other stuck work beside an unreviewable submission is named while that decision is open', async t => {
