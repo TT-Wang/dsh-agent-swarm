@@ -562,6 +562,31 @@ test('a wedged pass keeps the host\'s admission from running: the classifier nam
   await followExits(f, { source }, { steps: [[BUDGET(2), ['swarm_budget', 'swarm_cancel']]] })
 })
 
+test('while a wedged pass keeps the host\'s admission from running, the classifier names a recorded need by the blocker that holds: the next cause once the owner removed the first, and none when the host would admit its review', async t => {
+  for (const members of [['Author'], ['Author', 'Reviewer']]) {
+    const f = await fixture(t, { members, budget: { maxTasks: 1 } })
+    const { source } = await submitted(f)
+    const first = blockedNotice(f, source, BUDGET(1))
+    // The owner frees a task slot, and no pass runs to admit a review or name the next cause.
+    f.runtime.store.transaction(() => { const mission = f.runtime.mission(f.mission.id); f.runtime.store.put('missions', { ...mission, budget: { ...mission.budget, maxTasks: 2 } }) })
+    await publish(f, true)
+    assert.equal(f.runtime.reviewPathStalled(f.runtime.store.list('tasks', f.mission.id), f.runtime.store.list('members', f.mission.id)), true, 'nothing runs on the board')
+    if (members.length === 1) {
+      // No member may review it: the cause the admission would name next is true of the board now.
+      const next = blockedNotice(f, source, NO_MEMBER)
+      assert.deepEqual(decisionsOn(f, source).map(delivery => delivery.id), [first.id, next.id], 'the wedged classifier names the cause that holds now')
+      assert.deepEqual([first, next].map(notice => f.runtime.ownerDeliveryRelevant(f.runtime.mission(f.mission.id), f.runtime.store.get('deliveries', notice.id))), [false, true], 'and it alone is outstanding')
+      await followExits(f, { source }, { steps: [[NO_MEMBER, ['swarm_add_member', 'swarm_cancel']]] })
+    } else {
+      // An independent member is live: the host admits its review at its next pass, so no cause holds and none is invented.
+      assert.deepEqual(decisionsOn(f, source).map(delivery => delivery.id), [first.id], 'no decision states a cause the board does not have')
+      await f.pass()
+      assert.match(f.reviewsOf(source).map(review => review.id).join(), /^task_auto_review_\w+$/, 'the next pass admits the host review')
+      assert.equal(f.live(source), true)
+    }
+  }
+})
+
 test('two sources share the last task slot: the first gets the host review, the second the budget decision, and no decision is stale when written', async t => {
   const f = await fixture(t, { budget: { maxTasks: 3 } })
   const first = f.propose(), second = f.propose({ title: 'Implement the rest' })

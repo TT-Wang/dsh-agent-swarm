@@ -1292,12 +1292,13 @@ export class Notices {
     // So is a submitted artifact no live review can accept, named even behind
     // unrelated live work (verifier-1 challenge, evidence_a454a771) by the
     // runtime's own review admission: each pass admits the review or names the
-    // current blocker. This names, through that admission's emitter, only what it does not
-    // reach: a legacy submission without an artifact past the review grace (`ReviewNeed.ripe`)
+    // current blocker. This names, through that admission's emitter and blocker rule, only what it
+    // does not reach: a legacy submission without an artifact past the review grace (`ReviewNeed.ripe`)
     // and, while a wedged pass keeps it from running, a need it recorded (`ReviewNeed.recorded`).
     for (const task of view.unreviewed) {
       const need = this.rt.reviewNeed(task)
-      if (task.artifact === undefined ? need.ripe : options.wedged === true && need.recorded) this.notifyReviewBlocked(mission, task, need.id, this.rt.reviewPathBlocker(task, need) ?? BOARD_RUNNING)
+      const blocker = (task.artifact === undefined ? need.ripe : options.wedged === true && need.recorded) ? this.rt.reviewPathBlocker(task, need) : undefined
+      if (blocker !== undefined) this.notifyReviewBlocked(mission, task, need.id, blocker)
     }
     const fingerprint = this.rt.fingerprint(missionId)
     // R15-D1: a WEDGED pass is its own subject, exactly like a stall root. The
