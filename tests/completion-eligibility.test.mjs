@@ -18,14 +18,16 @@ const record = (mission, id, kind, status, acceptance, commit, covers) => ({ id,
   scope: ['src/'], acceptance, ...(covers === undefined ? {} : { covers }), checks: [], status, priority: 50, experiment: false, epoch: 0, evidenceIds: [],
   ...(commit === undefined ? {} : { artifact: { commit, baseCommit: 'b'.repeat(40), workspace: '/isolated', changedPaths: [] } }) })
 
-test('a verification task acceptance string cannot cover a mission criterion', async t => {
+test('only an accepted deliverable covers a mission criterion: not a verification task, by its text or by an id its row holds, and not an implementation without an artifact', async t => {
   const f = await fixture(t, ['works', 'extra'])
   f.put(record(f.mission, 'deliverable', 'implementation', 'accepted', ['works'], '1'.repeat(40), ['c1']))
-  f.put(record(f.mission, 'review', 'verification', 'accepted', ['works', 'extra']))
+  // Both rows are accepted and both hold c2; neither is deliverable work.
+  f.put(record(f.mission, 'review', 'verification', 'accepted', ['works', 'extra'], undefined, ['c2']))
+  f.put(record(f.mission, 'uncaptured', 'implementation', 'accepted', [], undefined, ['c2']))
   const snapshot = f.runtime.snapshot(f.owner, f.mission.id)
   assert.equal(snapshot.completion.eligible, false)
-  assert.match(snapshot.completion.reason, /"extra"/)
-  assert.throws(() => f.runtime.control(f.owner, f.mission.id, 'complete', 'verification claims both'), /"extra"/)
+  assert.match(snapshot.completion.reason, /criterion: c2 "extra"\. /)
+  assert.throws(() => f.runtime.control(f.owner, f.mission.id, 'complete', 'verification claims both'), /criterion: c2 "extra"\. /)
 })
 
 test('completion becomes eligible exactly when control(complete) succeeds', async t => {

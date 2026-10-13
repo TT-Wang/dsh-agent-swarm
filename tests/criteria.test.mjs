@@ -515,7 +515,9 @@ function writeV3(path, version = 3) {
     v3Task('hr', 'inherited', 'verification', 'pending', ['m1', PRIOR, 'extra'], { reviewOf: 'h2' }),
   ]) insert('tasks', row)
   insert('drafts', { id: 'draft', ownerSessionId: 'owner', revision: 1, status: 'draft', createdAt: 1, updatedAt: 1,
-    input: { ...plan('/repo'), acceptance: ['x1', 'x2'], tasks: [{ ...plan('/repo').tasks[0], acceptance: ['x2', 'own'], covers: undefined }, { ...plan('/repo').tasks[1], acceptance: ['x1', 'x2'], covers: undefined }] } })
+    input: { ...plan('/repo'), acceptance: ['x1', 'x2'], tasks: [{ ...plan('/repo').tasks[0], acceptance: ['x2', 'own'], covers: undefined }, { ...plan('/repo').tasks[1], acceptance: ['x1', 'x2'], covers: undefined },
+      // A second deliverable that copied a criterion: every task of a draft is cited, not only the first that changes.
+      { ...plan('/repo').tasks[0], key: 'docs', title: 'Docs', acceptance: ['x1', 'docs own'], covers: undefined }] } })
   db.exec(`PRAGMA user_version=${version}`)
   db.close()
 }
@@ -534,7 +536,8 @@ test('a v3 store cites the criteria its deliverables copied, once at open, and k
   // The amend guard reads the migrated row's own criteria, as it reads a v4 row that cites the same id.
   assert.deepEqual(opened.controlTask({ sessionId: 'owner' }, 'guarded', 'g', 'amend', { dependencies: [] }, 'the criterion is cited, not copied').dependencies, [])
   assert.equal(opened.store.get('tasks', 't1').revision, undefined, 'the upgrade is not a task write')
-  assert.deepEqual(opened.store.get('drafts', 'draft').input.tasks.map(task => [task.covers, task.acceptance]), [[['c2'], ['own']], [undefined, ['x1']]], 'a draft review keeps only its review-only text')
+  assert.deepEqual(opened.store.get('drafts', 'draft').input.tasks.map(task => [task.key, task.covers, task.acceptance]), [['code', ['c2'], ['own']], ['review', undefined, ['x1']], ['docs', ['c1'], ['docs own']]],
+    'both draft deliverables cite what they copied and keep only their own text; the review keeps only its review-only text')
   const reason = id => opened.completionError(opened.store.get('missions', id))
   assert.equal(reason('done'), undefined, 'covered before, covered after')
   assert.match(reason('stalled'), /criterion: c2 "b2"\. /, 'uncovered before, uncovered after; a review\'s text still covers nothing')
@@ -543,12 +546,18 @@ test('a v3 store cites the criteria its deliverables copied, once at open, and k
   const probe = new DatabaseSync(config.statePath, { readOnly: true })
   assert.equal(probe.prepare('PRAGMA user_version').get().user_version, 4)
   probe.close()
-  // Once: a v4 store is not cited again, so a row without covers stays without.
-  opened.store.transaction(() => { const row = opened.store.get('tasks', 't2'); delete row.covers; opened.store.put('tasks', row) })
+  // Once: a v4 store is not cited again. A v4 deliverable may hold a criterion's text as its own and cite nothing;
+  // reopening leaves that row as it is and moves no state revision.
+  opened.store.transaction(() => { const { covers: _cited, ...row } = opened.store.get('tasks', 't2'); opened.store.put('tasks', { ...row, acceptance: ['a2'] }) })
   await opened.dispose()
+  // Read from the closed file: whatever the runtime wrote while it ran is behind this revision.
+  const closed = new DatabaseSync(config.statePath, { readOnly: true })
+  const revision = Number(closed.prepare('SELECT revision FROM state_revision WHERE id=1').get().revision)
+  closed.close()
   const reopened = new SwarmRuntime(config, new FakeWorkers())
   t.after(() => reopened.dispose())
-  assert.equal(reopened.store.get('tasks', 't2').covers, undefined)
+  const kept = reopened.store.get('tasks', 't2')
+  assert.deepEqual([kept.acceptance, kept.covers, reopened.store.revision()], [['a2'], undefined, revision], 'the text stays its own, uncited, and nothing was written')
   await reopened.dispose()
   // Restoring a v3 snapshot, or an unversioned one, upgrades it the same way.
   for (const version of [3, 0]) {
