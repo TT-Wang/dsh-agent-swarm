@@ -21,7 +21,7 @@ export { TEMP_RENDEZVOUS_WINDOW_MS, sharedTempPaths, tempRendezvousDecision, typ
 import { awaitsDelivery } from './arena.ts'
 import { AdmissionRefusedError, classifyProviderOutage, LIMIT_LEVELS, scopeKeysOverlap, TASK_CLASSES, type AdmissionCandidate, type AdmissionDecision, type AdmissionReason, type AdmissionRecord, type LimitLevel, type LimitRule } from './scheduler.ts'
 import { validScope, scopeSubset } from './scope.ts'
-import { AdmissionError, assertCovers, assertDeclaredOutputs, assertScopeSelectors, dependencyAssumptions, formatDiagnostic, isNoopCheck, loadPackageScripts, normalizeReviewDependencies, normalizeScopeSelectors, normalizeTaskCeilings, reconcileTaskAdmission, requireHostChecks, taskCeilingBlock, taskGraphDefects, TaskGraphAdmissionError, type TaskGraphNode } from './admission.ts'
+import { AdmissionError, assertDeclaredOutputs, assertScopeSelectors, citedCovers, dependencyAssumptions, formatDiagnostic, isNoopCheck, loadPackageScripts, normalizeReviewDependencies, normalizeScopeSelectors, normalizeTaskCeilings, reconcileTaskAdmission, requireHostChecks, taskCeilingBlock, taskGraphDefects, TaskGraphAdmissionError, type TaskGraphNode } from './admission.ts'
 import { authorIdsOf, canBorrowTask, canOwnReview, strandedReview } from './assignment.ts'
 import { executionClock, executionElapsed } from './resource-time.ts'
 import { completionExempt, taskGraphIndex, uncoveredCriteria } from './task-graph.ts'
@@ -1271,9 +1271,9 @@ export class SwarmRuntime {
     requireText(input.title, 'title'); requireText(input.objective, 'objective')
     const acceptance = input.acceptance ?? []
     if (!Array.isArray(acceptance) || acceptance.length) requireStrings(acceptance, 'acceptance')
-    if (input.covers !== undefined) assertCovers(input.covers, mission.acceptance.length, 'covers')
-    if (input.covers?.length && input.kind === 'verification') throw new PolicyError('covers_invalid', 'validation_error', '[covers_invalid] A verification task checks what its source covers and cannot cover a criterion itself. Omit `covers` on the review; name the criterion in `covers` of a deliverable, or of a repair naming `replaces`, with `swarm_propose`, then retry.')
-    if (!acceptance.length && !input.covers?.length && !input.replaces?.length && input.kind !== 'verification') throw new PolicyError('task_acceptance_required', 'validation_error', '[task_acceptance_required] A new deliverable needs criteria. Pass `covers` with the ids of the mission criteria it satisfies (c1 is the mission\'s first acceptance item), or `acceptance` as its own nonempty criteria, with `swarm_propose`; or name the rejected task in `replaces` to inherit its criteria, then retry.')
+    const covers = citedCovers(input.covers, mission.acceptance.length, 'covers')
+    if (covers && input.kind === 'verification') throw new PolicyError('covers_invalid', 'validation_error', '[covers_invalid] A verification task checks what its source covers and cannot cover a criterion itself. Omit `covers` on the review; name the criterion in `covers` of a deliverable, or of a repair naming `replaces`, with `swarm_propose`, then retry.')
+    if (!acceptance.length && !covers && !input.replaces?.length && input.kind !== 'verification') throw new PolicyError('task_acceptance_required', 'validation_error', '[task_acceptance_required] A new deliverable needs criteria. Pass `covers` with the ids of the mission criteria it satisfies (c1 is the mission\'s first acceptance item), or `acceptance` as its own nonempty criteria, with `swarm_propose`; or name the rejected task in `replaces` to inherit its criteria, then retry.')
     if (!['research', 'implementation', 'verification', 'integration'].includes(input.kind)) throw new PolicyError('task_kind_invalid', 'validation_error', 'Unknown task kind')
     // The tool path's schema types these first; the browser propose RPC and the
     // exported runtime API reach here without it, and a stored string priority
@@ -1411,7 +1411,7 @@ export class SwarmRuntime {
     // written before `outputs` existed: it reads as [] ("this task writes
     // nothing"), and no output is inferred from its objective or acceptance.
     if (input.outputs !== undefined) task.outputs = [...input.outputs]
-    if (input.covers?.length) task.covers = [...input.covers]
+    if (covers) task.covers = covers
     if (input.assigneeId !== undefined) task.plannedAssigneeId = input.assigneeId
     if (input.assignmentMode !== undefined) task.assignmentMode = input.assignmentMode
     if (input.maxRecoveryAttempts !== undefined) task.maxRecoveryAttempts = input.maxRecoveryAttempts

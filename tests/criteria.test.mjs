@@ -136,6 +136,37 @@ test('a criterion a deliverable and its review both cite is cited once on the de
   assert.deepEqual([launched.mission.status, launched.tasks.find(task => task.kind === 'implementation').covers], ['active', ['c1', 'c2']])
 })
 
+test('citing nothing has one representation, no covers at all: a plan that spells it [] validates to the plan that omits it, and the row is the same whether swarm_propose admits the task or a staged repair rewrites it', async t => {
+  const citing = (workspace, covers) => { const input = plan(workspace); for (const task of input.tasks) task.covers = covers; return input }
+  // The deliverable keeps its own criterion, so it is admissible with no covers.
+  const omitted = validatePlan(citing('/repo', undefined))
+  assert.equal(JSON.stringify(validatePlan(citing('/repo', []))), JSON.stringify(omitted), 'a retry that writes [] is the saved plan')
+  assert.deepEqual(omitted.tasks.map(task => task.covers), [undefined, undefined])
+  // A cited list is the validated plan's own copy, never the caller's array.
+  const given = ['c1'], input = citing('/repo', undefined); input.tasks[0].covers = given
+  const [cited] = validatePlan(input).tasks
+  assert.deepEqual(cited.covers, ['c1']); assert.notEqual(cited.covers, given)
+  const { dir, runtime } = await makeRuntime(t, { workers: new FakeWorkers(), config: { tickMs: 60000, checkTimeoutMs: undefined } })
+  const owner = { sessionId: 'owner' }, claim = { grantRoot: dir, source: 'session' }
+  const rows = snapshot => snapshot.tasks.map(task => [task.kind, task.acceptance, 'covers' in task ? task.covers : 'no covers'])
+  // Admitted by swarm_propose: a fresh launch of the plan that writes [].
+  const fresh = runtime.createDraft(owner, citing(dir, []), claim)
+  const proposed = await runtime.launchDraft(owner, fresh.id, fresh.revision)
+  // Rewritten by the staged repair: the assembly fails once the deliverable exists citing c1, and the repaired plan writes [] for it.
+  const propose = runtime.propose.bind(runtime)
+  runtime.propose = (...args) => { const task = propose(...args); if (task.kind === 'verification') throw new Error('assembly fixture failure'); return task }
+  const first = citing(dir, undefined); first.tasks[0].covers = ['c1']
+  const draft = runtime.createDraft(owner, first, claim)
+  await assert.rejects(runtime.launchDraft(owner, draft.id, draft.revision), /assembly fixture failure/)
+  runtime.propose = propose
+  const failed = runtime.drafts(owner).find(saved => saved.id === draft.id)
+  assert.deepEqual(runtime.store.list('tasks', failed.missionId).map(task => task.covers), [['c1'], undefined], 'the staged deliverable cites c1')
+  const repaired = runtime.updateDraft(owner, failed.id, failed.revision, citing(dir, []), claim)
+  const rewritten = await runtime.launchDraft(owner, repaired.id, repaired.revision)
+  assert.deepEqual(rows(rewritten), rows(proposed))
+  assert.deepEqual(rows(proposed), [['implementation', ['has a test'], 'no covers'], ['verification', ['reads the diff'], 'no covers']])
+})
+
 test('a review\'s covers are checked where the plan wrote them and move onto its source only afterwards, so a refusal names each field once and never one the plan did not write', () => {
   const located = error => error.diagnostics.map(diagnostic => [diagnostic.code, diagnostic.location])
   // The review is listed before its source and names an unknown id: one diagnostic, at the review.

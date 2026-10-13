@@ -31,10 +31,11 @@ export function assertScopeSelectors(scopes: readonly string[], location: string
   }
 }
 
-/** `covers` lists distinct ids of the mission's `count` acceptance criteria (see `criterionId`). */
-export function assertCovers(covers: unknown, count: number, location: string): asserts covers is string[] {
-  const valid = Array.from({ length: count }, (_, index) => criterionId(index))
-  if (!Array.isArray(covers) || !covers.every((id, index) => valid.includes(id) && covers.indexOf(id) === index)) throw new AdmissionError('covers_invalid', 'validation_error', `[covers_invalid] ${location} must list distinct ids of the mission acceptance criteria, c1 for the first through ${valid.at(-1)} for the last; it has ${JSON.stringify(covers)}. Pass \`covers\` with each id this task satisfies once, never the criterion text, and retry the same task/request.`, location)
+/** `covers` as every plan task and task row holds it: its own list of distinct ids of the mission's `count` acceptance criteria (see `criterionId`), and no list at all when it cites none, however the plan or proposal wrote that. */
+export function citedCovers(covers: unknown, count: number, location: string): string[] | undefined {
+  const valid = Array.from({ length: count }, (_, index) => criterionId(index)), cited = covers === undefined ? [] : covers
+  if (!Array.isArray(cited) || !cited.every((id, index) => valid.includes(id) && cited.indexOf(id) === index)) throw new AdmissionError('covers_invalid', 'validation_error', `[covers_invalid] ${location} must list distinct ids of the mission acceptance criteria, c1 for the first through ${valid.at(-1)} for the last; it has ${JSON.stringify(covers)}. Pass \`covers\` with each id this task satisfies once, never the criterion text, and retry the same task/request.`, location)
+  return cited.length ? [...cited] : undefined
 }
 
 /** reviewOf already waits for submission; an ordinary edge would wait for acceptance. */

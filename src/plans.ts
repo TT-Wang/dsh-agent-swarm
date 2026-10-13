@@ -1,6 +1,6 @@
 /** Pure validation shared by staged browser plans and their launch boundary. */
 import { isAbsolute } from 'node:path'
-import { AdmissionError, assertCovers, assertDeclaredOutputs, assertScopeSelectors, classifyCheck, loadPackageScripts, dependencyAssumptions, formatDiagnostic, normalizeReviewDependencies, normalizeScopeSelectors, normalizeTaskCeilings, requireHostChecks, type AdmissionDiagnostic, type TaskCeilingInput } from './admission.ts'
+import { AdmissionError, assertDeclaredOutputs, assertScopeSelectors, citedCovers, classifyCheck, loadPackageScripts, dependencyAssumptions, formatDiagnostic, normalizeReviewDependencies, normalizeScopeSelectors, normalizeTaskCeilings, requireHostChecks, type AdmissionDiagnostic, type TaskCeilingInput } from './admission.ts'
 import { canOwnReview } from './assignment.ts'
 import type { PolicyErrorCategory } from './policy-error.ts'
 import { nextWorkerName, type CheckSyntaxIssue, type PlanInput, type PlanReviewOverride, type PlanTask } from './types.ts'
@@ -169,7 +169,7 @@ export function validatePlan(value: unknown, options: PlanValidationOptions = {}
     })
     task.acceptance ??= []
     inspectAdmission(() => strings(task.acceptance, `${at}.acceptance`, true))
-    if (task.covers !== undefined) inspectAdmission(() => assertCovers(task.covers, (value.acceptance as string[]).length, `${at}.covers`))
+    inspectAdmission(() => { task.covers = citedCovers(task.covers, (value.acceptance as string[]).length, `${at}.covers`) })
     // A plan states its deliverables: `outputs` is the only record of the files
     // a task writes, so a launched task must carry it. Empty is legal and means
     // "writes no file". Outputs are matched only against a scope of strings: a
@@ -228,7 +228,6 @@ export function validatePlan(value: unknown, options: PlanValidationOptions = {}
     if (task.review !== undefined) inspectAdmission(() => reviewOverride(task, `${at}.review`, members, tasks, Number((value.budget as Record<string, unknown>).maxSteps)))
   }
   if (undeclared.length) admissionIssues.push(outputsRequired(undeclared))
-  // Every field was checked where the plan wrote it. Only now do a review's covers move onto its source; a deliverable then needs criteria of its own or cited ones.
   for (const review of tasks.values()) if (review.kind === 'verification' && Array.isArray(review.covers)) { const source = tasks.get(String(review.reviewOf)); if (source) source.covers = [...new Set([...(Array.isArray(source.covers) ? source.covers : []), ...review.covers])]; delete review.covers }
   for (const [index, task] of [...tasks.values()].entries()) if (task.kind !== 'verification' && Array.isArray(task.acceptance) && !task.acceptance.length && !(task.covers as unknown[] | undefined)?.length) inspectAdmission(() => { throw new AdmissionError('plan_task_acceptance_required', 'validation_error', `[plan_task_acceptance_required] tasks[${index}] (${String(task.key)}) has neither covers nor acceptance. Add to \`covers\` the ids of the mission criteria it satisfies, or, when it satisfies none, give it its own \`acceptance\`, and relaunch the complete plan.`, `tasks[${index}]`) })
   if (experiments > Number(value.budget.maxExperiments)) inspectAdmission(() => { throw new AdmissionError('plan_experiments_exceed_budget', 'budget_error', 'Plan exceeds experiment budget', 'tasks') })
