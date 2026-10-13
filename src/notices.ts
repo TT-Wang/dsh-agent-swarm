@@ -987,7 +987,6 @@ export class Notices {
     const family = noticeFamily(delivery)
     if (family === 'stall-root') return this.openStallRoot(mission.id, delivery, view.tasks)
     if (family === 'review-blocked') return this.openReviewBlock(mission.id, delivery, view.tasks)
-    if (family === 'scheduling-pass') return this.openWedge(mission, delivery, view.tasks)
     if (BOARD_FAMILIES.includes(family) && !this.boardFactOpen(view, delivery)) return []
     // Coverage-complete names its terminal deliverable: the completion it asks for is what stays outstanding.
     if (family === 'coverage-complete') return delivery.subjects ?? []
@@ -1042,9 +1041,8 @@ export class Notices {
       return this.unresolvedSubjects(this.interpretation(mission.id), original ?? delivery).length > 0
     }
     if (BOARD_FAMILIES.includes(family)) return this.boardFactOpen(this.interpretation(mission.id), delivery)
-    if (family === 'scheduling-pass') return this.openWedge(mission, delivery, this.rt.store.list('tasks', mission.id)).length > 0
     if (family === 'review-blocked' || family === 'fallthrough' || family === 'stall-root'
-      || family === 'dispatch-question' || family === 'parked') {
+      || family === 'dispatch-question' || family === 'parked' || family === 'scheduling-pass') {
       const tasks = this.rt.store.list('tasks', mission.id)
       const subjects = delivery.subjects ?? fact.subjects ?? []
       // Old unattributed rows cannot be judged from their text alone.
@@ -1057,6 +1055,9 @@ export class Notices {
         if (subject === missionSubject(mission)) return true
         const task = taskFromSubject(subject, tasks)
         if (task === undefined || TERMINAL_STATES.has(task.status)) return false
+        // A wedged pass's naming holds while the work its key names is unfinished at those epochs, whatever a body
+        // does now: `Scheduling.escalateWedge` leaves a body on a held fact to this row, so it stays deliverable.
+        if (family === 'scheduling-pass') return true
         if (family === 'fallthrough') return !this.waitsLegitimately(task, tasks)
         if (family === 'dispatch-question') return task.status === 'pending'
         return this.interpretation(mission.id).parkedHolders.some(holder => holder.task.id === task.id)
@@ -1131,17 +1132,6 @@ export class Notices {
   /** A W3 stall or coverage-complete decision is outstanding while it is the board's fact under the identity it was told with; a mission blocked on its budget keeps it, like every decision (`ownerDeliveryMoot`), and only an active one is told a new fact (`ensureWitness`, `completeAutomatic`). */
   private boardFactOpen(view: MissionInterpretation, delivery: Pick<Delivery, 'notice'>): boolean {
     return this.boardFact(view)?.key === delivery.notice?.dedupKey
-  }
-
-  /**
-   * A wedged pass's naming is outstanding while its mission publishes as wedged
-   * (`Scheduling.passState`: in memory, since a restarted process owns no body)
-   * and the work it named is still unfinished at the epochs it named.
-   */
-  private openWedge(mission: Mission, delivery: Pick<Delivery, 'subjects'>, tasks: Task[]): string[] {
-    const subjects = delivery.subjects ?? []
-    const unfinished = (subject: string) => { const task = taskFromSubject(subject, tasks); return task !== undefined && !TERMINAL_STATES.has(task.status) }
-    return this.rt.passState(mission.id).wedged && subjects.every(subject => subject === missionSubject(mission) || unfinished(subject)) ? subjects : []
   }
 
   /**

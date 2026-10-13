@@ -626,7 +626,7 @@ test('a wedged pass is named once per naming fact, on the ledger alone: a body o
   assert.equal(Object.hasOwn(f.runtime.store.get('missions', f.mission.id), 'schedulingWedgeNotice'), false, 'nothing on the mission row records a naming')
 })
 
-test('a wedged pass\'s naming is outstanding exactly while its mission is wedged and the work it named is unfinished: withheld and unreminded once the body settles, open again when one wedges on the same fact', async t => {
+test('a wedged pass\'s naming is outstanding while the work it named is unfinished at the epochs it named, whatever a body does now: it stays the owner\'s to read once the body settles, a later body on the same fact is told by that row, and it ends when the named work moves on', async t => {
   const f = await setup({ clock: new FakeClock() })
   t.after(f.cleanup)
   const task = f.propose({ title: 'Never reached' })
@@ -635,23 +635,29 @@ test('a wedged pass\'s naming is outstanding exactly while its mission is wedged
   const first = wedgedBody(t, f, 'operation_wedge_open')
   const [naming] = wedgeRows(f)
   assert.deepEqual(naming.subjects, [`${task.id}@${taskOf(f.runtime, task.id).epoch}`], 'the naming names the work the pass never reached')
-  assert.equal(relevant(f, naming), true, 'outstanding while the body holds the mission past its bound')
+  // The hung call returns at its own bound before the owner has read the naming.
+  scheduling.closePass(f.mission.id, first)
+  assert.deepEqual([f.runtime.passState(f.mission.id).wedged, relevant(f, naming)], [false, true], 'no body is wedged, and the naming is still the owner\'s to read')
+  // Later bodies wedge on the same fact and settle: the one row tells them, in every phase.
+  for (const operationId of ['operation_wedge_2', 'operation_wedge_3']) {
+    const body = wedgedBody(t, f, operationId)
+    assert.deepEqual([body.escalatedAt !== undefined, wedgeRows(f).length, relevant(f, naming)], [true, 1, true], 'a body on the held fact writes no row: the row the owner can read tells it')
+    scheduling.closePass(f.mission.id, body)
+    assert.equal(relevant(f, naming), true)
+  }
   await f.runtime.flushOutbox(f.mission.id)
-  assert.ok(f.runtime.store.get('deliveries', naming.id).deliveredAt !== undefined, 'the naming reached the owner while the body was wedged')
+  assert.ok(f.runtime.store.get('deliveries', naming.id).deliveredAt !== undefined, 'it is delivered with no body wedged')
   const reminder = ordinal => ownerRows(f).find(delivery => delivery.notice.dedupKey === `obligation-followup:${naming.id}:${ordinal}`)
   f.clock.advance(f.runtime.notices.obligationFollowupMs)
   f.runtime.notices.absenceNet(f.mission.id)
-  assert.deepEqual(reminder(1)?.subjects, naming.subjects, 'and it is reminded while the wedge lasts')
-  scheduling.closePass(f.mission.id, first)
-  assert.equal(relevant(f, naming), false, 'no body is wedged once it settles: a queued naming would be withheld')
+  assert.deepEqual(reminder(1)?.subjects, naming.subjects, 'and reminded while no live path advances the work it named')
+  // A later pass reaches the work: its member takes it, at a new epoch.
+  await f.runtime.claim(f.actor(f.author), f.mission.id, task.id)
+  assert.notEqual(`${task.id}@${taskOf(f.runtime, task.id).epoch}`, naming.subjects[0])
+  assert.equal(relevant(f, naming), false, 'the naming ends when the work it named moves on')
   f.clock.advance(f.runtime.notices.obligationFollowupMs)
   f.runtime.notices.absenceNet(f.mission.id)
-  assert.equal(reminder(2), undefined, 'and its reminders end with the wedge, though the task it named is still pending')
-  // A later body wedges on the same fact: the same obligation, carried by the row the owner holds.
-  wedgedBody(t, f, 'operation_wedge_again')
-  assert.deepEqual([wedgeRows(f).length, relevant(f, naming)], [1, true], 'the held row is outstanding again, and no second row is written')
-  f.runtime.cancel(f.owner, f.mission.id, { taskId: task.id, reason: 'No longer needed' })
-  assert.equal(relevant(f, naming), false, 'nor is it outstanding once the work it named is withdrawn')
+  assert.equal(reminder(2), undefined, 'and so do its reminders')
 })
 
 const terminalRows = (f, chain) => ownerRows(f).filter(delivery => delivery.notice.dedupKey.startsWith(`guard-terminal:${chain}:`))
