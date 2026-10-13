@@ -202,7 +202,7 @@ test('the coverage and staged-criteria refusals are repaired as they say, throug
   const request = f.runtime.requestStart(f.owner, f.requestInput, { grantRoot: f.requestInput.workspace, source: 'session' })
   const launch = async plan => (await definitions.get('swarm_launch').execute({ requestId: request.id, ...plan }, { signal: new AbortController().signal, agent: { id: f.owner.sessionId } })).result
   const input = { ...f.input, acceptance: ['works', 'is documented'] }
-  await assert.rejects(launch(input), error => error.message.includes('[plan_criterion_uncovered] No deliverable covers c2 "is documented". Add each id to `covers` of the deliverable that satisfies it'))
+  await assert.rejects(launch(input), error => error.message.endsWith('\n[plan_criterion_uncovered] No deliverable covers c2 "is documented". Add each id to `covers` of the deliverable that satisfies it; keep the mission acceptance list unchanged.'))
   // As named: add the id to `covers` of the deliverable; the mission list is unchanged. The first
   // start then fails, leaving the mission staged with its criteria fixed.
   input.tasks = input.tasks.map(task => task.kind === 'verification' ? task : { ...task, covers: ['c1', 'c2'] })

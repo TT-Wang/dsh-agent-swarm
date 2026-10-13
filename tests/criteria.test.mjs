@@ -123,6 +123,19 @@ test('a review\'s covers move onto its source, once, so validating again and com
   assert.deepEqual(validatePlan(reversed).tasks.map(task => [task.key, task.covers]), [['review', undefined], ['code', ['c1', 'c2']]], 'a review listed before its source folds the same way')
 })
 
+test('a review\'s covers are checked where the plan wrote them and move onto its source only afterwards, so a refusal names each field once and never one the plan did not write', () => {
+  const located = error => error.diagnostics.map(diagnostic => [diagnostic.code, diagnostic.location])
+  // The review is listed before its source and names an unknown id: one diagnostic, at the review.
+  const reversed = plan('/repo'); reversed.tasks.reverse(); reversed.tasks[0].covers = ['c2', 'c9']
+  assert.throws(() => validatePlan(reversed), error => { assert.deepEqual(located(error), [['covers_invalid', 'tasks[0] (review).covers']]); return true })
+  // The review is refused for sharing its source's assignee. Its covers still count for that source, which has no criteria of its own and is not called bare.
+  const shared = plan('/repo'); shared.tasks[0].acceptance = []; shared.tasks[0].covers = undefined; shared.tasks[1].assigneeKey = 'builder'
+  assert.throws(() => validatePlan(shared), error => { assert.deepEqual(located(error), [['plan_review_independence_required', 'tasks[1] (review).assigneeKey']]); return true })
+  // A malformed list on the source is refused as written, whatever its review names.
+  const malformed = plan('/repo'); malformed.tasks[0].covers = 5
+  assert.throws(() => validatePlan(malformed), error => { assert.deepEqual(located(error), [['covers_invalid', 'tasks[0] (code).covers']]); return true })
+})
+
 test('propose stores a deliverable\'s ids as given and refuses unknown ids and any id on a review, so a later review cannot add coverage', async t => {
   const f = await setup({ clock: new FakeClock(), acceptance: ['works', 'is documented'] })
   t.after(f.cleanup)

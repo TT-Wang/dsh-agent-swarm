@@ -223,13 +223,13 @@ export function validatePlan(value: unknown, options: PlanValidationOptions = {}
         if (source.kind === 'verification') throw new AdmissionError('plan_review_source_invalid', 'tool_error', `${at}.reviewOf cannot name another verification task`, `${at}.reviewOf`)
         // A planned source's only author is its assignee.
         if (task.assigneeKey && !canOwnReview({ assigneeId: source.assigneeKey as string | undefined }, String(task.assigneeKey))) throw new AdmissionError('plan_review_independence_required', 'tool_error', `${at}.assigneeKey must differ from the reviewed source's assignee ${JSON.stringify(source.assigneeKey)}`, `${at}.assigneeKey`)
-        if (Array.isArray(task.covers)) { source.covers = [...new Set([...(source.covers as string[] | undefined ?? []), ...task.covers])]; delete task.covers }
       } else if (task.reviewOf !== undefined) throw new AdmissionError('plan_review_not_verification', 'tool_error', `${at}.reviewOf is only valid on verification tasks`, `${at}.reviewOf`)
     })
     if (task.review !== undefined) inspectAdmission(() => reviewOverride(task, `${at}.review`, members, tasks, Number((value.budget as Record<string, unknown>).maxSteps)))
   }
   if (undeclared.length) admissionIssues.push(outputsRequired(undeclared))
-  // After every review's covers moved onto its source: a deliverable needs criteria of its own or cited ones.
+  // Every field was checked where the plan wrote it. Only now do a review's covers move onto its source; a deliverable then needs criteria of its own or cited ones.
+  for (const review of tasks.values()) if (review.kind === 'verification' && Array.isArray(review.covers)) { const source = tasks.get(String(review.reviewOf)); if (source) source.covers = [...new Set([...(Array.isArray(source.covers) ? source.covers : []), ...review.covers])]; delete review.covers }
   for (const [index, task] of [...tasks.values()].entries()) if (task.kind !== 'verification' && Array.isArray(task.acceptance) && !task.acceptance.length && !(task.covers as unknown[] | undefined)?.length) inspectAdmission(() => { throw new AdmissionError('plan_task_acceptance_required', 'validation_error', `[plan_task_acceptance_required] tasks[${index}] (${String(task.key)}) has neither covers nor acceptance. Add to \`covers\` the mission criterion ids it satisfies, or give it its own \`acceptance\`, and relaunch the complete plan.`, `tasks[${index}]`) })
   if (experiments > Number(value.budget.maxExperiments)) inspectAdmission(() => { throw new AdmissionError('plan_experiments_exceed_budget', 'budget_error', 'Plan exceeds experiment budget', 'tasks') })
   if (admissionIssues.length) {

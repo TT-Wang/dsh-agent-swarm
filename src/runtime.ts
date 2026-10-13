@@ -2803,7 +2803,7 @@ export class SwarmRuntime {
     }
     for (const source of sources) if (source.assigneeKey === undefined) issues.push(`tasks[${source.key}].assigneeKey is required: choose the member who delivers this task`)
     const uncovered = uncoveredCriteria(plan.acceptance, new Set(sources.flatMap(task => task.covers ?? [])))
-    if (uncovered.length) issues.push(`[plan_criterion_uncovered] No deliverable covers ${uncovered.join(', ')}. Add each id to \`covers\` of the deliverable that satisfies it (covers on a verification task count for its reviewOf source); keep the mission acceptance list unchanged.`)
+    if (uncovered.length) issues.push(`[plan_criterion_uncovered] No deliverable covers ${uncovered.join(', ')}. Add each id to \`covers\` of the deliverable that satisfies it; keep the mission acceptance list unchanged.`)
     const implementations = sources.filter(task => task.kind === 'implementation')
     const byKey = new Map(plan.tasks.map(task => [task.key, task]))
     const dependsOn = (key: string, dependency: string): boolean => {
