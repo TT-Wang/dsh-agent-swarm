@@ -250,6 +250,26 @@ test('a worker reads its checklist in every result of its own calls: the registe
   assert.deepEqual([submitted.status, verified.status, f.runtime.store.get('tasks', source.id).covers], ['submitted', 'accepted', ['c1', 'c2']], 'the stored rows keep the ids')
 })
 
+test('the propose guard reads the proposal\'s own objective and acceptance: its own prior-work criterion needs a dependency, and a repair that only inherits that criterion is admitted without one', async t => {
+  const f = await setup({ clock: new FakeClock() })
+  t.after(f.cleanup)
+  const definitions = new Map()
+  registerTools({ tools: { register: definition => definitions.set(definition.name, definition) } }, f.runtime, f.mission.budget)
+  const propose = async args => (await definitions.get('swarm_propose').execute({ missionId: f.mission.id, workstreamId: f.stream.id, objective: 'Wire the reader into the command', kind: 'implementation', scope: ['**'], checks: ['test -d .'], ...args },
+    { signal: new AbortController().signal, agent: { id: f.owner.sessionId } })).result
+  const prior = 'The parser from the prior work is already in the worktree and still passes'
+  const tasks = () => f.runtime.store.list('tasks', f.mission.id).length
+  await assert.rejects(propose({ title: 'Assumes prior work', acceptance: [prior], outputs: [] }), error => error.message.startsWith('[dependency_assumption_missing] task: the acceptance[0] assumes '))
+  assert.equal(tasks(), 0, 'nothing was admitted')
+  const carrier = await propose({ title: 'Parser', covers: ['c1'], outputs: [] })
+  const original = await propose({ title: 'Reader', acceptance: [prior], dependencies: [carrier.id], outputs: [] })
+  f.runtime.cancel(f.owner, f.mission.id, { taskId: original.id, reason: 'Withdrawn for a narrower repair' })
+  // The repair drops the dependency and writes no criterion of that kind itself: the guard reads only what the proposal says.
+  const repair = await propose({ title: 'Reader repair', acceptance: ['unrelated'], replaces: [original.id] })
+  assert.deepEqual([repair.status, repair.acceptance, repair.dependencies], ['pending', ['unrelated'], []])
+  assert.deepEqual(f.runtime.observe(f.owner, f.mission.id, { taskId: repair.id }).task.acceptance, ['unrelated', prior], 'its worker still checks the criterion it inherits')
+})
+
 test('a staged mission\'s criteria are fixed: a repair may change covers and task criteria, never the mission list', async t => {
   const workers = new FakeWorkers()
   const { dir, runtime } = await makeRuntime(t, { workers, config: { tickMs: 60000, checkTimeoutMs: undefined } })
