@@ -82,9 +82,9 @@ test('M2-2: submission grace survives newer unrelated events without aging a new
   assert.equal(scheduling.unreviewedStall([submitted('new')]), false)
 })
 
-test('M2-3: the dispatch question leaves a member its own terminal speaks for to that terminal, without inventing budget refusals', () => {
-  const deliveries = []
-  const rt = makeRuntimeStub({ workers: new FakeWorkers({ autoIdle: true }), scopesOverlap: () => true, store: { list: table => table === 'deliveries' ? deliveries : [] } })
+test('M2-3: the dispatch question leaves a task whose every startable member the isolation invariant refuses to the workspace terminal, without inventing budget refusals', () => {
+  // The question is a predicate of the board and the handles: this runtime has no store to read.
+  const rt = makeRuntimeStub({ workers: new FakeWorkers({ autoIdle: true }), scopesOverlap: () => true })
   const scheduling = new Scheduling(rt); scheduling.ready = () => true
   const member = { id: 'one', name: 'One', phase: 'ready', status: 'idle', workspace: '/one' }
   const independent = { id: 't', title: 'Work', epoch: 0, objective: 'Write a new file from the baseline.', acceptance: [], dependencies: [], scope: ['**'] }
@@ -92,21 +92,8 @@ test('M2-3: the dispatch question leaves a member its own terminal speaks for to
   assert.equal(scheduling.dispatchQuestion('m', [independent], [{ ...member, workspace: '' }], [independent]), undefined)
   const unknown = scheduling.dispatchQuestion('m', [independent], [member], [independent])
   assert.match(unknown.message, /idle handle alone does not identify the dispatch blocker/)
-  // The owner holds that member's failed dispatch naming this task at this epoch: the attempt terminal already words this cause.
-  const failed = { to: 'owner', subjects: ['t@0'], notice: { class: 'decision', dedupKey: 'guard-terminal:attempt_lease:attempt_terminal:dispatch-failed:one:0123456789abcdef' } }
-  deliveries.push(failed)
-  assert.equal(scheduling.dispatchQuestion('m', [independent], [member], [independent]), undefined)
-  // Carried by a wake-budget summary, it is the same held fact.
-  deliveries.splice(0, 1, { to: 'owner', notice: { class: 'decision', dedupKey: 'wake-budget:m:0', aggregatedFacts: [{ dedupKey: failed.notice.dedupKey, subjects: failed.subjects }] } })
-  assert.equal(scheduling.dispatchQuestion('m', [independent], [member], [independent]), undefined)
-  // A terminal that names another member, or this task at another epoch, speaks for neither.
-  for (const other of [{ ...failed, notice: { ...failed.notice, dedupKey: failed.notice.dedupKey.replace(':one:', ':two:') } }, { ...failed, subjects: ['t@1'] }]) {
-    deliveries.splice(0, 1, other)
-    assert.match(scheduling.dispatchQuestion('m', [independent], [member], [independent]).message, /idle handle alone does not identify the dispatch blocker/)
-  }
-  // A second startable member no terminal speaks for leaves the gap unexplained: the question is asked.
-  deliveries.splice(0, 1, failed)
-  assert.match(scheduling.dispatchQuestion('m', [independent], [member, { ...member, id: 'two', name: 'Two', workspace: '/two' }], [independent]).message, /idle handle alone does not identify the dispatch blocker/)
+  // A second startable member the invariant does not refuse leaves the gap unexplained: the question is asked.
+  assert.match(scheduling.dispatchQuestion('m', [independent], [{ ...member, workspace: '' }, { ...member, id: 'two', name: 'Two', workspace: '/two' }], [independent]).message, /idle handle alone does not identify the dispatch blocker/)
 })
 
 test('stop recovery owns its member until quiescence, including before native startup', async () => {

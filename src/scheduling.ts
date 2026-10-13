@@ -14,7 +14,7 @@ import { liveReviewFor } from './admission.ts'
 import { pendingStopOwner, stopPending } from './attempts.ts'
 import { hasNotice } from './arena.ts'
 import { factKey, reasonDigest, subjectsOfTasks, taskSubject } from './notices.ts'
-import { emitGuardTerminal, guardTerminalKey } from './refusals.ts'
+import { emitGuardTerminal } from './refusals.ts'
 import { AdmissionRefusedError } from './scheduler.ts'
 import { isolationIssues } from './workspace-admission.ts'
 // R17-G6/G7: the one derivation of the derived member status.
@@ -105,8 +105,6 @@ export interface SchedulingPass {
 
 /** R16-D: the dedup-key family of the attempt reporting-bound escalation. */
 const ATTEMPT_SILENCE_PREFIX = 'attempt-silent:'
-/** The opener family of the attempt terminal a member's failed dispatch chain ends in: `dispatch-failed:<member>:<digest of the failure>`. */
-const DISPATCH_FAILED = 'dispatch-failed:'
 
 /** R16-D: one live attempt whose durable progress is past its declared bound. */
 interface SilentAttempt {
@@ -329,7 +327,7 @@ export class Scheduling {
             // same throw on a later pass is the request the owner already holds,
             // and another failure of the chain is another request.
             const detail = String(error)
-            emitGuardTerminal(this.rt, missionId, 'attempt_lease', { memberId: member.id, detail, localKey: `${DISPATCH_FAILED}${member.id}:${reasonDigest(detail)}` })
+            emitGuardTerminal(this.rt, missionId, 'attempt_lease', { memberId: member.id, detail, localKey: `dispatch-failed:${member.id}:${reasonDigest(detail)}` })
             continue
           }
         }
@@ -368,12 +366,9 @@ export class Scheduling {
    * - no eligible member exists at all (nothing is ready for a member; the board
    *   is someone else's witness, not this notice's).
    *
-   * - every startable eligible member is spoken for by its own terminal, the
-   *   one emitter of that cause: the isolation invariant refuses it (the
-   *   workspace terminal, `WorkspaceAdmission.isolationAllows`), or the owner
-   *   holds its failed dispatch naming this task at this epoch (`dispatch`'s
-   *   attempt terminal). A dead-end chain and this question never word one
-   *   subject's one cause twice.
+   * - the isolation invariant refuses every startable eligible member: the
+   *   workspace terminal is the one emitter of that cause
+   *   (`WorkspaceAdmission.isolationAllows`), by the predicate read here.
    *
    * Otherwise the notice names a handle holder or an unexplained dispatch gap.
    * An idle handle alone proves no budget refusal.
@@ -393,12 +388,7 @@ export class Scheduling {
       const startable = eligible.filter(member => this.startBlocker(member) === undefined)
       if (startable.length) {
         const issues = isolationIssues(members, tasks, (left, right) => this.rt.scopesOverlap(left, right))
-        // The facts the owner holds, a wake summary's constituents included.
-        const held = this.rt.store.list('deliveries', missionId).flatMap(row => row.to !== 'owner' || row.notice === undefined ? []
-          : [{ dedupKey: row.notice.dedupKey, subjects: row.subjects ?? [] }, ...(row.notice.aggregatedFacts ?? [])])
-        const spokenFor = (member: Member) => issues.some(issue => issue.memberIds.includes(member.id))
-          || held.some(fact => fact.dedupKey.startsWith(guardTerminalKey('attempt_lease', `${DISPATCH_FAILED}${member.id}:`)) && fact.subjects.includes(subjects[0]!))
-        if (startable.every(spokenFor)) continue
+        if (startable.every(member => issues.some(issue => issue.memberIds.includes(member.id)))) continue
         return { task, subjects, dedupKey,
           message: `Task ${task.id} (${task.title}, epoch ${task.epoch}) has an eligible idle member but was not dispatched this tick. An idle handle alone does not identify the dispatch blocker. Inspect the task and recorded admission/preparation diagnostics with swarm_observe; repair the reported cause or withdraw the task with swarm_cancel.` }
       }

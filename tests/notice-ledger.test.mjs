@@ -695,7 +695,7 @@ test('L-25: a guard terminal is one request per fact that opened it: the task bu
   assert.deepEqual(stallEventKeys(f, 'guard-terminal'), keys())
 })
 
-test('L-25: a failed dispatch is one request per member and failure, and the dispatch question leaves the task it names to it', async t => {
+test('L-25: a failed dispatch is one request per member and failure, whatever the board digest; the dispatch question about the task it names stays its own fact, told once under its own key', async t => {
   const f = await setup({ clock: new FakeClock(), workers: new FakeWorkers({ autoIdle: true }) })
   t.after(f.cleanup)
   // A guard of the author's dispatch chain throws on every pass.
@@ -707,7 +707,7 @@ test('L-25: a failed dispatch is one request per member and failure, and the dis
   await ticks(f, 2)
   const subject = `${task.id}@${taskOf(f.runtime, task.id).epoch}`
   const terminals = () => terminalRows(f, 'attempt_lease')
-  const questions = () => ownerRows(f).filter(delivery => delivery.notice.dedupKey.startsWith('dispatch-question:'))
+  const questions = () => ownerRows(f).filter(delivery => delivery.notice.dedupKey.startsWith('dispatch-question:')).map(delivery => delivery.notice.dedupKey)
   assert.equal(taskOf(f.runtime, task.id).status, 'pending', 'the author is never given its task')
   assert.deepEqual(terminals().map(delivery => [delivery.notice.dedupKey.replace(/[0-9a-f]{16}$/, '<digest>'), delivery.notice.reason, delivery.subjects]),
     [[`guard-terminal:attempt_lease:attempt_terminal:dispatch-failed:${f.author.id}:<digest>`, `Error: ${failure}`, [subject]]],
@@ -719,7 +719,6 @@ test('L-25: a failed dispatch is one request per member and failure, and the dis
   await ticks(f, 3)
   assert.notEqual(f.runtime.fingerprint(f.mission.id), board)
   assert.equal(terminals().length, 1, 'the same failure on another board digest is the request the owner holds')
-  assert.deepEqual(questions(), [], 'and the dispatch question does not word that task\'s one cause a second time, on either board')
   // Another failure of the same chain on this board is another request.
   const changed = f.runtime.fingerprint(f.mission.id)
   failure = 'worktree probe failed: ENOSPC'
@@ -727,7 +726,7 @@ test('L-25: a failed dispatch is one request per member and failure, and the dis
   assert.equal(f.runtime.fingerprint(f.mission.id), changed)
   assert.deepEqual(terminals().map(delivery => delivery.notice.reason), ['Error: worktree probe failed: EIO', `Error: ${failure}`], 'a different failure on an unchanged board is told')
   assert.deepEqual(stallEventKeys(f, 'guard-terminal'), terminals().map(delivery => delivery.notice.dedupKey), 'one stall event per request, naming its row')
-  assert.deepEqual(questions(), [])
+  assert.deepEqual(questions(), [`dispatch-question:${f.mission.id}:${subject}`], 'the undispatched task is the dispatch question\'s own fact at its epoch: asked once, whichever requests the chain holds')
 })
 
 test('a budget warning is told once per allocation and threshold, by the ledger alone: a projection that falls back under a told threshold warns no lower one, a new limit is a new allocation, and nothing on the mission row records a warning', async t => {
