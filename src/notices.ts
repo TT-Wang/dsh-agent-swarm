@@ -1105,15 +1105,14 @@ export class Notices {
 
   /**
    * The board's one fact while its condition holds, with the body and the
-   * identity it is told under. Completion refused: a stalled active board's
-   * W3 stall, keyed by the completion diagnostic and the stuck work the review
+   * identity it is told under. Completion refused: a stalled board's W3
+   * stall, keyed by the completion diagnostic and the stuck work the review
    * admission does not speak for (`onUnreviewedPath`): the one unschedulable
    * set its body and event state, else every other unfinished task; a board
    * with no other is that admission's alone. Completion allowed: coverage-complete
    * of an owner-assembled mission (no start request), keyed by its terminal work.
    */
   private boardFact(view: MissionInterpretation): { key: string; subjects: string[]; reason: string; content: string; statement: NoticeStatement; unschedulable?: string[] } | undefined {
-    if (view.mission.status !== 'active') return undefined
     const fact = (body: { content: string; statement: NoticeStatement }, subjects: string[], reason: string) =>
       ({ ...body, subjects, reason, key: factKey(view.missionId, { trigger: NOTICE_TEMPLATES[body.statement.family].trigger, reason, subjects, statement: body.statement }) })
     const refusal = this.rt.completionError(view.mission)
@@ -1126,7 +1125,7 @@ export class Notices {
     return { ...fact(renderNotice('board-stall', { reason: refusal, unschedulable: dead, subjects }), subjects, refusal), unschedulable: dead.map(task => task.id) }
   }
 
-  /** A W3 stall or coverage-complete decision is outstanding while it is the board's fact under the identity it was told with. */
+  /** A W3 stall or coverage-complete decision is outstanding while it is the board's fact under the identity it was told with; a mission blocked on its budget keeps it, like every decision (`ownerDeliveryMoot`), and only an active one is told a new fact (`ensureWitness`, `completeAutomatic`). */
   private boardFactOpen(view: MissionInterpretation, delivery: Pick<Delivery, 'notice'>): boolean {
     return this.boardFact(view)?.key === delivery.notice?.dedupKey
   }

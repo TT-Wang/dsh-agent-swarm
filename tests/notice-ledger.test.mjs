@@ -427,6 +427,49 @@ test('a queued W3 stall is withheld once its board can progress, and coverage-co
   assert.ok(reminder.subjects.includes(`${task.id}@${taskOf(f.runtime, task.id).epoch}`), 'among it the accepted deliverable')
 })
 
+test('a mission blocked on its budget keeps its board decision: a told W3 stall stays outstanding and is reminded, a told coverage-complete stays outstanding, and no new one is told', async t => {
+  /** The owner's fixed deadline passes: the budget guard blocks the mission at the next tick. */
+  const block = async f => {
+    f.runtime.updateBudget(f.owner, f.mission.id, { ...f.runtime.mission(f.mission.id).budget, deadlineAt: f.clock.now() + 60_000 }, 'A fixed deadline')
+    f.clock.advance(60_000)
+    await f.runtime.tick()
+    await f.runtime.settle(f.mission.id)
+    assert.equal(f.runtime.mission(f.mission.id).status, 'blocked', 'the exhausted duration blocked the mission')
+  }
+  const stalled = await setup({ clock: new FakeClock() })
+  t.after(stalled.cleanup)
+  await blockThroughReview(stalled, stalled.propose({ title: 'Dead end' }))
+  await stalled.runtime.settle(stalled.mission.id)
+  await ticks(stalled, 1)
+  const stall = stallRow(stalled)
+  assert.ok(stall, 'the stalled board told the owner')
+  await stalled.runtime.flushOutbox(stalled.mission.id)
+  await block(stalled)
+  assert.equal(relevant(stalled, stall), true, 'the blocked mission keeps the stall outstanding')
+  const reminders = () => ownerRows(stalled).filter(delivery => delivery.notice.dedupKey.startsWith(`obligation-followup:${stall.id}:`)).length
+  const before = reminders()
+  stalled.clock.advance(stalled.runtime.notices.obligationFollowupMs)
+  stalled.runtime.notices.absenceNet(stalled.mission.id)
+  assert.equal(reminders(), before + 1, 'and reminds the owner of it')
+  // Work withdrawn while the mission is blocked changes the stall's identity: a blocked mission is told no new board fact.
+  const told = () => ownerRows(stalled).filter(delivery => noticeFamily(delivery) === 'board-stall').length
+  const extra = stalled.runtime.store.list('tasks', stalled.mission.id).find(task => task.kind === 'verification')
+  stalled.runtime.cancel(stalled.owner, stalled.mission.id, { taskId: extra.id, reason: 'Not needed' })
+  await stalled.runtime.settle(stalled.mission.id)
+  await ticks(stalled, 3)
+  assert.deepEqual([relevant(stalled, stall), told()], [false, 1], 'the stall under its new identity is not told while the mission is blocked')
+
+  const covered = await setup({ clock: new FakeClock() })
+  t.after(covered.cleanup)
+  await acceptThroughReview(covered, covered.propose())
+  await covered.runtime.settle(covered.mission.id)
+  await ticks(covered, 1)
+  const coverage = coverageRow(covered)
+  assert.ok(coverage, 'the coverage-complete board told the owner')
+  await block(covered)
+  assert.equal(relevant(covered, coverage), true, 'the blocked mission keeps coverage-complete outstanding')
+})
+
 test('a wedged pass never pre-empts the review admission: a need that ripened since the last pass is left to it, and it admits the host review with no owner decision', async t => {
   const f = await setup({ clock: new FakeClock() })
   t.after(f.cleanup)
