@@ -27,6 +27,9 @@ await runScenario({
       const gate = deferred()
       const nativeStop = workers.stop.bind(workers)
       workers.stop = async id => { await gate.promise; await nativeStop(id) }
+      // The body the first signal kicked settles first: a kick made while it is
+      // open is coalesced into it, and this scenario's hour-long tick would never retry.
+      await f.runtime.settle(f.mission.id)
       f.workers.callbacks.idle(f.author.id)
       const abandoned = await eventually(() => events(f.runtime, f.mission.id, 'task/closeout-abandoned')[0], 'the exhausted close-out checkpoints the workspace')
       const blocked = taskOf(f.runtime, task.id)
