@@ -1321,8 +1321,8 @@ export class Notices {
 
   /**
    * The classifiers past the witness dedup. Returns false when the board is
-   * left to a later judgement (the dispatcher's own pass), true once it is
-   * judged, whether or not a notice was owed.
+   * left to a later judgement (the dispatcher's own pass, the review grace),
+   * true once it is judged, whether or not a notice was owed.
    */
   private judgeBoard(view: MissionInterpretation, options: { offPass?: boolean; wedged?: boolean }, stallRootNotices: number): boolean {
     const missionId = view.missionId
@@ -1400,11 +1400,11 @@ export class Notices {
     // the row-4 expiry recovery) is the next chance to run the queued task.
     const nonTerminal = view.nonTerminal
     if (nonTerminal.length && nonTerminal.every(task => task.status === 'running' && task.attempt !== undefined && task.attempt.leaseUntil >= this.rt.now())) return true
-    if (view.stalled) {
-      // The W3 stall while completion is refused, coverage-complete while an
-      // owner-assembled mission may complete; an automatic one completes on its pass.
-      this.notifyBoard(view)
-      return true
+    if (this.rt.reviewPathStalled(tasks, members)) {
+      // No live work: the board's own fact (the W3 stall, or coverage-complete; an automatic mission completes on its pass), told once
+      // every review need is past its grace (`stalled`). Until then the stall candidate is left to that judgement, not to the fall-through.
+      if (view.stalled) this.notifyBoard(view)
+      return view.stalled
     }
     // R14-F2(c): the unnamed fallback is replaced. While every unfinished task is
     // legitimately waiting, the runtime stays silent; otherwise it escalates

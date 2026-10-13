@@ -440,6 +440,43 @@ test('the W3 stall states one stuck set: its subjects, its body, its count and i
   assert.deepEqual(boardStallEvents(f).map(event => [event.data.noticeKey, event.data.unschedulable]), [[stall.notice.dedupKey, [dead.id]]], 'and its event records that set')
 })
 
+/**
+ * Work only the reviewer may take and the author's submission, with the
+ * reviewer then gone: dead work beside a review need inside its grace.
+ * `legacy` leaves the submission as an older build did (no artifact, so the
+ * review admission skips it); `running` adds unrelated live work.
+ */
+const graceBoard = async (t, { legacy = false, running = false } = {}) => {
+  const f = await setup({ clock: new FakeClock() })
+  t.after(f.cleanup)
+  const dead = f.propose({ title: 'Reviewer-only work', kind: 'research', checks: [], assigneeId: f.reviewer.id })
+  const source = f.propose()
+  const claimed = await f.runtime.claim(f.actor(f.author), f.mission.id, source.id)
+  await f.runtime.submit(f.actor(f.author), f.mission.id, { taskId: source.id, attemptId: claimed.attempt.id, output: 'candidate' })
+  if (legacy) f.runtime.store.transaction(() => { const row = taskOf(f.runtime, source.id); delete row.artifact; f.runtime.store.put('tasks', row) })
+  if (running) await f.runtime.claim(f.actor(f.author), f.mission.id, f.propose({ title: 'Unrelated work', kind: 'research', checks: [] }).id)
+  f.runtime.commit(f.mission.id, () => f.runtime.store.put('members', { ...f.runtime.store.get('members', f.reviewer.id), phase: 'stopped' }))
+  await f.runtime.settle(f.mission.id)
+  /** The families of the decisions naming a task at its epoch, reminders aside. */
+  const naming = task => ownerRows(f).filter(delivery => (delivery.subjects ?? []).includes(`${task.id}@${taskOf(f.runtime, task.id).epoch}`) && delivery.notice.trigger !== 'owner-decision-unresolved')
+  await ticks(f, 1)
+  assert.equal(f.runtime.reviewNeed(taskOf(f.runtime, source.id)).ripe, false, 'the need is inside its grace')
+  return { f, dead, source, naming, families: task => naming(task).map(delivery => noticeFamily(delivery)) }
+}
+
+test('a board with no live work is the stall\'s to name: inside a review grace it is a stall candidate the fall-through leaves alone, and its dead work is named by one decision', async t => {
+  const { f, dead, source, naming, families } = await graceBoard(t)
+  assert.deepEqual([families(dead), families(source)], [[], []], 'nothing is told inside the grace')
+  await ticks(f, 150)
+  assert.deepEqual(families(dead), ['board-stall'], 'past the grace the dead work is named once')
+  assert.deepEqual(families(source), ['review-blocked'], 'and the source by its admission')
+  await f.runtime.flushOutbox(f.mission.id)
+  for (let interval = 0; interval < 4; interval += 1) { f.clock.advance(f.runtime.notices.obligationFollowupMs); f.runtime.notices.absenceNet(f.mission.id); await f.runtime.flushOutbox(f.mission.id) }
+  assert.deepEqual(naming(dead).filter(delivery => relevant(f, delivery)).map(delivery => noticeFamily(delivery)), ['board-stall'], 'one outstanding decision names it')
+  const reminded = ownerRows(f).filter(delivery => delivery.notice.trigger === 'owner-decision-unresolved' && (delivery.subjects ?? []).some(subject => subject.startsWith(`${dead.id}@`)))
+  assert.equal(reminded.length, f.runtime.notices.maxObligationFollowups, 'and it is reminded as one obligation')
+})
+
 test('a queued W3 stall is withheld once its board can progress, and coverage-complete reminds the owner until the mission completes', async t => {
   const stalled = await setup({ clock: new FakeClock() })
   t.after(stalled.cleanup)
