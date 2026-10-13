@@ -238,9 +238,8 @@ export interface Mission {
    * changes and changes back does. Wall-clock `at` is never part of `F(S)`.
    */
   witness?: { fingerprint: string; kind: 'W2' | 'W3'; at: number }
-  /** Highest approaching-limit threshold already warned per budget dimension. */
+  /** When the owner last set the mission budget: a mission-root budget notice recorded before it is resolved. */
   budgetReviewedAt?: number
-  budgetWarned?: Record<string, number>
   /** Last successful delivery application; projected for the client after the event window scrolls. */
   appliedDelivery?: { resultCommit: string; appliedAt: number }
   /**
@@ -450,8 +449,6 @@ export interface Task {
   usedSteps?: number
   /** Durable block reason when the task exhausted one of its own ceilings. */
   ceiling?: TaskCeiling
-  /** Highest warning per dimension and allocation; runtime estimates never refill themselves. */
-  budgetWarned?: Record<string, number>
   preparationFailure?: { reason: string; transient: boolean; attempts: number; retryAt?: number }
   verificationRecovery?: { sourceTaskId: string; commit: string; reason: string; at: number }
   /** Per-command host verification timeout chosen for this task. */

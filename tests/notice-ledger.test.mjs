@@ -723,3 +723,27 @@ test('L-25: a failed dispatch is one request per member and failure, and the dis
   assert.deepEqual(stallEventKeys(f, 'guard-terminal'), terminals().map(delivery => delivery.notice.dedupKey), 'one stall event per request, naming its row')
   assert.deepEqual(questions(), [])
 })
+
+test('a budget warning is told once per allocation and threshold, by the ledger alone: a projection that falls back under a told threshold warns no lower one, a new limit is a new allocation, and nothing on the mission row records a warning', async t => {
+  const f = await setup({ clock: new FakeClock(), budget: { maxTokens: 10_000 } })
+  t.after(f.cleanup)
+  const told = () => events(f.runtime, f.mission.id, 'mission/budget-warning').filter(event => event.data.dimension === 'maxTokens').map(event => [event.data.limit, event.data.threshold, event.data.projected])
+  const reviews = () => ownerRows(f).flatMap(delivery => delivery.notice.aggregatedIdentities ?? []).map(identity => identity.dedupKey).filter(key => key.includes(':mission:maxTokens:'))
+  // The author settled 2000 tokens in one request and 7500 are spent; a second model request is in flight, estimated at 2000 more.
+  const author = f.runtime.store.get('members', f.author.id), mission = f.runtime.mission(f.mission.id)
+  f.runtime.commit(f.mission.id, () => { f.runtime.store.put('members', { ...author, accountedTokens: 2000, usage: { requests: 1 } }); f.runtime.store.put('missions', { ...mission, usedTokens: 7500 }) })
+  f.workers.activity = { id: 'model', kind: 'model', startedAt: f.clock.now(), updatedAt: f.clock.now() }
+  await ticks(f, 2)
+  assert.deepEqual(told(), [[10_000, 0.9, 9500]], 'the projection crossed both thresholds: the owner is told the higher one, once')
+  // The request ends without further usage: the projection falls back between the thresholds.
+  f.workers.activity = undefined
+  await ticks(f, 2)
+  assert.deepEqual(told(), [[10_000, 0.9, 9500]], 'a lower threshold after a higher one is not warned')
+  assert.deepEqual(reviews(), [`budget-review:${f.mission.id}:mission:maxTokens:10000:0.9`], 'the ledger row is the warning\'s one record')
+  assert.equal(Object.hasOwn(f.runtime.store.get('missions', f.mission.id), 'budgetWarned'), false, 'nothing on the mission row records it')
+  // The owner raises the limit: the same spend crosses the lower threshold of a new allocation.
+  f.runtime.updateBudget(f.owner, f.mission.id, { ...f.runtime.mission(f.mission.id).budget, maxTokens: 10_500 }, 'a little more room')
+  await ticks(f, 2)
+  assert.deepEqual(told(), [[10_000, 0.9, 9500], [10_500, 0.7, 7500]], 'a changed limit has its own warning')
+  assert.equal(Object.hasOwn(f.runtime.store.get('missions', f.mission.id), 'budgetWarned'), false)
+})

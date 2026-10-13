@@ -7,7 +7,7 @@
  * thin forwarding methods and re-exports the symbols its public surface had.
  */
 import { randomUUID, createHash } from 'node:crypto'
-import { arenaView as projectArenaView } from './arena.ts'
+import { arenaView as projectArenaView, hasNotice } from './arena.ts'
 import { currentEvidenceIds } from './attempts.ts'
 import { excerpt } from './declared-checks.ts'
 import { executionElapsed } from './resource-time.ts'
@@ -330,8 +330,10 @@ export class RuntimeGates {
   }
 
   /**
-   * Emit at most one approaching-limit warning per dimension per threshold. The
-   * first signal is a durable owner review notice; thresholds default to 0.7/0.9.
+   * Emit at most one approaching-limit warning per allocation (scope, dimension
+   * and limit) and threshold: a durable owner review notice; thresholds default
+   * to 0.7/0.9. The deliveries ledger is the one record of a warning, so a
+   * crossing the owner holds at that threshold or a higher one is not told again.
    */
   warnBudget(mission: Mission): void {
     if (mission.status !== 'active' || mission.budgetPause) return
@@ -357,14 +359,16 @@ export class RuntimeGates {
       // A claim a rework archived is history of a rejected round, so it counts toward no round's findings.
       if (task.maxFindings !== undefined) dimensions.push({ dimension: 'maxFindings', used: currentEvidenceIds(task).length, limit: task.maxFindings, inFlight: 0, task })
     }
-    const warnings: Array<{ gate: string; threshold: number; key: string; content: string; subjects: string[]; data: Record<string, string | number> }> = []
+    const warnings: Array<{ key: string; content: string; subjects: string[]; data: Record<string, string | number> }> = []
     let missionProgress: string | undefined
+    let ledger: Delivery[] | undefined
     for (const item of dimensions) {
       if (!(item.limit > 0)) continue
       const projected = item.used + item.inFlight + (item.reviewSlots ?? 0)
       const crossed = thresholds.filter(threshold => projected / item.limit >= threshold).at(-1)
-      const gate = `${item.task?.id ?? 'mission'}:${item.dimension}:${item.limit}`
-      if (crossed === undefined || crossed <= (this.rt.mission(mission.id).budgetWarned?.[gate] ?? 0)) continue
+      const review = `budget-review:${mission.id}:${item.task?.id ?? 'mission'}:${item.dimension}:${item.limit}`
+      if (crossed === undefined || thresholds.some(threshold => threshold >= crossed
+        && hasNotice(ledger ??= this.rt.store.list('deliveries', mission.id), { class: 'budget', dedupKey: `${review}:${threshold}`, from: 'runtime' }))) continue
       // This is only the numeric floor that restores threshold headroom, never
       // an estimate of the resources needed to finish the mission.
       const recommendation = Math.max(item.limit + 1, Math.ceil(Number((projected / thresholds[0]!).toFixed(6))))
@@ -378,7 +382,7 @@ export class RuntimeGates {
         projectionBasis: item.dimension === 'maxTokens' ? 'settled-plus-current-model-requests' : item.reviewSlots !== undefined ? 'admitted-plus-unpaired-reviews' : 'settled-plus-in-flight',
         ...(item.reviewSlots === undefined ? {} : { pendingReviewSlots: item.reviewSlots, remainingAfterReviews: Math.max(0, item.limit - projected) }),
         ...(suggestedLimit === undefined ? {} : { suggestedLimit, suggestedLimitBasis: 'threshold-headroom-only' }), ...(item.task === undefined ? {} : { taskId: item.task.id }), progress }
-      warnings.push({ gate, threshold: crossed, key: `budget-review:${mission.id}:${gate}:${crossed}`, data,
+      warnings.push({ key: `${review}:${crossed}`, data,
         subjects: this.rt.noticeSubjectsFor(mission.id, item.task === undefined ? {} : { taskId: item.task.id }),
         content: `${scope}: ${item.dimension} ${item.reviewSlots === undefined ? 'settled' : 'admitted'} ${item.used}/${item.limit}, remaining ${data.remaining}; ${item.reviewSlots === undefined ? `in-flight estimate ${item.inFlight}` : `${item.reviewSlots} known review slots still needed`}, projected ${projected}, threshold ${crossed}.${suggestedLimit === undefined ? '' : ` Threshold-headroom floor for ${item.dimension}: ${suggestedLimit}; decide the actual allowance from remaining work.`} Progress: ${progress}.${item.dimension === 'maxTokens' ? ' Token projection covers current requests only, not the cost of completing remaining tasks.' : ''}${item.dimension === 'maxFindings' ? ' Finding count is advisory.' : ''}` })
     }
@@ -386,13 +390,7 @@ export class RuntimeGates {
     // One owner wake for this pass; each dimension keeps its durable event and
     // identity so a later threshold, changed limit or restart remains distinct.
     this.rt.commit(mission.id, () => {
-      const current = this.rt.mission(mission.id)
-      current.budgetWarned = { ...(current.budgetWarned ?? {}) }
-      for (const warning of warnings) {
-        current.budgetWarned[warning.gate] = warning.threshold
-        this.rt.store.event(mission.id, 'mission/budget-warning', 'runtime', warning.data)
-      }
-      this.rt.store.put('missions', current)
+      for (const warning of warnings) this.rt.store.event(mission.id, 'mission/budget-warning', 'runtime', warning.data)
       const keys = warnings.map(warning => warning.key)
       const dedupKey = warnings.length === 1 ? keys[0]! : `budget-review:${mission.id}:batch:${createHash('sha256').update(keys.join('\n')).digest('hex').slice(0, 20)}`
       const instructions = 'Review remaining work and use swarm_budget with reason: budget for the mission, or taskId and taskBudget for a task. Exhaustion preserves work; an extension never overrides a user pause or fixed deadline.'
