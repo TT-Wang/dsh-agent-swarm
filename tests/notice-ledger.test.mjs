@@ -365,6 +365,30 @@ test('the review admission speaks only for its own source: other stuck work besi
   assert.deepEqual(ownerRows(running).filter(delivery => noticeFamily(delivery) !== 'review-blocked' && (delivery.subjects ?? []).some(subject => subject.startsWith(`${source.id}@`))).map(delivery => delivery.content), [], 'no other naming restates the source')
 })
 
+test('the W3 stall states one stuck set: its subjects, its body, its count and its event all leave out the review admission\'s tasks', async t => {
+  const f = await setup({ clock: new FakeClock() })
+  t.after(f.cleanup)
+  const source = f.propose()
+  const claimed = await f.runtime.claim(f.actor(f.author), f.mission.id, source.id)
+  await f.runtime.submit(f.actor(f.author), f.mission.id, { taskId: source.id, attemptId: claimed.attempt.id, output: 'candidate' })
+  // The only independent member was to review it; once it is gone the source is unreviewable and that review is unschedulable.
+  const review = f.propose({ title: 'Review', kind: 'verification', reviewOf: source.id, checks: [], assigneeId: f.reviewer.id })
+  const withdrawn = f.propose({ title: 'Prerequisite', kind: 'research', checks: [] })
+  const dead = f.propose({ title: 'Dependent', kind: 'research', checks: [], dependencies: [withdrawn.id] })
+  f.runtime.commit(f.mission.id, () => f.runtime.store.put('members', { ...f.runtime.store.get('members', f.reviewer.id), phase: 'stopped' }))
+  f.runtime.cancel(f.owner, f.mission.id, { taskId: withdrawn.id, reason: 'Not needed' })
+  await f.runtime.settle(f.mission.id)
+  await ticks(f, 150)
+  assert.deepEqual(f.runtime.interpretation(f.mission.id).unschedulable.map(task => task.id).sort(), [review.id, dead.id].sort(), 'the dispatcher counts the dead review and the dead dependent')
+  const stall = ownerRows(f).find(delivery => noticeFamily(delivery) === 'board-stall')
+  assert.ok(stall, 'the stalled board told the owner')
+  assert.deepEqual(stall.subjects, [`${dead.id}@${taskOf(f.runtime, dead.id).epoch}`], 'the stall names the stuck work the admission does not speak for')
+  assert.deepEqual(stall.notice.statement, { family: 'board-stall', counts: { unschedulable: 1 } }, 'its count is that set\'s')
+  assert.match(stall.content, new RegExp(`Unschedulable: ${dead.id} \\(research, pending, depends on ${withdrawn.id}\\)\\. Subjects: `), 'its body lists that set alone')
+  for (const task of [source, review]) assert.ok(!stall.content.split('Unschedulable: ')[1].includes(task.id), `the body restates nothing of the review path (${task.title})`)
+  assert.deepEqual(boardStallEvents(f).map(event => [event.data.noticeKey, event.data.unschedulable]), [[stall.notice.dedupKey, [dead.id]]], 'and its event records that set')
+})
+
 test('a queued W3 stall is withheld once its board can progress, and coverage-complete reminds the owner until the mission completes', async t => {
   const stalled = await setup({ clock: new FakeClock() })
   t.after(stalled.cleanup)
