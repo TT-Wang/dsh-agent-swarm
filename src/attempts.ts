@@ -628,7 +628,7 @@ export class Attempts {
     // chain fires with the workspace capture guard that produced the checkpoint,
     // with the dispatch sweep that re-pends the task, and (when the recovery
     // limit is already spent) with the close-out exhaustion terminal below.
-    emitGuardTerminal(this.rt, mission.id, 'attempt_lease', { taskId: current.id, memberId: member.id, localKey: `closeout-abandoned:${task.attempt?.id ?? 'unknown'}`, detail: `idle close-out abandoned attempt ${task.attempt?.id ?? 'unknown'}: the workspace was checkpointed at ${checkpoint.commit} and the task was re-pended (recovery ${current.recoveryCount ?? 0})` })
+    emitGuardTerminal(this.rt, mission.id, 'attempt_lease', { taskId: current.id, memberId: member.id, localKey: `closeout-abandoned:${task.attempt!.id}`, detail: `idle close-out abandoned attempt ${task.attempt?.id ?? 'unknown'}: the workspace was checkpointed at ${checkpoint.commit} and the task was re-pended (recovery ${current.recoveryCount ?? 0})` })
     this.idleSignals.delete(member.id)
     this.resumeStoppedAttempt(mission.id, current)
   }
