@@ -67,7 +67,7 @@ test('a copy-era row without covers checks exactly its stored list, and so does 
   assert.deepEqual(graph.checklist('review', criteria), stored)
 })
 
-test('an authored review is assigned and shown everything its source must satisfy, then its own criteria, and the registry lists each checklist', async t => {
+test('an authored review is assigned and shown everything its source must satisfy, then its own criteria, while the owner and the registry read the stored rows', async t => {
   const f = await setup({ clock: new FakeClock(), acceptance: ['value is two'] })
   t.after(f.cleanup)
   // The source cites c1 and stores only its own criterion, so its checklist is not its stored list.
@@ -81,10 +81,10 @@ test('an authored review is assigned and shown everything its source must satisf
   const assignment = f.runtime.store.list('deliveries', f.mission.id).find(delivery => delivery.kind === 'assignment' && delivery.taskId === review.id)
   assert.deepEqual(JSON.parse(assignment.content).task.acceptance, checklist, 'the reviewer is assigned its source\'s criteria')
   assert.deepEqual(f.runtime.observe(f.actor(f.reviewer), f.mission.id).current.task.acceptance, checklist, 'and observes them')
-  assert.deepEqual(f.runtime.observe(f.owner, f.mission.id, { taskId: review.id }).task.acceptance, checklist, 'and the owner reads them')
   assert.deepEqual(f.runtime.store.get('tasks', review.id).acceptance, ['reads the diff'], 'nothing is copied onto the stored review')
+  assert.deepEqual(f.runtime.observe(f.owner, f.mission.id, { taskId: review.id }).task.acceptance, ['reads the diff'], 'and the owner reads that row')
   const registered = f.runtime.artifacts(f.owner, { missionId: f.mission.id }).artifacts.find(row => row.taskId === source.id)
-  assert.deepEqual([registered.acceptance, registered.missionAcceptance], [['value is two', 'adds a test'], ['value is two']], 'the registry row carries the source\'s checklist')
+  assert.deepEqual([registered.acceptance, registered.covers, registered.missionAcceptance], [['adds a test'], ['c1'], ['value is two']], 'the registry row is the stored source beside the criteria its ids name')
 })
 
 const plan = (workspace, tasks) => ({ title: 'Plan', objective: 'Deliver', workspace, scope: ['src/'], acceptance: ['works', 'is documented'], budget,
@@ -192,7 +192,7 @@ test('each exit the bare-deliverable and covers refusals name is performed throu
   const propose = async args => (await definitions.get('swarm_propose').execute({ missionId: f.mission.id, workstreamId: f.stream.id, objective: 'Implement the scoped change', kind: 'implementation', scope: ['**'], checks: ['test -d .'], ...args },
     { signal: new AbortController().signal, agent: { id: f.owner.sessionId } })).result
   const tasks = () => f.runtime.store.list('tasks', f.mission.id).length
-  const checklist = task => f.runtime.observe(f.owner, f.mission.id, { taskId: task.id }).task.acceptance
+  const checklist = task => f.runtime.observe(f.actor(f.reviewer), f.mission.id, { taskId: task.id }).task.acceptance
   // A deliverable with no criteria at all: the refusal names three exits.
   await assert.rejects(propose({ title: 'Bare', outputs: [] }), error => error.message === '[task_acceptance_required] A new deliverable needs criteria. Pass `covers` with the ids of the mission criteria it satisfies (c1 is the mission\'s first acceptance item), or `acceptance` as its own nonempty criteria, with `swarm_propose`; or name the rejected task in `replaces` to inherit its criteria, then retry.')
   // An id that is unknown, repeated, or the criterion's text: one refusal, whose exit is each id once.
@@ -253,7 +253,7 @@ test('a repair answers for the ids its lineage cites, and a withdrawn deliverabl
   assert.match(g.runtime.completionError(g.runtime.mission(g.mission.id)), /criterion: c2 "is documented"\. /)
 })
 
-test('workers see criterion text, never bare ids; the owner also reads each task\'s covers and a fresh overview maps each id to its criterion', async t => {
+test('workers see criterion text, never bare ids; the owner reads the stored row with its covers, and a fresh overview maps each id to its criterion', async t => {
   const f = await setup({ clock: new FakeClock(), acceptance: ['works', 'is documented'] })
   t.after(f.cleanup)
   const task = f.propose({ acceptance: ['has a test'], covers: ['c2'] })
@@ -265,9 +265,9 @@ test('workers see criterion text, never bare ids; the owner also reads each task
     assert.deepEqual(record.acceptance, ['is documented', 'has a test']); assert.equal('covers' in record, false)
   }
   const owned = [f.runtime.observe(f.owner, f.mission.id, { taskId: task.id }).task, f.runtime.observe(f.owner, f.mission.id, { detail: 'full' }).board.find(row => row.id === task.id)]
-  for (const record of owned) assert.deepEqual([record.acceptance, record.covers], [['is documented', 'has a test'], ['c2']], 'the owner who cites ids reads them beside their text')
+  for (const record of owned) assert.deepEqual([record.acceptance, record.covers], [['has a test'], ['c2']], 'the owner reads the row it stored: the task\'s own criterion and the ids it cites')
   const overview = f.runtime.observe(f.owner, f.mission.id)
-  assert.deepEqual(overview.mission.criteria, { c1: 'works', c2: 'is documented' })
+  assert.deepEqual(overview.mission.criteria, { c1: 'works', c2: 'is documented' }, 'and resolves each id through the map its fresh overview carries')
   assert.equal(f.runtime.observe(f.owner, f.mission.id, { cursor: overview.nextCursor }).mission.criteria, undefined, 'a delta omits the unchanging criteria')
 })
 
@@ -317,6 +317,91 @@ test('a member reads its checklist in the task its own swarm_propose returns: a 
   assert.deepEqual([owned.acceptance, owned.covers], [['has an example'], ['c2']])
 })
 
+// One projection per reader, whichever tool answers. `read` is what the caller's model reads: the rendered result of its own call.
+function reader(f) {
+  const definitions = new Map()
+  registerTools({ tools: { register: definition => definitions.set(definition.name, definition) } }, f.runtime, f.mission.budget)
+  return async (name, caller, args = {}) => {
+    const definition = definitions.get(name)
+    const executed = await definition.execute({ missionId: f.mission.id, ...args }, { signal: new AbortController().signal, agent: { id: caller.sessionId } })
+    return JSON.parse(definition.output.render(args, executed)[0].text).result
+  }
+}
+
+test('the owner reads the stored row at every exit: a deliverable that only cites ids, and the repair that replaces it, read the same in the result of swarm_propose, swarm_control and swarm_cancel, in swarm_observe, in the snapshot and in swarm_registry', async t => {
+  const f = await setup({ clock: new FakeClock(), acceptance: ['works', 'is documented'] })
+  t.after(f.cleanup)
+  const read = reader(f)
+  const proposal = { workstreamId: f.stream.id, title: 'Deliver', objective: 'Implement the scoped change', kind: 'implementation', scope: ['**'], outputs: [], checks: ['test -d .'], assigneeId: f.author.id }
+  const criteria = row => [row.acceptance, row.covers, row.replaces]
+  // Every read of one task that is not the result of a write: by id, on the full board, in the UI snapshot, and each registry row of its artifacts.
+  const reads = async task => ({
+    observe: [(await read('swarm_observe', f.owner, { taskId: task.id })).task],
+    board: (await read('swarm_observe', f.owner, { detail: 'full' })).board.filter(row => row.id === task.id),
+    snapshot: JSON.parse(JSON.stringify(f.runtime.snapshot(f.owner, f.mission.id))).tasks.filter(row => row.id === task.id),
+    registry: (await read('swarm_registry', f.owner)).artifacts.filter(row => row.taskId === task.id),
+  })
+  const agree = async (task, written, stored) => {
+    assert.deepEqual(criteria(f.runtime.store.get('tasks', task.id)), stored, 'the durable row')
+    for (const [exit, rows] of Object.entries({ ...written, ...await reads(task) })) {
+      assert.ok(rows.length > 0, `${task.title}: ${exit} returns the task`)
+      for (const row of rows) assert.deepEqual(criteria(row), stored, `${task.title}: ${exit} reads the stored row`)
+    }
+  }
+  // The deliverable stores no criterion text, only the ids it cites; a review rejects it.
+  const original = await read('swarm_propose', f.owner, { ...proposal, acceptance: [], covers: ['c1', 'c2'] })
+  await blockThroughReview(f, original)
+  await agree(original, { propose: [original] }, [[], ['c1', 'c2'], undefined])
+  // Its repair stores nothing but the lineage: no text, no id.
+  const repair = await read('swarm_propose', f.owner, { ...proposal, title: 'Repair', replaces: [original.id] })
+  const amended = await read('swarm_control', f.owner, { taskId: repair.id, action: 'amend', changes: { maxRecoveryAttempts: 3 }, reason: 'Allow one more recovery' })
+  const claimed = await f.runtime.claim(f.actor(f.author), f.mission.id, repair.id)
+  await f.runtime.submit(f.actor(f.author), f.mission.id, { taskId: repair.id, attemptId: claimed.attempt.id, output: 'repaired candidate' })
+  await agree(repair, { propose: [repair], amend: [amended] }, [[], undefined, [original.id]])
+  const cancelled = await read('swarm_cancel', f.owner, { taskId: repair.id, reason: 'Withdrawn after the comparison' })
+  await agree(repair, { cancel: [cancelled] }, [[], undefined, [original.id]])
+  // The ids resolve through what the owner already holds: the criteria map of a fresh overview, and the mission list beside each registry row.
+  assert.deepEqual((await read('swarm_observe', f.owner)).mission.criteria, { c1: 'works', c2: 'is documented' })
+  for (const row of (await read('swarm_registry', f.owner)).artifacts) assert.deepEqual(row.missionAcceptance, ['works', 'is documented'])
+})
+
+test('a member reads its checklist and never an id at every exit: its assignment, the result of its own swarm_claim, swarm_propose, swarm_submit and swarm_verify, and every swarm_observe view of its task, its review source and another member\'s task', async t => {
+  const f = await setup({ clock: new FakeClock(), acceptance: ['works', 'is documented'] })
+  t.after(f.cleanup)
+  const read = reader(f)
+  const keys = value => value !== null && typeof value === 'object' ? Object.entries(value).flatMap(([key, item]) => [key, ...keys(item)]) : []
+  const both = ['works', 'is documented']
+  // Each task a member's call returned must list the criterion text, and nothing in the whole result may carry `covers`.
+  const exit = async (name, member, args, task, checklist) => {
+    const result = await read(name, member, args), shown = task(result)
+    assert.deepEqual([shown.acceptance, keys(result).includes('covers')], [checklist, false], `${name} ${JSON.stringify(args)}`)
+    return shown
+  }
+  const itself = result => result, current = result => result.current.task, byId = result => result.task
+  // Neither row stores a criterion's text: the deliverable only cites both ids, and its repair only names it.
+  const source = f.propose({ acceptance: [] })
+  assert.equal((await read('swarm_observe', f.author)).current, null, 'the author\'s first read is the focused view, before any assignment')
+  const claimed = await exit('swarm_claim', f.author, { taskId: source.id }, itself, both)
+  await exit('swarm_observe', f.author, {}, current, both)
+  await exit('swarm_observe', f.author, { taskId: source.id }, byId, both)
+  const proposal = { workstreamId: f.stream.id, scope: ['**'], outputs: [] }
+  await exit('swarm_propose', f.author, { ...proposal, title: 'Document it', objective: 'Document the change', kind: 'research', acceptance: ['has an example'], covers: ['c2'] }, itself, ['is documented', 'has an example'])
+  const review = await exit('swarm_propose', f.author, { ...proposal, title: 'Review', objective: 'Independent review', kind: 'verification', reviewOf: source.id, assigneeId: f.reviewer.id }, itself, both)
+  await exit('swarm_submit', f.author, { taskId: source.id, attemptId: claimed.attempt.id, output: 'candidate' }, itself, both)
+  const reviewing = await exit('swarm_claim', f.reviewer, { taskId: review.id }, itself, both)
+  await exit('swarm_observe', f.reviewer, {}, current, both)
+  await exit('swarm_observe', f.reviewer, { taskId: source.id }, byId, both)
+  await exit('swarm_verify', f.reviewer, { taskId: review.id, attemptId: reviewing.attempt.id, verdict: 'reject', reason: 'The candidate does not document the change' }, itself, both)
+  // The repair reaches its worker through the lineage alone, in the claim result and in the delta that names the changed assignment.
+  const repair = f.propose({ title: 'Repair', replaces: [source.id], acceptance: undefined, covers: undefined })
+  assert.deepEqual([f.runtime.store.get('tasks', repair.id).acceptance, f.runtime.store.get('tasks', repair.id).covers], [[], undefined])
+  await exit('swarm_claim', f.author, { taskId: repair.id }, itself, both)
+  assert.equal((await exit('swarm_observe', f.author, {}, current, both)).id, repair.id, 'the delta carries the new assignment')
+  const assignments = f.runtime.store.list('deliveries', f.mission.id).filter(delivery => delivery.kind === 'assignment').map(delivery => JSON.parse(delivery.content))
+  assert.deepEqual(assignments.map(body => [body.task.id, body.task.acceptance, keys(body).includes('covers')]), [source, review, repair].map(task => [task.id, both, false]), 'each assignment delivers the same checklist')
+  assert.deepEqual(f.runtime.store.get('tasks', source.id).covers, ['c1', 'c2'], 'the ids stay on the stored row, for the owner')
+})
+
 test('a budget resume delivers the task as its first assignment did: a deliverable that only cites ids and a review with no criteria of its own read the criterion text again, never a bare id', async t => {
   for (const reviewing of [false, true]) {
     const clock = new FakeClock(), f = await setup({ clock, budget: { maxTokens: 40, maxSteps: 100 }, acceptance: ['works', 'is documented'] })
@@ -364,7 +449,7 @@ test('the propose guard reads the proposal\'s own objective and acceptance: its 
   // The repair drops the dependency and writes no criterion of that kind itself: the guard reads only what the proposal says.
   const repair = await propose({ title: 'Reader repair', acceptance: ['unrelated'], replaces: [original.id] })
   assert.deepEqual([repair.status, repair.acceptance, repair.dependencies], ['pending', ['unrelated'], []])
-  assert.deepEqual(f.runtime.observe(f.owner, f.mission.id, { taskId: repair.id }).task.acceptance, ['unrelated', prior], 'its worker still checks the criterion it inherits')
+  assert.deepEqual(f.runtime.observe(f.actor(f.author), f.mission.id, { taskId: repair.id }).task.acceptance, ['unrelated', prior], 'its worker still checks the criterion it inherits')
 })
 
 test('a staged mission\'s criteria are fixed: a repair may change covers and task criteria, never the mission list', async t => {
@@ -388,7 +473,7 @@ test('a staged mission\'s criteria are fixed: a repair may change covers and tas
   const launched = await runtime.launchDraft(owner, repaired.id, repaired.revision)
   const code = launched.tasks.find(task => task.kind === 'implementation')
   assert.deepEqual([code.covers, code.acceptance], [['c2', 'c1'], ['keeps the API']], 'the staged row takes the repaired covers and criteria')
-  assert.deepEqual(runtime.observe(owner, launched.mission.id, { taskId: code.id }).task.acceptance, ['works', 'is documented', 'keeps the API'], 'its checklist lists them in mission order')
+  assert.deepEqual(taskGraphIndex(launched.tasks).checklist(code.id, launched.mission.acceptance), ['works', 'is documented', 'keeps the API'], 'its checklist lists them in mission order')
   assert.deepEqual(launched.mission.acceptance, ['works', 'is documented'])
 })
 

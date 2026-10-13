@@ -62,7 +62,7 @@ test('a launched plan with a deliverable and no review gets exactly one synthesi
   assert.match(review.id, /_deliver-review$/)
   assert.equal(review.assigneeId, undefined, 'unassigned: any independent member may take it')
   assert.deepEqual(review.scope, source.scope)
-  const checklist = task => f.runtime.observe({ sessionId: snapshot.mission.ownerSessionId }, snapshot.mission.id, { taskId: task.id }).task.acceptance
+  const checklist = task => f.runtime.observe({ sessionId: snapshot.members[0].sessionId }, snapshot.mission.id, { taskId: task.id }).task.acceptance
   assert.deepEqual([review.acceptance, checklist(review)], [[], checklist(source)], 'nothing is copied: the review checks its source\'s checklist')
   assert.equal(review.checkTimeoutMs, source.checkTimeoutMs)
   assert.equal(review.maxRecoveryAttempts, source.maxRecoveryAttempts)

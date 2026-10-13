@@ -885,7 +885,7 @@ export class SwarmRuntime {
     if (mission.executionTime !== undefined && !terminal(mission)) executionClock(mission, mission.executionTime.since !== undefined, this.now())
     return mission
   }
-  /** A task as a member reads it wherever the runtime hands it one, in its assignment, in `swarm_observe` and in the result of its own propose, claim, submit and verify: `acceptance` is its derived checklist, which holds the text of every criterion it cites, never the bare ids. */
+  /** One projection per reader. A member reads this wherever the runtime hands it a task, in its assignment, in `swarm_observe` and in the result of its own propose, claim, submit and verify: `acceptance` is its derived checklist, which holds the text of every criterion it cites, never the bare ids. The owner reads the stored row at every exit and resolves its `covers` through the mission's criteria. */
   private memberTask({ covers: _cited, ...task }: Task, mission = this.mission(task.missionId), graph = taskGraphIndex(this.store.list('tasks', task.missionId))): Task { return { ...task, acceptance: graph.checklist(task.id, mission.acceptance) } }
   participant(actor: Actor, missionId: string): { mission: Mission; member?: Member; key: string; owner: boolean } {
     const mission = this.mission(missionId)
@@ -2928,10 +2928,10 @@ export class SwarmRuntime {
     if (query.missionId !== undefined && missions.length === 0) throw new Error('Unknown mission or not visible to this session')
     const rows: Array<Record<string, unknown>> = []
     for (const mission of missions) {
-      const tasks = this.store.list('tasks', mission.id), graph = taskGraphIndex(tasks)
+      const tasks = this.store.list('tasks', mission.id)
       for (const task of tasks) {
         const identity = { missionId: mission.id, missionTitle: mission.title, missionStatus: mission.status, missionAcceptance: mission.acceptance,
-          taskId: task.id, taskTitle: task.title, taskKind: task.kind, taskStatus: task.status, acceptance: graph.checklist(task.id, mission.acceptance) }
+          taskId: task.id, taskTitle: task.title, taskKind: task.kind, taskStatus: task.status, acceptance: task.acceptance, covers: task.covers, replaces: task.replaces }
         for (const rejection of task.rejections ?? []) {
           if (task.kind !== 'verification') rows.push({ ...identity, artifact: { commit: rejection.commit }, archived: true,
             review: { taskId: rejection.reviewTaskId, verdict: 'refuted', reason: excerpt(rejection.reason, 400) } })
@@ -3267,7 +3267,7 @@ export class SwarmRuntime {
     const taskRef = (task: Task) => ({ id: task.id, title: task.title, kind: task.kind, status: task.status, ...(task.assigneeId ? { assigneeId: task.assigneeId } : {}), ...(task.assignmentMode ? { assignmentMode: task.assignmentMode } : {}), ...(task.attempt ? { attemptOwner: task.attempt.ownerId } : {}),
       ...(task.reviewOf ? { reviewOf: task.reviewOf } : {}), ...(task.dependencies.length ? { dependencies: task.dependencies } : {}), ...(task.replaces?.length ? { replaces: task.replaces } : {}), ...(task.artifact ? { artifact: task.artifact.commit } : {}), ...(task.reviewArtifact ? { reviewArtifact: task.reviewArtifact.commit } : {}),
       ...(task.recovery ? { recovery: task.recovery } : {}) })
-    const taskRecord = (task: Task, outputLimit: number) => ({ ...(member ? this.memberTask(task, mission, graph) : { ...task, acceptance: graph.checklist(task.id, mission.acceptance) }), ...(task.output !== undefined ? { output: excerpt(task.output, outputLimit) } : {}), ...(task.handoff !== undefined ? { handoff: excerpt(task.handoff, outputLimit) } : {}) })
+    const taskRecord = (task: Task, outputLimit: number) => ({ ...(member ? this.memberTask(task, mission, graph) : task), ...(task.output !== undefined ? { output: excerpt(task.output, outputLimit) } : {}), ...(task.handoff !== undefined ? { handoff: excerpt(task.handoff, outputLimit) } : {}) })
     const evidenceOf = (task: Task, full = false) => task.evidenceIds.map(evidenceId => this.store.get('evidence', evidenceId)).filter((item): item is Evidence => item !== undefined).map(item => evidenceRef(item, full))
     const runsWindow = (filter: { memberId?: string; taskId?: string; attemptId?: string }, limit: number, afterSeq?: number) => {
       const all = this.store.toolRuns(missionId, { ...filter, ...(afterSeq === undefined ? {} : { afterSeq }) })

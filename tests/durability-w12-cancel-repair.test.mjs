@@ -61,7 +61,7 @@ test('W12: cancelling a task admits one live repair and re-resolves its dependen
   // The repair stores only its own criteria; the withdrawn ones reach its worker through the lineage.
   const repair = f.propose({ title: 'Corrected repair', replaces: [original.id], acceptance: ['other', 'works'] })
   assert.deepEqual(repair.acceptance, ['other', 'works'], 'nothing is copied onto the repair')
-  assert.deepEqual(f.runtime.observe(f.owner, f.mission.id, { taskId: repair.id }).task.acceptance, ['other', 'works'], 'its checklist holds every criterion once')
+  assert.deepEqual(f.runtime.observe(f.actor(f.author), f.mission.id, { taskId: repair.id }).task.acceptance, ['other', 'works'], 'its checklist holds every criterion once')
   assert.equal(repair.status, 'pending', 'a cancelled task admits one live repair')
   assert.deepEqual(repair.replaces, [original.id])
   assert.deepEqual(f.current(original.id), before, 'the cancelled record is byte-for-byte unchanged by the repair')

@@ -43,7 +43,7 @@ async function fixture(t) {
     await runtime.verify(actor(reviewer), mission.id, { taskId: review.id, attemptId: claimedReview.attempt.id, verdict: value, reason: `Independent host checks ${value}` })
     return stored(task)
   }
-  const checklist = task => runtime.observe(owner, mission.id, { taskId: task.id }).task.acceptance
+  const checklist = task => runtime.observe(actor(reviewer), mission.id, { taskId: task.id }).task.acceptance
   return { runtime, budget, owner, mission, stream, propose, stored, verdict, checklist }
 }
 

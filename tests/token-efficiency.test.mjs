@@ -139,7 +139,7 @@ test('replacement errors name the failing condition and the live replacement', a
   assert.throws(() => f.propose(f.actorA, { replaces: [review.id] }), /verification task\. Repair its reviewed source/)
   assert.throws(() => f.propose(f.actorA, { replaces: [task.id], dependencies: [task.id] }), /is blocked and has no live replacement/)
   const repair = f.propose(f.actorA, { replaces: [task.id], acceptance: ['other'] })
-  assert.deepEqual(f.runtime.observe(f.owner, f.mission.id, { taskId: repair.id }).task.acceptance, [...f.current(task).acceptance, 'other'], 'a repair inherits the replaced acceptance instead of being refused')
+  assert.deepEqual(repair.acceptance, [...f.current(task).acceptance, 'other'], 'a repair inherits the replaced acceptance instead of being refused')
   const claimed = await f.runtime.claim(f.actorA, f.mission.id, repair.id)
   await f.runtime.submit(f.actorA, f.mission.id, { taskId: repair.id, attemptId: claimed.attempt.id, output: 'repaired' })
   await f.reviewed(repair)
