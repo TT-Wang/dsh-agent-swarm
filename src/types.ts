@@ -231,13 +231,6 @@ export interface Mission {
   /** Owner-session usage attributed by time window (planning and coordination). Outside the worker pool budget. */
   ownerUsage?: UsageBuckets
   /**
-   * S1: fingerprint of the board a wedged scheduling pass (one that never
-   * returned) was last named on, so a retried naming of one unchanged board is
-   * not repeated. Cleared when a pass changes the board or its naming reached
-   * the owner.
-   */
-  schedulingWedgeNotice?: string
-  /**
    * No-silent-state witness (docs/no-silent-state-spec.md §2): the fingerprint
    * `F(S)` of the board state at the moment the last owner-decision notice was
    * emitted, and its witness class. A notice is fresh only for the fingerprint

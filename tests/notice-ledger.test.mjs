@@ -587,3 +587,69 @@ test('a wedged pass never pre-empts the review admission: a need that ripened si
   assert.match(f.runtime.store.list('tasks', f.mission.id).find(row => row.reviewOf === task.id)?.id ?? 'none', /^task_auto_review_/, 'the admission admitted the host review')
   assert.deepEqual(ownerRows(f).filter(delivery => delivery.notice.dedupKey.startsWith('review-blocked:')).map(delivery => delivery.content), [], 'no owner decision raced it')
 })
+
+/** A scheduling body past its bound on the current board, as the tick watchdog finds and names it. */
+const wedgedBody = (t, f, operationId) => {
+  const scheduling = f.runtime.scheduling
+  const pass = { id: scheduling.passKey(f.mission.id), operationId, missionId: f.mission.id, startedAt: f.clock.now() - 60_000,
+    revisionBefore: f.runtime.store.revision(), fingerprintBefore: f.runtime.fingerprint(f.mission.id) }
+  scheduling.passes.set(f.mission.id, pass)
+  t.after(() => scheduling.closePass(f.mission.id, pass))
+  scheduling.checkSchedulingPasses()
+  return pass
+}
+const wedgeRows = f => ownerRows(f).filter(delivery => delivery.notice.trigger === 'scheduling-pass')
+const wedgeEvents = f => events(f.runtime, f.mission.id, 'mission/stalled').filter(event => event.data.cause === 'scheduling-pass')
+
+test('a wedged pass is named once per naming fact, on the ledger alone: a body on a held fact writes nothing, and a newly counted start failure names the next body on an unchanged board', async t => {
+  const f = await setup({ clock: new FakeClock() })
+  t.after(f.cleanup)
+  f.propose({ title: 'Never reached' })
+  await f.runtime.settle(f.mission.id)
+  const scheduling = f.runtime.scheduling
+  const board = f.runtime.fingerprint(f.mission.id)
+  const first = wedgedBody(t, f, 'operation_wedge_1')
+  assert.deepEqual(wedgeEvents(f).map(event => [event.data.runId, event.data.noticeKey]), [['operation_wedge_1', wedgeRows(f)[0]?.notice.dedupKey]], 'the first body is named: one row, and the one event that names it')
+  scheduling.closePass(f.mission.id, first)
+  // A second body wedges on the same fact: the owner already holds it.
+  const second = wedgedBody(t, f, 'operation_wedge_2')
+  assert.ok(second.escalatedAt !== undefined, 'the body is marked named, so the mission publishes as wedged')
+  assert.deepEqual([wedgeRows(f).length, wedgeEvents(f).length], [1, 1], 'and it writes neither a row nor an event')
+  scheduling.closePass(f.mission.id, second)
+  // A start failure is counted for a member: a new naming fact on the same board digest.
+  f.runtime.commit(f.mission.id, () => f.runtime.store.put('members', { ...f.runtime.store.get('members', f.author.id), startFailures: 1 }))
+  assert.equal(f.runtime.fingerprint(f.mission.id), board, 'the board digest cannot see the counted failure')
+  wedgedBody(t, f, 'operation_wedge_3')
+  assert.deepEqual(wedgeEvents(f).map(event => [event.data.runId, event.data.noticeKey]),
+    [['operation_wedge_1', wedgeRows(f)[0].notice.dedupKey], ['operation_wedge_3', wedgeRows(f)[1]?.notice.dedupKey]], 'the next body is named for the new fact, by its own row and event')
+  assert.match(wedgeRows(f)[1].notice.reason, new RegExp(`^pass-timeout .*${f.author.id}:1`), 'whose recorded reason carries the counted failure')
+  assert.equal(Object.hasOwn(f.runtime.store.get('missions', f.mission.id), 'schedulingWedgeNotice'), false, 'nothing on the mission row records a naming')
+})
+
+test('a wedged pass\'s naming is outstanding exactly while its mission is wedged and the work it named is unfinished: withheld and unreminded once the body settles, open again when one wedges on the same fact', async t => {
+  const f = await setup({ clock: new FakeClock() })
+  t.after(f.cleanup)
+  const task = f.propose({ title: 'Never reached' })
+  await f.runtime.settle(f.mission.id)
+  const scheduling = f.runtime.scheduling
+  const first = wedgedBody(t, f, 'operation_wedge_open')
+  const [naming] = wedgeRows(f)
+  assert.deepEqual(naming.subjects, [`${task.id}@${taskOf(f.runtime, task.id).epoch}`], 'the naming names the work the pass never reached')
+  assert.equal(relevant(f, naming), true, 'outstanding while the body holds the mission past its bound')
+  await f.runtime.flushOutbox(f.mission.id)
+  assert.ok(f.runtime.store.get('deliveries', naming.id).deliveredAt !== undefined, 'the naming reached the owner while the body was wedged')
+  const reminder = ordinal => ownerRows(f).find(delivery => delivery.notice.dedupKey === `obligation-followup:${naming.id}:${ordinal}`)
+  f.clock.advance(f.runtime.notices.obligationFollowupMs)
+  f.runtime.notices.absenceNet(f.mission.id)
+  assert.deepEqual(reminder(1)?.subjects, naming.subjects, 'and it is reminded while the wedge lasts')
+  scheduling.closePass(f.mission.id, first)
+  assert.equal(relevant(f, naming), false, 'no body is wedged once it settles: a queued naming would be withheld')
+  f.clock.advance(f.runtime.notices.obligationFollowupMs)
+  f.runtime.notices.absenceNet(f.mission.id)
+  assert.equal(reminder(2), undefined, 'and its reminders end with the wedge, though the task it named is still pending')
+  // A later body wedges on the same fact: the same obligation, carried by the row the owner holds.
+  wedgedBody(t, f, 'operation_wedge_again')
+  assert.deepEqual([wedgeRows(f).length, relevant(f, naming)], [1, true], 'the held row is outstanding again, and no second row is written')
+  f.runtime.cancel(f.owner, f.mission.id, { taskId: task.id, reason: 'No longer needed' })
+  assert.equal(relevant(f, naming), false, 'nor is it outstanding once the work it named is withdrawn')
+})

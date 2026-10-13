@@ -40,20 +40,26 @@ async function fixture(t) {
   return { root, source, baseline, options, workspaces, mission, member, task }
 }
 
-test('M2-1: a repeated wedge naming on the same board records once', () => {
-  const mission = { id: 'mission', status: 'active' }, records = []
-  const rt = makeRuntimeStub({ store: { get: () => structuredClone(mission), list: () => [], put: (_table, row) => Object.assign(mission, row), event: (_m, _t, _a, data) => records.push(data), revision: () => 0 },
-    stallPassTimeoutMs: 1000, fingerprint: () => 'same', commit: (_id, fn) => fn(), expectWedgedRelease() {}, notify() {}, pumpOutbox() {}, passSettled() {} })
+test('M2-1: a repeated pass-timeout naming is recorded once, through the ledger', () => {
+  const mission = { id: 'mission', status: 'active' }, records = [], deliveries = []
+  // The stub store has no `put`: a naming that wrote the mission row would throw.
+  const rt = makeRuntimeStub({ store: { get: () => structuredClone(mission), list: table => table === 'deliveries' ? deliveries : [], event: (_m, _t, _a, data) => records.push(data), revision: () => 0 },
+    stallPassTimeoutMs: 1000, fingerprint: () => 'same', commit: (_id, fn) => fn(), expectWedgedRelease() {}, pumpOutbox() {}, passSettled() {},
+    // The ledger row `notify` writes for a decision from the runtime.
+    notify(missionId, _content, _subjects, options) { deliveries.push({ id: `row-${deliveries.length}`, missionId, from: 'runtime', to: 'owner', notice: { class: 'decision', dedupKey: options.dedupKey } }) } })
   const scheduling = new Scheduling(rt)
-  // Two bodies wedge in turn on one unchanged board. The first naming's notice
-  // was suppressed (`notify` recorded nothing), so its wedge key outlives it.
+  // Two bodies wedge in turn on one naming fact. The first naming's row is the
+  // record: the second body is marked named and writes neither row nor event.
+  const named = []
   for (const operationId of ['one', 'two']) {
     const pass = { id: 'pass', operationId, missionId: mission.id, startedAt: 0, fingerprintBefore: 'same', revisionBefore: 0 }
     scheduling.passes.set(mission.id, pass)
     scheduling.checkSchedulingPasses()
+    named.push(pass.escalatedAt !== undefined)
     scheduling.closePass(mission.id, pass)
   }
-  assert.deepEqual(records.map(row => [row.runId, row.wedged]), [['one', true]])
+  assert.deepEqual(records.map(row => [row.runId, row.wedged, row.noticeKey]), [['one', true, deliveries[0].notice.dedupKey]])
+  assert.deepEqual({ rows: deliveries.length, named }, { rows: 1, named: [true, true] })
 })
 
 test('M2-2: submission grace survives newer unrelated events without aging a new submission', async t => {

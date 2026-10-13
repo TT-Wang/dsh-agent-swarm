@@ -91,7 +91,8 @@ test('S2: a stalled pass still delivers the owner escalation inside the declared
     // Only the watchdog can produce a `pass-timeout` escalation: a pass that
     // returned would have closed itself. So the wedged body never completed.
     assert.equal(event.data.stateUnchanged, true)
-    assert.equal(event.data.ownerNotified, true)
+    const row = f.runtime.store.list('deliveries', f.mission.id).find(item => item.to === 'owner' && item.notice?.dedupKey === event.data.noticeKey)
+    assert.equal(row?.notice.trigger, 'scheduling-pass', 'the escalation names its owner row')
     const delivered = await eventually(() => f.workers.deliveries
       .find(item => item.memberId === 'owner' && /did not return within 60ms/.test(item.content)),
       'the escalation notice must be delivered while the pass is stalled', 4_000)

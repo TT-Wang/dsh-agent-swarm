@@ -166,12 +166,14 @@ test('S1: a wedged body is not followed by refused successor passes, so the owne
 })
 
 test('S1: every body that wedges is named once, also when an earlier named body left the board unchanged', async () => {
-  // Before, the durable wedge key (the board fingerprint) outlived the named
-  // body: closePass cleared it only when the board changed during that body.
+  // Before, a naming was keyed by the board fingerprint, on the mission row.
   // H's every start hangs to its bound, and the second hung body changes
   // nothing, so the third body wedged on the board the key still named: every
   // tick's naming was refused by the key and that wedge got no event, no owner
-  // notice and no wedged mark. A named body that settles now clears the key.
+  // notice and no wedged mark. A naming is now keyed by its own fact on the
+  // deliveries ledger (the work the pass never reached and each member's
+  // counted start failures), and each of H's failed starts is counted, so each
+  // body's naming is a new fact whatever the board digest says.
   //
   // The clock and the ticks are driven by hand, and each of H's starts hangs
   // until the test ends it at its declared start bound (400ms of clock).
@@ -229,16 +231,17 @@ test('S1: every body that wedges is named once, also when an earlier named body 
   } finally { await f.cleanup() }
 })
 
-test('S1: the renaming of bodies that wedge on an unchanged board stops at the first naming the notice dedup suppressed', async () => {
-  // Before, a named body that settled always cleared the wedge key. A start
-  // under a recorded outage was never counted, so start-failure retirement never
-  // capped the renaming: every body that wedged in H's hung start was named
-  // again, about three per second, and each mission/stalled event claimed
-  // ownerNotified: true although the notice dedup had suppressed the row. The
-  // key is now cleared only when the naming reached the owner, and the event
-  // states what notify did. A start under a recorded outage is now also paced to
-  // one probe per outage window (tests/start-failure-recovery.test.mjs), so the
-  // recurring wedge here is a start that outlives the pass bound and then
+test('S1: bodies that wedge on a naming fact the owner already holds are told once: one row, one event', async () => {
+  // Before, "the owner was told" was kept three times beside the ledger row: a
+  // board-fingerprint key on the mission row, a flag on the body and an
+  // `ownerNotified` field on the event. A start under a recorded outage is never
+  // counted, so the bodies that wedged in H's slow start repeated one naming
+  // fact: the second was written as a mission/stalled event with
+  // ownerNotified: false and no row, and the key it left stopped the renaming.
+  // The ledger row is now the one record: a body whose naming fact is held is
+  // marked named and writes nothing. A start under a recorded outage is also
+  // paced to one probe per outage window (tests/start-failure-recovery.test.mjs),
+  // so the recurring wedge here is a start that outlives the pass bound and then
   // succeeds: never a failure, so never counted and never retired.
   //
   // Each slow start takes 250ms of the runtime's clock, which it moves while
@@ -259,6 +262,10 @@ test('S1: the renaming of bodies that wedge on an unchanged board stops at the f
   const clock = new FakeClock()
   const f = await setup({ workers, clock, budget: { maxWorkers: 8 }, config: { tickMs: 10, stallPassTimeoutMs: 100 } })
   try {
+    const scheduling = f.runtime.scheduling
+    const named = []
+    const closePass = scheduling.closePass.bind(scheduling)
+    scheduling.closePass = (missionId, pass) => { if (pass.escalatedAt !== undefined) named.push(pass.operationId); return closePass(missionId, pass) }
     const h = await f.runtime.addMember(f.owner, f.mission.id, { name: 'H', role: 'implementation', maxOutputTokens: 5_000 })
     workers.names.set(h.id, 'H')
     const task = f.propose({ title: 'Work for H', assigneeId: h.id })
@@ -267,13 +274,13 @@ test('S1: the renaming of bodies that wedge on an unchanged board stops at the f
     workers.hangH = true
     await ticksUntil(f, () => workers.hangs >= 7, 'H\'s starts keep outliving the pass bound', 600)
     const namings = wedgeEvents(f).filter(item => item.createdAt >= armedAt)
-    assert.ok(workers.hangs >= namings.length + 3, `bodies kept wedging (${workers.hangs} slow starts) after the last naming`)
-    assert.equal(f.runtime.store.get('members', h.id).phase, 'active', 'a slow start never fails, so start-failure retirement never caps the renaming')
-    assert.ok(namings.length >= 2, `the bodies are named until the notice dedup suppresses one (${namings.length})`)
-    assert.deepEqual(namings.map(item => item.data.ownerNotified), [...namings.slice(0, -1).map(() => true), false],
-      'every naming reached the owner except the last, a repeat the notice dedup suppressed; nothing is named after it')
+    assert.equal(f.runtime.store.get('members', h.id).phase, 'active', 'a slow start never fails, so no start failure is counted and the naming fact never changes')
+    assert.ok(named.length >= 3, `bodies kept wedging and each was marked named (${named.length} of ${workers.hangs} slow starts)`)
     const rows = f.runtime.store.list('deliveries', f.mission.id).filter(item => item.to === 'owner' && item.notice?.trigger === 'scheduling-pass' && item.createdAt >= armedAt)
-    assert.equal(rows.length, namings.length - 1, 'each naming that claims ownerNotified has its owner row')
+    assert.equal(rows.length, 1, 'the owner is told the one naming fact once')
+    assert.deepEqual(namings.map(item => [item.data.runId, item.data.noticeKey]), [[named[0], rows[0].notice.dedupKey]],
+      'the first body\'s naming wrote the row and the one event that names it; the bodies after it wrote neither')
+    assert.equal(Object.hasOwn(f.runtime.store.get('missions', f.mission.id), 'schedulingWedgeNotice'), false, 'and nothing on the mission row records the telling')
   } finally { await f.cleanup() }
 })
 
