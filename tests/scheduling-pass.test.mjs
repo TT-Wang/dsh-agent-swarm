@@ -269,6 +269,9 @@ test('S1: bodies that wedge on a naming fact the owner already holds are told on
     const h = await f.runtime.addMember(f.owner, f.mission.id, { name: 'H', role: 'implementation', maxOutputTokens: 5_000 })
     workers.names.set(h.id, 'H')
     const task = f.propose({ title: 'Work for H', assigneeId: h.id })
+    // The body H's admission kicked re-validates the workspace on disk: it settles
+    // first, so no body is in flight across the hand-driven ticks before H hangs.
+    await f.runtime.settle(f.mission.id)
     await ticksUntil(f, () => taskOf(f.runtime, task.id).status === 'running', 'the task dispatches to H', 400)
     const armedAt = clock.now()
     workers.hangH = true
