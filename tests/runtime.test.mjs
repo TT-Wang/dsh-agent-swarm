@@ -244,8 +244,8 @@ test('an independently accepted repair retires blocked obligations and can conve
   assert.equal(oldVerdict.status,'blocked')
   // The repair stores its own criteria; the replaced obligations reach it through the lineage, never substituted.
   const repaired=f.propose(f.actorA,{title:'Repair',replaces:[original.id],acceptance:['unrelated','works']})
-  assert.deepEqual(repaired.acceptance,['unrelated','works'])
-  assert.deepEqual(f.runtime.observe(f.owner,f.mission.id,{taskId:repaired.id}).task.acceptance,[...original.acceptance,'unrelated'],'the covered criterion first, then the lineage\'s own, without duplicates')
+  assert.deepEqual(f.runtime.store.get('tasks',repaired.id).acceptance,['unrelated','works'])
+  for (const read of [repaired,f.runtime.observe(f.owner,f.mission.id,{taskId:repaired.id}).task]) assert.deepEqual(read.acceptance,[...original.acceptance,'unrelated'],'the member who proposed it and the owner read the covered criterion first, then the lineage\'s own, without duplicates')
   await submitAndReview(repaired)
   const repairedBoard=f.runtime.snapshot(f.owner,f.mission.id)
   assert.equal(repairedBoard.tasks.find(t=>t.id===original.id).status,'cancelled')

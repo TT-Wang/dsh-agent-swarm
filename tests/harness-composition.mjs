@@ -176,7 +176,7 @@ setResponder(options => {
         missionId: source.missionId, workstreamId: task.workstreamId,
         title: `Independent review: ${task.title}`, objective: 'Review the submitted artifact and run its required checks.',
         kind: 'verification', reviewOf: task.id, assigneeId: reviewer.id,
-        scope: task.scope, acceptance: task.acceptance, outputs: [],
+        scope: task.scope, outputs: [],
       })
     }
     if (script.stage === 'submit') {

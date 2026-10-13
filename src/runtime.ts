@@ -885,7 +885,7 @@ export class SwarmRuntime {
     if (mission.executionTime !== undefined && !terminal(mission)) executionClock(mission, mission.executionTime.since !== undefined, this.now())
     return mission
   }
-  /** A task as its worker and reviewers read it, in its assignment, in `swarm_observe` and in the result of their own claim, submit and verify: `acceptance` is its derived checklist, which holds the text of every criterion it cites, never the bare ids. */
+  /** A task as a member reads it wherever the runtime hands it one, in its assignment, in `swarm_observe` and in the result of its own propose, claim, submit and verify: `acceptance` is its derived checklist, which holds the text of every criterion it cites, never the bare ids. */
   private memberTask({ covers: _cited, ...task }: Task, mission = this.mission(task.missionId), graph = taskGraphIndex(this.store.list('tasks', task.missionId))): Task { return { ...task, acceptance: graph.checklist(task.id, mission.acceptance) } }
   participant(actor: Actor, missionId: string): { mission: Mission; member?: Member; key: string; owner: boolean } {
     const mission = this.mission(missionId)
@@ -1425,7 +1425,7 @@ export class SwarmRuntime {
     this.warnBudget(this.mission(missionId))
     this.warnIntegrationGap(mission, task)
     this.kick(missionId)
-    return task
+    return owner ? task : this.memberTask(task)
   }
 
   /** ENV: the adapter's measured envelope, widened to the environment facts it also reports. */

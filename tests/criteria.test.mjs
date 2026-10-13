@@ -250,6 +250,28 @@ test('a worker reads its checklist in every result of its own calls: the registe
   assert.deepEqual([submitted.status, verified.status, f.runtime.store.get('tasks', source.id).covers], ['submitted', 'accepted', ['c1', 'c2']], 'the stored rows keep the ids')
 })
 
+test('a member reads its checklist in the task its own swarm_propose returns: a review proposed with no criteria lists what its source must satisfy, and only the owner reads the stored row', async t => {
+  const f = await setup({ clock: new FakeClock(), acceptance: ['works', 'is documented'] })
+  t.after(f.cleanup)
+  const definitions = new Map()
+  registerTools({ tools: { register: definition => definitions.set(definition.name, definition) } }, f.runtime, f.mission.budget)
+  const propose = async (proposer, args) => (await definitions.get('swarm_propose').execute({ missionId: f.mission.id, workstreamId: f.stream.id, scope: ['**'], outputs: [], ...args }, { signal: new AbortController().signal, agent: { id: proposer.sessionId } })).result
+  // The source only cites both ids; its author proposes the review with the fields a review needs and no criteria.
+  const source = f.propose({ acceptance: [] })
+  const claimed = await f.runtime.claim(f.actor(f.author), f.mission.id, source.id)
+  await f.runtime.submit(f.actor(f.author), f.mission.id, { taskId: source.id, attemptId: claimed.attempt.id, output: 'candidate' })
+  const review = await propose(f.author, { title: 'Review', objective: 'Independent review', kind: 'verification', reviewOf: source.id, assigneeId: f.reviewer.id })
+  assert.deepEqual([review.acceptance, 'covers' in review, f.runtime.store.get('tasks', review.id).acceptance], [['works', 'is documented'], false, []], 'the row stores none of the text the member reads')
+  const reviewing = await f.runtime.claim(f.actor(f.reviewer), f.mission.id, review.id)
+  assert.deepEqual(reviewing.acceptance, review.acceptance, 'the proposer read the checklist the reviewer is assigned')
+  // A member that cites an id reads the criterion's text back; the owner, who decides coverage, reads the row it stored.
+  const deliverable = { title: 'Document it', objective: 'Document the change', kind: 'research', acceptance: ['has an example'], covers: ['c2'] }
+  const cited = await propose(f.author, deliverable)
+  assert.deepEqual([cited.acceptance, 'covers' in cited, f.runtime.store.get('tasks', cited.id).covers], [['is documented', 'has an example'], false, ['c2']])
+  const owned = await propose(f.owner, { ...deliverable, title: 'Document it again' })
+  assert.deepEqual([owned.acceptance, owned.covers], [['has an example'], ['c2']])
+})
+
 test('a budget resume delivers the task as its first assignment did: a deliverable that only cites ids and a review with no criteria of its own read the criterion text again, never a bare id', async t => {
   for (const reviewing of [false, true]) {
     const clock = new FakeClock(), f = await setup({ clock, budget: { maxTokens: 40, maxSteps: 100 }, acceptance: ['works', 'is documented'] })
