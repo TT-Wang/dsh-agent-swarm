@@ -402,6 +402,26 @@ test('a member reads its checklist and never an id at every exit: its assignment
   assert.deepEqual(f.runtime.store.get('tasks', source.id).covers, ['c1', 'c2'], 'the ids stay on the stored row, for the owner')
 })
 
+test('a reviewer reads its source as it reads its own task: observe().current.reviewSource lists the source\'s checklist and carries no covers, in the delta that names the new assignment and in the focused view', async t => {
+  const f = await setup({ clock: new FakeClock(), acceptance: ['works', 'is documented'] })
+  t.after(f.cleanup)
+  // The source cites c2 beside its own criterion; the review adds one of its own.
+  const source = f.propose({ acceptance: ['adds a test'], covers: ['c2'] })
+  const claimed = await f.runtime.claim(f.actor(f.author), f.mission.id, source.id)
+  await f.runtime.submit(f.actor(f.author), f.mission.id, { taskId: source.id, attemptId: claimed.attempt.id, output: 'candidate' })
+  const review = f.propose({ kind: 'verification', reviewOf: source.id, checks: [], acceptance: ['reads the diff'], assigneeId: f.reviewer.id })
+  assert.equal(f.runtime.observe(f.actor(f.reviewer), f.mission.id).current, null, 'the reviewer\'s first read precedes its assignment')
+  await f.runtime.claim(f.actor(f.reviewer), f.mission.id, review.id)
+  const delta = f.runtime.observe(f.actor(f.reviewer), f.mission.id), focused = f.runtime.observe(f.actor(f.reviewer), f.mission.id, { after: 0 })
+  assert.deepEqual([delta.delta, focused.delta, focused.member.id], [true, undefined, f.reviewer.id])
+  for (const [name, view] of Object.entries({ delta, focused })) {
+    const shown = view.current.reviewSource
+    assert.deepEqual([shown.id, shown.status, shown.acceptance, 'covers' in shown], [source.id, 'submitted', ['is documented', 'adds a test'], false], `${name}: the source's checklist, the cited criterion as text before its own, and no id`)
+    assert.deepEqual([view.current.task.acceptance, 'covers' in view.current.task], [['is documented', 'adds a test', 'reads the diff'], false], `${name}: the review checks that list, then its own criterion`)
+  }
+  assert.deepEqual([f.runtime.store.get('tasks', source.id).acceptance, f.runtime.store.get('tasks', source.id).covers], [['adds a test'], ['c2']], 'the stored source keeps its own criterion and the id')
+})
+
 test('a budget resume delivers the task as its first assignment did: a deliverable that only cites ids and a review with no criteria of its own read the criterion text again, never a bare id', async t => {
   for (const reviewing of [false, true]) {
     const clock = new FakeClock(), f = await setup({ clock, budget: { maxTokens: 40, maxSteps: 100 }, acceptance: ['works', 'is documented'] })
