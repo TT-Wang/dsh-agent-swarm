@@ -292,7 +292,7 @@ try {
   const reviewer = (await ownerCall('swarm_add_member', { missionId, name: 'reviewer', role: 'independent verifier' })).result
   const implementation = (await ownerCall('swarm_propose', {
     missionId, workstreamId: workstream.id, title: 'Implement value two', objective: 'Change value.cjs to export two.',
-    kind: 'implementation', scope: ['value.cjs'], acceptance: ['value is two'], outputs: ['value.cjs'], checks: ['node check.cjs'], assigneeId: builder.id,
+    kind: 'implementation', scope: ['value.cjs'], acceptance: ['node check.cjs passes'], covers: ['c1'], outputs: ['value.cjs'], checks: ['node check.cjs'], assigneeId: builder.id,
   })).result
   await waitUntil(() => ctx.swarm.snapshot({ sessionId: ownerId }, missionId).tasks.find(task => task.id === implementation.id)?.status === 'accepted', 'implementation and peer-proposed review')
   const integration = (await ownerCall('swarm_propose', {
@@ -318,13 +318,24 @@ try {
   assert(transcript.some(call => call.sessionId === reviewer.sessionId && call.name === 'swarm_verify'), 'independent peer must actually verify')
   assert(transcript.some(call => call.sessionId === builder.sessionId && call.name === 'bash'), 'worker must run a real Harness tool')
   assert(userMessages.some(delivery => delivery.message.source.deliveryKind === 'assignment'))
-  // The integration cites its criterion by id alone, so the row it stores holds no criterion text. Every task
-  // a worker's own call returned (its submit, its verify, the review it proposed) still lists that text, as its
-  // assignment does, and never the bare id.
-  const workerTasks = requests.filter(request => request.sessionId !== ownerId).flatMap(request => toolBlocks(request.messages))
+  // No row stores the mission criterion's text: both deliverables cite it as c1, the implementation beside a
+  // criterion of its own, and neither review holds anything. The owner reads exactly those rows.
+  const storedCriteria = task => [task.acceptance, task.covers]
+  assert.deepEqual([implementation.id, integration.id].map(id => storedCriteria(completed.tasks.find(task => task.id === id))), [[['node check.cjs passes'], ['c1']], [[], ['c1']]])
+  assert.deepEqual(completed.tasks.filter(task => task.kind === 'verification').map(storedCriteria), [[[], undefined], [[], undefined]])
+  // Every worker reads the derived checklist instead: the cited criterion as text, then what the task (or, for a
+  // review, its source) adds. That holds in every task a worker's own call returned (its submit, its verify, the
+  // review it proposed), and the snapshot below pins it for every assignment.
+  const checklistOf = task => task.id === implementation.id || task.reviewOf === implementation.id ? ['value is two', 'node check.cjs passes'] : ['value is two']
+  const workerRequests = requests.filter(request => request.sessionId !== ownerId)
+  const workerTasks = workerRequests.flatMap(request => toolBlocks(request.messages))
     .flatMap(block => { try { return [JSON.parse(texts(block).join('\n')).result] } catch { return [] } }).filter(result => result?.workstreamId !== undefined && Array.isArray(result.acceptance))
-  for (const [kind, status] of [['integration', 'submitted'], ['verification', 'accepted']]) assert(workerTasks.some(task => task.kind === kind && task.status === status && task.reviewOf !== implementation.id), `a worker must read its ${kind} result`)
-  for (const task of workerTasks) assert.deepEqual([task.acceptance, 'covers' in task], [['value is two'], false], `the ${task.kind} task a worker's call returned must list the criterion text and no bare id`)
+  for (const [kind, status] of [['implementation', 'submitted'], ['integration', 'submitted'], ['verification', 'accepted'], ['verification', 'pending']]) assert(workerTasks.some(task => task.kind === kind && task.status === status), `a worker must read its ${status} ${kind} result`)
+  for (const task of workerTasks) assert.deepEqual(task.acceptance, checklistOf(task), `the ${task.kind} task a worker's call returned must list its checklist as text`)
+  // No id reaches a worker anywhere: not in a delivery, not in any tool result, as a key or inside an excerpt of one.
+  const workerFacing = workerRequests.flatMap(request => [...request.messages.filter(message => message.source?.kind === 'swarm'), ...toolBlocks(request.messages)]).map(item => texts(item).join('\n'))
+  assert(workerFacing.length > 0 && workerFacing.some(text => text.includes('"acceptance"')), 'workers must have read tasks')
+  for (const text of workerFacing) assert.doesNotMatch(text, /"covers\\?"/, 'no worker-facing delivery or tool result may carry covers')
   for (const request of requests) {
     for (const message of request.messages.filter(message => message.source?.kind === 'swarm')) {
       assert(userMessages.some(delivery => delivery.sessionId === request.sessionId && delivery.message.id === message.id), 'every model-visible swarm delivery must have a real session-log event')
