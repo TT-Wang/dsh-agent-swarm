@@ -54,14 +54,14 @@ async function assertNamedCalls(text, expected) {
 const deferredReason = f => events(f.runtime, f.mission.id, 'task/verification-deferred').at(-1)?.data.reason
 const hostRuns = f => f.runtime.store.list('tool_runs', f.mission.id).filter(run => run.tool === 'swarm.host_verification')
 
-/** Submit `source` as the author, then claim an independent review of it (admitted as `reviewId` when given) as the reviewer. */
+/** Submit `source` as the author, then claim an independent review of it (admitted as `reviewId` when given, with no criteria of its own) as the reviewer. */
 async function submitForReview(f, source, write = async () => {}, reviewId = undefined) {
   const claimed = await f.runtime.claim(f.actor(f.author), f.mission.id, source.id)
   await write(claimed)
   await f.runtime.submit(f.actor(f.author), f.mission.id, { taskId: source.id, attemptId: claimed.attempt.id, output: 'candidate' })
   const review = f.runtime.propose(f.owner, f.mission.id, {
     outputs: [], workstreamId: f.stream.id, title: 'Review the source', objective: 'Independently review the scoped change',
-    kind: 'verification', reviewOf: source.id, scope: ['**'], acceptance: MISSION_ACCEPTANCE, assigneeId: f.reviewer.id,
+    kind: 'verification', reviewOf: source.id, scope: ['**'], assigneeId: f.reviewer.id,
   }, reviewId)
   const taken = await f.runtime.claim(f.actor(f.reviewer), f.mission.id, review.id)
   return { review, verify: (reason = 'Review against acceptance') => f.runtime.verify(f.actor(f.reviewer), f.mission.id, { taskId: review.id, attemptId: taken.attempt.id, verdict: 'accept', reason }) }
@@ -91,10 +91,12 @@ const answer = f => async () => { await writeFile(join(f.author.workspace, 'src/
 
 test('exit 127: the row is unrunnable with the command\'s own output, and the environment exit really works', async t => {
   const f = await realFixture(t)
-  const source = f.propose({ checks: ['PATH="$PWD/node_modules/.bin:$PATH" swarm-toolchain'] })
+  // The source only cites the mission criterion and the review has no criteria of its own, so neither row holds its text.
+  const source = f.propose({ acceptance: [], checks: ['PATH="$PWD/node_modules/.bin:$PATH" swarm-toolchain'] })
   const { review, verify } = await submitForReview(f, source, answer(f))
   const deferred = await verify()
   assert.equal(deferred.status, 'blocked', 'the review defers')
+  assert.deepEqual([deferred.acceptance, 'covers' in deferred, taskOf(f.runtime, review.id).acceptance], [MISSION_ACCEPTANCE, false, []], 'the reviewer reads its checklist in the deferred result, as in its assignment')
   assert.equal(taskOf(f.runtime, source.id).status, 'submitted', 'the source stays submitted')
   const runs = hostRuns(f)
   assert.deepEqual(runs.map(run => [run.result.exitCode, run.result.failureKind]), [[127, 'unrunnable'], [127, 'unrunnable']], 'both passes are unrunnable rows')
