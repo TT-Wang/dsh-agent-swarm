@@ -192,6 +192,14 @@ async function followExits(f, { source }, { steps, refused = [] }) {
   refused.forEach((pattern, index) => assert.match(f.refused[index], pattern))
 }
 
+/** Publish one committed transition with no scheduling pass, as an ordinary publication or as the one after a wedged pass was named. */
+const publish = async (f, wedged) => {
+  if (wedged) f.runtime.notices.expectWedgedRelease(f.mission.id)
+  f.runtime.notices.transition(f.mission.id)
+  await new Promise(resolve => queueMicrotask(resolve))
+}
+const decisionsOn = (f, task) => f.runtime.store.list('deliveries', f.mission.id).filter(delivery => delivery.notice?.dedupKey?.startsWith(`review-blocked:${f.mission.id}:${task.id}:`))
+
 /** Submit a source and let the review grace pass, beside `running`'s unrelated work when given. */
 async function submitted(f, { running, source = f.propose() } = {}) {
   await f.submit(source)
@@ -229,6 +237,15 @@ async function exhausted(f, { running } = {}) {
   const review = taskOf(f.runtime, automatic.id)
   assert.deepEqual([review.status, review.recoveryCount, review.resumeAfterStop], ['blocked', review.maxRecoveryAttempts, undefined], 'the review is blocked at its recovery limit')
   if (running !== undefined) await f.run(running(f))
+  await f.pass()
+  return { source }
+}
+
+/** A submission as an older build left it: no artifact, so the host's admission skips it and only the classifier names it. */
+async function legacy(f) {
+  const source = f.propose()
+  await f.submit(source)
+  f.runtime.store.transaction(() => { const row = taskOf(f.runtime, source.id); delete row.artifact; f.runtime.store.put('tasks', row) })
   await f.pass()
   return { source }
 }
@@ -454,6 +471,19 @@ const FAMILIES = [
     block: f => deferred(f, { running: author }),
     steps: [[DEFERRED, ['swarm_control']]],
   },
+  // The host reviews only a captured artifact, so on a board with nothing else to do a legacy submission still has the owner's exits.
+  {
+    name: 'a submission an older build left without an artifact, on a board with nothing else to do',
+    block: legacy,
+    steps: [[RUNNING, PROPOSE_OR_CANCEL]],
+  },
+  {
+    name: 'a submission an older build left without an artifact, and the task budget is exhausted',
+    options: { budget: { maxTasks: 1 } },
+    block: legacy,
+    // The raise changes no task: the classifier still names the cause that holds next.
+    steps: [[BUDGET(1), ['swarm_budget', 'swarm_cancel']], [RUNNING, PROPOSE_OR_CANCEL]],
+  },
   {
     name: 'beside running work, a submission an older build left without an artifact has a blocked review that did not defer',
     block: async f => {
@@ -518,23 +548,17 @@ test('a wedged pass keeps the host\'s admission from running: the classifier nam
   await f.runtime.settle(f.mission.id)
   f.clock.advance(1_500)
   // Past the review grace with no scheduling pass: only the classifier can name the board.
-  const publish = async wedged => {
-    if (wedged) f.runtime.notices.expectWedgedRelease(f.mission.id)
-    f.runtime.notices.transition(f.mission.id)
-    await new Promise(resolve => queueMicrotask(resolve))
-  }
-  await publish(false)
-  const decisionsOn = task => f.runtime.store.list('deliveries', f.mission.id).filter(delivery => delivery.notice?.dedupKey?.startsWith(`review-blocked:${f.mission.id}:${task.id}:`))
+  await publish(f, false)
   blockedNotice(f, legacy, BUDGET(2))
-  assert.deepEqual(decisionsOn(source), [], 'an ordinary pass leaves a source with an artifact to the host\'s admission')
-  await publish(true)
-  assert.deepEqual(decisionsOn(source), [], 'a wedged pass never pre-empts an admission that has not recorded the need yet')
+  assert.deepEqual(decisionsOn(f, source), [], 'an ordinary pass leaves a source with an artifact to the host\'s admission')
+  await publish(f, true)
+  assert.deepEqual(decisionsOn(f, source), [], 'a wedged pass never pre-empts an admission that has not recorded the need yet')
   // The host's admission records the need and names its blocker; a wedged pass then restates nothing.
   await f.pass()
   assert.equal(events(f.runtime, f.mission.id, 'task/review-missing').filter(event => event.data.taskId === source.id).length, 1)
   const told = blockedNotice(f, source, BUDGET(2))
-  await publish(true)
-  assert.deepEqual(decisionsOn(source).map(delivery => delivery.id), [told.id], 'the recorded need keeps its one decision')
+  await publish(f, true)
+  assert.deepEqual(decisionsOn(f, source).map(delivery => delivery.id), [told.id], 'the recorded need keeps its one decision')
   await followExits(f, { source }, { steps: [[BUDGET(2), ['swarm_budget', 'swarm_cancel']]] })
 })
 

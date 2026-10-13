@@ -1289,6 +1289,16 @@ export class Notices {
     // owner decision no other notice can advance, so an unrelated notice that
     // consumed the board fingerprint must not silence it.
     const stallRootNotices = this.notifyStallRoots(view)
+    // So is a submitted artifact no live review can accept, named even behind
+    // unrelated live work (verifier-1 challenge, evidence_a454a771) by the
+    // runtime's own review admission: each pass admits the review or names the
+    // current blocker. This names, through that admission's emitter, only what it does not
+    // reach: a legacy submission without an artifact past the review grace (`ReviewNeed.ripe`)
+    // and, while a wedged pass keeps it from running, a need it recorded (`ReviewNeed.recorded`).
+    for (const task of view.unreviewed) {
+      const need = this.rt.reviewNeed(task)
+      if (task.artifact === undefined ? need.ripe : options.wedged === true && need.recorded) this.notifyReviewBlocked(mission, task, need.id, this.rt.reviewPathBlocker(task, need) ?? BOARD_RUNNING)
+    }
     const fingerprint = this.rt.fingerprint(missionId)
     // R15-D1: a WEDGED pass is its own subject, exactly like a stall root. The
     // board witness records that *some* notice announced this fingerprint; an
@@ -1378,17 +1388,6 @@ export class Notices {
         this.notify(missionId, question.message, view.subjectsOf([question.task]), { dedupe: true, dedupKey: question.dedupKey })
       })
       return true
-    }
-    // A submitted artifact no live review can accept is an owner decision, named
-    // even behind unrelated live work (verifier-1 challenge, evidence_a454a771)
-    // by the runtime's own review admission: each pass admits the review or
-    // names the current blocker. This names, through that admission's emitter,
-    // only what it skips: a legacy submission without an artifact past the
-    // review grace (`ReviewNeed.ripe`) and, while a wedged pass keeps the
-    // admission from running, a need it recorded (`ReviewNeed.recorded`).
-    for (const task of view.unreviewed) {
-      const need = this.rt.reviewNeed(task)
-      if (task.artifact === undefined ? need.ripe : options.wedged === true && need.recorded) this.notifyReviewBlocked(view.mission, task, need.id, this.rt.reviewPathBlocker(task, need) ?? BOARD_RUNNING)
     }
     // Row 3 (documented scope): a board whose *every* non-terminal task is
     // running under a live lease is exempt outright. Running work plus a pending
