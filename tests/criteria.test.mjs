@@ -280,7 +280,8 @@ test('a repair answers for the ids its lineage cites, and a withdrawn deliverabl
   const g = await setup({ clock: new FakeClock(), acceptance: ['works', 'is documented'] })
   t.after(g.cleanup)
   await acceptThroughReview(g, g.propose({ covers: ['c1'] }))
-  g.runtime.cancel(g.owner, g.mission.id, { taskId: g.propose({ covers: ['c2'] }).id, reason: 'Withdrawn' })
+  // Research needs no artifact, so nothing but its status keeps the withdrawn task from covering c2.
+  g.runtime.cancel(g.owner, g.mission.id, { taskId: g.propose({ kind: 'research', checks: [], covers: ['c2'] }).id, reason: 'Withdrawn' })
   assert.match(g.runtime.completionError(g.runtime.mission(g.mission.id)), /criterion: c2 "is documented"\. /)
 })
 
