@@ -16,6 +16,7 @@ import { execFileSync } from 'node:child_process'
 import { criterionId, type AutoStart, type Delivery, type DraftPlan, type Evidence, type Member, type Mission, type PlanTask, type Post, type PostKind, type SwarmEvent, type Task, type ToolRun, type Workstream } from './types.ts'
 import type { AdmissionReason, AdmissionRecord, LimitRule } from './scheduler.ts'
 import { PROGRESS_KINDS, type EventKind } from './events.ts'
+import { taskGraphIndex } from './task-graph.ts'
 // R17-G7: one derivation for the derived member status; the store never persists it.
 import { deriveMemberStatus, memberPhaseOf } from './projection.ts'
 
@@ -451,20 +452,19 @@ export class SwarmStore {
     if (result === null || typeof result !== 'object' || !('id' in result) || typeof result.id !== 'string' || (id !== undefined && result.id !== id)) throw new Error('Corrupt swarm record identity')
     return result as Tables[T]
   }
-  /** The v4 upgrade, once, in the opening transaction like any other change: each deliverable and draft plan task cites by id, instead of holding, the mission criteria it copied, and a draft so rewritten moves to its next revision; a staged mission takes its saved draft's criteria, as its v3 relaunch would have. */
+  /** The v4 upgrade, once, in the opening transaction like any other change. One rule for every task row and draft plan task: its own acceptance drops what its checklist already takes from elsewhere (`supplied`: its review source's checklist and the criteria of the tasks it replaces), and a deliverable cites by id, instead of holding, the mission criteria left in it. A draft so rewritten moves to its next revision; a staged mission takes its saved draft's criteria, as its v3 relaunch would have. */
   private citeCriteria(): void {
-    const cite = (task: Task | PlanTask, texts: unknown): boolean => {
-      if (task.kind === 'verification' || !Array.isArray(texts) || !Array.isArray(task.acceptance)) return false
-      const covers = texts.flatMap((text, index) => task.acceptance.includes(text) ? [criterionId(index)] : [])
-      if (covers.length) Object.assign(task, { covers, acceptance: task.acceptance.filter(item => !texts.includes(item)) })
-      return covers.length > 0
+    const cite = (task: Task | PlanTask, texts: string[], supplied: unknown[]): boolean => {
+      const held: unknown[] = Array.isArray(task.acceptance) ? task.acceptance : [], cited: unknown[] = task.kind === 'verification' ? [] : texts, own = held.filter(item => !supplied.includes(item)), covers = cited.flatMap((text, index) => own.includes(text) ? [criterionId(index)] : []), changed = covers.length > 0 || own.length < held.length
+      if (changed) Object.assign(task, { acceptance: own.filter(item => !cited.includes(item)) }, covers.length ? { covers } : {})
+      return changed
     }
     for (const draft of this.list('drafts')) {
-      const mission = this.get('missions', draft.missionId ?? '')
+      const mission = this.get('missions', draft.missionId ?? ''), held = new Map(draft.input.tasks.map(task => [task.key, task.acceptance]))
       if (mission?.status === 'staged') this.upsert('missions', { ...mission, acceptance: draft.input.acceptance })
-      if (draft.input.tasks.map(task => cite(task, draft.input.acceptance)).includes(true)) this.upsert('drafts', { ...draft, revision: draft.revision + 1, updatedAt: this.now() })
+      if (draft.input.tasks.map(task => cite(task, draft.input.acceptance, held.get(task.reviewOf ?? '') ?? [])).includes(true)) this.upsert('drafts', { ...draft, revision: draft.revision + 1, updatedAt: this.now() })
     }
-    for (const task of this.list('tasks')) if (cite(task, this.get('missions', task.missionId)?.acceptance)) this.upsert('tasks', task)
+    for (const mission of this.list('missions')) this.list('tasks', mission.id).forEach((task, _at, rows) => { if (cite(task, mission.acceptance, taskGraphIndex(rows.map(row => row === task ? { ...row, acceptance: [] } : row)).checklist(task.id, mission.acceptance))) this.upsert('tasks', task) })
   }
   /** Read a mission's records, or all records for host recovery. */
   list<T extends Table>(table: T, missionId?: string): Tables[T][] {

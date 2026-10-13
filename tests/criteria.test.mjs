@@ -500,7 +500,7 @@ const v3Task = (id, missionId, kind, status, acceptance, extra = {}) => ({ id, m
 function writeV3(path, version = 3) {
   const db = new DatabaseSync(path)
   const insert = (table, row) => db.prepare(`INSERT INTO ${table}(id,mission_id,value) VALUES(?,?,?)`).run(row.id, row.missionId ?? row.id, JSON.stringify(row))
-  for (const row of [v3Mission('done', ['a1', 'a2']), v3Mission('stalled', ['b1', 'b2']), v3Mission('repaired', ['p1', 'p2']), v3Mission('guarded', [PRIOR])]) insert('missions', row)
+  for (const row of [v3Mission('done', ['a1', 'a2']), v3Mission('stalled', ['b1', 'b2']), v3Mission('repaired', ['p1', 'p2']), v3Mission('guarded', [PRIOR]), v3Mission('inherited', ['m1'])]) insert('missions', row)
   for (const row of [
     v3Task('t1', 'done', 'research', 'accepted', ['a1', 'own']), v3Task('t2', 'done', 'research', 'accepted', ['a2']),
     v3Task('r1', 'done', 'verification', 'accepted', ['a1', 'own'], { reviewOf: 't1' }),
@@ -509,6 +509,10 @@ function writeV3(path, version = 3) {
     v3Task('p', 'repaired', 'research', 'cancelled', ['p1', 'p2']), v3Task('q', 'repaired', 'research', 'accepted', ['p1'], { replaces: ['p'] }),
     // A pending deliverable that copied a criterion assuming prior work, and the task that carries that work.
     v3Task('carrier', 'guarded', 'research', 'accepted', ['own']), v3Task('g', 'guarded', 'implementation', 'pending', [PRIOR], { dependencies: ['carrier'] }),
+    // A repair as a v3 build stored it: every criterion of the task it replaces, then the one its proposal added; and the review the host added with a copy of that list.
+    v3Task('dep', 'inherited', 'research', 'accepted', ['dep own']), v3Task('h1', 'inherited', 'implementation', 'blocked', ['m1', PRIOR], { dependencies: ['dep'] }),
+    v3Task('h2', 'inherited', 'implementation', 'pending', ['m1', PRIOR, 'extra'], { dependencies: ['dep'], replaces: ['h1'] }),
+    v3Task('hr', 'inherited', 'verification', 'pending', ['m1', PRIOR, 'extra'], { reviewOf: 'h2' }),
   ]) insert('tasks', row)
   insert('drafts', { id: 'draft', ownerSessionId: 'owner', revision: 1, status: 'draft', createdAt: 1, updatedAt: 1,
     input: { ...plan('/repo'), acceptance: ['x1', 'x2'], tasks: [{ ...plan('/repo').tasks[0], acceptance: ['x2', 'own'], covers: undefined }, { ...plan('/repo').tasks[1], acceptance: ['x1', 'x2'], covers: undefined }] } })
@@ -524,13 +528,13 @@ test('a v3 store cites the criteria its deliverables copied, once at open, and k
   const opened = new SwarmRuntime(config, new FakeWorkers())
   t.after(() => opened.dispose())
   const covers = id => opened.store.get('tasks', id).covers
-  assert.deepEqual(['t1', 't2', 'r1', 'u1', 'ru', 'p', 'q'].map(covers), [['c1'], ['c2'], undefined, ['c1'], undefined, ['c1', 'c2'], ['c1']])
-  assert.deepEqual(['t1', 'r1', 'q', 'g'].map(id => opened.store.get('tasks', id).acceptance), [['own'], ['a1', 'own'], [], []], 'a cited criterion leaves the own list; a review keeps its text')
+  assert.deepEqual(['t1', 't2', 'r1', 'u1', 'ru', 'p', 'q'].map(covers), [['c1'], ['c2'], undefined, ['c1'], undefined, ['c1', 'c2'], undefined], 'a repair cites nothing its lineage already cites')
+  assert.deepEqual(['t1', 'r1', 'ru', 'q', 'g'].map(id => opened.store.get('tasks', id).acceptance), [['own'], [], ['b2'], [], []], 'a cited criterion leaves the own list; a review keeps only what its source does not supply')
   assert.deepEqual(taskGraphIndex(opened.store.list('tasks', 'done')).checklist('t1', ['a1', 'a2']), ['a1', 'own'], 'what its worker and reviewers check is unchanged')
   // The amend guard reads the migrated row's own criteria, as it reads a v4 row that cites the same id.
   assert.deepEqual(opened.controlTask({ sessionId: 'owner' }, 'guarded', 'g', 'amend', { dependencies: [] }, 'the criterion is cited, not copied').dependencies, [])
   assert.equal(opened.store.get('tasks', 't1').revision, undefined, 'the upgrade is not a task write')
-  assert.deepEqual(opened.store.get('drafts', 'draft').input.tasks.map(task => [task.covers, task.acceptance]), [[['c2'], ['own']], [undefined, ['x1', 'x2']]])
+  assert.deepEqual(opened.store.get('drafts', 'draft').input.tasks.map(task => [task.covers, task.acceptance]), [[['c2'], ['own']], [undefined, ['x1']]], 'a draft review keeps only its review-only text')
   const reason = id => opened.completionError(opened.store.get('missions', id))
   assert.equal(reason('done'), undefined, 'covered before, covered after')
   assert.match(reason('stalled'), /criterion: c2 "b2"\. /, 'uncovered before, uncovered after; a review\'s text still covers nothing')
@@ -552,12 +556,29 @@ test('a v3 store cites the criteria its deliverables copied, once at open, and k
     if (version === 0) { copyFileSync(join(dir, 'v3.sqlite'), snapshot); const db = new DatabaseSync(snapshot); db.exec('PRAGMA user_version=0'); db.close() }
     SwarmStore.restore(config.statePath, snapshot)
     const restored = new SwarmRuntime(config, new FakeWorkers())
-    assert.deepEqual(restored.store.get('tasks', 'q').covers, ['c1'], `v${version}`)
+    assert.deepEqual(restored.store.get('tasks', 't1').covers, ['c1'], `v${version}`)
     await restored.dispose()
   }
   // A store from a later schema fails closed, as a v3 build refuses this one.
   const future = new DatabaseSync(config.statePath); future.exec('PRAGMA user_version=5'); future.close()
   assert.throws(() => new SwarmRuntime(config, new FakeWorkers()), /Unsupported swarm schema 5; expected 4/)
+})
+
+test('the v4 upgrade leaves every row as a v4 build would have written it: a repair keeps only the criteria its proposal added and a review only its review-only ones, so the amend guard answers the same whatever the row\'s age', async t => {
+  const { config, runtime } = await makeRuntime(t)
+  await runtime.dispose()
+  writeV3(config.statePath)
+  const opened = new SwarmRuntime(config, new FakeWorkers())
+  t.after(() => opened.dispose())
+  const stored = id => { const { acceptance, covers } = opened.store.get('tasks', id); return [acceptance, covers] }
+  // What a v4 swarm_propose stores for the same three proposals: the original cites c1 beside its own criterion, the repair names it in `replaces` and adds one, the review copies nothing.
+  assert.deepEqual(['h1', 'h2', 'hr'].map(stored), [[[PRIOR], ['c1']], [['extra'], undefined], [[], undefined]])
+  const graph = taskGraphIndex(opened.store.list('tasks', 'inherited'))
+  for (const id of ['h2', 'hr']) assert.deepEqual(graph.checklist(id, ['m1']), ['m1', 'extra', PRIOR], `${id}: its worker still checks every criterion the v3 row listed`)
+  // The repair no longer holds the inherited criterion that assumes prior work, so dropping its dependency is admitted, as it is for a v4 repair that only inherits it.
+  assert.deepEqual(opened.controlTask({ sessionId: 'owner' }, 'inherited', 'h2', 'amend', { dependencies: [] }, 'the criterion is inherited, not its own').dependencies, [])
+  // The original states that criterion itself and is carried by its repair, so it is not amended at all.
+  assert.throws(() => opened.controlTask({ sessionId: 'owner' }, 'inherited', 'h1', 'amend', { dependencies: [] }, 'carried'), error => error.code === 'task_replaced')
 })
 
 test('the v4 upgrade commits like any other change: a draft it rewrites moves to its next revision, so a page that still holds the v3 draft cannot save over the cited ids, and the state cursor names what changed', async t => {
@@ -568,7 +589,7 @@ test('the v4 upgrade commits like any other change: a draft it rewrites moves to
   // Beside the draft that copied a criterion: one whose tasks copied none, which the upgrade leaves as it is.
   const db = new DatabaseSync(config.statePath)
   const held = JSON.parse(db.prepare('SELECT value FROM drafts WHERE id=?').get('draft').value)
-  const plain = { ...held, id: 'plain', input: { ...held.input, tasks: held.input.tasks.map(task => ({ ...task, acceptance: ['own'] })) } }
+  const plain = { ...held, id: 'plain', input: { ...held.input, tasks: held.input.tasks.map(task => ({ ...task, acceptance: [task.kind === 'verification' ? 'reads the diff' : 'own'] })) } }
   db.prepare('INSERT INTO drafts(id,mission_id,value) VALUES(?,?,?)').run(plain.id, plain.id, JSON.stringify(plain))
   const before = Number(db.prepare('SELECT revision FROM state_revision WHERE id=1').get().revision)
   db.close()
@@ -578,14 +599,14 @@ test('the v4 upgrade commits like any other change: a draft it rewrites moves to
   const owner = { sessionId: 'owner' }, claim = { grantRoot: dir, source: 'session' }
   const upgraded = opened.store.get('drafts', 'draft')
   assert.deepEqual([upgraded.revision, upgraded.updatedAt, upgraded.input.tasks[0].covers], [held.revision + 1, clock.now(), ['c2']], 'the rewritten draft is a new revision, written at the upgrade')
-  assert.deepEqual(opened.store.get('drafts', 'plain'), plain, 'a draft that copied no criterion is not rewritten')
+  assert.deepEqual(opened.store.get('drafts', 'plain'), plain, 'a draft whose tasks hold only their own criteria is not rewritten')
   // What the open page sends: the revision and the plan it loaded before the restart.
   assert.throws(() => opened.updateDraft(owner, held.id, held.revision, held.input, claim), error => error.code === 'draft_revision_conflict')
   assert.deepEqual(opened.store.get('drafts', 'draft').input.tasks[0].covers, ['c2'], 'the cited ids survive the stale save')
   // The page's watch cursor is the revision it last saw: the upgrade is one change after it, naming the owner and each mission whose rows it rewrote.
   assert.equal(opened.store.revision(), before + 1)
   const [change, ...more] = opened.store.changesSince(before)
-  assert.deepEqual([change.revision, [...change.scopes].sort(), more], [before + 1, ['done', 'draft', 'guarded', 'owner', 'repaired', 'stalled'], []])
+  assert.deepEqual([change.revision, [...change.scopes].sort(), more], [before + 1, ['done', 'draft', 'guarded', 'inherited', 'owner', 'repaired', 'stalled'], []])
   await opened.dispose()
   // Once: reopening the v4 store rewrites nothing and moves no cursor.
   const reopened = new SwarmRuntime(config, new FakeWorkers())
