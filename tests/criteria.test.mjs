@@ -306,6 +306,7 @@ test('model-visible schemas name criteria by id, and covers is declared but neve
   }
   assert.match(definitions.get('swarm_create').parameters.properties.acceptance.description, /numbered c1, c2, … in this order/)
   assert.match(definitions.get('swarm_propose').parameters.properties.covers.description, /^Deliverables only: .*Refused on a verification task/)
+  assert.ok(OWNER_PROMPT.includes(' Several implementation branches need an integration depending on all of them. Acceptance criteria are c1, c2, … in order; deliverables cite ids they satisfy in covers, never text; cover every id. Declare files a task writes in outputs per schema;'), 'the owner protocol tells the planner to cite every criterion by id, among its planning rules')
   assert.doesNotMatch(OWNER_PROMPT, /verbatim|paraphrase/)
   assert.doesNotMatch(JSON.stringify([...definitions.values()].map(definition => definition.parameters)), /copied exactly|paraphrase does not match/)
 })

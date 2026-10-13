@@ -95,6 +95,8 @@ test('one natural-language command saves bounded request and wakes exact owner w
   assert.match(message.content[0].text, /planningEpoch: 1/)
   assert.match(message.content[0].text, /Planning deadline:/)
   assert.match(message.content[0].text, /maxSteps, maxFindings/)
+  assert.ok(message.content[0].text.includes('choose the team, task graph, scopes, the criterion ids each deliverable covers, real check commands,'), 'the planner is told to cite criteria by id')
+  assert.doesNotMatch(message.content[0].text, /verbatim|paraphrase/)
   assert.equal(f.runtime.list(f.agent.id).length, 0, 'planning has not yet admitted workers')
   f.pending.resolve(); await new Promise(resolve => setImmediate(resolve))
   assert.equal(f.runtime.starts({ sessionId: f.agent.id })[0].status, 'failed', 'idle without a launch is a durable actionable failure')
