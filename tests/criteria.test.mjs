@@ -660,16 +660,18 @@ test('the v4 upgrade leaves every row as a v4 build would have written it: a rep
   assert.throws(() => opened.controlTask({ sessionId: 'owner' }, 'inherited', 'h1', 'amend', { dependencies: [] }, 'carried'), error => error.code === 'task_replaced')
 })
 
-test('the v4 upgrade commits like any other change: a draft it rewrites moves to its next revision, so a page that still holds the v3 draft cannot save over the cited ids, and the state cursor names what changed', async t => {
+test('the v4 upgrade commits like any other change: a draft it rewrites, by citing an id or only by dropping a review\'s copy of its source, moves to its next revision, so a page that still holds the v3 draft cannot save over it, and the state cursor names what changed', async t => {
   const clock = new FakeClock()
   const { dir, config, runtime } = await makeRuntime(t, { clock })
   await runtime.dispose()
   writeV3(config.statePath)
-  // Beside the draft that copied a criterion: one whose tasks copied none, which the upgrade leaves as it is.
+  // Beside the draft that copied a criterion, two that copied none. In `echoed` the review holds a copy of its source's own
+  // criterion, which its checklist takes from that source; in `plain` every task holds only its own, and the upgrade leaves it as it is.
   const db = new DatabaseSync(config.statePath)
   const held = JSON.parse(db.prepare('SELECT value FROM drafts WHERE id=?').get('draft').value)
-  const plain = { ...held, id: 'plain', input: { ...held.input, tasks: held.input.tasks.map(task => ({ ...task, acceptance: [task.kind === 'verification' ? 'reads the diff' : 'own'] })) } }
-  db.prepare('INSERT INTO drafts(id,mission_id,value) VALUES(?,?,?)').run(plain.id, plain.id, JSON.stringify(plain))
+  const holding = (id, own) => ({ ...held, id, input: { ...held.input, tasks: held.input.tasks.map(task => ({ ...task, acceptance: [own(task)] })) } })
+  const echoed = holding('echoed', () => 'own'), plain = holding('plain', task => task.kind === 'verification' ? 'reads the diff' : 'own')
+  for (const draft of [echoed, plain]) db.prepare('INSERT INTO drafts(id,mission_id,value) VALUES(?,?,?)').run(draft.id, draft.id, JSON.stringify(draft))
   const before = Number(db.prepare('SELECT revision FROM state_revision WHERE id=1').get().revision)
   db.close()
   clock.advance(5000)
@@ -678,14 +680,18 @@ test('the v4 upgrade commits like any other change: a draft it rewrites moves to
   const owner = { sessionId: 'owner' }, claim = { grantRoot: dir, source: 'session' }
   const upgraded = opened.store.get('drafts', 'draft')
   assert.deepEqual([upgraded.revision, upgraded.updatedAt, upgraded.input.tasks[0].covers], [held.revision + 1, clock.now(), ['c2']], 'the rewritten draft is a new revision, written at the upgrade')
+  const dropped = opened.store.get('drafts', 'echoed')
+  assert.deepEqual([dropped.revision, dropped.updatedAt, dropped.input.tasks.map(task => [task.key, task.acceptance, task.covers])], [held.revision + 1, clock.now(), [['code', ['own'], undefined], ['review', [], undefined], ['docs', ['own'], undefined]]],
+    'a draft in which only the review changed is rewritten too: the review keeps nothing its source supplies, and no deliverable cites anything')
   assert.deepEqual(opened.store.get('drafts', 'plain'), plain, 'a draft whose tasks hold only their own criteria is not rewritten')
   // What the open page sends: the revision and the plan it loaded before the restart.
-  assert.throws(() => opened.updateDraft(owner, held.id, held.revision, held.input, claim), error => error.code === 'draft_revision_conflict')
+  for (const stale of [held, echoed]) assert.throws(() => opened.updateDraft(owner, stale.id, stale.revision, stale.input, claim), error => error.code === 'draft_revision_conflict', stale.id)
   assert.deepEqual(opened.store.get('drafts', 'draft').input.tasks[0].covers, ['c2'], 'the cited ids survive the stale save')
+  assert.deepEqual(opened.store.get('drafts', 'echoed'), dropped, 'and so does the review that copies nothing')
   // The page's watch cursor is the revision it last saw: the upgrade is one change after it, naming the owner and each mission whose rows it rewrote.
   assert.equal(opened.store.revision(), before + 1)
   const [change, ...more] = opened.store.changesSince(before)
-  assert.deepEqual([change.revision, [...change.scopes].sort(), more], [before + 1, ['done', 'draft', 'guarded', 'inherited', 'owner', 'repaired', 'stalled'], []])
+  assert.deepEqual([change.revision, [...change.scopes].sort(), more], [before + 1, ['done', 'draft', 'echoed', 'guarded', 'inherited', 'owner', 'repaired', 'stalled'], []])
   await opened.dispose()
   // Once: reopening the v4 store rewrites nothing and moves no cursor.
   const reopened = new SwarmRuntime(config, new FakeWorkers())
