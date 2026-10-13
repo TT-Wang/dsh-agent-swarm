@@ -347,7 +347,6 @@ export class SwarmStore {
       this.db.exec(`PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA busy_timeout=${this.busyTimeoutMs}; PRAGMA wal_autocheckpoint=${WAL_AUTOCHECKPOINT_PAGES}; PRAGMA journal_size_limit=${WAL_JOURNAL_SIZE_LIMIT};`)
       const version = this.db.prepare('PRAGMA user_version').get()?.user_version
       if (typeof version !== 'number' || version < 0 || version > SCHEMA_VERSION) throw new Error(`Unsupported swarm schema ${String(version)}; expected ${SCHEMA_VERSION}`)
-      // The schema and its upgrade commit like any other change: rows the upgrade rewrites move the state cursor for their scopes.
       this.transaction(() => {
         for (const table of TABLES) {
           this.db.exec(`CREATE TABLE IF NOT EXISTS ${table} (id TEXT PRIMARY KEY, mission_id TEXT NOT NULL, value TEXT NOT NULL); CREATE INDEX IF NOT EXISTS ${table}_mission ON ${table}(mission_id);`)
@@ -452,7 +451,7 @@ export class SwarmStore {
     if (result === null || typeof result !== 'object' || !('id' in result) || typeof result.id !== 'string' || (id !== undefined && result.id !== id)) throw new Error('Corrupt swarm record identity')
     return result as Tables[T]
   }
-  /** The v4 upgrade, once at open: each deliverable and draft plan task cites by id, instead of holding, the mission criteria it copied, and a draft so rewritten moves to its next revision; a staged mission takes its saved draft's criteria, as its v3 relaunch would have. */
+  /** The v4 upgrade, once, in the opening transaction like any other change: each deliverable and draft plan task cites by id, instead of holding, the mission criteria it copied, and a draft so rewritten moves to its next revision; a staged mission takes its saved draft's criteria, as its v3 relaunch would have. */
   private citeCriteria(): void {
     const cite = (task: Task | PlanTask, texts: unknown): boolean => {
       if (task.kind === 'verification' || !Array.isArray(texts) || !Array.isArray(task.acceptance)) return false
