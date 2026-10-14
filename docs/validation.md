@@ -46,8 +46,9 @@ member failure and a start failure below the bound shared `decision:<mission>:<s
 proposal `budget:<mission>:mission:<mission>:none`: failure 2 after failure 1, a second outage class, a second
 challenge, another temp path, a new refusal reason or a raised limit was dropped. Right model: `NotifyOptions`
 requires a trigger or an explicit key at the type level; each site passes its event and the reason that opens its
-fact, and a start failure, an outage class transition and a challenge are opened by their own event
-(`SwarmStore.event` returns the event's sequence). notify always deduplicates; an escalation never is. Deleted: the
+fact, and a start failure and a challenge are opened by their own event (`SwarmStore.event` returns the event's
+sequence); a provider outage is its class on the member's open work (repair round 1 below). notify always
+deduplicates; an escalation never is. Deleted: the
 `dedupe` option, the class fallback, and the relevance branch that read the class-named trigger `decision` as an
 older build's missing-review notice (such a row is now an unclassified legacy fact, deliverable like any other)
 (`tests/notice-openers.test.mjs`, the second path in `tests/temp-rendezvous.test.mjs`, the legacy row in
@@ -81,6 +82,34 @@ the same blocked task, and whether the W3 stall is an owed decision or a same-su
 | `node scripts/faults/run.mjs` | 24/24 | 24/24 |
 | `npm run test:web` / `npm run test:command-web` | passed, 13 checks / passed, 10 checks | not run |
 | Test files steps 8 to 10 touched (12), three rounds of two concurrent copies | 72/72 runs passed | 20 files touched or reading the changed docs: 256/256 |
+
+**Repair round 1 of steps 8 to 10** (`f1a14f5` to `fa7c58b`). `src` net against `29a0268` is now −579 lines
+(+629/−1208); the round is −26.
+- `f1a14f5` (fix). Step 8 opened a provider outage notice by the event of each class transition, read from
+  `Member.providerOutage`. A scheduling pass clears that record whenever it restarts a resident member, so four
+  same-class reports on one preserved attempt, with a pass between each, woke the owner four times. The outage is now
+  its class on the member's open work, and the ledger alone decides, so the class over the member's next task is told
+  too. The transition gate is deleted (`tests/notice-openers.test.mjs` fails on `29a0268`, on `e30eba6` and with the
+  gate restored). A pass that restarts a resident member still records the route as recovered and resets outage
+  pacing. That predates this batch (`scheduling.ts:278` at `29a0268`) and is recorded open in known-limitations.
+- `8201147` (refactor). The arena's `pendingReadiness` and `ArenaView.pendingDispatchable` had no production reader
+  after step 9 and were a weaker second readiness rule: they skipped preparation back-off, stop owners, capability and
+  borrowing. They are deleted. Their pins now ask the dispatcher's eligibility through `fingerprintBoard` or
+  `eligible`.
+- `fa7c58b` (test). The worker's refused-proposal request has each exit it names performed through the registered
+  tools.
+- A worker's refused proposal and the owner's refused admission at the same limit are two differently worded
+  requests. Both existed at `29a0268`. Folding them into one request per limit would end the wake per proposer that
+  the design names, so it is recorded in known-limitations as an owner decision.
+
+| Check at `fa7c58b` | 0.1.5-rc.3 (`a4c74a91e0`) | 0.1.7-rc.1 (`46a7f68b09`) |
+| --- | --- | --- |
+| `npm run typecheck` / `npm run build` | passed / passed | passed / passed |
+| `npm run test:harness` | passed; `UPDATE_SMOKE_SNAPSHOT=1` leaves `tests/fixtures/model-visible.expected.json` unchanged | passed |
+| `npm run test:replay` | passed, digest unchanged | passed, digest unchanged |
+| `node scripts/faults/run.mjs` | 24/24 | 24/24 |
+| `scripts/smoke-web.mjs` / `scripts/smoke-command-web.mjs` | passed, 13 checks / passed, 10 checks | passed / passed |
+| Test files the round touched (6), three rounds of two concurrent copies | 36/36 runs passed | the 7 touched or outage files, once: 64/64 tests |
 
 ## Round-29 simplification batch 9: one authorization rule, one exit table, a derived progress clock (2026-09-25)
 
