@@ -1960,7 +1960,7 @@ export class SwarmRuntime {
     this.commit(missionId, () => {
       // R15-A1: the escalation names the task or attempt it is about, so the
       // owner ledger shows the subject without reparsing the body.
-      this.notices.enqueueOwnerNotice(missionId, body, { class: 'escalation', dedupKey, from: member.id }, false, { id: deliveryId, escalation, subjects: this.noticeSubjectsFor(missionId, { taskId, memberId: member.id }) })
+      this.notices.enqueueOwnerNotice(missionId, body, { class: 'escalation', dedupKey, from: member.id }, { id: deliveryId, escalation, subjects: this.noticeSubjectsFor(missionId, { taskId, memberId: member.id }) })
       this.store.event(missionId, 'escalation/raised', member.id, {
         escalationId: escalation.id, memberId: member.id, deliveryId,
         ...(taskId === undefined ? {} : { taskId }), ...(attemptId === undefined ? {} : { attemptId }),
