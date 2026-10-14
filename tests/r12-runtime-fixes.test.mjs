@@ -79,7 +79,7 @@ test('successful startup bookkeeping failures do not cancel the handle or spend 
   const f = await fixture(t)
   let signal
   f.workers.start = async (_spec, value) => { signal = value }
-  f.runtime.clearProviderOutage = () => { throw new Error('injected bookkeeping failure') }
+  f.runtime.recordStarted = () => { throw new Error('injected bookkeeping failure') }
   await assert.rejects(f.runtime.startWorker(f.mission, f.a), /bookkeeping/)
   assert.equal(signal.aborted, false)
   assert.equal(f.runtime.store.events(f.mission.id, 100).filter(e => e.type === 'member/resume-failed').length, 0)

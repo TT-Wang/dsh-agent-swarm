@@ -936,6 +936,31 @@ test('a start failure over the work bound to its member is that work\'s one requ
   assert.deepEqual(requests().filter(request => request === 'dispatch question'), ['dispatch question'], 'the dispatch question names the holder at the next pass end')
 })
 
+test('P3: a start that adopts the member\'s running session ends its counted start failures, so the start failure no longer holds the pending work bound to it: with the handle still busy, the dispatch question names the holder', async t => {
+  const f = await setup({ clock: new FakeClock() })
+  t.after(f.cleanup)
+  // Only the reviewer's handle is idle. The author's first start fails; the next finds its session running and adopts it (the adapter resolves true), mid-turn.
+  f.workers.idle.add(f.reviewer.id)
+  const start = f.workers.start.bind(f.workers)
+  let failures = 1
+  f.workers.start = async spec => {
+    if (spec.member.id !== f.author.id) return start(spec)
+    if (failures-- > 0) throw Object.assign(new Error('worker start failed'), { code: 'EMFILE' })
+    await start(spec)
+    return true
+  }
+  const task = f.propose({ title: 'Bound to the author' })
+  await f.runtime.settle(f.mission.id)
+  await ticks(f, 1)
+  await f.runtime.settle(f.mission.id)
+  const subject = `${task.id}@${taskOf(f.runtime, task.id).epoch}`
+  assert.ok(ownerRows(f).some(delivery => delivery.content.startsWith('Author could not start (failure 1 of 3)') && delivery.subjects.includes(subject)), 'the start failure names the work bound to the author')
+  await ticks(f, 6)
+  await f.runtime.settle(f.mission.id)
+  assert.deepEqual([taskOf(f.runtime, task.id).status, subjectOf(f, task), f.runtime.store.get('members', f.author.id).startFailures], ['pending', subject, undefined], 'the adoption cleared the counted failures; the work waits at the epoch the failure named')
+  assert.deepEqual(ownerRows(f).filter(delivery => noticeFamily(delivery) === 'dispatch-question').map(delivery => delivery.subjects), [[subject]], 'the dispatch question names it, once')
+})
+
 test('work pinned to a member retired for start failures is the retirement\'s while those failures stand: beside running work no fall-through names it', async t => {
   const f = await setup({ clock: new FakeClock(), workers: new FakeWorkers({ autoIdle: true }) })
   t.after(f.cleanup)

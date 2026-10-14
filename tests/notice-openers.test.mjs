@@ -27,8 +27,7 @@ test('each start failure below the bound is its own fact, opened by its event: f
   fail()
   assert.deepEqual(failures(), [['failure 1 of 3', root], ['failure 2 of 3', root]], 'the second failure on the same subjects is told')
   // A successful start ends the run (what the start path records); the next failure opens a new one on the same subjects.
-  f.runtime.startFailures.delete(f.author.id)
-  f.runtime.clearProviderOutage(f.mission.id, f.author.id)
+  f.runtime.recordStarted(f.mission.id, f.author.id, true)
   fail()
   assert.deepEqual(failures(), [['failure 1 of 3', root], ['failure 2 of 3', root], ['failure 1 of 3', root]], 'a new run\'s first failure is told too')
 })

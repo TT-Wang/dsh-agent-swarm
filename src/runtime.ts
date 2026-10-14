@@ -3897,16 +3897,17 @@ export class SwarmRuntime {
     const outage = member.providerOutage
     return outage !== undefined && this.now() - outage.at <= PROVIDER_OUTAGE_WINDOW_MS ? outage : undefined
   }
-  /** R11-01: a start that opened the member's session proves the route recovered. */
-  clearProviderOutage(missionId: string, memberId: string): void {
+  /**
+   * S5c: a start that leaves the member's session running, an adoption included,
+   * ends its counted start failures (`startFailures` mirrors them). R11-01: only
+   * one that opened the session proves the route recovered from its outage.
+   */
+  recordStarted(missionId: string, memberId: string, opened: boolean): void {
+    this.startFailures.delete(memberId)
     const member = this.store.get('members', memberId)
-    if (member === undefined) return
-    // S5c: a successful start also clears the durable consecutive-failure count
-    // (the same event that proves the route recovered proves the failures
-    // stopped). `startFailures` stays as the in-process mirror only.
-    const outage = member.providerOutage
-    if (outage === undefined && member.startFailures === undefined) return
-    delete member.providerOutage
+    const outage = opened ? member?.providerOutage : undefined
+    if (member === undefined || (outage === undefined && member.startFailures === undefined)) return
+    if (outage !== undefined) delete member.providerOutage
     delete member.startFailures
     delete member.startError
     this.commit(missionId, () => {
@@ -4263,9 +4264,8 @@ export class SwarmRuntime {
           throw controller.signal.reason
         }
         // A bookkeeping failure is not a failed native startup: it must not cancel
-        // a working handle or charge task recovery credit. An adopted session
-        // opened nothing, so it proves nothing about the route.
-        if (!adopted) { this.startFailures.delete(member.id); this.clearProviderOutage(mission.id, member.id) }
+        // a working handle or charge task recovery credit.
+        this.recordStarted(mission.id, member.id, !adopted)
       } finally {
         clearTimeout(timer)
         options.signal?.removeEventListener('abort', cancel)
