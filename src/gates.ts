@@ -165,7 +165,7 @@ export class RuntimeGates {
     // Spec §2: dispatchable means a pending task at least one member whose
     // status is idle or waiting can run. A working member is already busy.
     const runnable = members.filter(member => member.status === 'idle' || member.status === 'waiting')
-    const ready = new Set(tasks.filter(task => task.status === 'pending' && runnable.some(member => this.rt.ready(task, member, tasks))).map(task => task.id))
+    const ready = new Set(tasks.filter(task => task.status === 'pending' && runnable.some(member => this.rt.eligible(task, member, tasks))).map(task => task.id))
     const unreviewed = new Set(tasks.filter(task => task.status === 'submitted' && !this.rt.reviewable(task, tasks)).map(task => task.id))
     return {
       status: mission.status,

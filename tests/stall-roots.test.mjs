@@ -99,7 +99,8 @@ test('a pending task whose only eligible member still owes a stop past its bound
   // The board the dispatcher sees: the member that owes the stop is not
   // eligible, so the task is not dispatchable, and no dispatch question can be
   // asked about it. The classifier reads the same eligibility, in its ordinary
-  // judgement and in a wedged one (which asks about busy members too).
+  // judgement and in a wedged one (which asks about busy members too), and so
+  // does the owner instruments' count of dispatchable work.
   for (const wedged of [false, true]) {
     const f = await fixture(t, { clock: new FakeClock(), stallPassTimeoutMs: 40 })
     let release
@@ -126,6 +127,7 @@ test('a pending task whose only eligible member still owes a stop past its bound
     assert.deepEqual(f.stallRoots().map(delivery => delivery.notice.dedupKey), [`stall-root:${f.mission.id}:${stopping.id}@${epochOf(stopping)}`], `wedged=${wedged}: the stop past its bound is a stall root`)
     assert.deepEqual(f.fallthroughs().map(delivery => delivery.subjects), [[`${queued.id}@${epochOf(queued)}`]], `wedged=${wedged}: the task queued behind it is named`)
     assert.equal(f.runtime.store.get('tasks', queued.id).status, 'pending', `wedged=${wedged}: and it was never dispatched`)
+    assert.deepEqual([f.runtime.observe(f.owner, f.mission.id).pendingDispatchable, f.runtime.interpretation(f.mission.id).dispatchable.length], [0, 0], `wedged=${wedged}: the owner instruments count no dispatchable work`)
     release()
   }
 })
