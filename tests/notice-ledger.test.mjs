@@ -1069,6 +1069,14 @@ test('the isolation request is outstanding exactly while the invariant lists its
       `${exit}, without the repair, leaves the violation listed: the one request stays outstanding`)
     assert.deepEqual((await remind(f, request)).map(delivery => delivery.subjects), [request.subjects], 'and the owner is reminded of it')
   }
+  // The board changes under the listed violation: a third member joins, in its own worktree, and the task is still the reviewer's.
+  const changed = await board()
+  const digest = changed.f.runtime.fingerprint(changed.f.mission.id)
+  await changed.f.runtime.addMember(changed.f.owner, changed.f.mission.id, { name: 'Third', role: 'implementation', maxOutputTokens: 5_000 })
+  await quiet(changed.f)
+  assert.notEqual(changed.f.runtime.fingerprint(changed.f.mission.id), digest, 'the board digest moved')
+  assert.deepEqual([taskOf(changed.f.runtime, changed.task.id).status, changed.f.runtime.isolationViolations(changed.f.mission.id).length, ownerRows(changed.f).filter(delivery => noticeFamily(delivery) === 'dispatch-question')], ['pending', 1, []],
+    'the dispatch question adds no second wording on the new board: the invariant refuses every startable member the task could go to, and the request is the one emitter of that cause')
   // "Repair the condition, then ... resume": the repair is what ends the request.
   const { f, task, request, repair, tool } = await board()
   assert.match(request.content, /Repair the condition, then use `swarm_control`/)

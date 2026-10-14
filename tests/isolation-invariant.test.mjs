@@ -108,8 +108,6 @@ test('S7: a shared worktree is refused durably, never dispatched into, and its d
     assert.equal(f.workers.started.filter(id => id === f.reviewer.id).length, starts,
       'no worker handle is started for the refused member while the violation holds')
     assert.equal(terminals().length, 1, 'one decision for the one violation, though dispatch refuses both members on every tick')
-    assert.deepEqual(f.runtime.store.list('deliveries', f.mission.id).filter(delivery => delivery.to === 'owner' && delivery.notice?.dedupKey.startsWith('dispatch-question:')), [],
-      'and the dispatch question adds no second wording: the workspace terminal is the one emitter of this cause')
     assert.equal(Object.hasOwn(f.runtime.store.get('missions', f.mission.id), 'isolationRefusal'), false, 'nothing on the mission row records the refusal')
 
     // Repair the durable state: each live member gets its own isolated worktree.
