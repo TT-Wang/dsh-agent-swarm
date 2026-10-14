@@ -844,6 +844,24 @@ test('a member whose starts are failing is spoken for by its start-failure notic
   assert.deepEqual(questions(), [], 'and no question was ever owed')
 })
 
+test('a cancellation that strands a dependent leaves it to the board classifier: one decision names it at its epoch, the fall-through beside running work and the W3 stall on a board with nothing else to do', async t => {
+  for (const running of [true, false]) {
+    const f = await setup({ clock: new FakeClock() })
+    t.after(f.cleanup)
+    if (running) await f.runtime.claim(f.actor(f.reviewer), f.mission.id, f.propose({ title: 'Unrelated work', kind: 'research', checks: [], assigneeId: f.reviewer.id }).id)
+    const prerequisite = f.propose({ title: 'Prerequisite', kind: 'research', checks: [] })
+    const dependent = f.propose({ title: 'Dependent', kind: 'research', checks: [], dependencies: [prerequisite.id] })
+    const cancelled = f.runtime.cancel(f.owner, f.mission.id, { taskId: prerequisite.id, reason: 'Not needed' })
+    assert.deepEqual(cancelled.strandedDependents, [dependent.id], `running=${running}: the cancellation reports the dependent it strands`)
+    await f.runtime.settle(f.mission.id)
+    await ticks(f, 20)
+    const subject = `${dependent.id}@${taskOf(f.runtime, dependent.id).epoch}`
+    const decisions = ownerRows(f).filter(delivery => (delivery.subjects ?? []).includes(subject) && delivery.notice.trigger !== 'owner-decision-unresolved')
+    assert.deepEqual(decisions.map(delivery => noticeFamily(delivery)), [running ? 'fallthrough' : 'board-stall'], `running=${running}: one decision names the stranded dependent, the board's own`)
+    assert.equal(relevant(f, decisions[0]), true, `running=${running}: and it is outstanding`)
+  }
+})
+
 test('a provider outage\'s notice names the member\'s open work or the mission root, never the pending work it is assigned: the dispatch question about that work is asked, once, on an unchanged board', async t => {
   const f = await setup({ clock: new FakeClock(), workers: new FakeWorkers({ autoIdle: true }) })
   t.after(f.cleanup)

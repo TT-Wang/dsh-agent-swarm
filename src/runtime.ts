@@ -2517,7 +2517,8 @@ export class SwarmRuntime {
       for (const reviewerId of reviewers) released.add(reviewerId)
       // Withdrawal strands admitted dependents whose lineage no longer reaches
       // live work. They stay pending (and repairable) instead of being treated
-      // as dead; the owner is told which replacement obligation to admit.
+      // as dead: the result and the event name them, and the board classifier
+      // names each one no live path advances.
       for (const dependent of this.store.list('tasks', missionId)) {
         if (dependent.id === task.id || dependent.status !== 'pending') continue
         const references = dependent.dependencies.some(dependency => this.dependencyIdentities(missionId, dependency).has(task.id))
@@ -2526,13 +2527,6 @@ export class SwarmRuntime {
       this.store.event(missionId, 'task/cancelled', key, { taskId: task.id, reason: input.reason, previousStatus,
         ...(attempt === undefined ? {} : { attemptId: attempt.id, ownerId: attempt.ownerId }),
         ...(strandedDependents.length ? { strandedDependents } : {}) })
-      if (strandedDependents.length) {
-        // The withdrawn task and every stranded dependent are the subjects: the
-        // decision names exactly the obligations the owner must replace. The
-        // subject list comes from the shared interpretation, not a second read.
-        const view = this.interpretation(missionId)
-        this.notify(missionId, `Cancelling ${task.id} stranded admitted dependents ${strandedDependents.join(', ')}. Propose a replacement for ${task.id} with replaces; dependents resolve to the live repair automatically.`, view.subjectsOf([task, ...view.tasks.filter(candidate => strandedDependents.includes(candidate.id))]), { from: key })
-      }
     })
     if (task.resumeAfterStop !== undefined) this.attempts.resumeStoppedAttempt(missionId, task)
     this.kick(missionId)

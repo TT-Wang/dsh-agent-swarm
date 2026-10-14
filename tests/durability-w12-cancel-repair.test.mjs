@@ -54,7 +54,8 @@ test('W12: cancelling a task admits one live repair and re-resolves its dependen
   assert.equal(f.current(original.id).status, 'cancelled')
   const [cancelled] = f.events('task/cancelled')
   assert.deepEqual(cancelled.data.strandedDependents, [admitted.id], 'the durable event names the stranded dependent')
-  await eventually(() => f.workers.deliveries.find(delivery => delivery.to === 'owner' && /stranded admitted dependents/.test(delivery.content)), 'the owner is told to repair the withdrawal', 2500)
+  // The board classifier names the dependent no live path advances: on this board with nothing else to do, the W3 stall.
+  await eventually(() => f.workers.deliveries.find(delivery => delivery.to === 'owner' && /^Mission stalled/.test(delivery.content) && delivery.content.includes(`${admitted.id} (research, pending, depends on ${original.id})`)), 'the owner is told the dependent is stranded', 2500)
   // A new dependent is still refused while no live repair exists.
   assert.throws(() => f.research({ title: 'New dependent', dependencies: [original.id] }), /no live replacement/)
   const before = structuredClone(f.current(original.id))
