@@ -10,7 +10,6 @@ import { admissionRowId, decideAdmission, defaultLimitRules, scopeKeysOverlap, t
 import { WriterBusyError } from './store.ts'
 import { PolicyError } from './policy-error.ts'
 import { hasNotice } from './arena.ts'
-import { missionSubject } from './notices.ts'
 import type { SwarmRuntime } from './runtime.ts'
 import type { Budget, Member, Mission, Task } from './types.ts'
 
@@ -205,29 +204,19 @@ export class RefusalRegistry {
   }
 
   /**
-   * Refuse a worker proposal for an allowance, budget or ceiling reason and
-   * make it an owner decision: the refusal is recorded durably, an owner notice
-   * names the member, the limit and the reason, and the same refusal is thrown
-   * so the worker's tool result carries it. Never called for the owner, who
-   * sees the error directly and is the actor who can raise the ceiling.
+   * Refuse a proposal at a mission admission limit, whoever proposed it. The
+   * limit is one coded owner decision request, the task-ceiling chain's
+   * terminal keyed by the limit it met: a refusal under a limit the owner holds
+   * never wakes it again, and a raised limit that refuses is a new request. A
+   * worker's refusal is also recorded and thrown, so its tool result carries
+   * it; the owner, the actor who can raise the limit, is refused by its caller.
    */
-  refuseProposal(mission: Mission, proposer: string, title: string, reason: string, limit: number): never {
-    const message = `Worker ${proposer} cannot propose ${JSON.stringify(title)}: ${reason} (limit ${limit}). The owner can raise the mission ceiling with swarm_budget or admit the work with swarm_propose.`
-    // Round 14: the budget chain's terminal element is the *owner decision*, not
-    // the worker's tool error. The worker keeps the round-13 refusal text; the
-    // owner notice becomes the coded decision request naming the executable
-    // exits, one per proposer, refusal reason and limit: a refusal the owner
-    // already holds never wakes it again, and a new reason or limit does.
-    const terminal = guardTerminal('budget', { memberId: proposer, detail: `the proposal ${JSON.stringify(title)} was refused: ${reason} (limit ${limit})` })
-    this.rt.commit(mission.id, () => {
-      this.rt.store.event(mission.id, 'task/proposal-refused', proposer, { memberId: proposer, title, reason, limit })
-      // R15-A1: a refused proposal has no task to name yet, so the mission root is
-      // the exact lineage root of the decision.
-      this.rt.notify(mission.id, terminal.message, [missionSubject(mission)], { from: proposer, noticeClass: 'budget', trigger: 'task/proposal-refused', reason: `${reason} (limit ${limit})` })
-    })
-    // The owner notice must not wait for the next scheduler tick; flush it now.
-    this.rt.kick(mission.id)
-    throw new Error(message)
+  refuseProposal(mission: Mission, proposer: string | undefined, title: string, budget: 'task' | 'experiment', admitted: number, limit: number): void {
+    const reason = `mission ${budget} budget exhausted (${admitted}/${limit} ${budget}s admitted)`
+    emitGuardTerminal(this.rt, mission.id, 'task_ceiling', { detail: reason, localKey: `${budget}-budget:${limit}` })
+    if (proposer === undefined) return
+    this.rt.commit(mission.id, () => this.rt.store.event(mission.id, 'task/proposal-refused', proposer, { memberId: proposer, title, reason, limit }))
+    throw new Error(`Worker ${proposer} cannot propose ${JSON.stringify(title)}: ${reason} (limit ${limit}). The owner can raise the mission ceiling with swarm_budget or admit the work with swarm_propose.`)
   }
 }
 

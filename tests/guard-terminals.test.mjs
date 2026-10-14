@@ -50,7 +50,7 @@ import { setTimeout as sleep } from 'node:timers/promises'
 import { guardActions, guardBoard, guardDispatchActions, guardMissionTerminal, guardProgressActions, guardTerminalChain, terminalEscalation } from './guard-model.mjs'
 import { emitGuardTerminal, guardTerminal } from '../lib/refusals.js'
 import { dependencyAssumptions, reconcileTaskAdmission } from '../lib/admission.js'
-import { assessText, toolSchemaIndex } from './refusal-inventory.mjs'
+import { assessText, ownerTools, sessionTools, toolSchemaIndex } from './refusal-inventory.mjs'
 import { setup, eventually, events, FakeClock, budget } from './faults/harness.mjs'
 
 /** The model-visible code of the R12-F9 admission refusal. */
@@ -413,21 +413,20 @@ test('R14 runtime (workspace chain): a revoked workspace escalates with the code
   } finally { await f.cleanup() }
 })
 
-test('R14 runtime (budget chain): a refused worker proposal escalates as a coded owner decision', async () => {
+test('R14 runtime (task ceiling chain): a refused worker proposal escalates as the coded admission request, whose exit, performed through the registered tools, admits the work', async () => {
   const f = await setup({ budget: { maxTasks: 1 } })
   try {
+    const owner = await ownerTools(f), worker = await sessionTools(f, f.author.sessionId)
     f.propose({ title: 'Owner fills the only slot' })
-    const stream = f.runtime.store.list('workstreams', f.mission.id)[0]
-    assert.throws(() => f.runtime.propose(f.actor(f.author), f.mission.id, {
-      outputs: [], workstreamId: stream.id, title: 'Worker overflow', objective: 'Overflow the ceiling', kind: 'research',
-      scope: ['**'], acceptance: f.mission.acceptance,
-    }), /task budget exhausted/)
+    const proposal = { outputs: [], workstreamId: f.stream.id, title: 'Worker overflow', objective: 'Overflow the ceiling', kind: 'research', scope: ['**'], acceptance: f.mission.acceptance, checks: [] }
+    await assert.rejects(worker('swarm_propose', proposal), /task budget exhausted/)
     const notice = await eventually(() => f.workers.deliveries
-      .find(delivery => delivery.memberId === 'owner' && /\[budget_terminal\]/.test(delivery.content)),
+      .find(delivery => delivery.memberId === 'owner' && /\[task_ceiling_terminal\]/.test(delivery.content)),
       'the ceiling refusal must become a coded owner decision', 8_000)
     assert.deepEqual(lintRefusal(notice.content), [])
-    assert.match(notice.content, /swarm_budget/)
-    assert.match(notice.content, /budget/)
+    assert.match(notice.content, /`swarm_budget` with a finite raised `budget` and `reason`, then retry the original admission/)
+    await owner('swarm_budget', { budget: { ...f.runtime.mission(f.mission.id).budget, maxTasks: 2 }, reason: 'Room for the worker' })
+    assert.equal((await worker('swarm_propose', proposal)).proposedBy, f.author.id, 'the retried admission succeeds')
   } finally { await f.cleanup() }
 })
 

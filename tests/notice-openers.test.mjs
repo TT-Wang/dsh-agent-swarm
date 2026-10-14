@@ -101,37 +101,31 @@ test('a member failure is the member on its open work, whatever the provider tex
   assert.deepEqual(failures(), [['Author', root], ['Reviewer', root], ['Author', [`${work.id}@${taskOf(f.runtime, work.id).epoch}`]]], 'the member\'s failure over its new work is a new fact, told once')
 })
 
-test('a worker\'s refused proposal is one fact per reason and limit, and each exit it names is performed through the registered tools: swarm_control\'s resume and swarm_cancel admit nothing and tell nothing new, swarm_budget admits the work, and a refusal under the raised limit is a new fact', async t => {
+/** The admission requests on the ledger: the limit each was opened by, and the refusal its row records. */
+const admissionRequests = f => ownerRows(f, /^\[task_ceiling_terminal\]/).map(delivery => [delivery.notice.dedupKey.split(':').slice(3).join(':'), delivery.notice.reason])
+
+test('a refused proposal is one request per limit, whoever proposed it, and its exit is performed through the registered tools: swarm_budget raises the limit, the retried admission succeeds, and a refusal under the raised limit is a new request', async t => {
   const f = await fixture(t, { budget: { maxTasks: 1 } })
   const owner = await ownerTools(f)
   const worker = await sessionTools(f, f.author.sessionId)
-  const held = f.propose({ title: 'Admitted' })
+  f.propose({ title: 'Admitted' })
   const proposal = title => ({ outputs: [], workstreamId: f.stream.id, title, objective: 'More work', kind: 'research', scope: ['**'], acceptance: MISSION_ACCEPTANCE, checks: [] })
-  const refused = title => assert.rejects(worker('swarm_propose', proposal(title)), /task budget exhausted/)
-  const refusals = () => ownerRows(f, /^\[budget_terminal\]/).filter(delivery => delivery.from === f.author.id).map(delivery => delivery.content.match(/was refused: (.*\(limit \d+\))\)/)[1])
-  const first = 'mission task budget exhausted (1/1 tasks admitted) (limit 1)'
-  await refused('More')
-  await refused('More again')
-  assert.deepEqual(refusals(), [first], 'the same refusal is told once')
-  const [request] = ownerRows(f, /^\[budget_terminal\]/)
-  assert.deepEqual([...new Set(request.content.match(/\bswarm_\w+/g))].sort(), ['swarm_budget', 'swarm_cancel', 'swarm_control'], 'the request names these tools')
-  assert.match(request.content, /Explicit user pause remains until `swarm_control` with `action: resume`/)
-  assert.equal((await owner('swarm_control', { action: 'resume', reason: 'Resume' })).status, 'active', 'the resume is accepted: the mission was never paused')
-  await refused('More after the resume')
-  assert.deepEqual(refusals(), [first], 'it admits nothing, and the refusal is still the one the owner holds')
-  assert.match(request.content, /Use `swarm_cancel` with `taskId` and `reason` to withdraw mistaken work; cancellation never resets consumed budget/)
-  await owner('swarm_cancel', { taskId: held.id, reason: 'Withdrawn' })
-  assert.equal(taskOf(f.runtime, held.id).status, 'cancelled', 'the work is withdrawn')
-  await refused('More after the cancel')
-  assert.deepEqual(refusals(), [first], 'and, as the request says, its admission is not given back')
-  assert.match(request.content, /`swarm_budget` using `budget` and `reason`/)
+  await assert.rejects(worker('swarm_propose', proposal('More')), /task budget exhausted \(1\/1 tasks admitted\) \(limit 1\)/)
+  await assert.rejects(worker('swarm_propose', proposal('More again')), /task budget exhausted/)
+  await assert.rejects(owner('swarm_propose', proposal('The owner\'s own')), /mission_task_budget_exhausted/)
+  assert.deepEqual(admissionRequests(f), [['task-budget:1', 'mission task budget exhausted (1/1 tasks admitted)']], 'every proposer\'s refusal at the limit is the one request')
+  assert.deepEqual(events(f.runtime, f.mission.id, 'task/proposal-refused').map(event => [event.actor, event.data.title]), [[f.author.id, 'More'], [f.author.id, 'More again']], 'each worker refusal is recorded')
+  assert.deepEqual(ownerRows(f, /cannot propose|\[budget_terminal\]/), [], 'and nothing is told in the budget chain\'s words')
+  const [request] = ownerRows(f, /^\[task_ceiling_terminal\]/)
+  assert.deepEqual([...new Set(request.content.match(/\bswarm_\w+/g))], ['swarm_budget'], 'the request names one exit')
+  assert.match(request.content, /`swarm_budget` with a finite raised `budget` and `reason`, then retry the original admission/)
   await owner('swarm_budget', { budget: { ...f.runtime.mission(f.mission.id).budget, maxTasks: 2 }, reason: 'Room for one more' })
-  assert.equal((await worker('swarm_propose', proposal('More after the raise'))).proposedBy, f.author.id, 'the raised limit admits the worker\'s proposal')
-  await refused('One more after the raise')
-  assert.deepEqual(refusals(), [first, 'mission task budget exhausted (2/2 tasks admitted) (limit 2)'], 'the refusal under the raised limit is a new fact')
+  assert.equal((await worker('swarm_propose', proposal('More after the raise'))).proposedBy, f.author.id, 'the retried admission succeeds')
+  await assert.rejects(worker('swarm_propose', proposal('One more after the raise')), /task budget exhausted \(2\/2 tasks admitted\) \(limit 2\)/)
+  assert.deepEqual(admissionRequests(f).map(([opener]) => opener), ['task-budget:1', 'task-budget:2'], 'the refusal under the raised limit is a new request')
 })
 
-test('a worker\'s refused proposal is keyed by its reason as well as its limit: a task-budget and an experiment-budget refusal from one proposer at one limit value are two facts', async t => {
+test('a worker\'s refused proposal is keyed by the limit it met: a task-budget and an experiment-budget refusal at one limit value are two requests', async t => {
   const f = await fixture(t, { budget: { maxTasks: 2, maxExperiments: 2 } })
   f.propose({ title: 'First experiment', experiment: true })
   f.propose({ title: 'Second experiment', experiment: true })
@@ -139,8 +133,7 @@ test('a worker\'s refused proposal is keyed by its reason as well as its limit: 
   assert.throws(() => f.runtime.propose(f.actor(f.author), f.mission.id, proposal()), /task budget exhausted \(2\/2 tasks admitted\) \(limit 2\)/)
   f.runtime.updateBudget(f.owner, f.mission.id, { ...f.runtime.mission(f.mission.id).budget, maxTasks: 5 }, 'Room for tasks, not experiments')
   assert.throws(() => f.runtime.propose(f.actor(f.author), f.mission.id, proposal({ experiment: true })), /experiment budget exhausted \(2\/2 experiments admitted\) \(limit 2\)/)
-  const refusals = ownerRows(f, /^\[budget_terminal\]/).filter(delivery => delivery.from === f.author.id).map(delivery => delivery.content.match(/was refused: (.*\(limit \d+\))\)/)[1])
-  assert.deepEqual(refusals, ['mission task budget exhausted (2/2 tasks admitted) (limit 2)', 'mission experiment budget exhausted (2/2 experiments admitted) (limit 2)'])
+  assert.deepEqual(admissionRequests(f), [['task-budget:2', 'mission task budget exhausted (2/2 tasks admitted)'], ['experiment-budget:2', 'mission experiment budget exhausted (2/2 experiments admitted)']])
 })
 
 test('an escalation names its fact like every notice: over the wake budget the window\'s summary carries it with its identity and subjects, and its deliveryId names that summary', async t => {

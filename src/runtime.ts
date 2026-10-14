@@ -347,7 +347,7 @@ export class SwarmRuntime {
   private recordRefusal(candidate: AdmissionCandidate, decision: AdmissionDecision, latencyMs: number): void { return this.refusals.recordRefusal(candidate, decision, latencyMs) }
   upsertBudgetRefusals(mission: Mission, reason: string): void { return this.refusals.upsertBudgetRefusals(mission, reason) }
   private recordWriterBusyRecovery(mission: Mission): void { return this.refusals.recordWriterBusyRecovery(mission) }
-  private refuseProposal(mission: Mission, proposer: string, title: string, reason: string, limit: number): never { return this.refusals.refuseProposal(mission, proposer, title, reason, limit) }
+  private refuseProposal(mission: Mission, proposer: string | undefined, title: string, budget: 'task' | 'experiment', admitted: number, limit: number): void { return this.refusals.refuseProposal(mission, proposer, title, budget, admitted, limit) }
 
   /** M1a seam 3/7: owner notices, witnesses and the outbox that delivers them. */
   private readonly notices = new Notices(this)
@@ -1272,20 +1272,13 @@ export class SwarmRuntime {
     if (!stream || stream.missionId !== missionId) throw new PolicyError('workstream_unknown', 'validation_error', 'Unknown workstream')
     const tasks = this.store.list('tasks', missionId)
     if (tasks.length >= mission.budget.maxTasks) {
-      // The owner is the only actor who can raise the ceiling; a worker refusal
-      // is a decision the owner must see, not just an error in a tool result.
-      if (!owner) this.refuseProposal(mission, key, input.title, `mission task budget exhausted (${tasks.length}/${mission.budget.maxTasks} tasks admitted)`, mission.budget.maxTasks)
-      // S4b: the ceiling that refuses the owner is a terminal too. The owner's
-      // tool result carries the prose; the durable coded decision request makes
-      // the refusal a recorded decision with the executable exits (raise the
-      // ceiling with swarm_budget, or withdraw work with swarm_cancel).
-      emitGuardTerminal(this, missionId, 'task_ceiling', { detail: `mission task budget exhausted (${tasks.length}/${mission.budget.maxTasks} tasks admitted)`, localKey: `task-budget:${mission.budget.maxTasks}` })
+      // The owner is the only actor who can raise the ceiling: a refusal at the
+      // limit is the owner's one decision request, whoever proposed.
+      this.refuseProposal(mission, owner ? undefined : key, input.title, 'task', tasks.length, mission.budget.maxTasks)
       throw new PolicyError('mission_task_budget_exhausted', 'budget_error', '[mission_task_budget_exhausted] Mission task budget exhausted: raise maxTasks with swarm_budget(budget, reason), then propose the task again')
     }
     if (input.experiment && tasks.filter(t => t.experiment).length >= mission.budget.maxExperiments) {
-      const used = tasks.filter(t => t.experiment).length
-      if (!owner) this.refuseProposal(mission, key, input.title, `mission experiment budget exhausted (${used}/${mission.budget.maxExperiments} experiments admitted)`, mission.budget.maxExperiments)
-      emitGuardTerminal(this, missionId, 'task_ceiling', { detail: `mission experiment budget exhausted (${used}/${mission.budget.maxExperiments} experiments admitted)`, localKey: `experiment-budget:${mission.budget.maxExperiments}` })
+      this.refuseProposal(mission, owner ? undefined : key, input.title, 'experiment', tasks.filter(t => t.experiment).length, mission.budget.maxExperiments)
       throw new PolicyError('mission_experiment_budget_exhausted', 'budget_error', 'Mission experiment budget exhausted')
     }
     const dependencies = [...new Set(normalizeReviewDependencies(input.kind, input.reviewOf, input.dependencies))]

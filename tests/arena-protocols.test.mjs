@@ -91,7 +91,7 @@ test('proposal capacity is the aggregate mission budget and never shrinks when t
     assert.equal(admitted.result.proposedBy, f.alice.id)
   }
   await assert.rejects(propose.execute(proposal(f, { title: 'Over aggregate' }), alice), /task budget exhausted/)
-  const notice = notices(f).filter(delivery => delivery.notice.class === 'budget').at(-1)
+  const notice = notices(f).filter(delivery => delivery.notice.dedupKey.startsWith('guard-terminal:task_ceiling:')).at(-1)
   assert.match(notice.content, /6\/6/)
   const count = notices(f).length
   await assert.rejects(propose.execute(proposal(f, { title: 'Still over aggregate' }), alice), /task budget exhausted/)
@@ -109,11 +109,11 @@ test('R11-17: the experiment ceiling refuses a worker proposal with an owner not
   const f = await fixture(t, { budget: { maxTasks: 6, maxWorkers: 2, maxExperiments: 0 } })
   const tools = definitions(f.runtime)
   await assert.rejects(tools.get('swarm_propose').execute(proposal(f, { title: 'Experiment', experiment: true }), execution(f.alice.sessionId)), /experiment budget exhausted/)
-  const notice = notices(f).find(delivery => delivery.notice.class === 'budget')
+  // The limit's one request, whoever proposed; the proposer is on the refusal's own event.
+  const notice = notices(f).find(delivery => delivery.notice.dedupKey === 'guard-terminal:task_ceiling:task_ceiling_terminal:experiment-budget:0')
   assert.ok(notice)
-  assert.match(notice.content, new RegExp(f.alice.id))
-  assert.match(notice.content, /experiment budget exhausted \(0\/0/)
-  assert.match(notice.content, /limit 0/)
+  assert.match(notice.content, /experiment budget exhausted \(0\/0 experiments admitted\)/)
+  assert.deepEqual(f.runtime.store.events(f.mission.id, 100).filter(event => event.type === 'task/proposal-refused').map(event => [event.data.memberId, event.data.limit]), [[f.alice.id, 0]])
 })
 
 test('the notice ledger records sent, queued and claimed with the state fingerprint and is read-only', async t => {
@@ -132,17 +132,17 @@ test('the notice ledger records sent, queued and claimed with the state fingerpr
 
   // Synchronous read: the notice is recorded and queued, not yet delivered.
   const queuedView = f.runtime.noticeLedger(f.owner, f.mission.id)
-  const queued = queuedView.ledger.find(entry => entry.class === 'budget')
+  const admission = entry => entry.dedupKey.startsWith('guard-terminal:task_ceiling:')
+  const queued = queuedView.ledger.find(admission)
   assert.ok(queued, 'the ledger exposes the notice')
   assert.equal(queued.state, 'queued')
   assert.equal(queued.deliveredAt, undefined)
   assert.equal(queued.consumedAt, undefined, 'transport is never relabelled as consumption')
   assert.ok(Number.isSafeInteger(queued.sentAt) && Number.isSafeInteger(queued.queuedAt))
   assert.equal(queued.sentAt, queued.queuedAt, 'sent and queued are recorded at enqueue')
-  // R17-G3: the identity is the fact — the refusal's event, subject@epoch and the
-  // recorded reason with its limit — not a digest of the whole board, so an
-  // unrelated change cannot re-arm this notice.
-  assert.match(queued.dedupKey, /^task\/proposal-refused:mission_[0-9a-f-]+:mission:mission_[0-9a-f-]+:[0-9a-f]{16}$/, `the dedup key is the fact key: ${queued.dedupKey}`)
+  // R17-G3: the identity is the fact — the admission limit the refusal met — not a
+  // digest of the whole board, so an unrelated change cannot re-arm this notice.
+  assert.equal(queued.dedupKey, `guard-terminal:task_ceiling:task_ceiling_terminal:task-budget:${f.mission.budget.maxTasks}`, 'the dedup key is the limit the refusal met')
   assert.equal(queued.deliveryId, queued.id)
   // Read-only: two reads of the same state are identical and mutate nothing.
   const revision = f.runtime.store.revision()
@@ -153,7 +153,7 @@ test('the notice ledger records sent, queued and claimed with the state fingerpr
 
   // The outbox drains on the scheduler pass: the transport fact is `delivered`.
   const deliveredEntry = await eventually(() => {
-    const entry = f.runtime.noticeLedger(f.owner, f.mission.id).ledger.find(row => row.class === 'budget')
+    const entry = f.runtime.noticeLedger(f.owner, f.mission.id).ledger.find(admission)
     return entry?.state === 'claimed' ? entry : undefined
   }, 'the owner notice was never delivered', 5000)
   assert.ok(deliveredEntry.deliveredAt >= deliveredEntry.sentAt)
