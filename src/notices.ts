@@ -523,8 +523,6 @@ const id = (prefix: string) => `${prefix}_${randomUUID()}`
 
 /** A review-blocked decision's identity: one per blocker reason of one review need (`SwarmRuntime.reviewNeed`) of a source. */
 const reviewBlockedKey = (missionId: string, sourceId: string, need: string, reason: string): string => `review-blocked:${missionId}:${sourceId}:${need}:${reason}`
-/** Whether a task is an unreviewable submission or a review of one: that review path is the review admission's decision (`SwarmRuntime.admitMissingReviews`), which no board naming restates. */
-const onUnreviewedPath = (view: MissionInterpretation, task: Task): boolean => view.unreviewed.some(source => task.id === source.id || task.reviewOf === source.id)
 /** The families of the board's own fact: the W3 stall, or an owner-assembled mission's coverage-complete (R10-14). */
 const BOARD_FAMILIES: readonly string[] = ['board-stall', 'coverage-complete']
 
@@ -1065,23 +1063,22 @@ export class Notices {
   /**
    * The board's one fact while its condition holds, with the body and the
    * identity it is told under. Completion refused: a stalled board's W3
-   * stall, keyed by the completion diagnostic and the stuck work the review
-   * admission does not speak for (`onUnreviewedPath`): the one unschedulable
-   * set its body and event state, else every other unfinished task; a board
-   * with no other is that admission's alone. Completion allowed: coverage-complete
-   * of an owner-assembled mission (no start request), keyed by its terminal work.
+   * stall, keyed by the completion diagnostic and its stuck work (the
+   * unschedulable tasks, else every unfinished one), one set that its subjects,
+   * body, count and event state; not told while a submission the review
+   * admission speaks for is unreviewable, whose own record or decision then
+   * speaks for the board. Completion allowed: coverage-complete of an
+   * owner-assembled mission (no start request), keyed by its terminal work.
    */
-  private boardFact(view: MissionInterpretation): { key: string; subjects: string[]; reason: string; content: string; statement: NoticeStatement; unschedulable?: string[] } | undefined {
+  private boardFact(view: MissionInterpretation): { key: string; subjects: string[]; reason: string; content: string; statement: NoticeStatement } | undefined {
     const fact = (body: { content: string; statement: NoticeStatement }, subjects: string[], reason: string) =>
       ({ ...body, subjects, reason, key: factKey(view.missionId, { trigger: NOTICE_TEMPLATES[body.statement.family].trigger, reason, subjects, statement: body.statement }) })
     const refusal = this.rt.completionError(view.mission)
     if (refusal === undefined) return this.rt.store.list('starts', view.missionId).length > 0 ? undefined
       : fact(renderNotice('coverage-complete', { missionTitle: view.mission.title }), view.subjectsOf(view.tasks.filter(task => TERMINAL_STATES.has(task.status))), 'every acceptance criterion is independently covered')
-    const rest = view.nonTerminal.filter(task => !onUnreviewedPath(view, task))
-    if (!view.stalled || (view.nonTerminal.length > 0 && rest.length === 0)) return undefined
-    const dead = view.unschedulable.filter(task => rest.includes(task))
-    const subjects = view.subjectsOf(dead.length ? dead : rest)
-    return { ...fact(renderNotice('board-stall', { reason: refusal, unschedulable: dead, subjects }), subjects, refusal), unschedulable: dead.map(task => task.id) }
+    if (!view.stalled || view.unreviewed.length > 0) return undefined
+    const subjects = view.subjectsOf(view.unschedulable.length ? view.unschedulable : view.nonTerminal)
+    return fact(renderNotice('board-stall', { reason: refusal, unschedulable: view.unschedulable, subjects }), subjects, refusal)
   }
 
   /** A W3 stall or coverage-complete decision is outstanding while it is the board's fact under the identity it was told with; a mission blocked on its budget keeps it, like every decision (`ownerDeliveryMoot`), and only an active one is told a new fact (`ensureWitness`). */
@@ -1331,18 +1328,17 @@ export class Notices {
     // pass instead), the W3 stall once a stalled board's review needs are past
     // their grace (`boardFact`).
     this.notifyBoard(view)
-    // No live work: stuck work is the W3 stall's alone; until it is stalled the
-    // stall candidate is left to that judgement, not to the fall-through.
-    if (this.rt.reviewPathStalled(tasks, members)) return
+    // An unreviewable submission the review admission speaks for: its record or decision speaks for the board.
+    // No live work: stuck work is the W3 stall's alone (a stall candidate until the board is stalled).
+    if (view.unreviewed.length || this.rt.reviewPathStalled(tasks, members)) return
     // R14-F2(c): the unnamed fallback is replaced. While every unfinished task is
     // legitimately waiting, the runtime stays silent; otherwise it escalates
     // UNCONDITIONALLY and names every task its classifier did not recognise, so
     // no state can be silent and unnamed at the same time.
-    // A task the root classifier already named, or the review admission speaks
-    // for (`onUnreviewedPath`), is recognised: the fall-through names only what
-    // no other witness speaks for.
+    // A task the root classifier already named is recognised: the fall-through
+    // names only what no other witness speaks for.
     const roots = new Set(view.stallRoots.map(task => task.id))
-    const unrecognised = nonTerminal.filter(task => !roots.has(task.id) && !onUnreviewedPath(view, task) && !this.waitsLegitimately(task, tasks))
+    const unrecognised = nonTerminal.filter(task => !roots.has(task.id) && !this.waitsLegitimately(task, tasks))
     if (!unrecognised.length) return
     // R17-G3: the fact is the named subjects and the recorded reason (the
     // classifier's verdict), never the board digest.
@@ -1492,10 +1488,10 @@ export class Notices {
     const fact = this.boardFact(view)
     if (fact === undefined || hasNotice(this.rt.store.list('deliveries', missionId), { class: 'decision', dedupKey: fact.key, from: 'runtime' })) return
     this.rt.commit(missionId, () => {
-      const { content, subjects, key, reason, statement, unschedulable } = fact
-      if (!this.notify(missionId, content, subjects, { dedupKey: key, trigger: NOTICE_TEMPLATES[statement.family].trigger, reason, statement }) || unschedulable === undefined) return
+      const { content, subjects, key, reason, statement } = fact
+      if (!this.notify(missionId, content, subjects, { dedupKey: key, trigger: NOTICE_TEMPLATES[statement.family].trigger, reason, statement }) || statement.family !== 'board-stall') return
       // F(S), the board digest it was told on, is an audit field.
-      this.rt.store.event(missionId, 'mission/stalled', 'runtime', { reason, fingerprint: this.rt.fingerprint(missionId), unschedulable, noticeKey: key })
+      this.rt.store.event(missionId, 'mission/stalled', 'runtime', { reason, fingerprint: this.rt.fingerprint(missionId), unschedulable: view.unschedulable.map(task => task.id), noticeKey: key })
     })
   }
 
