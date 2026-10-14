@@ -7,6 +7,81 @@ Current **0.7.0** working-tree checks and the historical **0.6.0** baseline are 
 | `0.1.5-rc.3` (npm `latest`, default host) | `a4c74a91e06b00fe0b0937bde982170c526cc842` |
 | `0.1.7-rc.1` (npm `next`) | `46a7f68b0922371ce7144b668b90e377d8e799f4` |
 
+## Round-30 simplification batch 11: one notice ledger (2026-10-14)
+
+**Gate at `4b2604b`** (branch `batch11/ledger` on `29a0268`, 68 commits before this entry, which is documentation only).
+`src` net against `29a0268`: −553 lines (+622/−1175). The last group (design steps 8 to 10) is −90 of it.
+
+**One record that the owner was told** (review M-1; design step 7, with the owner's amendment of the no-silent-state
+spec §2, §4 and §6 and of the F19 contract). Wrong model: beside the deliveries ledger row, "told" was a mission-row
+stamp keyed by the board digest F(S) (`Mission.witness`, `stallNotice`, `coverageNotice`, `schedulingStallNotice`,
+`schedulingWedgeNotice`, `isolationRefusal`, `budgetWarned`), written whatever the ledger decided, and the witness
+stamp gated the board classifier, so any family's notice on one digest consumed every other family's fact on it, and
+a stop bound, lease end or review grace that expired on an unchanged digest stayed silent. Right model: the row is the
+only record; `ensureWitness` runs every family at every pass end and every publication outside a live pass, each
+family checks its own key on the ledger before it commits, and a key is `<family>:<scope>:<opener>` with no board
+digest, wall clock or in-memory counter in it. Pause is the owner's own `mission/pause` event. Deleted: the seven
+mission fields, the dead `Task.budgetWarned`, the witness gate with its back-off bypass and re-stamp, every stamp and
+clear, and `ownerNotified` on the stall events, which now carry the `noticeKey` of the row they exist with.
+
+**One family field, one emitter per condition** (L-21). The family is the key prefix, which is also `noticeFamily`,
+the reviewed template and the recorded statement (`10697eb`), so the W3 stall (`board-stall:`) and coverage-complete
+(`coverage-complete:`) are withheld once the mission completes and reminded only while their own condition holds.
+`judgeBoard` is the one emitter of the W3 stall and of an owner-assembled mission's coverage-complete; completion
+only completes (`b36bd09`), the no-progress watchdog and `stallPasses` are deleted (`253fbd0`), the isolation
+terminal is the one emitter of an isolation refusal, a cancellation's stranded dependent is named by the board
+classifier (`f6b9c34`), and while a submission the review admission speaks for is unreviewable its decision speaks
+for the board (`d451784`).
+
+**Wedged passes, guard terminals, budget warnings** (L-25). A wedged pass's naming is one ledger row per naming fact
+(the mission's unfinished work and each member's counted start failures; `d515e4d`), outstanding while the work it
+named is unfinished. A guard terminal is one request per chain and the fact that opened it, declared at its call site
+(a limit, a budget pause, a task at its epoch, an attempt, a member's failing dispatch, an isolation violation;
+`af09ce7`, `f3acf6d`), never the board digest, so distinct failures of one chain are distinct requests. A budget
+warning is told once per allocation and threshold, from the ledger alone (`43ff5cf`).
+
+**Every notice names its fact** (design step 8, `afce859`). Wrong model: notify defaulted a fact's trigger to its
+class, so a preparation failure, a deferred verification, a challenge, a temp-path rendezvous, a provider outage, a
+member failure and a start failure below the bound shared `decision:<mission>:<subjects>:none`, and a worker's refused
+proposal `budget:<mission>:mission:<mission>:none`: failure 2 after failure 1, a second outage class, a second
+challenge, another temp path, a new refusal reason or a raised limit was dropped. Right model: `NotifyOptions`
+requires a trigger or an explicit key at the type level; each site passes its event and the reason that opens its
+fact, and a start failure, an outage class transition and a challenge are opened by their own event
+(`SwarmStore.event` returns the event's sequence). notify always deduplicates; an escalation never is. Deleted: the
+`dedupe` option, the class fallback, and the relevance branch that read the class-named trigger `decision` as an
+older build's missing-review notice (such a row is now an unclassified legacy fact, deliverable like any other)
+(`tests/notice-openers.test.mjs`, the second path in `tests/temp-rendezvous.test.mjs`, the legacy row in
+`tests/rule-owner-channel.test.mjs`).
+
+**One identity domain** (design step 9, `201dd3d`). Wrong model: an escalation's dedupKey was the 64-hex arena digest
+of the board with the notice channel excluded (`noticeFingerprint`), a key that identified nothing since escalations
+are never deduplicated, exposed again as `ownerInstruments.noticeDedupKey`; its full variant was computed into an
+arena-view field nothing showed. Right model: an escalation is told under `escalation:<id>`; F(S) is the one board
+digest, an owner instrument and audit field. Deleted: `noticeFingerprint`, `arenaLedgerDigest` and its digest,
+`Notices.noticeKey`, `SwarmRuntime.noticeKey`, the `fingerprintRecords` pair and `noticeDedupKey`.
+
+**Behaviour after an upgrade** is recorded in [known-limitations.md](known-limitations.md) ("Change and return",
+"Upgrade from a build before batch 11"): a condition that returns with the same opener is carried by its row's
+relevance and remaining reminders, not announced again; conditions whose key changed are announced once more.
+
+**Recorded open** (known-limitations): the failed-dispatch terminal beside the dispatch question, and a start-failure
+retirement beside the board classifier naming the same stranded task, are two wordings of one condition; an
+isolation violation whose text recurs after a repair is the same decision. Found by this entry's checks and not
+resolved: `tests/client-event-projection.test.mjs` "a real restart with the human root removed projects the
+revocation with its reason" fails from `6f87081` (it passes at `29a0268` and at `6f87081^`). After a revocation the
+board, no longer short-circuited by the stall root's witness stamp, also tells its W3 stall, so the panel's three
+newest events no longer include the revocation; the W3 stall, the stall root and the workspace terminal then name
+the same blocked task, and whether the W3 stall is an owed decision or a same-subject duplicate is not decided here.
+
+| Check at `4b2604b` | 0.1.5-rc.3 (`a4c74a91e0`) | 0.1.7-rc.1 (`46a7f68b09`) |
+| --- | --- | --- |
+| `npm run typecheck` / `npm run build` | passed / passed | passed / passed |
+| `npm run test:harness` | passed; `UPDATE_SMOKE_SNAPSHOT=1` leaves `tests/fixtures/model-visible.expected.json` unchanged | passed |
+| `npm run test:replay` | passed, digest `sha256:61a921e64088b78b957cd6aeaa563d5436d4a6eae4b0130725d1f3c74c6f971e` unchanged | passed, digest unchanged |
+| `node scripts/faults/run.mjs` | 24/24 | 24/24 |
+| `npm run test:web` / `npm run test:command-web` | passed, 13 checks / passed, 10 checks | not run |
+| Test files steps 8 to 10 touched (12), three rounds of two concurrent copies | 72/72 runs passed | 20 files touched or reading the changed docs: 256/256 |
+
 ## Round-29 simplification batch 9: one authorization rule, one exit table, a derived progress clock (2026-09-25)
 
 **Gate at `27fa353` and `19dbc30`.** Seven branches were merged onto main `75b765a` on `b9-integration` (`96f6db9`
