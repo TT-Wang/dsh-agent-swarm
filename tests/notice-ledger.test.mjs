@@ -727,6 +727,8 @@ test('L-25: a failed dispatch is one request per member and failure, whatever th
   assert.equal(f.runtime.fingerprint(f.mission.id), changed)
   assert.deepEqual(terminals().map(delivery => delivery.notice.reason), ['Error: worktree probe failed: EIO', `Error: ${failure}`], 'a different failure on an unchanged board is told')
   assert.deepEqual(stallEventKeys(f, 'guard-terminal'), terminals().map(delivery => delivery.notice.dedupKey), 'one stall event per request, naming its row')
+  // Open (docs/known-limitations.md): the question is a second wording of the failing chain's condition. It has no predicate
+  // for a failing chain, so it is asked once the board digest moves; what is pinned here is that it is asked once, under its own key.
   assert.deepEqual(questions(), [`dispatch-question:${f.mission.id}:${subject}`], 'the undispatched task is the dispatch question\'s own fact at its epoch: asked once, whichever requests the chain holds')
 })
 
