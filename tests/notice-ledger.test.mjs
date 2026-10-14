@@ -296,23 +296,6 @@ test('a coverage-complete board is never reported as a stall: an owner-assembled
   }
 })
 
-test('the board classifier is the one emitter of the board\'s facts: a pass starts by admitting the host review, so a submission whose review need ripened between passes is never first reported as a stall', async t => {
-  const f = await setup({ clock: new FakeClock() })
-  t.after(f.cleanup)
-  const source = f.propose()
-  f.propose({ title: 'Builds on the source', kind: 'research', checks: [], dependencies: [source.id] })
-  const claimed = await f.runtime.claim(f.actor(f.author), f.mission.id, source.id)
-  await f.runtime.submit(f.actor(f.author), f.mission.id, { taskId: source.id, attemptId: claimed.attempt.id, output: 'candidate' })
-  await f.runtime.settle(f.mission.id)
-  // The review need ripens with no write, and the next pass starts on it.
-  f.clock.advance(Math.max(f.runtime.config.tickMs, 1_000))
-  assert.equal(f.runtime.interpretation(f.mission.id).stalled, true, 'the board the pass starts on is stalled')
-  await f.runtime.tick()
-  await f.runtime.settle(f.mission.id)
-  assert.match(f.runtime.store.list('tasks', f.mission.id).find(task => task.reviewOf === source.id)?.id ?? 'none', /^task_auto_review_/, 'the pass admitted the host review')
-  assert.deepEqual([boardStallEvents(f), ownerRows(f).filter(delivery => noticeFamily(delivery) === 'board-stall')], [[], []], 'no W3 stall was told before it')
-})
-
 test('D3: a submission whose review need ripened, beside a dependent that waits on it, is never reported as a stall before the host admits its review, whichever route judges the board first', async t => {
   const grace = f => Math.max(f.runtime.config.tickMs, 1_000)
   const told = f => [boardStallEvents(f), ownerRows(f).filter(delivery => delivery.content.startsWith('Mission stalled'))]
