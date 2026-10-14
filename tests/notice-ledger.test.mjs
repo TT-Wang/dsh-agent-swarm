@@ -376,6 +376,27 @@ test('coverage-complete is told whenever completion is allowed, whatever the sta
   assert.equal(ownerRows(f).filter(delivery => noticeFamily(delivery) === 'coverage-complete').length, 1, 'coverage-complete is told')
 })
 
+test('the board classifier is the one emitter of the board\'s facts: a pass that blocks the mission on its deadline tells the block alone, and the W3 stall its board owes is told once the owner resumes it', async t => {
+  const f = await setup({ clock: new FakeClock() })
+  t.after(f.cleanup)
+  f.runtime.updateBudget(f.owner, f.mission.id, { ...f.runtime.mission(f.mission.id).budget, deadlineAt: f.clock.now() + 1_000 }, 'A fixed deadline')
+  await f.runtime.settle(f.mission.id)
+  const prerequisite = f.propose({ title: 'Prerequisite', kind: 'research', checks: [] })
+  const dependent = f.propose({ title: 'Dependent', kind: 'research', checks: [], dependencies: [prerequisite.id] })
+  // The deadline passes and the owner's cancellation strands the dependent: the queued pass starts on the stalled board and blocks the mission.
+  f.clock.advance(1_000)
+  f.runtime.cancel(f.owner, f.mission.id, { taskId: prerequisite.id, reason: 'Not needed' })
+  await f.runtime.settle(f.mission.id)
+  assert.equal(f.runtime.mission(f.mission.id).status, 'blocked', 'the pass blocked the mission on its deadline')
+  assert.deepEqual([ownerRows(f).map(delivery => noticeFamily(delivery)), boardStallEvents(f)], [['guard-terminal'], []], 'the owner is told the block alone')
+  f.runtime.updateBudget(f.owner, f.mission.id, { ...f.runtime.mission(f.mission.id).budget, deadlineAt: f.clock.now() + 3_600_000 }, 'More time')
+  await f.runtime.settle(f.mission.id)
+  await ticks(f, 2)
+  assert.equal(f.runtime.mission(f.mission.id).status, 'active', 'the owner resumed the mission')
+  const stalls = ownerRows(f).filter(delivery => noticeFamily(delivery) === 'board-stall')
+  assert.deepEqual([stalls.map(delivery => delivery.subjects), boardStallEvents(f).length], [[[`${dependent.id}@${taskOf(f.runtime, dependent.id).epoch}`]], 1], 'then the board classifier tells the stall, once')
+})
+
 test('an unreviewable submission is the review admission\'s decision alone: the board classifier adds no W3 stall, even for a review of it no live member can take', async t => {
   for (const review of [false, true]) {
     const f = await setup({ clock: new FakeClock() })
