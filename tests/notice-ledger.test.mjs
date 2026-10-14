@@ -1140,6 +1140,37 @@ test('every exit a failed dispatch\'s request names, performed through the owner
   assert.deepEqual((await remind(f, request)).map(delivery => delivery.subjects), [request.subjects], 'which is reminded while the task it names is stuck')
 })
 
+test('the isolation request is its violation\'s: keyed by the violation\'s text and naming the unfinished work of every member it lists, told once however often it refuses them; a changed violation is a second request, and only the violation the invariant lists is outstanding and reminded', async t => {
+  const f = await setup({ clock: new FakeClock(), workers: new FakeWorkers({ autoIdle: true }), budget: LONG })
+  t.after(f.cleanup)
+  const worktree = (member, workspace) => f.runtime.store.transaction(() => f.runtime.store.put('members', { ...f.runtime.store.get('members', member.id), workspace }))
+  // The reviewer is moved into the author's worktree, and both members hold work.
+  worktree(f.reviewer, f.runtime.store.get('members', f.author.id).workspace)
+  const reviewers = f.propose({ title: 'Reviewer work', assigneeId: f.reviewer.id, kind: 'research', checks: [] })
+  const authors = f.propose({ title: 'Author work' })
+  await quiet(f)
+  const request = (violation, tasks) => [`guard-terminal:workspace:workspace_terminal:isolation:${sha16(violation)}`, `the isolation invariant refuses dispatch: ${violation}`, tasks.map(task => subjectOf(f, task)).sort()]
+  const told = () => terminalRows(f, 'workspace').map(delivery => [delivery.notice.dedupKey, delivery.notice.reason, [...delivery.subjects].sort()])
+  const [sharing, ...others] = f.runtime.isolationViolations(f.mission.id)
+  assert.match(sharing, /share one provisioned worktree/)
+  assert.deepEqual(others, [])
+  const shared = request(sharing, [reviewers, authors])
+  assert.deepEqual(told(), [shared], 'one request for the violation: keyed by its text, recording it as the reason, and naming the unfinished work of both members it lists')
+  await ticks(f, 3)
+  assert.equal(told().length, 1, 'told once, though the invariant refuses both members on every pass')
+  // The violation changes: the author's worktree is lost altogether, so the reviewer shares none.
+  nextWindow(f)
+  worktree(f.author, '')
+  await quiet(f)
+  const [missing, ...rest] = f.runtime.isolationViolations(f.mission.id)
+  assert.match(missing, /has no provisioned isolated worktree/)
+  assert.deepEqual(rest, [], 'the invariant lists the new violation alone')
+  assert.deepEqual(told(), [shared, request(missing, [authors])], 'the changed violation is a second request, keyed by its own text and naming the work of the one member it lists')
+  const [first, second] = terminalRows(f, 'workspace')
+  assert.deepEqual([relevant(f, first), relevant(f, second)], [false, true], 'only the violation the invariant lists is outstanding: another violation being listed keeps no other request open')
+  assert.deepEqual([(await remind(f, first)).length, (await remind(f, second)).map(delivery => delivery.subjects)], [0, [second.subjects]], 'and only that one is reminded')
+})
+
 test('the isolation request is outstanding exactly while the invariant lists its violation: reminded while it does, whatever the exits it names do to the task through the owner\'s registered tools, and neither delivered nor reminded once the worktrees are repaired', async t => {
   /** The reviewer is moved into the author's worktree, and work is given to the reviewer. */
   const board = async () => {
