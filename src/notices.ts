@@ -1,10 +1,8 @@
 /**
- * Notices and witnesses: the owner-notice ledger (dedup by class + key), the
- * bounded outbox that delivers it outside the mission queue, and the durable
- * stall / coverage / integration-gap witnesses. M1a seam 3/7.
- *
- * Behaviour-identical to the code moved from src/runtime.ts: the runtime keeps
- * thin forwarding methods, so no call site changed.
+ * Notices and witnesses: the owner-notice ledger, the one record that the
+ * owner was told (dedup by class, key and sender, each key naming its fact),
+ * the bounded outbox that delivers it outside the mission queue, and the board
+ * classifier whose families each tell their own fact. M1a seam 3/7.
  */
 import { createHash, randomUUID } from 'node:crypto'
 import { covered, hasNotice, noticeLedger as projectNoticeLedger } from './arena.ts'

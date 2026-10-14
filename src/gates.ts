@@ -69,8 +69,9 @@ interface MissionFingerprintTask {
 /**
  * Stable digest `F(S)` of the owner-observable board (docs/no-silent-state-spec.md
  * §4). Every field is durable state; wall-clock fields are excluded by
- * construction, so an idle tick never changes the fingerprint and an unchanged
- * board cannot re-notify. Pure so a test can recompute it from the board.
+ * construction, so an idle tick never changes the fingerprint. It is an owner
+ * instrument and an audit field, never a notice's identity. Pure so a test can
+ * recompute it from the board.
  */
 export function missionFingerprint(board: MissionFingerprintBoard): string {
   const order = (a: { id: string }, b: { id: string }) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0)
@@ -164,9 +165,9 @@ export class RuntimeGates {
         ready: ready.has(task.id), unreviewed: unreviewed.has(task.id) })),
       members: members.map(member => ({ id: member.id, status: member.status })),
       // Owner-observable outbox backlog only: a delivery to a live member is the
-      // wake channel and is flushed in the same scheduling pass, and the owner
-      // notice being emitted is the witness for this state. Counting either
-      // would make every notice change the fingerprint it was keyed by.
+      // wake channel and is flushed in the same scheduling pass, and an owner
+      // notice is the ledger's record of a fact told about this board, not
+      // board state, so telling one never moves the digest.
       pendingDeliveries: this.rt.store.list('deliveries', missionId).filter(delivery => delivery.deliveredAt === undefined
         && delivery.to !== 'owner'
         && !members.some(member => member.id === delivery.to && member.status !== 'stopped')).length,

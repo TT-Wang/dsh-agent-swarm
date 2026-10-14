@@ -613,7 +613,7 @@ export type NoticeClass = 'decision' | 'blocker' | 'failure' | 'budget' | 'stall
  * `queued` is the outbox entry awaiting the owner session, and `claimed` is the
  * adapter delivery that put it in front of the owner. The dedup key is the
  * identity of the fact the notice tells (an escalation, never deduplicated,
- * carries the board digest), so the ledger proves which facts were announced.
+ * carries its own id), so the ledger proves which facts were announced.
  */
 export interface NoticeEnvelope {
   dedupKey: string

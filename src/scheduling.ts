@@ -361,10 +361,9 @@ export class Scheduling {
    *
    * Returns undefined — no owner decision — when:
    * - every dispatchable task carries an open attempt (the close-out path is
-   *   already nudging it; W6 owns that state), or
+   *   already nudging it; W6 owns that state);
    * - no eligible member exists at all (nothing is ready for a member; the board
-   *   is someone else's witness, not this notice's).
-   *
+   *   is someone else's witness, not this notice's); or
    * - every startable eligible member is refused by the isolation invariant, or
    *   has counted start failures (cleared by its next successful start) and is
    *   the task's assignee: the workspace terminal, and the start-failure notice
