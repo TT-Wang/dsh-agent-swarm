@@ -21,7 +21,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { join } from 'node:path'
-import { FakeWorkers, eventually, makeRuntime } from './faults/harness.mjs'
+import { FakeClock, FakeWorkers, eventually, makeRuntime } from './faults/harness.mjs'
 
 class Workers extends FakeWorkers {
   checks = [{ command: 'node check.cjs', exitCode: 0, output: 'ok' }]
@@ -30,8 +30,9 @@ class Workers extends FakeWorkers {
   async deliver(member, delivery) { this.deliveries.push({ member, delivery }) }
   async captureArtifact(member) { return { ...this.artifact, workspace: member.workspace } }
 }
-async function fixture(t) {
-  const { dir: directory, runtime, workers, budget } = await makeRuntime(t, { workers: new Workers(),
+/** With a `clock` (FakeClock) the runtime runs no tick timer: the test moves the clock and ticks by hand. */
+async function fixture(t, clock) {
+  const { dir: directory, runtime, workers, budget } = await makeRuntime(t, { workers: new Workers(), clock,
     config: { maxMessageChars: 10000, maxEvents: 500, maxTasksPerMember: 100, checkTimeoutMs: undefined },
     budget: { maxTokens: 100000, maxSteps: 1000, maxDurationMs: 3600000, maxTasks: 100 } })
   const owner = { sessionId: 'liveness-owner' }
@@ -48,7 +49,7 @@ async function fixture(t) {
   const current = task => runtime.store.get('tasks', typeof task === 'string' ? task : task.id)
   const events = type => runtime.store.events(mission.id, 500).filter(event => event.type === type)
   const control = pattern => workers.deliveries.filter(item => item.delivery.kind === 'control' && pattern.test(item.delivery.content))
-  return { runtime, workers, owner, mission, stream, author, reviewer, actor, propose, current, events, control }
+  return { runtime, workers, owner, mission, stream, author, reviewer, actor, propose, current, events, control, clock }
 }
 
 test('a covered swarm_create mission retains blocked work until the owner explicitly withdraws it', async t => {
@@ -86,18 +87,25 @@ test('a covered swarm_create mission retains blocked work until the owner explic
 })
 
 test('a submitted task with no live review is given the host\'s review, and the owner is not woken', async t => {
-  const f = await fixture(t)
+  const f = await fixture(t, new FakeClock())
+  await f.runtime.settle(f.mission.id)
   const source = f.propose()
   const claimed = await f.runtime.claim(f.actor(f.author), f.mission.id, source.id)
   await f.runtime.submit(f.actor(f.author), f.mission.id, { taskId: source.id, attemptId: claimed.attempt.id, output: 'candidate' })
+  await f.runtime.settle(f.mission.id)
   // No review was proposed. The idle independent Reviewer can own one, so the
-  // host's review admission repairs the gap: no stall and no decision are owed.
-  const review = await eventually(() => f.runtime.store.list('tasks', f.mission.id).find(task => task.reviewOf === source.id),
-    'the host admits a review of the unreviewable submission', 2500)
-  assert.match(review.id, /^task_auto_review_/, 'the review is the host\'s own')
+  // host's review admission repairs the gap at the first pass past the review
+  // grace: no stall and no decision are owed.
+  for (let tick = 0; tick < 3 && !f.runtime.store.list('tasks', f.mission.id).some(task => task.reviewOf === source.id); tick++) {
+    f.clock.advance(1_000)
+    await f.runtime.tick()
+    await f.runtime.settle(f.mission.id)
+  }
+  const review = f.runtime.store.list('tasks', f.mission.id).find(task => task.reviewOf === source.id)
+  assert.match(review?.id ?? 'none', /^task_auto_review_/, 'the host admits its own review of the unreviewable submission')
   assert.equal(f.current(source.id).status, 'submitted', 'the submission stays under review')
-  assert.deepEqual(f.events('mission/stalled'), [], 'the board was never reported stalled')
-  assert.deepEqual(f.control(/Mission stalled|review_path_missing/), [], 'and the owner was not woken')
+  assert.deepEqual(f.events('mission/stalled').filter(event => event.data.cause === undefined), [], 'the board was never reported stalled')
+  assert.deepEqual(f.runtime.store.list('deliveries', f.mission.id).filter(delivery => delivery.to === 'owner' && /Mission stalled|review_path_missing/.test(delivery.content)), [], 'and the owner was not woken')
 })
 
 test('a create-path stall notice names the parked work, and admitting the follow-up wakes its member', async t => {

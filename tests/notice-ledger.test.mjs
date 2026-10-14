@@ -603,7 +603,7 @@ test('a legacy source beside dead work and running work is ordinary stuck work: 
   assert.deepEqual(events(f.runtime, f.mission.id, 'task/review-blocked'), [], 'no review-path decision names it')
 })
 
-test('a queued W3 stall is withheld once its board can progress, and coverage-complete reminds the owner until the mission completes', async t => {
+test('a queued W3 stall is withheld once its board can progress, and coverage-complete reminds the owner while the board stays coverage-complete', async t => {
   const stalled = await setup({ clock: new FakeClock() })
   t.after(stalled.cleanup)
   await blockThroughReview(stalled, stalled.propose({ title: 'Dead end' }))
@@ -639,6 +639,12 @@ test('a queued W3 stall is withheld once its board can progress, and coverage-co
   assert.ok(reminder, 'the unresolved completion decision is reminded')
   assert.deepEqual(reminder.subjects, coverage.subjects, 'the reminder names the terminal work the decision named')
   assert.ok(reminder.subjects.includes(`${task.id}@${taskOf(f.runtime, task.id).epoch}`), 'among it the accepted deliverable')
+  // The owner admits more work through the registered tool: the board is no longer coverage-complete.
+  const tool = await ownerTools(f)
+  await tool('swarm_propose', { workstreamId: f.stream.id, title: 'More work', objective: 'Extend the mission', kind: 'research', scope: ['**'], outputs: [], acceptance: MISSION_ACCEPTANCE, checks: [] })
+  f.clock.advance(f.runtime.notices.obligationFollowupMs)
+  f.runtime.notices.absenceNet(f.mission.id)
+  assert.equal(ownerRows(f).find(delivery => delivery.notice.dedupKey === `obligation-followup:${coverage.id}:2`), undefined, 'its reminders stop once the board is no longer coverage-complete')
 })
 
 test('a mission blocked on its budget keeps its board decision: a told W3 stall stays outstanding and is reminded, a told coverage-complete stays outstanding, and no new one is told', async t => {
