@@ -232,8 +232,6 @@ export class Scheduling {
             if (this.rt.shuttingDown || this.rt.mission(missionId).status !== 'active') return false
             continue
           }
-          this.rt.startFailures.delete(member.id)
-          this.rt.clearProviderOutage(missionId, member.id)
           if (this.rt.shuttingDown || this.rt.mission(missionId).status !== 'active') return false
           // R10-09/S3: a parked member is dispatchable. The adapter's idle
           // precondition can be false for a parked agent (a pending inbox item or a

@@ -3903,7 +3903,7 @@ export class SwarmRuntime {
     const outage = member.providerOutage
     return outage !== undefined && this.now() - outage.at <= PROVIDER_OUTAGE_WINDOW_MS ? outage : undefined
   }
-  /** R11-01: a successful start or operation proves the route recovered. */
+  /** R11-01: a start that opened the member's session proves the route recovered. */
   clearProviderOutage(missionId: string, memberId: string): void {
     const member = this.store.get('members', memberId)
     if (member === undefined) return
@@ -4225,7 +4225,7 @@ export class SwarmRuntime {
     const configured = this.config.workerStartTimeoutMs
     const timeoutMs = configured !== undefined && Number.isFinite(configured) && configured > 0 ? Math.min(configured, 2147483647) : 60_000
     const timer = setTimeout(() => controller.abort(new Error(`Worker startup timed out after ${timeoutMs}ms`)), timeoutMs)
-    let failed = false
+    let failed = false, adopted = false
     const promise = Promise.resolve().then(async () => {
       try {
         // A start may adopt the member worktree, so it is re-validated first,
@@ -4244,7 +4244,7 @@ export class SwarmRuntime {
           const entry = this.workerStarts.get(member.id)!
           entry.nativePending = true
           void native.then(() => { entry.nativePending = false }, () => { entry.nativePending = false })
-          try { await abortableStart(native, controller.signal) }
+          try { adopted = await abortableStart(native, controller.signal) }
           finally {
             // Every body awaiting this start stamps its progress before the start commits its outcome.
             const bodies = entry.bodies ?? []
@@ -4268,10 +4268,10 @@ export class SwarmRuntime {
           this.defer(() => this.workers.stop(member.id))
           throw controller.signal.reason
         }
-        // A bookkeeping failure is not a failed native startup: it must not
-        // cancel a working handle or charge task recovery credit.
-        this.startFailures.delete(member.id)
-        this.clearProviderOutage(mission.id, member.id)
+        // A bookkeeping failure is not a failed native startup: it must not cancel
+        // a working handle or charge task recovery credit. An adopted session
+        // opened nothing, so it proves nothing about the route.
+        if (!adopted) { this.startFailures.delete(member.id); this.clearProviderOutage(mission.id, member.id) }
       } finally {
         clearTimeout(timer)
         options.signal?.removeEventListener('abort', cancel)

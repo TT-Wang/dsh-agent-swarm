@@ -231,7 +231,7 @@ test('a worker the host tore down first stops without reading its retired inbox,
     'the journal restores the accepted input the host teardown cleared')
 })
 
-test('an agent-loop reload ends the worker resident, so the next start opens a live agent with the input it accepted', async t => {
+test('a start of a running worker adopts its session and opens nothing; an agent-loop reload ends the resident, so the next start opens a live agent with the input it accepted', async t => {
   const f = await fixture(t, undefined, {
     beforeChunks: (_action, options, count) => count === 1 ? new Promise((_resolve, reject) => {
       options.signal.addEventListener('abort', () => reject(options.signal.reason), { once: true })
@@ -239,12 +239,15 @@ test('an agent-loop reload ends the worker resident, so the next start opens a l
   })
   await f.adapter.deliver(f.member, message(f.member))
   await eventually(() => f.requests.length === 1, 'the assignment turn never reached the provider', 10000)
+  const running = f.ctx.agents.get(SessionId(f.member.sessionId))
+  assert.equal(await f.adapter.start(f.spec), true, 'a start during the running turn adopts the resident')
+  assert.equal(f.ctx.agents.get(SessionId(f.member.sessionId)), running, 'on the same native agent')
   await f.adapter.deliver(f.member, { ...message(f.member, 'finding-one'), kind: 'finding', content: 'A finding for the next step.' })
   await f.agentLoop.dispose()
   assert.equal(f.adapter.isIdle(f.member.id), false, 'a worker whose agent the host retired is not startable')
   await f.ctx.plugin(AgentLoop, { agents: [] })
   // No adapter stop in between: the runtime's next dispatch pass only starts the member again.
-  await f.adapter.start(f.spec)
+  assert.equal(await f.adapter.start(f.spec), false, 'this start opened the session')
   const agent = f.ctx.agents.get(SessionId(f.member.sessionId))
   assert.notEqual(agent, undefined, 'the start opened a live agent')
   assert.deepEqual(agent.inbox.nextStep.map(item => item.id), ['swarm:finding-one'], 'the journal restores the accepted input the reload cleared')

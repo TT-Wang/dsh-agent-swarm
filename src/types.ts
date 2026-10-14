@@ -1047,7 +1047,8 @@ export interface WorkerAdapter {
   inspectDelivery(mission: Mission, resultCommit: string, signal?: AbortSignal): Promise<DeliveryInspection>
   applyDelivery(mission: Mission, resultCommit: string, signal?: AbortSignal): Promise<DeliveryApplication>
   prepareWorkspace(mission: Mission, memberId: string): Promise<string>
-  start(spec: WorkerSpec, signal?: AbortSignal): Promise<void>
+  /** Resolves true when it adopted the member's session already running: that start opened nothing. */
+  start(spec: WorkerSpec, signal?: AbortSignal): Promise<boolean>
   deliver(member: Member, delivery: Delivery): Promise<void>
   stop(memberId: string): Promise<void>
   /** Only returns operations still owned by a live, uncancelled adapter execution. */

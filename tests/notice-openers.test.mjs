@@ -33,14 +33,17 @@ test('each start failure below the bound is its own fact, opened by its event: f
   assert.deepEqual(failures(), [['failure 1 of 3', root], ['failure 2 of 3', root], ['failure 1 of 3', root]], 'a new run\'s first failure is told too')
 })
 
-test('a provider outage is its class on the member\'s open work, whatever each report\'s text: a retry, a report after a pass restarted the resident member and a return to a class already told are that fact; another class, or the class over new work inside the outage event window, is a new one', async t => {
+test('a provider outage is its class on the member\'s open work, whatever each report\'s text: a retry between scheduling passes, which adopt the running member and record no recovery, and a return to a class already told are that fact; another class, or the class over new work inside the outage event window, is a new one', async t => {
   const f = await fixture(t)
+  // The adapter's contract: a start of a member whose session is running adopts it and opens nothing.
+  const start = f.workers.start.bind(f.workers)
+  f.workers.start = async spec => { const running = f.workers.started.includes(spec.member.id); await start(spec); return running }
   const first = f.propose({ title: 'Running work' })
   const claimed = await f.runtime.claim(f.actor(f.author), f.mission.id, first.id)
   const outages = () => ownerRows(f, /^Author provider/).map(delivery => [delivery.content.match(/provider (\S+) outage/)[1], delivery.subjects])
   const subject = task => [`${task.id}@${f.runtime.store.get('tasks', task.id).epoch}`]
   const report = (outage, status, message) => f.workers.callbacks.providerOutage(f.author.id, { class: outage, status, message })
-  // What the adapter reports while it retries the preserved attempt in place, a scheduling pass between reports: each pass restarts the resident member.
+  // What the adapter reports while it retries the preserved attempt in place, a scheduling pass between reports.
   // Each report's text differs by its request id.
   for (let pass = 0; pass < 3; pass++) {
     report('rate-limit', 429, `Rate limit reached for requests. Request id: req_${pass}`)
@@ -48,9 +51,12 @@ test('a provider outage is its class on the member\'s open work, whatever each r
     f.runtime.kick(f.mission.id)
     await f.runtime.settle(f.mission.id)
   }
-  assert.ok(events(f.runtime, f.mission.id, 'provider/recovered').length >= 2, 'the passes restarted the member between reports')
+  assert.ok(f.workers.started.filter(id => id === f.author.id).length > 3, 'each pass started the member, adopting its running session')
+  assert.deepEqual([events(f.runtime, f.mission.id, 'provider/outage').length, events(f.runtime, f.mission.id, 'provider/recovered').length], [1, 0],
+    'an adoption opened nothing, so it records no recovery, and the window bounds the outage event to one')
+  assert.equal(f.runtime.store.get('members', f.author.id).providerOutage?.class, 'rate-limit', 'the outage stays recorded on the member')
   assert.equal(f.runtime.store.get('tasks', first.id).attempt?.id, claimed.attempt.id, 'on the same preserved attempt')
-  assert.deepEqual(outages(), [['rate-limit', subject(first)]], 'a report after a pass is the fact the owner holds')
+  assert.deepEqual(outages(), [['rate-limit', subject(first)]], 'a retry is the fact the owner holds')
   report('unavailable', 503, 'upstream down')
   report('rate-limit', 429, 'Rate limit reached for requests')
   assert.deepEqual(outages(), [['rate-limit', subject(first)], ['unavailable', subject(first)]], 'another class is told; a return to a class told on this work is not')

@@ -590,7 +590,7 @@ export class HarnessWorkers implements WorkerAdapter {
     return applyDelivery({ source: mission.workspace, baselineCommit: mission.baseline.snapshotCommit, resultCommit }, signal)
   }
 
-  async start(spec: WorkerSpec, signal?: AbortSignal): Promise<void> {
+  async start(spec: WorkerSpec, signal?: AbortSignal): Promise<boolean> {
     signal?.throwIfAborted()
     if (this.closing) throw new Error('Worker adapter is disposed')
     this.observer()
@@ -599,13 +599,15 @@ export class HarnessWorkers implements WorkerAdapter {
       if (existing.spec.member.sessionId !== spec.member.sessionId) throw new Error('Worker identity changed')
       if (existing.stopping !== undefined) { await existing.stopping; return await this.start(spec, signal) }
       existing.abort.signal.throwIfAborted()
-      return await this.awaitOpening(existing, signal)
+      await this.awaitOpening(existing, signal)
+      return true
     }
     const resident: Resident = { spec, abort: new AbortController(), opening: Promise.resolve(), observations: new Set(), delivered: new Set(), recoveryInbox: new Map(), journalWrites: Promise.resolve(), totalTokens: 0, usage: emptyBuckets(), lastPromptTokens: 0, compactionRequested: false, recordedExecutions: new WeakSet(), rejectedPendingStep: false, activities: new Map() }
     this.residents.set(spec.member.id, resident)
     resident.opening = this.open(resident)
     try { await this.awaitOpening(resident, signal) }
     catch (error) { if (this.residents.get(spec.member.id) === resident) this.residents.delete(spec.member.id); throw error }
+    return false
   }
 
   private async awaitOpening(resident: Resident, signal?: AbortSignal): Promise<void> {
