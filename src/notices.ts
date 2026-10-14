@@ -589,13 +589,15 @@ export class Notices {
    */
   notify(missionId: string, content: string, subjects: string[], options: NotifyOptions): boolean {
     const { fact, identity } = this.noticeIdentity(missionId, subjects, options)
-    return !hasNotice(this.rt.store.list('deliveries', missionId), identity) && (this.enqueueOwnerNotice(missionId, content, identity, { subjects: fact.subjects, fact }), true)
+    if (hasNotice(this.rt.store.list('deliveries', missionId), identity)) return false
+    this.enqueueOwnerNotice(missionId, content, identity, fact)
+    return true
   }
 
   /** Tell the owner one fact in a transaction of its own: a fact the ledger already holds (its class, key and sender) commits nothing; otherwise one commit writes its row, then `then`, the record that exists only with that row. */
   tell(missionId: string, content: string, subjects: string[], options: NotifyOptions, then?: () => void): boolean {
     const { fact, identity } = this.noticeIdentity(missionId, subjects, options)
-    return !hasNotice(this.rt.store.list('deliveries', missionId), identity) && this.rt.commit(missionId, () => { this.enqueueOwnerNotice(missionId, content, identity, { subjects: fact.subjects, fact }); then?.(); return true })
+    return !hasNotice(this.rt.store.list('deliveries', missionId), identity) && this.rt.commit(missionId, () => { this.enqueueOwnerNotice(missionId, content, identity, fact); then?.(); return true })
   }
 
   /**
@@ -613,36 +615,34 @@ export class Notices {
   }
 
   /**
-   * Record one owner-addressed notice durably under the identity its caller
-   * derived and found off the ledger (`noticeIdentity` for a fact; an escalation
-   * names its own and is never deduplicated). Returns the delivery that carries
-   * it (over the wake budget, the window's summary). Callers may already be
+   * Record one owner-addressed fact durably under the identity its caller found
+   * off the ledger (`noticeIdentity`; an escalation's own, never deduplicated),
+   * with `row`, what only its own row carries. Returns the delivery that carries
+   * the fact (over the wake budget, the window's summary). Callers may already be
    * inside a transaction; this method never opens one.
    */
-  enqueueOwnerNotice(missionId: string, content: string, identity: { class: NoticeClass; dedupKey: string; from: string }, extra: Partial<Delivery> & { fact?: NoticeFactRecord }): Delivery {
-    const fact = extra.fact
+  enqueueOwnerNotice(missionId: string, content: string, identity: { class: NoticeClass; dedupKey: string; from: string }, fact: NoticeFactRecord, row: Pick<Partial<Delivery>, 'id' | 'escalation'> = {}): Delivery {
     const { class: noticeClass, dedupKey, from } = identity
     const at = this.rt.now()
     // R17-G4: one per-owner budget bounds every family together. Over budget, the
     // fact is carried by the window's degraded summary instead of being dropped.
     // A covered fact is no wake, so it neither spends a slot nor joins a summary.
-    const summary = fact?.coveredBy === undefined ? this.wakeWindowFor(missionId, at) : undefined
+    const summary = fact.coveredBy === undefined ? this.wakeWindowFor(missionId, at) : undefined
     if (summary !== undefined && summary.count >= this.wakeBudget) {
-      const facts = fact?.facts ?? [`[${fact?.trigger ?? noticeClass}] ${content}`]
+      const facts = fact.facts ?? [`[${fact.trigger}] ${content}`]
       return this.appendToWakeSummary(missionId, summary, facts, [{
         class: noticeClass, dedupKey, from, contentDigest: createHash('sha256').update(content).digest('hex'),
-      }, ...(fact?.aggregatedIdentities ?? [])], at, {
-        class: noticeClass, dedupKey, from, subjects: fact?.subjects ?? [],
-        trigger: fact?.trigger ?? noticeClass, reason: fact?.reason ?? '', createdAt: at, questionId: fact?.questionId, deliveryFailureId: fact?.deliveryFailureId,
+      }, ...(fact.aggregatedIdentities ?? [])], at, {
+        class: noticeClass, dedupKey, from, subjects: fact.subjects,
+        trigger: fact.trigger, reason: fact.reason, createdAt: at, questionId: fact.questionId, deliveryFailureId: fact.deliveryFailureId,
       })
     }
-    const { fact: _fact, ...deliveryExtra } = extra
     const delivery: Delivery = {
       id: id('msg'), missionId, from, to: 'owner', kind: noticeClass === 'escalation' ? 'escalation' : 'control',
       content, createdAt: at,
-      notice: { dedupKey, class: noticeClass, sentAt: at, queuedAt: at, ...(fact === undefined ? {} : { subjects: fact.subjects, trigger: fact.trigger, reason: fact.reason, facts: fact.facts, aggregatedIdentities: fact.aggregatedIdentities, questionId: fact.questionId, deliveryFailureId: fact.deliveryFailureId,
-        ...(fact.coveredBy === undefined ? {} : { coveredBy: fact.coveredBy }), ...(fact.statement === undefined ? {} : { statement: fact.statement }) }) } as NonNullable<Delivery['notice']>,
-      ...deliveryExtra,
+      notice: { dedupKey, class: noticeClass, sentAt: at, queuedAt: at, subjects: fact.subjects, trigger: fact.trigger, reason: fact.reason, facts: fact.facts, aggregatedIdentities: fact.aggregatedIdentities, questionId: fact.questionId, deliveryFailureId: fact.deliveryFailureId,
+        ...(fact.coveredBy === undefined ? {} : { coveredBy: fact.coveredBy }), ...(fact.statement === undefined ? {} : { statement: fact.statement }) } as NonNullable<Delivery['notice']>,
+      ...row, subjects: fact.subjects,
     }
     const limit = Math.min(MAX_OWNER_NOTICE_CHARS, this.rt.config.maxMessageChars)
     if (content.length > limit) {

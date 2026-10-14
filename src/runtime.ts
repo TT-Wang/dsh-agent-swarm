@@ -1951,18 +1951,18 @@ export class SwarmRuntime {
       } else if ((task.attempt?.ownerId ?? task.assigneeId) !== member.id) throw new Error('Escalation task is not owned by the caller')
     }
     const escalationId = id('esc'), dedupKey = `escalation:${escalationId}`
-    const deliveryId = id('msg')
     const escalation: Escalation = {
       id: escalationId, missionId, fromMemberId: member.id,
       ...(taskId === undefined ? {} : { taskId }), ...(attemptId === undefined ? {} : { attemptId }),
-      body, dedupKey, createdAt: this.now(), deliveryId,
+      body, dedupKey, createdAt: this.now(), deliveryId: id('msg'),
     }
     this.commit(missionId, () => {
-      // R15-A1: the escalation names the task or attempt it is about, so the
-      // owner ledger shows the subject without reparsing the body.
-      this.notices.enqueueOwnerNotice(missionId, body, { class: 'escalation', dedupKey, from: member.id }, { id: deliveryId, escalation, subjects: this.noticeSubjectsFor(missionId, { taskId, memberId: member.id }) })
+      // R15-A1: its fact names the task or attempt it is about. Its delivery is the
+      // one that carries it: its own row, or over the wake budget the summary.
+      escalation.deliveryId = this.notices.enqueueOwnerNotice(missionId, body, { class: 'escalation', dedupKey, from: member.id },
+        { subjects: this.noticeSubjectsFor(missionId, { taskId, memberId: member.id }), trigger: 'escalation/raised', reason: '' }, { id: escalation.deliveryId, escalation }).id
       this.store.event(missionId, 'escalation/raised', member.id, {
-        escalationId: escalation.id, memberId: member.id, deliveryId,
+        escalationId: escalation.id, memberId: member.id, deliveryId: escalation.deliveryId,
         ...(taskId === undefined ? {} : { taskId }), ...(attemptId === undefined ? {} : { attemptId }),
         dedupKey, bodyChars: body.length,
       })

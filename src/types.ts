@@ -655,7 +655,7 @@ export interface Escalation {
   /** Its own identity on the deliveries ledger, `escalation:<id>`: an escalation is never deduplicated. */
   dedupKey: string
   createdAt: number
-  /** Delivery record that carries it to the owner through the notice path. */
+  /** Delivery that carries it to the owner: its own row, or over the wake budget the window's summary. */
   deliveryId: string
 }
 export interface Delivery {

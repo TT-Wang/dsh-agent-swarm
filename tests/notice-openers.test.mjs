@@ -143,6 +143,20 @@ test('a worker\'s refused proposal is keyed by its reason as well as its limit: 
   assert.deepEqual(refusals, ['mission task budget exhausted (2/2 tasks admitted) (limit 2)', 'mission experiment budget exhausted (2/2 experiments admitted) (limit 2)'])
 })
 
+test('an escalation names its fact like every notice: over the wake budget the window\'s summary carries it with its identity and subjects, and its deliveryId names that summary', async t => {
+  const f = await fixture(t)
+  const work = f.propose({ title: 'Assigned work' })
+  f.runtime.notices.wakeBudget = 1
+  f.runtime.commit(f.mission.id, () => f.runtime.notify(f.mission.id, 'An earlier owner decision', [`mission:${f.mission.id}`], { trigger: 'test/earlier', reason: 'spends the window' }))
+  const escalation = f.runtime.escalate(f.actor(f.author), f.mission.id, { body: 'Please decide how to proceed.' })
+  const carrier = f.runtime.store.get('deliveries', escalation.deliveryId)
+  assert.match(carrier?.notice?.dedupKey ?? 'no delivery', /^wake-budget:/, 'the deliveryId names the summary that carries it')
+  const part = carrier.notice.aggregatedFacts.find(constituent => constituent.dedupKey === escalation.dedupKey)
+  assert.deepEqual([part?.class, part?.from, part?.trigger, part?.subjects], ['escalation', f.author.id, 'escalation/raised', [`${work.id}@${taskOf(f.runtime, work.id).epoch}`]],
+    'the summary keeps the escalation\'s identity, sender and subjects')
+  assert.deepEqual(events(f.runtime, f.mission.id, 'escalation/raised').map(event => event.data.deliveryId), [escalation.deliveryId], 'the event records the same delivery')
+})
+
 test('a notice that names no fact is refused where it is written: NotifyOptions requires a trigger or an explicit key', () => {
   // The refusal is the compiler's: without a trigger or a key, the class alone
   // would name the fact, and every fact of that class on these subjects with it.
