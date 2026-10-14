@@ -627,6 +627,52 @@ test('a wedged pass is named once per naming fact, on the ledger alone: a body o
   assert.equal(Object.hasOwn(f.runtime.store.get('missions', f.mission.id), 'schedulingWedgeNotice'), false, 'nothing on the mission row records a naming')
 })
 
+test('a wedged pass\'s naming is the W2 witness of the board digest it was told on, like every owner decision and never the board\'s W3 stall: once the body settles, a publication on that digest judges nothing again, a body on a held fact witnesses nothing, and a moved digest is judged', async t => {
+  const f = await setup({ clock: new FakeClock() })
+  t.after(f.cleanup)
+  // All of the mission's work runs under a live lease, so the board classifier owes it nothing (row 3): only the naming witnesses this board.
+  const task = f.propose({ title: 'Held by live work' })
+  await f.runtime.claim(f.actor(f.author), f.mission.id, task.id)
+  await f.runtime.settle(f.mission.id)
+  const scheduling = f.runtime.scheduling, notices = f.runtime.notices
+  const witness = () => f.runtime.store.get('missions', f.mission.id).witness
+  const board = f.runtime.fingerprint(f.mission.id)
+  assert.notEqual(witness()?.fingerprint, board, 'nothing has witnessed this board digest yet')
+  /** Every run of the classifiers past the witness dedup, by the branch that ran them. */
+  const judged = []
+  const judge = notices.judgeBoard.bind(notices)
+  notices.judgeBoard = (view, options, roots) => { judged.push(options.wedged === true ? 'wedged' : 'unwedged'); return judge(view, options, roots) }
+  /** A body past the bound live work holds a naming to, as the tick watchdog finds and marks it. */
+  const body = operationId => {
+    const pass = { id: scheduling.passKey(f.mission.id), operationId, missionId: f.mission.id, startedAt: f.clock.now() - f.runtime.stallPassReleaseBoundMs,
+      revisionBefore: f.runtime.store.revision(), fingerprintBefore: f.runtime.fingerprint(f.mission.id) }
+    scheduling.passes.set(f.mission.id, pass)
+    t.after(() => scheduling.closePass(f.mission.id, pass))
+    scheduling.checkSchedulingPasses()
+    return pass
+  }
+  const first = body('operation_wedge_witness_1')
+  assert.equal(wedgeRows(f).length, 1, 'the body is named')
+  const stamped = witness()
+  assert.deepEqual(stamped, { fingerprint: board, kind: 'W2', at: f.clock.now() }, 'the naming is the W2 witness of the board digest it was told on')
+  await Promise.resolve()
+  assert.deepEqual(judged, ['wedged'], 'the naming\'s own publication judges the board past the witness, with the wedged branch')
+  // The hung call returns: the pass end is a publication on the digest the naming witnessed.
+  scheduling.closePass(f.mission.id, first)
+  await Promise.resolve()
+  await f.runtime.flushOutbox(f.mission.id)
+  assert.equal(f.runtime.fingerprint(f.mission.id), board)
+  assert.deepEqual([judged, witness(), ownerRows(f).length], [['wedged'], stamped, 1], 'that digest is witnessed: the classifier is not run again, and nothing is told or stamped')
+  // The board digest moves, and a second body wedges on the naming fact the owner holds.
+  f.runtime.commit(f.mission.id, () => f.runtime.store.put('members', { ...f.runtime.store.get('members', f.reviewer.id), phase: 'stopped' }))
+  await Promise.resolve()
+  const moved = f.runtime.fingerprint(f.mission.id)
+  assert.notEqual(moved, board, 'the board digest moved')
+  assert.deepEqual(judged, ['wedged', 'unwedged'], 'a publication on a digest no notice witnessed is judged')
+  const second = body('operation_wedge_witness_2')
+  assert.deepEqual([second.escalatedAt !== undefined, wedgeRows(f).length, witness()], [true, 1, stamped], 'a body on a held naming fact writes nothing, so it witnesses nothing: the moved digest is not stamped')
+})
+
 test('a wedged pass\'s naming is outstanding while the work it named is unfinished at the epochs it named, whatever a body does now: it stays the owner\'s to read once the body settles, a later body on the same fact is told by that row, and it ends when the named work moves on', async t => {
   const f = await setup({ clock: new FakeClock() })
   t.after(f.cleanup)
