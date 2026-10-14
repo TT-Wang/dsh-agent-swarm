@@ -352,6 +352,7 @@ test('D3: a submission whose review need ripened, beside a dependent that waits 
 })
 
 test('coverage-complete is told whenever completion is allowed, whatever the stall predicate says: beside an exempt experiment whose worker stop is still settling', async t => {
+  // A pin of critique change 6 against 6f87081, which told the board's fact only on a board with no live work; 29a0268 tells it too.
   let release
   const settling = new Promise(resolve => { release = resolve })
   const f = await setup({ clock: new FakeClock(), budget: { maxExperiments: 1 } })
@@ -903,6 +904,7 @@ test('a provider outage\'s notice names the member\'s open work or the mission r
 })
 
 test('a judgement of a board whose fact the owner holds commits nothing, and a tick judges the board at most twice: the dispatch question, the fall-through, the W3 stall', async t => {
+  // A pin of critique change 4: it fails when a branch skips its ledger check. 29a0268 passes it once its W3 stall is read under the family it had there.
   const boards = {
     'dispatch-question': async () => {
       const f = await setup({ clock: new FakeClock() })
