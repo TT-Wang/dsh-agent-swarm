@@ -194,7 +194,7 @@ export class Scheduling {
    */
   async dispatch(mission: Mission, missionId: string, pass?: SchedulingPass): Promise<boolean> {
         // R17-G1: the dispatcher reads the SAME shared interpretation every
-        // owner-facing generator consumes (`ready`, `dispatchable`, the task and
+        // owner-facing generator consumes (`eligible`, `dispatchable`, the task and
         // member rows), so no notice can describe a board the dispatcher would
         // act on differently. The view is rebuilt after each await, so it is
         // never staler than the per-step store reads it replaces.
@@ -262,7 +262,7 @@ export class Scheduling {
             continue
           }
           const all = view.tasks
-          const ready = all.filter(t => view.ready(t, member)).sort((a, b) => b.priority - a.priority || a.createdAt - b.createdAt)
+          const ready = all.filter(t => view.eligible(t, member)).sort((a, b) => b.priority - a.priority || a.createdAt - b.createdAt)
           // R12-F9 (a task whose text assumes prior work no content-carrying edge
           // provides) is refused where a dependency set is written: plan
           // validation, propose() and the owner's `changes.dependencies`
@@ -383,7 +383,7 @@ export class Scheduling {
       // An open attempt is not a dispatch candidate: the close-out path nudges it
       // (W6) or the lease path recovers it, and a second owner wake would be noise.
       if (task.attempt !== undefined) continue
-      const eligible = members.filter(member => memberPhaseOf(member) !== 'stopped' && !pendingStopOwner(tasks, member.id) && this.ready(task, member, tasks))
+      const eligible = members.filter(member => this.eligible(task, member, tasks))
       if (!eligible.length) continue
       const subjects = [taskSubject(task)]
       const dedupKey = `dispatch-question:${missionId}:${task.id}@${task.epoch}`
@@ -406,6 +406,9 @@ export class Scheduling {
     return this.readinessBlocker(task, member, tasks) === undefined
   }
 
+  /** The dispatcher's eligibility, which every reader of a dispatchable task asks: a live member that owes no stop, for which the task is ready. */
+  eligible(task: Task, member: Member, tasks: Task[]): boolean { return memberPhaseOf(member) !== 'stopped' && !pendingStopOwner(tasks, member.id) && this.ready(task, member, tasks) }
+
   /** The same readiness decision supplies a concrete refusal without another policy model. */
   readinessBlocker(task: Task, member: Member, tasks?: Task[]): string | undefined {
     if (task.status !== 'pending') return `task ${task.id} is ${task.status}; inspect its current attempt, artifact or recovery condition with swarm_observe(taskId)`
@@ -420,11 +423,9 @@ export class Scheduling {
     // now. A busy, stopping, retired or non-independent preference cannot reserve
     // an untouched task while another member is idle. This adds no reservation.
     const preferred = this.rt.store.get('members', task.assigneeId)
-    const availableForBorrowing = preferred === undefined || memberPhaseOf(preferred) === 'stopped'
+    const availableForBorrowing = preferred === undefined || !this.eligible(task, preferred, all)
       || all.some(candidate => candidate.status === 'running' && candidate.attempt?.ownerId === preferred.id)
-      || pendingStopOwner(all, preferred.id)
       || this.startBlocker(preferred) !== undefined
-      || !this.capable(task, preferred, all)
     return availableForBorrowing ? undefined : `preferred member ${task.assigneeId} is available for this task; the owner can amend assigneeId to change the preference`
   }
 

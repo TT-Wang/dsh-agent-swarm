@@ -12,7 +12,7 @@ import { hostContextOf, memberPhaseOf } from './projection.ts'
 import { formatDiagnostic, missingReviewDiagnostic } from './admission.ts'
 import { guardTerminalKey, requireText } from './refusals.ts'
 import { taskGraphIndex } from './task-graph.ts'
-import { blockCauses, pendingStopOwner, stopFaultKey } from './attempts.ts'
+import { blockCauses, stopFaultKey } from './attempts.ts'
 import { isolationOpener } from './workspace-admission.ts'
 import { PolicyError } from './policy-error.ts'
 import type { SwarmRuntime } from './runtime.ts'
@@ -321,9 +321,9 @@ export interface MissionInterpretation {
   nonTerminal: Task[]
   stallRoots: Task[]
   replaced: Set<string>
-  /** The dispatcher's own readiness predicate, bound to these rows. */
-  ready: (task: Task, member: Member, tasks?: Task[]) => boolean
-  /** Pending tasks a runnable member that owes no stop can run right now (the dispatcher's question and eligibility). */
+  /** The dispatcher's eligibility (`Scheduling.eligible`), bound to these rows. */
+  eligible: (task: Task, member: Member) => boolean
+  /** Pending tasks an eligible runnable member can run right now (the dispatcher's question). */
   dispatchable: Task[]
   /** The review admission's sources (`unreviewedSources`). */
   unreviewed: Task[]
@@ -820,7 +820,7 @@ export class Notices {
    * R17-G1: the ONE shared interpretation of a mission's durable state. Every
    * owner-facing generator reads this view instead of re-reading raw rows and
    * re-deriving its own answer, and the dispatcher's own predicates
-   * (`ready`, `unfinishedDependencies`, `reviewable`) are what it exposes, so a
+   * (`eligible`, `unfinishedDependencies`, `reviewable`) are what it exposes, so a
    * notice can never describe a board the dispatcher would act on differently.
    * Read-only: it writes nothing and holds no cache.
    */
@@ -834,11 +834,11 @@ export class Notices {
       nonTerminal: tasks.filter(task => !TERMINAL_STATES.has(task.status)),
       stallRoots: this.stallRoots(tasks),
       replaced: replacementCoverage(tasks),
-      ready: (task, member, rows = tasks) => this.rt.ready(task, member, rows),
+      eligible: (task, member) => this.rt.eligible(task, member, tasks),
       // The dispatcher's own question and its own predicates, computed once here
       // so a notice can never describe a board the dispatcher would act on
-      // differently (`ready`, `reviewable`, `unschedulable`, `stalled`).
-      dispatchable: tasks.filter(task => task.status === 'pending' && runnable.some(member => !pendingStopOwner(tasks, member.id) && this.rt.ready(task, member, tasks))),
+      // differently (`eligible`, `reviewable`, `unschedulable`, `stalled`).
+      dispatchable: tasks.filter(task => task.status === 'pending' && runnable.some(member => this.rt.eligible(task, member, tasks))),
       unreviewed: unreviewedSources(this.rt, tasks),
       unschedulable: this.rt.unschedulable(mission, tasks, members),
       stalled: this.rt.stalled(tasks, members),
@@ -1268,7 +1268,7 @@ export class Notices {
     const runnable = view.runnable
     // R17-G1: the dispatcher's own `dispatchable` set, from the shared view.
     const dispatchable = options.wedged === true
-      ? tasks.filter(task => task.status === 'pending' && members.some(member => memberPhaseOf(member) !== 'stopped' && !pendingStopOwner(tasks, member.id) && view.ready(task, member)))
+      ? tasks.filter(task => task.status === 'pending' && members.some(member => view.eligible(task, member)))
       : view.dispatchable
     if (dispatchable.length) {
       // A handle that is working is not a silent board: when no runnable member
