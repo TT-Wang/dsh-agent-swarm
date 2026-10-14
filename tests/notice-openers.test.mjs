@@ -119,6 +119,18 @@ test('a worker\'s refused proposal is one fact per reason and limit, and each ex
   assert.deepEqual(refusals(), [first, 'mission task budget exhausted (2/2 tasks admitted) (limit 2)'], 'the refusal under the raised limit is a new fact')
 })
 
+test('a worker\'s refused proposal is keyed by its reason as well as its limit: a task-budget and an experiment-budget refusal from one proposer at one limit value are two facts', async t => {
+  const f = await fixture(t, { budget: { maxTasks: 2, maxExperiments: 2 } })
+  f.propose({ title: 'First experiment', experiment: true })
+  f.propose({ title: 'Second experiment', experiment: true })
+  const proposal = extra => ({ outputs: [], workstreamId: f.stream.id, title: 'More', objective: 'More work', kind: 'research', scope: ['**'], acceptance: MISSION_ACCEPTANCE, checks: [], ...extra })
+  assert.throws(() => f.runtime.propose(f.actor(f.author), f.mission.id, proposal()), /task budget exhausted \(2\/2 tasks admitted\) \(limit 2\)/)
+  f.runtime.updateBudget(f.owner, f.mission.id, { ...f.runtime.mission(f.mission.id).budget, maxTasks: 5 }, 'Room for tasks, not experiments')
+  assert.throws(() => f.runtime.propose(f.actor(f.author), f.mission.id, proposal({ experiment: true })), /experiment budget exhausted \(2\/2 experiments admitted\) \(limit 2\)/)
+  const refusals = ownerRows(f, /^\[budget_terminal\]/).filter(delivery => delivery.from === f.author.id).map(delivery => delivery.content.match(/was refused: (.*\(limit \d+\))\)/)[1])
+  assert.deepEqual(refusals, ['mission task budget exhausted (2/2 tasks admitted) (limit 2)', 'mission experiment budget exhausted (2/2 experiments admitted) (limit 2)'])
+})
+
 test('a notice that names no fact is refused where it is written: NotifyOptions requires a trigger or an explicit key', () => {
   // The refusal is the compiler's: without a trigger or a key, the class alone
   // would name the fact, and every fact of that class on these subjects with it.
