@@ -1,47 +1,33 @@
 /**
- * Arena protocols: the mission-state fingerprint, the aggregate proposal
- * safety limit, and the read-only notice/escalation projections.
+ * Arena protocols: pending readiness and the read-only notice/escalation
+ * projections, with the deliveries ledger's one dedup rule (`hasNotice`).
  *
  * Everything here is a pure function over durable records so the runtime, the
  * tests and the UI projection derive the same answer without a second policy
  * engine. The runtime remains the only writer; these helpers never mutate.
- *
- * The arena ledger digest is the notice-ledger projection of the `F(S)` of
- * `docs/no-silent-state-spec.md` §4: a stable digest of the owner-observable
- * board that excludes wall-clock fields, so an unchanged state keeps its key
- * and a changed state gets a new one. Owner notices record it as their dedup
- * key (spec §3, §6), which is what lets the ledger prove which states were
- * announced. The no-silent-state invariant itself uses the runtime's exported
- * `missionFingerprint(board)` (T1a's 32-hex F(S)).
+ * A notice's identity is the fact it names (`factKey`, src/notices.ts); the
+ * board digest `F(S)` is the runtime's `missionFingerprint`, an instrument.
  */
 import { createHash } from 'node:crypto'
 import { taskGraphIndex, type TaskGraphIndex } from './task-graph.ts'
 import { assignmentAllows, canOwnReview } from './assignment.ts'
-import { liveReviewFor } from './admission.ts'
-import { memberPhaseOf } from './projection.ts'
-import type { Delivery, Escalation, Evidence, Member, Mission, NoticeClass, Task } from './types.ts'
+import type { Delivery, Escalation, Member, Mission, NoticeClass, Task } from './types.ts'
 
 /** Owner-observable board, as durable records; no wall-clock value participates. */
-interface FingerprintInput {
+interface ArenaInput {
   mission: Pick<Mission, 'status'>
   tasks: readonly Task[]
   members: readonly Member[]
-  evidence: readonly Evidence[]
   deliveries: readonly Delivery[]
 }
 
 const byId = <T extends { id: string }>(left: T, right: T): number => (left.id < right.id ? -1 : left.id > right.id ? 1 : 0)
 
-/** A submitted task's live review path: the scheduler's one live-review rule (`liveReviewFor`). */
-function hasReviewPath(tasks: readonly Task[], members: readonly Member[], source: Task): boolean {
-  return liveReviewFor(tasks, source, new Set(members.filter(member => memberPhaseOf(member) !== 'stopped').map(member => member.id))) !== undefined
-}
-
 /**
  * Count pending tasks that a live member could actually run, versus pending
  * tasks that are blocked by dependencies, a dead assignee or review
  * independence. `waiting` counts as live: dispatch to a waiting member is
- * fresh input (R10-09/S3), so the fingerprint must not call it not-ready.
+ * fresh input (R10-09/S3), so readiness must not call it not-ready.
  */
 export function pendingReadiness(tasks: readonly Task[], members: readonly Member[], graph: TaskGraphIndex = taskGraphIndex(tasks)): { ready: number; notReady: number } {
   const live = members.filter(member => member.status === 'idle' || member.status === 'waiting')
@@ -58,53 +44,12 @@ export function pendingReadiness(tasks: readonly Task[], members: readonly Membe
   return { ready, notReady }
 }
 
-/**
- * The arena ledger digest: the notice-ledger projection of `F(S)` per spec §4.
- * The canonical projection is sorted everywhere, contains no timestamp, and is
- * hashed so the notice ledger and its tests can compare states by value. The
- * no-silent-state invariant itself uses the runtime's exported
- * `missionFingerprint(board)` (T1a's 32-hex F(S)); this 64-hex digest is the
- * ledger's dedup-key projection and is deliberately a different value domain.
- */
-export function arenaLedgerDigest(input: FingerprintInput): string {
-  return digest(input, false)
-}
-
-/**
- * The notice dedup key: the arena ledger digest with the owner-notice channel
- * itself excluded from the pending-delivery count. A notice is the witness for
- * a state, so counting the witness as board state would change the very key it
- * was recorded under and make the ledger suppress nothing. It equals
- * `arenaLedgerDigest` for every state with no owner notice in flight, which is
- * the normal case because the outbox drains on the same tick.
- */
-export function noticeFingerprint(input: FingerprintInput): string {
-  return digest(input, true)
-}
-
 /** A covered owner fact (`coveredBy`, src/notices.ts) is never sent: the delivery covering it carried the obligation. */
 export const covered = (delivery: Pick<Delivery, 'notice'>): boolean => (delivery.notice as { coveredBy?: string } | undefined)?.coveredBy !== undefined
 
 /** Whether a delivery is still owed to its recipient; a covered fact never is. */
 export function awaitsDelivery(delivery: Pick<Delivery, 'deliveredAt' | 'notice'>): boolean {
   return delivery.deliveredAt === undefined && !covered(delivery)
-}
-
-function digest(input: FingerprintInput, excludeNotices: boolean, readiness = pendingReadiness(input.tasks, input.members)): string {
-  const { mission, tasks, members, evidence, deliveries } = input
-  const canonical = {
-    status: mission.status,
-    tasks: [...tasks].sort(byId).map(task => [task.id, task.status, task.attempt?.ownerId ?? null]),
-    ready: readiness.ready,
-    notReady: readiness.notReady,
-    submittedUnreviewed: tasks.filter(task => task.status === 'submitted' && !hasReviewPath(tasks, members, task)).map(task => task.id).sort(),
-    members: [...members].sort(byId).map(member => [member.id, member.status]),
-    pendingDeliveries: deliveries.filter(delivery => awaitsDelivery(delivery) && !(excludeNotices && delivery.notice !== undefined)).length,
-    challenged: evidence.filter(item => item.status === 'challenged').map(item => item.id).sort(),
-    ceilings: tasks.filter(task => task.ceiling !== undefined)
-      .map(task => [task.id, task.ceiling!.dimension, task.ceiling!.limit, task.ceiling!.used]).sort((left, right) => String(left[0]).localeCompare(String(right[0]))),
-  }
-  return createHash('sha256').update(JSON.stringify(canonical)).digest('hex')
 }
 
 /** One owner notice as the ledger exposes it: immutable, read-only projection. */
@@ -157,12 +102,11 @@ export function noticeLedger(deliveries: readonly Delivery[], limit = 20): Notic
 }
 
 /**
- * Whether the same class already announced the same state fingerprint from the
- * same sender. `content` narrows the match to an identical message. A different
- * message in the same state is a different decision and must still reach the
- * owner; an identical repeat is spam. Summaries retain the original identities
- * on their durable row, so aggregation, delivery and restart cannot re-arm a
- * fact. Older summaries without those identities cannot prove a match.
+ * Whether the ledger already holds the fact `dedupKey` names, of the same class
+ * from the same sender. `content` narrows the match to an identical message.
+ * Summaries retain the original identities on their durable row, so
+ * aggregation, delivery and restart cannot re-arm a fact. Older summaries
+ * without those identities cannot prove a match.
  */
 export function hasNotice(deliveries: readonly Delivery[], match: { class: NoticeClass; dedupKey: string; from: string; content?: string }): boolean {
   const contentDigest = match.content === undefined ? undefined : createHash('sha256').update(match.content).digest('hex')
@@ -210,7 +154,6 @@ interface ArenaMemberView {
 interface ArenaView {
   missionId: string
   status: Mission['status']
-  fingerprint: string
   pendingDispatchable: number
   members: ArenaMemberView[]
   notices: NoticeLedgerEntry[]
@@ -218,7 +161,7 @@ interface ArenaView {
   lastNotice?: { class: NoticeClass; dedupKey: string; at: number }
 }
 
-export function arenaView(input: FingerprintInput & { missionId: string; now: number; leaseMs: number; limit?: number }): ArenaView {
+export function arenaView(input: ArenaInput & { missionId: string; now: number; leaseMs: number; limit?: number }): ArenaView {
   const { missionId, now, leaseMs, limit = 20 } = input
   const notices = noticeLedger(input.deliveries, limit)
   const running = input.tasks.filter(task => task.status === 'running' && task.attempt !== undefined)
@@ -227,7 +170,6 @@ export function arenaView(input: FingerprintInput & { missionId: string; now: nu
   return {
     missionId,
     status: input.mission.status,
-    fingerprint: digest(input, false, readiness),
     pendingDispatchable: readiness.ready,
     members: [...input.members].sort(byId).map(member => {
       const current = running.find(task => task.attempt!.ownerId === member.id)

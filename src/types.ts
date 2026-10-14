@@ -652,7 +652,7 @@ export interface Escalation {
   taskId?: string
   attemptId?: string
   body: string
-  /** Mission-state fingerprint F(S) at raise time. */
+  /** Its own identity on the deliveries ledger, `escalation:<id>`: an escalation is never deduplicated. */
   dedupKey: string
   createdAt: number
   /** Delivery record that carries it to the owner through the notice path. */

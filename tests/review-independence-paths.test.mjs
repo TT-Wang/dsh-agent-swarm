@@ -9,7 +9,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { authorIdsOf, canOwnReview } from '../lib/assignment.js'
-import { arenaLedgerDigest, arenaView, pendingReadiness } from '../lib/arena.js'
+import { arenaView, pendingReadiness } from '../lib/arena.js'
 import { validatePlan } from '../lib/plans.js'
 import { boardIndex } from '../lib/types/client/projection.js'
 import { FakeClock, MISSION_ACCEPTANCE, setup, taskOf } from './faults/harness.mjs'
@@ -220,13 +220,6 @@ test('arena: readiness and the member projection never offer a review to a prior
   const view = arenaView({ missionId: 'mission', now: 2, leaseMs: 1_000, mission: { status: 'active' }, tasks, members: [member('prior'), member('independent')], evidence: [], deliveries: [] })
   assert.equal(view.members.find(entry => entry.id === 'prior').pendingTaskId, undefined)
   assert.equal(view.members.find(entry => entry.id === 'independent').pendingTaskId, 'review')
-})
-
-test('arena digest: a submitted source whose only review no live member may own is unreviewed', () => {
-  const { tasks, member } = board()
-  // Same member statuses (so the same readiness), only the independent member's phase differs.
-  const digest = phase => arenaLedgerDigest({ mission: { status: 'active' }, tasks, members: [member('prior'), { ...member('independent'), phase }], evidence: [], deliveries: [] })
-  assert.notEqual(digest('stopped'), digest('active'), 'the digest records the lost review path')
 })
 
 test('client projection: a review only a prior owner could take is shown blocked, not ready', () => {

@@ -391,7 +391,6 @@ export class SwarmRuntime {
    * notice path asks exactly the predicate the sweep used.
    */
   dispatchQuestion(missionId: string, tasks: Task[], members: Member[], dispatchable: Task[]): ReturnType<Scheduling['dispatchQuestion']> { return this.scheduling.dispatchQuestion(missionId, tasks, members, dispatchable) }
-  noticeKey(missionId: string): string { return this.notices.noticeKey(missionId) }
   noticeLedger(actor: Actor, missionId: string, query: { limit?: number } = {}): unknown { return this.notices.noticeLedger(actor, missionId, query) }
   private bounded(text: string): string { return this.notices.bounded(text) }
   private ensureWitness(missionId: string): void { return this.notices.ensureWitness(missionId) }
@@ -439,7 +438,6 @@ export class SwarmRuntime {
   /** M1a seam 2/7: derived fingerprints, usage accounting and the budget gate. */
   private readonly gates = new RuntimeGates(this)
   fingerprint(missionId: string): string { return this.gates.fingerprint(missionId) }
-  fingerprintRecords(missionId: string): { mission: Mission; tasks: Task[]; members: Member[]; evidence: Evidence[]; deliveries: Delivery[] } { return this.gates.fingerprintRecords(missionId) }
   fingerprintBoard(missionId: string): MissionFingerprintBoard { return this.gates.fingerprintBoard(missionId) }
   private ownerInstruments(missionId: string, full: boolean): Record<string, unknown> { return this.gates.ownerInstruments(missionId, full) }
   private boardWindow(missionId: string, memberId: string, afterSeq: number): Record<string, unknown> { return this.gates.boardWindow(missionId, memberId, afterSeq) }
@@ -1925,12 +1923,12 @@ export class SwarmRuntime {
    * Raise one typed, durable owner escalation. This is deliberately not a board
    * post: a post is cross-task visibility addressed to any member, while an
    * escalation is a first-class record that always reaches the owner through
-   * the same notice path as every other owner decision, with the mission state
-   * fingerprint it was raised in, the authenticated sender, and the task and
-   * attempt it concerns. Recording it grants no authority — it changes no task,
-   * member, budget or evidence state and no runtime path reads its body as an
-   * instruction. An explicit escalation is never deduplicated: two asks are two
-   * records, unlike the automatic notices that dedup per state fingerprint.
+   * the same notice path as every other owner decision, with the authenticated
+   * sender and the task and attempt it concerns. Recording it grants no
+   * authority — it changes no task, member, budget or evidence state and no
+   * runtime path reads its body as an instruction. An explicit escalation is
+   * never deduplicated: its identity is its own id, so two asks are two records,
+   * unlike the automatic notices, each deduplicated by its fact.
    */
   escalate(actor: Actor, missionId: string, input: { body: string; taskId?: string; attemptId?: string }): Escalation {
     const { mission, member } = this.participant(actor, missionId)
@@ -1952,13 +1950,12 @@ export class SwarmRuntime {
         if (task.attempt.ownerId !== member.id) throw new Error('Escalation attempt is not owned by the caller')
       } else if ((task.attempt?.ownerId ?? task.assigneeId) !== member.id) throw new Error('Escalation task is not owned by the caller')
     }
-    const dedupKey = this.noticeKey(missionId)
-    const at = this.now()
+    const escalationId = id('esc'), dedupKey = `escalation:${escalationId}`
     const deliveryId = id('msg')
     const escalation: Escalation = {
-      id: id('esc'), missionId, fromMemberId: member.id,
+      id: escalationId, missionId, fromMemberId: member.id,
       ...(taskId === undefined ? {} : { taskId }), ...(attemptId === undefined ? {} : { attemptId }),
-      body, dedupKey, createdAt: at, deliveryId,
+      body, dedupKey, createdAt: this.now(), deliveryId,
     }
     this.commit(missionId, () => {
       // R15-A1: the escalation names the task or attempt it is about, so the

@@ -15,7 +15,7 @@ import { memberPhaseOf } from './projection.ts'
 import { emitGuardTerminal } from './refusals.ts'
 import { noticeFamily } from './notices.ts'
 import type { SwarmRuntime } from './runtime.ts'
-import type { Delivery, Evidence, Member, Mission, Post, Task, UsageBuckets, UsageSnapshotSource } from './types.ts'
+import type { Delivery, Member, Mission, Post, Task, UsageBuckets, UsageSnapshotSource } from './types.ts'
 
 const USAGE_KEYS = ['uncachedInputTokens', 'cacheReadTokens', 'cacheWriteTokens', 'outputTokens', 'reasoningTokens', 'requests'] as const
 
@@ -143,16 +143,6 @@ export class RuntimeGates {
     return fingerprint
   }
 
-  fingerprintRecords(missionId: string): { mission: Mission; tasks: Task[]; members: Member[]; evidence: Evidence[]; deliveries: Delivery[] } {
-    return {
-      mission: this.rt.mission(missionId),
-      tasks: this.rt.store.list('tasks', missionId),
-      members: this.rt.store.list('members', missionId),
-      evidence: this.rt.store.list('evidence', missionId),
-      deliveries: this.rt.store.list('deliveries', missionId),
-    }
-  }
-
   /**
    * The owner-observable fingerprint board built from durable state only. The
    * readiness/review counts come from the same predicates the scheduler and the
@@ -197,13 +187,12 @@ export class RuntimeGates {
    * projection of durable records; it writes nothing.
    */
   ownerInstruments(missionId: string, full: boolean): Record<string, unknown> {
-    const records = this.fingerprintRecords(missionId)
+    const records = { mission: this.rt.mission(missionId), tasks: this.rt.store.list('tasks', missionId), members: this.rt.store.list('members', missionId), deliveries: this.rt.store.list('deliveries', missionId) }
     const view = projectArenaView({ ...records, missionId, now: this.rt.now(), leaseMs: this.rt.config.leaseMs })
     const counts = { sent: view.notices.length, queued: view.notices.filter(entry => entry.state === 'queued').length, claimed: view.notices.filter(entry => entry.state === 'claimed').length }
     return {
-      // T3d: the owner-visible fingerprint is the board digest F(S), never the arena ledger's dedup digest.
+      // T3d: the owner-visible fingerprint is the board digest F(S); no notice is keyed by it.
       fingerprint: this.fingerprint(missionId),
-      noticeDedupKey: this.rt.noticeKey(missionId),
       pendingDispatchable: this.fingerprintBoard(missionId).tasks.filter(task => task.ready).length,
       ...(view.lastNotice === undefined ? {} : { lastWitness: { ...view.lastNotice, family: noticeFamily(records.deliveries.find(delivery => delivery.id === view.notices[0]!.deliveryId)!) } }),
       notices: counts,

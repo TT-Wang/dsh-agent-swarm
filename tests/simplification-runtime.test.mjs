@@ -66,7 +66,6 @@ test('synchronous graph reuse keeps repair deduplication and sees changed carrie
   repair.status = 'accepted'; f.runtime.store.put('tasks', repair)
   assert.deepEqual(f.runtime.unfinishedDependencies(mission.id, dependent), [])
   assert.equal(pendingReadiness(rows(), members).ready, 1, 'the dependent becomes ready; exact reviewOf stays cancelled')
-  assert.notEqual(board().fingerprint, before.fingerprint)
   const competing = task(mission.id, 'competing', 'accepted', { replaces: [original.id] })
   f.runtime.store.put('tasks', competing)
   assert.equal(pendingReadiness(rows(), members).ready, 0, 'a newly ambiguous carrier cannot satisfy a dependency')

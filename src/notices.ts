@@ -7,7 +7,7 @@
  * thin forwarding methods, so no call site changed.
  */
 import { createHash, randomUUID } from 'node:crypto'
-import { covered, hasNotice, noticeFingerprint as computeNoticeKey, noticeLedger as projectNoticeLedger } from './arena.ts'
+import { covered, hasNotice, noticeLedger as projectNoticeLedger } from './arena.ts'
 import { hostContextOf, memberPhaseOf } from './projection.ts'
 import { formatDiagnostic, missingReviewDiagnostic } from './admission.ts'
 import { guardTerminalKey, requireText } from './refusals.ts'
@@ -614,11 +614,6 @@ export class Notices {
     return { fact, identity: { class: noticeClass, dedupKey: options.dedupKey ?? factKey(missionId, fact), from: options.from ?? 'runtime' } }
   }
 
-  /** The notice dedup key: F(S) with the owner-notice channel excluded. */
-  noticeKey(missionId: string): string {
-    return computeNoticeKey(this.rt.fingerprintRecords(missionId))
-  }
-
   /**
    * Record one owner-addressed notice durably under the identity its caller
    * derived (`noticeIdentity` for a fact; an escalation names its own). Returns
@@ -815,7 +810,7 @@ export class Notices {
       ledger: entries,
       page: { limit, returned: entries.length },
       fingerprint: this.rt.fingerprint(missionId),
-      note: 'Read-only: each row names the subjects the notice is about (`taskId@epoch` or `mission:<id>`) and the mission-state fingerprint it announced. `state` is the transport fact (queued, or claimed by the adapter that put it in front of the owner session); consumption is unknown because this host exposes no reliable signal for it; resolution is a task/mission transition, never a transport event. Recording a notice changes no task, member or budget state.',
+      note: 'Read-only: each row names the subjects the notice is about (`taskId@epoch` or `mission:<id>`) and the dedup key it was told under, which names its fact. `state` is the transport fact (queued, or claimed by the adapter that put it in front of the owner session); consumption is unknown because this host exposes no reliable signal for it; resolution is a task/mission transition, never a transport event. Recording a notice changes no task, member or budget state.',
     }
   }
 
