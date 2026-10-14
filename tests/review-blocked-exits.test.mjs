@@ -538,7 +538,7 @@ test('a submission an older build left without an artifact is ordinary stuck wor
   }
 })
 
-test('every exit the W3 stall and the fall-through name for a submission an older build left without an artifact, performed through the owner\'s registered tools: swarm_control stops the mission; a repair is refused while the submission stands and a review of it never reaches a verdict (docs/known-limitations.md); withdrawing it with swarm_cancel retires the decision and the repair it then admits reaches a verdict', async t => {
+test('every exit the W3 stall and the fall-through name for a submission an older build left without an artifact, performed through the owner\'s registered tools: swarm_control stops the mission; amending its dependencies or assignee with swarm_control and a repair are refused while the submission stands, and a review of it never reaches a verdict (docs/known-limitations.md); withdrawing it with swarm_cancel retires the decision and the repair it then admits reaches a verdict', async t => {
   /** A legacy submission past its grace, named by the board's own decision: the W3 stall on a board with nothing else to do, the fall-through beside a third member's running work. */
   const legacyBoard = async running => {
     const f = await fixture(t, { members: ['Author', 'Reviewer', 'Runner'] })
@@ -552,7 +552,7 @@ test('every exit the W3 stall and the fall-through name for a submission an olde
     const subject = `${source.id}@${taskOf(f.runtime, source.id).epoch}`
     const namings = f.runtime.store.list('deliveries', f.mission.id).filter(delivery => delivery.to === 'owner' && delivery.notice !== undefined && (delivery.subjects ?? []).includes(subject))
     assert.deepEqual(namings.map(delivery => noticeFamily(delivery)), [running ? 'fallthrough' : 'board-stall'], `running=${running}: the board's decision names the submission`)
-    assert.match(namings[0].content, running ? /admit a repair or review with swarm_propose, or decide with swarm_control/ : /admit a repair or review with swarm_propose.*withdraw it explicitly with swarm_cancel.*Use swarm_control stop/)
+    assert.match(namings[0].content, running ? /admit a repair or review with swarm_propose, or decide with swarm_control/ : /amend the existing task dependencies or assignee with swarm_control, admit a repair or review with swarm_propose.*withdraw it explicitly with swarm_cancel.*Use swarm_control stop/)
     const relevant = () => f.runtime.ownerDeliveryRelevant(f.runtime.mission(f.mission.id), f.runtime.store.get('deliveries', namings[0].id))
     assert.equal(relevant(), true, `running=${running}: and it is outstanding`)
     return { f, source, relevant }
@@ -566,6 +566,12 @@ test('every exit the W3 stall and the fall-through name for a submission an olde
       assert.deepEqual([f.runtime.mission(f.mission.id).status, relevant()], ['stopped', false], `running=${running}: swarm_control stop ends the mission and the decision`)
     }
     const { f, source, relevant } = await legacyBoard(running)
+    // The W3 stall names amending the task's dependencies or assignee with swarm_control, which the fall-through's "decide with swarm_control" covers.
+    for (const changes of [{ assigneeId: f.reviewer.id }, { dependencies: [] }]) {
+      await assert.rejects(f.tool('swarm_control', { action: 'amend', taskId: source.id, changes, reason: 'Follow the exit the decision names' }), /\[artifact_policy_immutable\]/,
+        `running=${running}: amending ${Object.keys(changes)[0]} is refused while the submission stands`)
+    }
+    assert.deepEqual([taskOf(f.runtime, source.id).status, relevant()], ['submitted', true], `running=${running}: the refused amendments change nothing, and the decision is still outstanding`)
     await assert.rejects(f.tool('swarm_propose', repairOf(f, source)), /only blocked or cancelled work can be replaced/, `running=${running}: a repair is refused while the submission stands`)
     const review = await f.tool('swarm_propose', { workstreamId: f.stream.id, title: 'Review the source', objective: 'Independently review the submitted artifact', kind: 'verification', scope: ['**'],
       acceptance: MISSION_ACCEPTANCE, outputs: [], reviewOf: source.id, assigneeId: f.reviewer.id })
