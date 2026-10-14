@@ -729,7 +729,271 @@ test('L-25: a failed dispatch is one request per member and failure, whatever th
   assert.deepEqual(questions(), [`dispatch-question:${f.mission.id}:${subject}`], 'the undispatched task is the dispatch question\'s own fact at its epoch: asked once, whichever requests the chain holds')
 })
 
-test('a budget warning is told once per allocation and threshold, by the ledger alone: a projection that falls back under a told threshold warns no lower one, a new limit is a new allocation, and nothing on the mission row records a warning', async t => {
+/** Every body and deferred operation settles, two ticks run, and what they started settles too. */
+const quiet = async f => { await f.runtime.settle(f.mission.id); await ticks(f, 2); await f.runtime.settle(f.mission.id) }
+/** The openers of one chain's requests on the ledger, in the order they were told. */
+const openers = (f, chain) => terminalRows(f, chain).map(delivery => delivery.notice.dedupKey.split(':').slice(3).join(':'))
+const requestKeys = f => ownerRows(f).filter(delivery => delivery.notice.dedupKey.startsWith('guard-terminal:')).map(delivery => delivery.notice.dedupKey)
+/** A new wake window, so the next fact is its own delivery and not a constituent of a summary. */
+const nextWindow = f => f.clock.advance(f.runtime.notices.wakeBudgetWindowMs + 1)
+const reminders = (f, row) => ownerRows(f).filter(delivery => delivery.notice.dedupKey.startsWith(`obligation-followup:${row.id}:`))
+/** Deliver what is queued, let one reminder interval pass, and return the reminders the absence net then wrote for a row. */
+const remind = async (f, row) => {
+  await f.runtime.flushOutbox(f.mission.id)
+  const before = reminders(f, row).length
+  f.clock.advance(f.runtime.notices.obligationFollowupMs)
+  f.runtime.notices.absenceNet(f.mission.id)
+  return reminders(f, row).slice(before)
+}
+const namedTools = text => [...new Set(text.match(/\bswarm_\w+/g))].sort()
+/** A mission long enough for a test that keeps scheduling after a reminder interval. */
+const LONG = { maxDurationMs: 86_400_000 }
+
+test('L-25: each budget pause has its own request: told once while the pause lasts, and the exhaustion after the owner raised the budget with swarm_budget is told again', async t => {
+  const f = await setup({ clock: new FakeClock(), budget: { maxTokens: 10_000 } })
+  t.after(f.cleanup)
+  const tool = await ownerTools(f)
+  const spend = tokens => f.runtime.commit(f.mission.id, () => f.runtime.store.put('missions', { ...f.runtime.mission(f.mission.id), usedTokens: tokens }))
+  spend(10_000)
+  await quiet(f)
+  const first = f.runtime.mission(f.mission.id).budgetPause.id
+  await ticks(f, 3)
+  assert.deepEqual(openers(f, 'budget'), [`budget-pause:${first}`], 'the pause is one request, however many ticks it lasts')
+  assert.match(terminalRows(f, 'budget')[0].content, /`swarm_budget` using `budget` and `reason`/, 'which names the exit')
+  nextWindow(f)
+  await tool('swarm_budget', { budget: { ...f.runtime.mission(f.mission.id).budget, maxTokens: 20_000 }, reason: 'More room' })
+  await quiet(f)
+  assert.equal(f.runtime.mission(f.mission.id).status, 'active', 'that exit resumes the mission')
+  spend(20_000)
+  await quiet(f)
+  const second = f.runtime.mission(f.mission.id).budgetPause.id
+  assert.deepEqual(openers(f, 'budget'), [`budget-pause:${first}`, `budget-pause:${second}`], 'the second exhaustion is its own pause, so its own request')
+  assert.deepEqual(stallEventKeys(f, 'guard-terminal'), requestKeys(f), 'one stall event per request, naming its row')
+})
+
+test('L-25: a task ceiling is one request per task epoch and dimension: the task that exhausts the allocation the owner raised with swarm_budget is told again', async t => {
+  const f = await setup({ clock: new FakeClock() })
+  t.after(f.cleanup)
+  const tool = await ownerTools(f)
+  const task = f.propose({ title: 'Ceiling bound', maxSteps: 1 })
+  /** The author takes the task and steps until its ceiling refuses one. */
+  const exhaust = async () => {
+    await f.runtime.claim(f.actor(f.author), f.mission.id, task.id)
+    while (await f.workers.callbacks.beforeStep(f.author.id, true) !== false) { /* a charged step */ }
+    await quiet(f)
+    assert.equal(taskOf(f.runtime, task.id).status, 'blocked')
+    return `ceiling:${task.id}@${taskOf(f.runtime, task.id).epoch}:maxSteps`
+  }
+  const first = await exhaust()
+  assert.deepEqual(openers(f, 'task_ceiling'), [first], 'the request is keyed by the task at the epoch it blocked and the dimension it exhausted')
+  assert.match(terminalRows(f, 'task_ceiling')[0].content, /`swarm_budget` using `taskId`, `taskBudget` and `reason`/, 'and names the exit')
+  nextWindow(f)
+  await tool('swarm_budget', { taskId: task.id, taskBudget: { maxSteps: 2 }, reason: 'More steps' })
+  await quiet(f)
+  assert.equal(taskOf(f.runtime, task.id).status, 'pending', 'that exit re-pends the task')
+  const second = await exhaust()
+  assert.deepEqual(openers(f, 'task_ceiling'), [first, second], 'the raised allocation running out is a new fact: the task at its new epoch')
+  assert.notEqual(second, first)
+  assert.deepEqual(stallEventKeys(f, 'guard-terminal'), requestKeys(f), 'one stall event per request, naming its row')
+})
+
+test('L-25: the close-out requests are keyed by what ended: an abandoned close-out per attempt and an exhausted recovery per task epoch, so the recovery the owner extended with swarm_control is told again when it runs out', async t => {
+  const f = await setup({ clock: new FakeClock(), workers: new FakeWorkers({ autoIdle: true }), config: { maxIdleCloseouts: 0 } })
+  t.after(f.cleanup)
+  const tool = await ownerTools(f)
+  const task = f.propose({ title: 'Close-out', maxRecoveryAttempts: 2 })
+  await quiet(f)
+  /** The author's turn ends with its attempt open: the close-out checkpoints it and re-pends the task. */
+  const abandon = async () => {
+    const attempt = taskOf(f.runtime, task.id).attempt.id
+    f.runtime.attempts.onIdle(f.author.id)
+    await quiet(f)
+    return `closeout-abandoned:${attempt}`
+  }
+  const exhausted = () => `recovery-exhausted:${task.id}@${taskOf(f.runtime, task.id).epoch}`
+  const first = await abandon()
+  assert.deepEqual([taskOf(f.runtime, task.id).status, openers(f, 'attempt_lease')], ['running', [first]], 'the abandoned attempt is told, and the task is dispatched again')
+  nextWindow(f)
+  const second = await abandon()
+  const spent = exhausted()
+  assert.deepEqual([taskOf(f.runtime, task.id).status, openers(f, 'attempt_lease')], ['blocked', [first, second, spent]],
+    'the next attempt\'s abandonment is its own request, and so is the recovery it exhausted, on the one transition')
+  nextWindow(f)
+  await tool('swarm_control', { taskId: task.id, action: 'amend', changes: { maxRecoveryAttempts: 3 }, reason: 'One more recovery' })
+  await quiet(f)
+  assert.equal(taskOf(f.runtime, task.id).status, 'running', 'the owner\'s extension lets the task run again')
+  const third = await abandon()
+  assert.deepEqual(openers(f, 'attempt_lease'), [first, second, spent, third, exhausted()], 'the extended recovery running out is a new fact: the task at its new epoch')
+  assert.notEqual(exhausted(), spent)
+  assert.deepEqual(stallEventKeys(f, 'guard-terminal'), requestKeys(f), 'one stall event per request, naming its row')
+})
+
+test('L-25: a close-out whose checkpoint fails is one request per task epoch: the task the owner resumed with swarm_control is told again when its next close-out fails', async t => {
+  const f = await setup({ clock: new FakeClock(), workers: new FakeWorkers({ autoIdle: true }), config: { maxIdleCloseouts: 0 } })
+  t.after(f.cleanup)
+  const tool = await ownerTools(f)
+  const task = f.propose({ title: 'Held attempt', maxRecoveryAttempts: 3 })
+  f.workers.captureArtifact = async () => { throw new Error('[workspace_uncommitted] Member workspace has uncommitted work') }
+  /** The dispatched author's turn ends with its attempt open, and the close-out cannot checkpoint the workspace. */
+  const fail = async () => {
+    await quiet(f)
+    assert.equal(taskOf(f.runtime, task.id).status, 'running')
+    f.runtime.attempts.onIdle(f.author.id)
+    await quiet(f)
+    assert.equal(taskOf(f.runtime, task.id).status, 'blocked')
+    return `closeout-failed:${task.id}@${taskOf(f.runtime, task.id).epoch}`
+  }
+  const first = await fail()
+  assert.deepEqual(openers(f, 'attempt_lease'), [first])
+  assert.match(terminalRows(f, 'attempt_lease')[0].content, /`action: resume` after repair/, 'the request names the exit')
+  nextWindow(f)
+  await tool('swarm_control', { taskId: task.id, action: 'resume', reason: 'Workspace repaired' })
+  const second = await fail()
+  assert.deepEqual(openers(f, 'attempt_lease'), [first, second], 'the resumed task failing its close-out again is a new fact: the task at its new epoch')
+  assert.notEqual(second, first)
+  assert.deepEqual(stallEventKeys(f, 'guard-terminal'), requestKeys(f), 'one stall event per request, naming its row')
+})
+
+test('L-25: a lease-expiry checkpoint failure is one request per attempt: the next attempt whose lease expires over the same workspace is told again', async t => {
+  const f = await setup({ clock: new FakeClock() })
+  t.after(f.cleanup)
+  const task = f.propose({ title: 'Expiring attempt', maxRecoveryAttempts: 3 })
+  // The owner of the attempt is quiescent, so the lease-expiry path tries a checkpoint, which the workspace refuses.
+  f.workers.idle.add(f.author.id)
+  f.workers.captureArtifact = async () => { throw new Error('[workspace_uncommitted] dirty workspace') }
+  const expire = async () => {
+    await quiet(f)
+    const attempt = taskOf(f.runtime, task.id).attempt.id
+    f.clock.advance(f.runtime.config.leaseMs + 1)
+    await quiet(f)
+    return `checkpoint-failed:${attempt}`
+  }
+  const first = await expire()
+  assert.deepEqual(openers(f, 'attempt_lease'), [first])
+  const second = await expire()
+  assert.deepEqual(openers(f, 'attempt_lease'), [first, second], 'each attempt whose checkpoint failed is its own request')
+  assert.notEqual(second, first)
+  assert.deepEqual(stallEventKeys(f, 'guard-terminal'), requestKeys(f), 'one stall event per request, naming its row')
+})
+
+test('the mission admission request\'s exit, performed through the owner\'s registered tools: swarm_budget and a retry admit the work, a refusal repeated under one limit is the request the owner holds, and a refusal under the raised limit is a new one', async t => {
+  const f = await setup({ clock: new FakeClock(), budget: { maxTasks: 1 } })
+  t.after(f.cleanup)
+  const tool = await ownerTools(f)
+  const proposal = title => ({ workstreamId: f.stream.id, title, objective: 'Do the work the mission needs', kind: 'research', scope: ['**'], outputs: [], acceptance: MISSION_ACCEPTANCE, checks: [] })
+  await tool('swarm_propose', proposal('The one admitted task'))
+  for (const title of ['One too many', 'One too many, again']) await assert.rejects(tool('swarm_propose', proposal(title)), /mission_task_budget_exhausted/)
+  assert.deepEqual([openers(f, 'task_ceiling'), stallEventKeys(f, 'guard-terminal').length], [['task-budget:1'], 1], 'two refusals under one limit are one request and one event')
+  const [request] = terminalRows(f, 'task_ceiling')
+  assert.deepEqual(namedTools(request.content), ['swarm_budget'])
+  assert.match(request.content, /use `swarm_budget` with a finite raised `budget` and `reason`, then retry the original admission/)
+  nextWindow(f)
+  await tool('swarm_budget', { budget: { ...f.runtime.mission(f.mission.id).budget, maxTasks: 2 }, reason: 'Room for one more' })
+  assert.equal((await tool('swarm_propose', proposal('One too many'))).title, 'One too many', 'the retried admission goes through')
+  // A refusal has no end of its own: its request stays the owner's to read until the mission completes.
+  assert.equal(relevant(f, request), true)
+  await assert.rejects(tool('swarm_propose', proposal('A third')), /mission_task_budget_exhausted/)
+  assert.deepEqual(openers(f, 'task_ceiling'), ['task-budget:1', 'task-budget:2'], 'the limit the owner raised refuses under its own request')
+  assert.deepEqual(stallEventKeys(f, 'guard-terminal'), requestKeys(f), 'one stall event per request, naming its row')
+})
+
+test('every exit a wedged pass\'s naming names, performed through the owner\'s registered tools: withdrawing the work it named retires it, and a repair beside that work leaves it outstanding', async t => {
+  const exits = {
+    'admit a repair with swarm_propose': { retires: false, perform: ({ f, tool }) => tool('swarm_propose', { workstreamId: f.stream.id, title: 'Repair', objective: 'Repair the unreached work', kind: 'research', scope: ['**'], outputs: [], acceptance: MISSION_ACCEPTANCE, checks: [] }) },
+    'withdraw the blocking work with swarm_cancel': { retires: true, perform: ({ task, tool }) => tool('swarm_cancel', { taskId: task.id, reason: 'No longer needed' }) },
+  }
+  for (const [exit, { retires, perform }] of Object.entries(exits)) {
+    const f = await setup({ clock: new FakeClock() })
+    t.after(f.cleanup)
+    const task = f.propose({ title: 'Never reached' })
+    await f.runtime.settle(f.mission.id)
+    wedgedBody(t, f, 'operation_wedge_exit')
+    const [naming] = wedgeRows(f)
+    assert.deepEqual(namedTools(naming.content), ['swarm_cancel', 'swarm_propose'], 'the naming names these tools')
+    assert.ok(naming.content.includes(exit), `the naming names: ${exit}`)
+    assert.equal(relevant(f, naming), true)
+    await perform({ f, task, tool: await ownerTools(f) })
+    assert.equal(relevant(f, naming), !retires, retires ? `${exit} retires the naming` : `${exit} leaves the work it named unfinished, so the naming stays outstanding`)
+  }
+})
+
+test('every exit a failed dispatch\'s request names, performed through the owner\'s registered tools: the request has no end of its own and is never told twice, and its reminders follow the task it names', async t => {
+  /** The author's dispatch chain throws on every pass while `fault.on`; its task stays pending and the chain's request names it. */
+  const board = async () => {
+    const f = await setup({ clock: new FakeClock(), workers: new FakeWorkers({ autoIdle: true }), budget: LONG })
+    t.after(f.cleanup)
+    const fault = { on: true }
+    const isolationAllows = f.runtime.isolationAllows.bind(f.runtime)
+    f.runtime.isolationAllows = (missionId, member) => { if (fault.on && member.id === f.author.id) throw new Error('worktree probe failed: EIO'); return isolationAllows(missionId, member) }
+    const task = f.propose({ title: 'Work for the author' })
+    await quiet(f)
+    const [request] = terminalRows(f, 'attempt_lease')
+    assert.deepEqual(namedTools(request.content), ['swarm_control'])
+    return { f, task, request, fault, tool: await ownerTools(f) }
+  }
+  const exits = {
+    '`action: resume` after repair': async ({ task, fault, tool }) => { fault.on = false; await tool('swarm_control', { taskId: task.id, action: 'resume', reason: 'Repaired' }) },
+    '`action: amend`, `changes.assigneeId` and `reason` to fence and reassign it': ({ f, task, tool }) => tool('swarm_control', { taskId: task.id, action: 'amend', changes: { assigneeId: f.reviewer.id }, reason: 'Reassign' }),
+  }
+  for (const [exit, perform] of Object.entries(exits)) {
+    const fixture = await board()
+    const { f, task, request } = fixture
+    assert.ok(request.content.includes(exit), `the request names: ${exit}`)
+    await perform(fixture)
+    await quiet(f)
+    assert.equal(taskOf(f.runtime, task.id).status, 'running', `${exit} lets the task run`)
+    assert.deepEqual([terminalRows(f, 'attempt_lease').length, relevant(f, request), (await remind(f, request)).length], [1, true, 0],
+      'the request stays the record the owner can read, and nothing reminds the owner of a task that moved on')
+  }
+  // The resume without the repair: the chain fails again under the same opener.
+  const { f, task, request, tool } = await board()
+  await tool('swarm_control', { taskId: task.id, action: 'resume', reason: 'Retry' })
+  await quiet(f)
+  assert.deepEqual([taskOf(f.runtime, task.id).status, terminalRows(f, 'attempt_lease').length], ['pending', 1], 'the same failure is the request the owner holds')
+  assert.deepEqual((await remind(f, request)).map(delivery => delivery.subjects), [request.subjects], 'which is reminded while the task it names is stuck')
+})
+
+test('the isolation request is outstanding exactly while the invariant lists its violation: reminded while it does, whatever the exits it names do to the task through the owner\'s registered tools, and neither delivered nor reminded once the worktrees are repaired', async t => {
+  /** The reviewer is moved into the author's worktree, and work is given to the reviewer. */
+  const board = async () => {
+    const f = await setup({ clock: new FakeClock(), workers: new FakeWorkers({ autoIdle: true }), budget: LONG })
+    t.after(f.cleanup)
+    const own = f.runtime.store.get('members', f.reviewer.id).workspace
+    f.runtime.store.transaction(() => f.runtime.store.put('members', { ...f.runtime.store.get('members', f.reviewer.id), workspace: f.runtime.store.get('members', f.author.id).workspace }))
+    const task = f.propose({ title: 'Reviewer work', assigneeId: f.reviewer.id, kind: 'research', checks: [] })
+    await quiet(f)
+    const [request] = terminalRows(f, 'workspace')
+    assert.deepEqual(namedTools(request.content), ['swarm_control'])
+    const repair = () => f.runtime.store.transaction(() => f.runtime.store.put('members', { ...f.runtime.store.get('members', f.reviewer.id), workspace: own }))
+    return { f, task, request, repair, tool: await ownerTools(f) }
+  }
+  // The exits the request names act on the task; without the repair the violation still refuses both members.
+  const unrepaired = {
+    '`action: resume` and `reason`': ({ task, tool }) => tool('swarm_control', { taskId: task.id, action: 'resume', reason: 'Retry' }),
+    'amend the same task\'s scope/dependencies/assignee with `action: amend` and `changes`': ({ f, task, tool }) => tool('swarm_control', { taskId: task.id, action: 'amend', changes: { assigneeId: f.author.id }, reason: 'Reassign' }),
+  }
+  for (const [exit, perform] of Object.entries(unrepaired)) {
+    const fixture = await board()
+    const { f, task, request } = fixture
+    assert.ok(request.content.includes(exit), `the request names: ${exit}`)
+    await perform(fixture)
+    await quiet(f)
+    assert.deepEqual([taskOf(f.runtime, task.id).status, f.runtime.isolationViolations(f.mission.id).length, terminalRows(f, 'workspace').length, relevant(f, request)], ['pending', 1, 1, true],
+      `${exit}, without the repair, leaves the violation listed: the one request stays outstanding`)
+    assert.deepEqual((await remind(f, request)).map(delivery => delivery.subjects), [request.subjects], 'and the owner is reminded of it')
+  }
+  // "Repair the condition, then ... resume": the repair is what ends the request.
+  const { f, task, request, repair, tool } = await board()
+  assert.match(request.content, /Repair the condition, then use `swarm_control`/)
+  repair()
+  assert.deepEqual([f.runtime.isolationViolations(f.mission.id), relevant(f, request)], [[], false], 'the repaired worktrees end the request: a queued one is withheld')
+  assert.deepEqual(await remind(f, request), [], 'and no reminder follows it, though the task it named is still pending')
+  await tool('swarm_control', { taskId: task.id, action: 'resume', reason: 'Repaired' })
+  await quiet(f)
+  assert.equal(taskOf(f.runtime, task.id).status, 'running', 'the resumed task is dispatched')
+})
+
+test('a budget warning is told once per allocation and threshold, by the ledger alone: a projection that falls back under a told threshold warns no lower one, the limit the owner raises with swarm_budget is a new allocation that retires the old warning, and nothing on the mission row records one', async t => {
   const f = await setup({ clock: new FakeClock(), budget: { maxTokens: 10_000 } })
   t.after(f.cleanup)
   const told = () => events(f.runtime, f.mission.id, 'mission/budget-warning').filter(event => event.data.dimension === 'maxTokens').map(event => [event.data.limit, event.data.threshold, event.data.projected])
@@ -746,9 +1010,13 @@ test('a budget warning is told once per allocation and threshold, by the ledger 
   assert.deepEqual(told(), [[10_000, 0.9, 9500]], 'a lower threshold after a higher one is not warned')
   assert.deepEqual(reviews(), [`budget-review:${f.mission.id}:mission:maxTokens:10000:0.9`], 'the ledger row is the warning\'s one record')
   assert.equal(Object.hasOwn(f.runtime.store.get('missions', f.mission.id), 'budgetWarned'), false, 'nothing on the mission row records it')
-  // The owner raises the limit: the same spend crosses the lower threshold of a new allocation.
-  f.runtime.updateBudget(f.owner, f.mission.id, { ...f.runtime.mission(f.mission.id).budget, maxTokens: 10_500 }, 'a little more room')
+  // The owner takes the exit the warning names: the same spend crosses the lower threshold of a new allocation.
+  const warnings = () => ownerRows(f).filter(delivery => delivery.notice.trigger === 'mission/budget-warning')
+  const [warned] = warnings()
+  assert.deepEqual([namedTools(warned.content), relevant(f, warned)], [['swarm_budget'], true])
+  await (await ownerTools(f))('swarm_budget', { budget: { ...f.runtime.mission(f.mission.id).budget, maxTokens: 10_500 }, reason: 'A little more room' })
   await ticks(f, 2)
   assert.deepEqual(told(), [[10_000, 0.9, 9500], [10_500, 0.7, 7500]], 'a changed limit has its own warning')
+  assert.deepEqual(warnings().map(delivery => relevant(f, delivery)), [false, true], 'and the warning of the allocation the owner replaced is no longer outstanding')
   assert.equal(Object.hasOwn(f.runtime.store.get('missions', f.mission.id), 'budgetWarned'), false)
 })
