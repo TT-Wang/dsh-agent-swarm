@@ -147,6 +147,42 @@ the same blocked task. Whether the W3 stall is an owed decision or a same-subjec
 | `scripts/smoke-web.mjs` / `scripts/smoke-command-web.mjs` | passed, 13 checks / passed, 10 checks | passed, 13 checks / passed, 10 checks |
 | Test files the round touched (3), three rounds of two concurrent copies | 18/18 runs passed | the 3 touched files and 3 outage or refusal files, once: 100/100 tests |
 
+**Repair round 3 of steps 8 to 10** (`a44f044` to `b6527ec`). `src` net against `29a0268` is now −583 lines
+(+667/−1250); the round is +1.
+- `a44f044` (fix). Step 8 keyed a member failure by its message. The provider's text can carry per-request data (a
+  context-length error names the tokens each turn requested) and such an error is no classified outage, so one
+  unchanged condition woke the owner once per report. The fact is now the member on its open work, like the outage:
+  the text is the body, and the member id tells two members apart while neither holds work, which `29a0268`'s generic
+  key collapsed (`tests/notice-openers.test.mjs` fails on `29a0268` and with the message key). `src` net 0.
+- `2a63505` (fix). Every successful start cleared the member's provider outage, and the dispatch sweep cleared it
+  again. A pass that finds a worker running adopts its session and opens nothing, so an outage reported during a turn
+  was cleared after each pass: `provider/recovered` per pass, a new `provider/outage` event per report, and no
+  quiescence for probes or reroutes. Round 1 had recorded that in known-limitations instead of fixing it.
+  `WorkerAdapter.start` now resolves true for an adoption, only an opening start clears, and the sweep's second clear
+  is deleted (`tests/notice-openers.test.mjs`, three reports with passes between: one outage event and no recovery,
+  3 and 3 on `29a0268`; `tests/harness-workers.test.mjs` through the real adapter, which resolves `undefined` on
+  `29a0268`). `src` net +1: the adapter's return value and its declared contract, against the deleted clear.
+- `604c0ac` (fix). `enqueueOwnerNotice` kept a fact-less branch only escalations reached, with the class fallbacks
+  step 8 had deleted elsewhere, and returned a delivery no caller read. Over the wake budget an escalation's summary
+  constituent had no subjects and its `deliveryId` named no delivery (as on `29a0268`). The escalation now names its
+  fact (`escalation/raised`), the fact is a required parameter, and the escalation records the delivery that carries
+  it, its own row or the summary (`tests/notice-openers.test.mjs` fails on `29a0268`). `src` net 0. The arena's
+  escalations list still reads escalations off their own rows (known-limitations).
+- `b6527ec` (test). Round 2 rendered the revocation's overview from a snapshot cut at the revocation. The test now reads
+  the real snapshot once the fenced board is judged: the overview's three newest events are the workspace terminal,
+  the stall root and the W3 stall, and the revocation is read in the panel's progress and the zh table. Making the
+  terminal the one emitter for the work it blocks would contradict F19 row 7c, which keeps a ceiling-blocked root
+  beside its terminal, so it is left to the owner; known-limitations and both READMEs state the three wordings.
+
+| Check at `b6527ec` | 0.1.5-rc.3 (`a4c74a91e0`) | 0.1.7-rc.1 (`46a7f68b09`) |
+| --- | --- | --- |
+| `npm run typecheck` / `npm run build` | passed / passed | passed / passed |
+| `npm run test:harness` | passed; `UPDATE_SMOKE_SNAPSHOT=1` leaves `tests/fixtures/model-visible.expected.json` unchanged | passed |
+| `npm run test:replay` | passed, digest unchanged | passed, digest unchanged |
+| `node scripts/faults/run.mjs` | 24/24 | 24/24 |
+| `scripts/smoke-web.mjs` / `scripts/smoke-command-web.mjs` | passed, 13 checks / passed, 10 checks | passed, 13 checks / passed, 10 checks |
+| Test files the round touched (3), three rounds of two concurrent copies | 18/18 runs passed | the 3 touched files and 3 outage, start or escalation files, once: 61/61 tests |
+
 ## Round-29 simplification batch 9: one authorization rule, one exit table, a derived progress clock (2026-09-25)
 
 **Gate at `27fa353` and `19dbc30`.** Seven branches were merged onto main `75b765a` on `b9-integration` (`96f6db9`
