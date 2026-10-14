@@ -1031,10 +1031,11 @@ export interface WorkerCallbacks {
   verificationCleanupFailure?(info: VerificationCleanupFailure): void
   /**
    * R11-01: a classified provider outage (quota, rate limit, provider
-   * unavailable). The adapter classifies; the runtime emits the durable event,
-   * keeps the attempt alive and never spends recovery credit on the pause.
+   * unavailable). The adapter classifies, and this is the error's one report
+   * (never also a `failure`); the runtime emits the durable event, keeps the
+   * attempt alive and never spends recovery credit on the pause.
    */
-  providerOutage?(memberId: string, outage: ProviderOutage): void
+  providerOutage(memberId: string, outage: ProviderOutage): void
 }
 /** One declared check `/bin/sh` could not parse: its position in the probed list and the parser's own diagnostic. */
 export interface CheckSyntaxIssue { index: number; message: string }

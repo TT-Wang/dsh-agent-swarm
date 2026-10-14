@@ -486,14 +486,10 @@ export class HarnessWorkers implements WorkerAdapter {
   private failure(memberId: string, error: unknown): void {
     if (this.closing) return
     // R11-01: classify at the boundary where the provider error is still
-    // structured, then report both the raw failure (existing contract) and the
-    // typed outage. A callback failure must never mask the other report.
+    // structured. A classified outage is the route's, not the member's failure,
+    // so it is reported as that outage alone; anything else is the failure.
     const outage = classifyProviderOutage(error)
-    if (outage !== undefined) {
-      try { this.observer().providerOutage?.(memberId, outage) }
-      catch (callbackError) { this.ctx.logger.error(`Swarm provider-outage observer failed: ${errorText(callbackError)}`) }
-    }
-    try { this.observer().failure(memberId, errorText(error)) }
+    try { if (outage === undefined) this.observer().failure(memberId, errorText(error)); else this.observer().providerOutage(memberId, outage) }
     catch (callbackError) { this.ctx.logger.error(`Swarm failure observer failed: ${errorText(callbackError)}`) }
   }
   private observe(resident: Resident, operation: () => Promise<void>): void {
