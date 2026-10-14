@@ -1570,6 +1570,36 @@ test('the isolation request is outstanding exactly while the invariant lists its
   assert.equal(taskOf(f.runtime, task.id).status, 'running', 'the resumed task is dispatched')
 })
 
+test('a task\'s budget warning is told once per task, dimension, limit and threshold over many ticks: a lower threshold after a higher one is not warned, and the limit the owner raises is a new allocation', async t => {
+  const f = await setup({ clock: new FakeClock() })
+  t.after(f.cleanup)
+  const task = f.propose({ title: 'Bounded work', maxSteps: 10 })
+  await f.runtime.claim(f.actor(f.author), f.mission.id, task.id)
+  const steps = used => f.runtime.commit(f.mission.id, () => f.runtime.store.put('tasks', { ...taskOf(f.runtime, task.id), usedSteps: used }))
+  const told = () => events(f.runtime, f.mission.id, 'mission/budget-warning').filter(event => event.data.taskId === task.id).map(event => [event.data.dimension, event.data.limit, event.data.threshold, event.data.projected])
+  const rows = (limit, threshold) => ownerRows(f).filter(delivery => [delivery.notice.dedupKey, ...(delivery.notice.aggregatedIdentities ?? []).map(identity => identity.dedupKey)]
+    .includes(`budget-review:${f.mission.id}:${task.id}:maxSteps:${limit}:${threshold}`)).length
+  // Eight steps are settled and the author's model request is in flight: the projection crosses both thresholds.
+  steps(8)
+  f.workers.activity = { id: 'model', kind: 'model', startedAt: f.clock.now(), updatedAt: f.clock.now() }
+  await ticks(f, 3)
+  assert.deepEqual(told(), [['maxSteps', 10, 0.9, 9]], 'the higher threshold is told, once over every tick')
+  assert.deepEqual([rows(10, 0.9), rows(10, 0.7)], [1, 0], 'by one row of the task, dimension, limit and threshold')
+  // The request ends: the projection falls back between the thresholds.
+  f.workers.activity = undefined
+  await ticks(f, 3)
+  assert.deepEqual(told(), [['maxSteps', 10, 0.9, 9]], 'a lower threshold after a higher one is not warned')
+  assert.deepEqual([rows(10, 0.9), rows(10, 0.7)], [1, 0])
+  // The owner raises the task's allocation: the same spend is under the lower threshold of the new limit until a step crosses it.
+  await (await ownerTools(f))('swarm_budget', { taskId: task.id, taskBudget: { maxSteps: 12 }, reason: 'Room to finish' })
+  await ticks(f, 3)
+  assert.deepEqual(told(), [['maxSteps', 10, 0.9, 9]], 'eight of twelve crosses no threshold')
+  steps(9)
+  await ticks(f, 3)
+  assert.deepEqual(told(), [['maxSteps', 10, 0.9, 9], ['maxSteps', 12, 0.7, 9]], 'the new limit has its own warning, once')
+  assert.deepEqual([rows(10, 0.9), rows(12, 0.7)], [1, 1])
+})
+
 test('a budget warning is told once per allocation and threshold, by the ledger alone: a projection that falls back under a told threshold warns no lower one, the limit the owner raises with swarm_budget is a new allocation that retires the old warning, and nothing on the mission row records one', async t => {
   const f = await setup({ clock: new FakeClock(), budget: { maxTokens: 10_000 } })
   t.after(f.cleanup)
