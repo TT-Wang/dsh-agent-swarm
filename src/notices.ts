@@ -508,13 +508,10 @@ const reviewBlockedKey =(missionId: string, sourceId: string, need: string, reas
 /** The families of the board's own fact: the W3 stall, or an owner-assembled mission's coverage-complete (R10-14). */
 const BOARD_FAMILIES: readonly string[] = ['board-stall', 'coverage-complete']
 /**
- * R20: the decisions that hold the work they keep open (`Notices.openSubjects`)
- * from the board's own namings, by key prefix: a rejection, a preparation
- * failure, a start failure or retirement, a worker delivery failure, and a guard
- * request raised for a task, or a revocation's for the work its fence blocked. A
- * request raised for a member (a failed dispatch, an isolation violation, an
- * unanswered question) states no block of the work it names: like every other
- * notice, it holds nothing.
+ * R20: the decisions that hold the work they keep open (`Notices.openSubjects`),
+ * by key prefix. A guard request raised for a member (a failed dispatch, an
+ * isolation violation, an unanswered question) states no block of the work it
+ * names and, like any notice not listed, holds nothing.
  */
 const HOLDING: readonly string[] = ['task/rejected:', 'task/preparation-failed:', 'member/resume-failed:', 'worker-delivery-failed:',
   ...['recovery-exhausted:', 'stop:', 'closeout-failed:', 'closeout-abandoned:', 'checkpoint-failed:'].map(localKey => guardTerminalKey('attempt_lease', { localKey })),
@@ -1059,16 +1056,15 @@ export class Notices {
   }
 
   /**
-   * R20, the one rule for "this decision is still open", read alike by its
-   * delivery, its reminders and the board's deferral (`HOLDING`): the subjects a
-   * notice whose cause has its own end keeps open; undefined while it is judged
-   * by the subjects it names. A refused admission is open while the limit it met
-   * is current; an isolation violation while listed; a worker delivery failure
-   * while that delivery is failed; a stop fault until its exact cleanup succeeds.
-   * A rejection holds its task while blocked, a preparation failure while the
-   * task carries it, a start failure the pending work bound to its member while
-   * the member's counted start failures stand (else the mission root): each over
-   * the work unfinished at the named epoch that no live path advances.
+   * R20, the one rule for "this decision is still open", read by its delivery,
+   * its reminders and the board's deferral (`HOLDING`): the subjects a notice
+   * whose cause ends on its own keeps open, else undefined. A refused admission
+   * while the limit it met is current; an isolation violation while listed; a
+   * delivery failure while that delivery fails; a stop fault until its cleanup
+   * succeeds. A rejection, a preparation failure or a start failure, the work it
+   * names that is unfinished at that epoch and advanced by no live path, while
+   * that task is blocked, carries the failure, or is pending and bound to the
+   * member whose counted start failures stand (else the root, while they do).
    */
   private openSubjects(mission: Mission, delivery: Delivery): string[] | undefined {
     const key = delivery.notice?.dedupKey ?? '', fact = noticeRow(delivery)
@@ -1277,7 +1273,6 @@ export class Notices {
       // For a completed pass the T3 rule stands: an all-busy board is working, not
       // silent, and owes no witness.
       if (options.wedged !== true && !members.some(member => member.status === 'waiting' || (member.status === 'idle' && this.rt.workers.isIdle(member.id)))) return
-      // R20: a task an open decision holds (a start failure while its member's failures stand) is that decision's.
       const held = this.held(view)
       const question = this.rt.dispatchQuestion(missionId, tasks, members, dispatchable.filter(task => !held(task)))
       // The dedup key belongs to the task and its epoch, so every pass end and
@@ -1366,11 +1361,9 @@ export class Notices {
   }
 
   /**
-   * R20, one condition, one owner decision: whether a task a board-level
-   * naming would tell is held by a decision on its own row (`HOLDING`) that
-   * keeps it open at its epoch, by the openness its delivery and reminders read
-   * (`unresolvedSubjects`). Once that decision's cause ends, the naming is told
-   * at the next judgement. The rows are read only when a naming is due.
+   * R20, one condition, one owner decision: whether a decision on its own row
+   * (`HOLDING`) keeps the task a board-level naming would tell open at its epoch,
+   * by the openness its delivery and reminders read (`unresolvedSubjects`).
    */
   private held(view: MissionInterpretation): (task: Task) => boolean {
     let open: Set<string> | undefined

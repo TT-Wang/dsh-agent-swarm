@@ -360,12 +360,11 @@ export class Scheduling {
    * the member whose handle holds the task instead of claiming an admission
    * refusal that was never recorded.
    *
-   * It is the open pass's own question (asked at its end, or for a wedged pass):
-   * work not dispatched this tick whose dispatch blocker the runtime does not
-   * identify. Returns undefined — no owner decision — when no pass is open, or:
-   * - every dispatchable task carries an open attempt (the close-out path is
-   *   already nudging it; W6 owns that state) or a blocker the pass's own request
-   *   names (`SchedulingPass.identified`); or
+   * It is the open pass's own (asked at its end, or for a wedged pass): work not
+   * dispatched this tick whose blocker the runtime does not identify. Returns
+   * undefined — no owner decision — when no pass is open, or when:
+   * - every dispatchable task carries an open attempt (W6's close-out nudges it)
+   *   or a blocker the pass's own request names (`SchedulingPass.identified`); or
    * - no eligible member exists at all (nothing is ready for a member; the board
    *   is someone else's witness, not this notice's).
    * A task an open owner decision holds is never passed in (`Notices.held`).
