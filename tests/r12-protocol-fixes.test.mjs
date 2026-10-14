@@ -9,6 +9,9 @@ import { Attempts, pendingStopOwner } from '../lib/attempts.js'
 import { wakePrecision } from './instruments.mjs'
 import { FakeClock, FakeWorkers, MISSION_ACCEPTANCE, makeRuntime, makeRuntimeStub, setup } from './faults/harness.mjs'
 
+/** A stub runtime's `tell`: the fact's own transaction, then the record that exists only with it (the ledger is not modelled). */
+function tell(missionId, _content, _subjects, _options, then) { return this.commit(missionId, () => { then?.(); return true }) }
+
 function guardFixture() {
   const mission = { id: 'm', ownerSessionId: 'owner', status: 'active' }
   const question = { id: 'q', missionId: 'm', from: 'worker', to: 'owner', content: 'Choose an API', replyExpected: true, deliveredAt: 1 }
@@ -84,7 +87,7 @@ function refusalFixture() {
       get: (table, id) => table === 'missions' ? { id, status: 'active' } : admissions.get(id), list: () => [],
       recordAdmission: row => admissions.set(row.id, structuredClone(row)),
       event: (missionId, type, actor, data) => events.push({ missionId, type, actor, data }),
-    }, fingerprint: () => 'stable', isMissionTerminal: () => false, noticeSubjectsFor: () => [], notify() {}, pumpOutbox() {},
+    }, fingerprint: () => 'stable', isMissionTerminal: () => false, noticeSubjectsFor: () => [], notify() {}, tell, pumpOutbox() {},
   })
   return { rt, registry: new RefusalRegistry(rt), admissions, events, release: () => { busy = false } }
 }
@@ -215,7 +218,7 @@ function stopFixture(reason, stop) {
     task: (_mission, id) => structuredClone(rows.get(id)), mission: () => mission,
     isMissionTerminal: value => ['stopped', 'completed'].includes(value.status),
     defer: fn => { pending.push(Promise.resolve().then(fn)) }, exclusive: (_id, fn) => fn(), commit: (_id, fn) => fn(),
-    kick() {}, fingerprint: () => 'stable', noticeSubjectsFor: () => [], notify() {}, pumpOutbox() {},
+    kick() {}, fingerprint: () => 'stable', noticeSubjectsFor: () => [], notify() {}, tell, pumpOutbox() {},
   })
   return { mission, rows, pending, events, stopped, attempts: new Attempts(rt) }
 }

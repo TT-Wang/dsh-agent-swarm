@@ -368,7 +368,7 @@ export function guardTerminalKey(chain: GuardChainId, context: GuardTerminalCont
   return `guard-terminal:${chain}:${GUARD_TERMINAL_CODES[chain]}:${context.localKey ?? `question:${context.questionId}`}`
 }
 
-/** The dedup `emitGuardTerminal` applies: the owner already holds the decision request `key` names. */
+/** Whether the owner already holds the decision request `key` names: the ledger's dedup every request is told under (`Notices.tell`). */
 export function guardTerminalHeld(rt: SwarmRuntime, missionId: string, key: string): boolean {
   return hasNotice(rt.store.list('deliveries', missionId), { class: 'decision', dedupKey: key, from: 'runtime' })
 }
@@ -380,10 +380,10 @@ export function guardTerminalHeld(rt: SwarmRuntime, missionId: string, key: stri
  *
  *     emitGuardTerminal(this.rt, missionId, '<chain>', { taskId, memberId, detail, localKey: '<opener>' })
  *
- * The terminal is always built, and its request is written unless the same
- * request is already on the deliveries ledger. Nothing else suppresses it: a
- * failure of the chain under another opener is another request whatever the
- * board looks like, and a busy writer is recorded (`queueWriterBusy`), never
+ * The terminal is always built, and its request is told (`Notices.tell`) unless
+ * the same request is already on the deliveries ledger. Nothing else suppresses
+ * it: a failure of the chain under another opener is another request whatever
+ * the board looks like, and a busy writer is recorded (`queueWriterBusy`), never
  * silent. It names its caller's subjects, else the task it was asked about,
  * else the member's unfinished work, else the mission root (`noticeSubjectsFor`).
  */
@@ -396,32 +396,22 @@ export function emitGuardTerminal(rt: SwarmRuntime, missionId: string, chain: Gu
   if (mission === undefined || rt.isMissionTerminal(mission)) return undefined
   const terminal = guardTerminal(chain, context)
   const key = guardTerminalKey(chain, context)
-  if (guardTerminalHeld(rt, missionId, key)) return terminal
+  const subjects = context.subjects ?? rt.noticeSubjectsFor(missionId, { taskId: context.taskId, memberId: context.memberId })
   try {
-    rt.commit(missionId, () => {
-      // The board-stall event type is reused with `cause: 'guard-terminal'`, so
-      // the durable log names the chain and the code without inventing an
-      // unregistered event type (the vocabulary is a separate owner surface).
-      // It exists only with the row its `noticeKey` names.
-      rt.store.event(missionId, 'mission/stalled', 'runtime', {
-        cause: 'guard-terminal', chain: terminal.chain, code: terminal.code,
-        taskId: context.taskId ?? null, memberId: context.memberId ?? null, detail: context.detail ?? null, noticeKey: key,
-      })
-      const subjects = context.subjects ?? rt.noticeSubjectsFor(missionId, { taskId: context.taskId, memberId: context.memberId })
-      rt.notify(missionId, terminal.message, [...new Set(subjects)], { dedupKey: key, reason: context.detail, questionId: context.questionId })
-    })
+    // The board-stall event type is reused with `cause: 'guard-terminal'`, so the
+    // durable log names the chain and the code without inventing an unregistered
+    // event type (the vocabulary is a separate owner surface). It exists only
+    // with the row its `noticeKey` names. The notice path must not share the fate
+    // of the pass that could not report it: the queue-external pump delivers it.
+    if (rt.tell(missionId, terminal.message, [...new Set(subjects)], { dedupKey: key, reason: context.detail, questionId: context.questionId }, () => rt.store.event(missionId, 'mission/stalled', 'runtime', {
+      cause: 'guard-terminal', chain, code: terminal.code, taskId: context.taskId ?? null, memberId: context.memberId ?? null, detail: context.detail ?? null, noticeKey: key,
+    }))) rt.pumpOutbox()
   } catch (error) {
-    // A busy writer must not turn an escalation into an unhandled rejection: it
-    // is recorded once the writer is free (`recordWriterBusyRecovery`), and the
-    // chain re-derives its state on the next pass.
-    if (error instanceof WriterBusyError) {
-      queueWriterBusy(rt, { at: rt.now(), attempts: error.attempts, missionId, chain, context, detail: error.message })
-      return terminal
-    }
-    throw error
+    // The best-effort contract of a busy writer: an escalation it refused is
+    // recorded once the writer is free (`recordWriterBusyRecovery`), never an
+    // unhandled rejection, and the chain re-derives its state on the next pass.
+    if (!(error instanceof WriterBusyError)) throw error
+    queueWriterBusy(rt, { at: rt.now(), attempts: error.attempts, missionId, chain, context, detail: error.message })
   }
-  // The notice path must not share the fate of the pass that could not report
-  // it: the queue-external pump delivers it.
-  rt.pumpOutbox()
   return terminal
 }
