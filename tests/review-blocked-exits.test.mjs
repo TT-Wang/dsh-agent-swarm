@@ -34,6 +34,8 @@ import { sidebarState } from '../lib/types/client/progress.js'
 
 const { definitions } = await toolSchemaIndex()
 
+/** A deliverable cites the mission's criteria by id; it copies none of their text. */
+const COVERS = MISSION_ACCEPTANCE.map((_, index) => `c${index + 1}`)
 const MISSION = { title: 'Review exits', objective: 'Every review-path blocker names an exit that works', scope: ['**'], acceptance: MISSION_ACCEPTANCE }
 const STREAM = { title: 'Exits', objective: 'Exercise each review-path blocker' }
 const memberInput = (name, index) => ({ name, role: index === 0 ? 'implementation' : 'verification', maxOutputTokens: 5_000 })
@@ -58,7 +60,7 @@ async function fixture(t, { members = ['Author', 'Reviewer'], budget: overrides,
     const snapshot = await runtime.startPlan(owner, runtime.requestStart(owner, { commandId: 'review-exits', goal: MISSION.objective, workspace: dir }, claim).id, {
       ...MISSION, workspace: dir, budget, members: members.map((name, index) => ({ key: `m${index}`, ...memberInput(name, index) })),
       workstreams: [{ key: 'main', ...STREAM }],
-      tasks: [{ key: 'impl', workstreamKey: 'main', title: 'Implement', objective: 'Implement the scoped change', kind: 'implementation', outputs: [], scope: ['**'], acceptance: MISSION_ACCEPTANCE, assigneeKey: 'm0', checks: ['test -d .'], maxRecoveryAttempts: 2, checkTimeoutMs: 30_000 }],
+      tasks: [{ key: 'impl', workstreamKey: 'main', title: 'Implement', objective: 'Implement the scoped change', kind: 'implementation', outputs: [], scope: ['**'], covers: COVERS, assigneeKey: 'm0', checks: ['test -d .'], maxRecoveryAttempts: 2, checkTimeoutMs: 30_000 }],
     })
     mission = snapshot.mission
     ;[stream] = runtime.store.list('workstreams', mission.id)
@@ -76,7 +78,7 @@ async function fixture(t, { members = ['Author', 'Reviewer'], budget: overrides,
   const actor = member => ({ sessionId: member.sessionId })
   // On a launched mission the owner's every proposal carries the allocations the primary agent chooses.
   const propose = (extra = {}) => runtime.propose(owner, mission.id, { outputs: [], workstreamId: stream.id, title: 'Implement', objective: 'Implement the scoped change',
-    kind: 'implementation', scope: ['**'], acceptance: MISSION_ACCEPTANCE, checks: ['test -d .'], assigneeId: author.id, ...(launched ? CHOSEN : {}), ...extra })
+    kind: 'implementation', scope: ['**'], covers: COVERS, checks: ['test -d .'], assigneeId: author.id, ...(launched ? CHOSEN : {}), ...extra })
   return {
     ...f, actor, propose, tool: await ownerTools(f), refused: [],
     submit: async source => {
@@ -150,7 +152,6 @@ async function perform(f, source, reason, tool, named) {
     // The corrected command a repair holds.
     checks: () => ['test -f README.md'],
     kind: () => taskOf(f.runtime, source.id).kind,
-    acceptance: () => taskOf(f.runtime, source.id).acceptance,
     reason: () => 'Follow the exit the decision names',
     role: () => 'verification',
     maxOutputTokens: () => 5_000,
@@ -236,7 +237,7 @@ const DEFERRAL = {
 async function deferred(f, { running, kind = 'infrastructure' } = {}) {
   const source = f.propose()
   await f.submit(source)
-  const review = f.propose({ title: 'Review the source', objective: 'Independently review the scoped change', kind: 'verification', reviewOf: source.id, checks: undefined, assigneeId: f.reviewer.id })
+  const review = f.propose({ title: 'Review the source', objective: 'Independently review the scoped change', kind: 'verification', reviewOf: source.id, checks: undefined, covers: undefined, assigneeId: f.reviewer.id })
   const taken = await f.runtime.claim(f.actor(f.reviewer), f.mission.id, review.id)
   f.workers.checks = [DEFERRAL[kind]]
   assert.equal((await f.runtime.verify(f.actor(f.reviewer), f.mission.id, { taskId: review.id, attemptId: taken.attempt.id, verdict: 'accept', reason: 'Review against acceptance' })).status, 'blocked')
@@ -414,7 +415,7 @@ const FAMILIES = [
       const source = f.propose()
       await f.submit(source)
       const review = f.runtime.propose(f.owner, f.mission.id, { outputs: [], workstreamId: f.stream.id, title: 'Review the source', objective: 'Independently review the scoped change',
-        kind: 'verification', reviewOf: source.id, scope: ['**'], acceptance: MISSION_ACCEPTANCE, assigneeId: f.reviewer.id })
+        kind: 'verification', reviewOf: source.id, scope: ['**'], assigneeId: f.reviewer.id })
       // The rows as that build left them: no artifact on the submission, and a
       // review blocked by something other than a deferral (no recovery record).
       f.runtime.store.transaction(() => {

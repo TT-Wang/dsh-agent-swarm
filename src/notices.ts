@@ -391,7 +391,7 @@ export function taskFromSubject(subject: string, tasks: readonly Task[]): Task |
  */
 export const reviewGraceMs = (config: { tickMs: number }): number => Math.max(config.tickMs, 1000)
 /** The exits a review-path blocker may name beside its own cause's (admit the review, naming the recovery limit a launched mission's admission requires and every mission accepts; or withdraw the source), and the blocker while the host's own review waits for the board. */
-export const ADMIT_REVIEW = 'admit a review with swarm_propose(kind: "verification", reviewOf, acceptance, outputs: [], maxRecoveryAttempts)'
+export const ADMIT_REVIEW = 'admit a review with swarm_propose(kind: "verification", reviewOf, outputs: [], maxRecoveryAttempts)'
 export const WITHDRAW_SOURCE = 'withdraw the source with swarm_cancel(taskId, reason)'
 export const BOARD_RUNNING = `it has no live independent review path and cannot reach a verdict while the rest of the board keeps running: ${ADMIT_REVIEW}, or ${WITHDRAW_SOURCE}`
 
