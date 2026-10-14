@@ -12,7 +12,7 @@ import { selectAcceptedDelivery } from './task-graph.ts'
 import { assignmentAllows, canBorrowTask, canOwnReview, strandedReview } from './assignment.ts'
 import { liveReviewFor } from './admission.ts'
 import { pendingStopOwner, stopPending } from './attempts.ts'
-import { factKey, reasonDigest, subjectsOfTasks, taskSubject } from './notices.ts'
+import { factKey, subjectsOfTasks, taskSubject } from './notices.ts'
 import { emitGuardTerminal } from './refusals.ts'
 import { AdmissionRefusedError } from './scheduler.ts'
 import { isolationIssues } from './workspace-admission.ts'
@@ -323,8 +323,8 @@ export class Scheduling {
             // The terminal of this member's chain, opened by this failure of the work
             // its request names: the same throw over that work on a later pass is the
             // request the owner already holds; other work or another failure is another.
-            const detail = String(error), work = this.rt.noticeSubjectsFor(missionId, { memberId: member.id }).sort().join('+')
-            emitGuardTerminal(this.rt, missionId, 'attempt_lease', { memberId: member.id, detail, localKey: `dispatch-failed:${member.id}:${work}:${reasonDigest(detail)}` })
+            const detail = String(error), subjects = this.rt.noticeSubjectsFor(missionId, { memberId: member.id })
+            emitGuardTerminal(this.rt, missionId, 'attempt_lease', { memberId: member.id, detail, subjects, localKey: factKey(missionId, { trigger: `dispatch-failed:${member.id}`, reason: detail, subjects }) })
             continue
           }
         }

@@ -507,7 +507,7 @@ export class WorkspaceAdmission {
   isolationAllows(missionId: string, member: Member): boolean {
     const violation = this.isolationIssues(missionId).find(entry => entry.memberIds.includes(member.id))
     if (violation === undefined) return true
-    emitGuardTerminal(this.rt, missionId, 'workspace', { memberIds: violation.memberIds, localKey: isolationOpener(violation.message),
+    emitGuardTerminal(this.rt, missionId, 'workspace', { subjects: violation.memberIds.flatMap(id => this.rt.noticeSubjectsFor(missionId, { memberId: id })), localKey: isolationOpener(violation.message),
       detail: `the isolation invariant refuses dispatch: ${violation.message}` })
     return false
   }

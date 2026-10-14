@@ -284,8 +284,8 @@ export interface GuardTerminal {
 interface GuardTerminalScope {
   taskId?: string
   memberId?: string
-  /** The members whose unfinished work the request names, when the terminal is not one member's. */
-  memberIds?: readonly string[]
+  /** The subjects the request names, when its caller has computed them (`noticeSubjectsFor`). */
+  subjects?: readonly string[]
   detail?: string
 }
 /**
@@ -384,8 +384,8 @@ export function guardTerminalHeld(rt: SwarmRuntime, missionId: string, key: stri
  * request is already on the deliveries ledger. Nothing else suppresses it: a
  * failure of the chain under another opener is another request whatever the
  * board looks like, and a busy writer is recorded (`queueWriterBusy`), never
- * silent. The request names the task it was asked about, else each named
- * member's unfinished work, else the mission root (`noticeSubjectsFor`).
+ * silent. It names its caller's subjects, else the task it was asked about,
+ * else the member's unfinished work, else the mission root (`noticeSubjectsFor`).
  */
 export function emitGuardTerminal(rt: SwarmRuntime, missionId: string, chain: GuardChainId, context: GuardTerminalContext): GuardTerminal | undefined {
   const mission = rt.store.get('missions', missionId)
@@ -407,7 +407,7 @@ export function emitGuardTerminal(rt: SwarmRuntime, missionId: string, chain: Gu
         cause: 'guard-terminal', chain: terminal.chain, code: terminal.code,
         taskId: context.taskId ?? null, memberId: context.memberId ?? null, detail: context.detail ?? null, noticeKey: key,
       })
-      const subjects = (context.memberIds ?? [context.memberId]).flatMap(memberId => rt.noticeSubjectsFor(missionId, { taskId: context.taskId, memberId }))
+      const subjects = context.subjects ?? rt.noticeSubjectsFor(missionId, { taskId: context.taskId, memberId: context.memberId })
       rt.notify(missionId, terminal.message, [...new Set(subjects)], { dedupKey: key, reason: context.detail, questionId: context.questionId })
     })
   } catch (error) {

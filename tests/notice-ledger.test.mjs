@@ -1029,9 +1029,9 @@ test('L-25: a failed dispatch is one request per member, the work it names and t
   const terminals = () => terminalRows(f, 'attempt_lease')
   const questions = () => ownerRows(f).filter(delivery => delivery.notice.dedupKey.startsWith('dispatch-question:')).map(delivery => delivery.notice.dedupKey)
   assert.equal(taskOf(f.runtime, task.id).status, 'pending', 'the author is never given its task')
-  assert.deepEqual(terminals().map(delivery => [delivery.notice.dedupKey.replace(/[0-9a-f]{16}$/, '<digest>'), delivery.notice.reason, delivery.subjects]),
-    [[`guard-terminal:attempt_lease:attempt_terminal:dispatch-failed:${f.author.id}:${subject}:<digest>`, `Error: ${failure}`, [subject]]],
-    'the chain\'s terminal is keyed by the member, its unfinished work and the failure, records the failure as its reason and names that work')
+  assert.deepEqual(terminals().map(delivery => [delivery.notice.dedupKey, delivery.notice.reason, delivery.subjects]),
+    [[`guard-terminal:attempt_lease:attempt_terminal:${factKey(f.mission.id, { trigger: `dispatch-failed:${f.author.id}`, reason: `Error: ${failure}`, subjects: [subject] })}`, `Error: ${failure}`, [subject]]],
+    'the chain\'s terminal is opened by factKey\'s rule over the member, its unfinished work and the failure, records the failure as its reason and names that work')
   // The board changes under the same failure: the reviewer is given work.
   const board = f.runtime.fingerprint(f.mission.id)
   f.propose({ title: 'Work for the reviewer', assigneeId: f.reviewer.id, kind: 'research', checks: [] })
@@ -1425,7 +1425,7 @@ test('L-25: a failed dispatch\'s request is the failure of the work it names: th
   const failure = 'Member has uncommitted commits'
   const isolationAllows = f.runtime.isolationAllows.bind(f.runtime)
   f.runtime.isolationAllows = (missionId, member) => { if (member.id === f.author.id) throw new Error(failure); return isolationAllows(missionId, member) }
-  const opener = subjects => `dispatch-failed:${f.author.id}:${[...subjects].sort().join('+')}:${sha16(`Error: ${failure}`)}`
+  const opener = subjects => factKey(f.mission.id, { trigger: `dispatch-failed:${f.author.id}`, reason: `Error: ${failure}`, subjects })
   const told = () => terminalRows(f, 'attempt_lease').map(delivery => [delivery.notice.dedupKey.split(':').slice(3).join(':'), delivery.subjects, delivery.notice.reason])
   const request = subjects => [opener(subjects), subjects, `Error: ${failure}`]
   const first = f.propose({ title: 'First work for the author' })
