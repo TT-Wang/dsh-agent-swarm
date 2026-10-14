@@ -12,7 +12,8 @@ import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import { join, resolve } from 'node:path'
 import ts from 'typescript'
-import { FakeClock, PROJECT, events, setup } from './faults/harness.mjs'
+import { FakeClock, MISSION_ACCEPTANCE, PROJECT, events, setup, taskOf } from './faults/harness.mjs'
+import { ownerTools, sessionTools } from './refusal-inventory.mjs'
 
 const ownerRows = (f, pattern) => f.runtime.store.list('deliveries', f.mission.id).filter(delivery => delivery.to === 'owner' && delivery.notice !== undefined && pattern.test(delivery.content))
 const fixture = async (t, options = {}) => { const f = await setup({ clock: new FakeClock(), ...options }); t.after(f.cleanup); return f }
@@ -84,19 +85,34 @@ test('a member failure is keyed by its recorded message: another failure on the 
   assert.deepEqual(ownerRows(f, /^Author failed: /).map(delivery => delivery.content), ['Author failed: session crashed', 'Author failed: provider returned malformed output'])
 })
 
-test('a worker\'s refused proposal is one fact per reason and limit: a repeat is not told again, a raised limit is', async t => {
+test('a worker\'s refused proposal is one fact per reason and limit, and each exit it names is performed through the registered tools: swarm_control\'s resume and swarm_cancel admit nothing and tell nothing new, swarm_budget admits the work, and a refusal under the raised limit is a new fact', async t => {
   const f = await fixture(t, { budget: { maxTasks: 1 } })
-  f.propose({ title: 'Admitted' })
-  const proposeAsAuthor = title => assert.throws(() => f.runtime.propose(f.actor(f.author), f.mission.id, {
-    outputs: [], workstreamId: f.stream.id, title, objective: 'More work', kind: 'research', scope: ['**'], acceptance: ['works'], checks: [] }), /task budget exhausted/)
+  const owner = await ownerTools(f)
+  const worker = await sessionTools(f, f.author.sessionId)
+  const held = f.propose({ title: 'Admitted' })
+  const proposal = title => ({ outputs: [], workstreamId: f.stream.id, title, objective: 'More work', kind: 'research', scope: ['**'], acceptance: MISSION_ACCEPTANCE, checks: [] })
+  const refused = title => assert.rejects(worker('swarm_propose', proposal(title)), /task budget exhausted/)
   const refusals = () => ownerRows(f, /^\[budget_terminal\]/).filter(delivery => delivery.from === f.author.id).map(delivery => delivery.content.match(/was refused: (.*\(limit \d+\))\)/)[1])
-  proposeAsAuthor('More')
-  proposeAsAuthor('More again')
-  assert.deepEqual(refusals(), ['mission task budget exhausted (1/1 tasks admitted) (limit 1)'], 'the same refusal is told once')
-  f.runtime.updateBudget(f.owner, f.mission.id, { ...f.runtime.mission(f.mission.id).budget, maxTasks: 2 }, 'room for one more')
-  f.propose({ title: 'Admitted after the raise' })
-  proposeAsAuthor('More after the raise')
-  assert.deepEqual(refusals(), ['mission task budget exhausted (1/1 tasks admitted) (limit 1)', 'mission task budget exhausted (2/2 tasks admitted) (limit 2)'], 'the raised limit is a new fact')
+  const first = 'mission task budget exhausted (1/1 tasks admitted) (limit 1)'
+  await refused('More')
+  await refused('More again')
+  assert.deepEqual(refusals(), [first], 'the same refusal is told once')
+  const [request] = ownerRows(f, /^\[budget_terminal\]/)
+  assert.deepEqual([...new Set(request.content.match(/\bswarm_\w+/g))].sort(), ['swarm_budget', 'swarm_cancel', 'swarm_control'], 'the request names these tools')
+  assert.match(request.content, /Explicit user pause remains until `swarm_control` with `action: resume`/)
+  assert.equal((await owner('swarm_control', { action: 'resume', reason: 'Resume' })).status, 'active', 'the resume is accepted: the mission was never paused')
+  await refused('More after the resume')
+  assert.deepEqual(refusals(), [first], 'it admits nothing, and the refusal is still the one the owner holds')
+  assert.match(request.content, /Use `swarm_cancel` with `taskId` and `reason` to withdraw mistaken work; cancellation never resets consumed budget/)
+  await owner('swarm_cancel', { taskId: held.id, reason: 'Withdrawn' })
+  assert.equal(taskOf(f.runtime, held.id).status, 'cancelled', 'the work is withdrawn')
+  await refused('More after the cancel')
+  assert.deepEqual(refusals(), [first], 'and, as the request says, its admission is not given back')
+  assert.match(request.content, /`swarm_budget` using `budget` and `reason`/)
+  await owner('swarm_budget', { budget: { ...f.runtime.mission(f.mission.id).budget, maxTasks: 2 }, reason: 'Room for one more' })
+  assert.equal((await worker('swarm_propose', proposal('More after the raise'))).proposedBy, f.author.id, 'the raised limit admits the worker\'s proposal')
+  await refused('One more after the raise')
+  assert.deepEqual(refusals(), [first, 'mission task budget exhausted (2/2 tasks admitted) (limit 2)'], 'the refusal under the raised limit is a new fact')
 })
 
 test('a notice that names no fact is refused where it is written: NotifyOptions requires a trigger or an explicit key', () => {
