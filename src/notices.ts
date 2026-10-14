@@ -377,6 +377,8 @@ export function taskFromSubject(subject: string, tasks: readonly Task[]): Task |
   const task = tasks.find(candidate => candidate.id === match[1])
   return task !== undefined && task.epoch === Number(match[2]) ? task : undefined
 }
+/** The task a subject names while it is unfinished at that epoch: the term a subject-judged notice is deliverable and reminded by. */
+const unfinished = (subject: string, tasks: readonly Task[]): Task | undefined => { const task = taskFromSubject(subject, tasks); return task === undefined || TERMINAL_STATES.has(task.status) ? undefined : task }
 
 /** The exits a review-path blocker may name beside its own cause's (admit the review, naming the recovery limit a launched mission's admission requires and every mission accepts; or withdraw the source), and the blocker while the host's own review waits for the board. */
 export const ADMIT_REVIEW = 'admit a review with swarm_propose(kind: "verification", reviewOf, acceptance, outputs: [], maxRecoveryAttempts)'
@@ -996,8 +998,8 @@ export class Notices {
         return mission.status === 'blocked' || mission.budgetPause !== undefined || view.stalled
           || (view.tasks.length > 0 && view.nonTerminal.length === 0)
       }
-      const task = taskFromSubject(subject, view.tasks)
-      return task !== undefined && !TERMINAL_STATES.has(task.status) && !this.waitsLegitimately(task, view.tasks)
+      const task = unfinished(subject, view.tasks)
+      return task !== undefined && !this.waitsLegitimately(task, view.tasks)
     })
   }
 
@@ -1049,15 +1051,14 @@ export class Notices {
       if (subjects.length === 0) return true
       if (family === 'stall-root') return this.openStallRoot(mission.id, delivery, tasks).length > 0
       if (family === 'review-blocked') return this.openReviewBlock(mission.id, delivery, tasks).length === subjects.length
+      // A wedged pass's naming holds for the work it named that is unfinished at that epoch: a body is named once (one on a held fact is left to this row), so no later fact speaks for the rest.
+      if (family === 'scheduling-pass') return subjects.some(subject => subject === missionSubject(mission) || unfinished(subject, tasks) !== undefined)
       // A batch asserts the condition for every named subject. If one changes,
       // the transition publisher emits the remaining subjects as a fresh fact.
       return subjects.every(subject => {
         if (subject === missionSubject(mission)) return true
-        const task = taskFromSubject(subject, tasks)
-        if (task === undefined || TERMINAL_STATES.has(task.status)) return false
-        // A wedged pass's naming holds while the work its key names is unfinished at those epochs, whatever a body
-        // does now: `Scheduling.escalateWedge` leaves a body on a held fact to this row, so it stays deliverable.
-        if (family === 'scheduling-pass') return true
+        const task = unfinished(subject, tasks)
+        if (task === undefined) return false
         if (family === 'fallthrough') return !this.waitsLegitimately(task, tasks)
         if (family === 'dispatch-question') return task.status === 'pending'
         return this.interpretation(mission.id).parkedHolders.some(holder => holder.task.id === task.id)

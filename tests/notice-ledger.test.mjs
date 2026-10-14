@@ -899,6 +899,15 @@ test('the mission admission request\'s exit, performed through the owner\'s regi
 })
 
 const subjectOf = (f, task) => `${task.id}@${taskOf(f.runtime, task.id).epoch}`
+/** Two tasks no pass has reached: the author's, and one only the reviewer may take. */
+const twoUnreached = async t => {
+  const f = await setup({ clock: new FakeClock(), budget: LONG })
+  t.after(f.cleanup)
+  const one = f.propose({ title: 'Never reached one' })
+  const two = f.propose({ title: 'Never reached two', kind: 'research', checks: [], assigneeId: f.reviewer.id })
+  await f.runtime.settle(f.mission.id)
+  return { f, one, two }
+}
 const stopReviewer = f => f.runtime.commit(f.mission.id, () => f.runtime.store.put('members', { ...f.runtime.store.get('members', f.reviewer.id), phase: 'stopped' }))
 
 test('naming a body is the transition its wedged publication belongs to, whether or not the naming writes a row: a board fact committed inside the bound of a body on a held naming fact is told at that bound', async t => {
@@ -922,6 +931,28 @@ test('naming a body is the transition its wedged publication belongs to, whether
   assert.deepEqual([body.escalatedAt !== undefined, wedgeRows(f).length, wedgeEvents(f).length], [true, 1, 1], 'the body is named, and the naming writes neither a row nor an event')
   await Promise.resolve()
   assert.deepEqual(stallRow(f)?.subjects, [subjectOf(f, dead)], 'the board the body left unpublished is judged at its bound: the stuck work is told while the body is still wedged, with no other commit')
+})
+
+test('a wedged pass\'s naming of several tasks is outstanding for the work still unfinished at the epochs it named: one withdrawn while the body stays wedged leaves the naming the owner\'s to read and its reminders name the rest, and it ends with the last', async t => {
+  for (const delivered of [false, true]) {
+    const { f, one, two } = await twoUnreached(t)
+    const body = wedgedBody(t, f, 'operation_wedge_two')
+    const [naming] = wedgeRows(f)
+    assert.deepEqual([...naming.subjects].sort(), [subjectOf(f, one), subjectOf(f, two)].sort(), 'the naming names both tasks the pass never reached')
+    if (delivered) await f.runtime.flushOutbox(f.mission.id)
+    assert.equal(f.runtime.store.get('deliveries', naming.id).deliveredAt !== undefined, delivered)
+    // The owner withdraws one named task. The body is still wedged, and a body is named once.
+    f.runtime.cancel(f.owner, f.mission.id, { taskId: two.id, reason: 'Not needed' })
+    await ticks(f, 2)
+    assert.deepEqual([f.runtime.passState(f.mission.id).wedged, f.runtime.scheduling.passes.get(f.mission.id) === body, wedgeRows(f).length, taskOf(f.runtime, one.id).status], [true, true, 1, 'pending'],
+      'the body is still wedged on work it named, and nothing names it again')
+    assert.equal(relevant(f, naming), true, `the ${delivered ? 'delivered naming stays in the owner\'s inbox' : 'queued naming is still delivered'}: it is the one record of the wedge that holds the remaining work`)
+    assert.deepEqual((await remind(f, naming)).map(delivery => delivery.subjects), [[subjectOf(f, one)]], 'its reminder names the work still unfinished')
+    assert.equal(relevant(f, naming), true, 'and a naming the owner is reminded of is one the owner can read')
+    f.runtime.cancel(f.owner, f.mission.id, { taskId: one.id, reason: 'Not needed either' })
+    assert.equal(relevant(f, naming), false, 'the naming ends with the last task it named')
+    assert.deepEqual(await remind(f, naming), [], 'and so do its reminders')
+  }
 })
 
 test('every exit a wedged pass\'s naming names, performed through the owner\'s registered tools: withdrawing the work it named retires it, and a repair beside that work leaves it outstanding', async t => {
