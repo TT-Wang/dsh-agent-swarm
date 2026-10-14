@@ -22,12 +22,17 @@ const coverageRow = f => ownerRows(f).find(delivery => /is ready to complete/.te
 /** The W3 stall's own events: the board classifier's `mission/stalled`, which carries no cause. */
 const boardStallEvents = f => events(f.runtime, f.mission.id, 'mission/stalled').filter(event => event.data.cause === undefined)
 const ticks = async (f, count) => { for (let tick = 0; tick < count; tick += 1) { f.clock.advance(f.runtime.config.tickMs); await f.runtime.tick() } }
-/** A board stalled on work only the reviewer may take, dead once the reviewer is gone: its one stuck subject. */
+/** Work only the reviewer may take, dead once the reviewer is gone: stuck work no owner decision holds, so the W3 stall is its namer. */
+const strandOnReviewer = f => {
+  const dead = f.propose({ title: 'Reviewer-only work', kind: 'research', checks: [], assigneeId: f.reviewer.id })
+  f.runtime.commit(f.mission.id, () => f.runtime.store.put('members', { ...f.runtime.store.get('members', f.reviewer.id), phase: 'stopped' }))
+  return dead
+}
+/** A board stalled on that work: its one stuck subject. */
 const deadAssigneeBoard = async t => {
   const f = await setup({ clock: new FakeClock() })
   t.after(f.cleanup)
-  const dead = f.propose({ title: 'Reviewer-only work', kind: 'research', checks: [], assigneeId: f.reviewer.id })
-  f.runtime.commit(f.mission.id, () => f.runtime.store.put('members', { ...f.runtime.store.get('members', f.reviewer.id), phase: 'stopped' }))
+  const dead = strandOnReviewer(f)
   await f.runtime.settle(f.mission.id)
   await ticks(f, 1)
   return { f, dead }
@@ -41,7 +46,7 @@ test('L-21: the W3 stall, coverage-complete, duplicate-carrier and wedged-pass r
   const clock = new FakeClock()
   const stalled = await setup({ clock })
   t.after(stalled.cleanup)
-  await blockThroughReview(stalled, stalled.propose({ title: 'Dead end' }))
+  strandOnReviewer(stalled)
   await stalled.runtime.settle(stalled.mission.id)
   await stalled.runtime.tick()
   const stall = stallRow(stalled)
@@ -161,8 +166,7 @@ test('the board classifier tells what a live pass left unpublished: the pass end
       const scheduling = f.runtime.scheduling
       const pass = scheduling.openPass(f.mission.id)
       t.after(() => scheduling.closePass(f.mission.id, pass))
-      // The rejected root is its rejection decision's (R20), so the stalled board's own fact is the W3 stall.
-      if (board === 'stall') await blockThroughReview(f, f.propose({ title: 'Dead end' }))
+      if (board === 'stall') strandOnReviewer(f)
       else await acceptThroughReview(f, f.propose())
       await Promise.resolve()
       const told = () => ownerRows(f).filter(delivery => ['board-stall', 'coverage-complete', 'stall-root'].includes(noticeFamily(delivery))).map(delivery => noticeFamily(delivery)).sort()
@@ -179,10 +183,32 @@ test('the board classifier tells what a live pass left unpublished: the pass end
   }
 })
 
+test('the W3 stall tells the stuck work no open decision holds: beside a rejection it names the other stuck work alone, in its subjects, body, count and event', async t => {
+  const f = await setup({ clock: new FakeClock() })
+  t.after(f.cleanup)
+  const source = f.propose({ title: 'Rejected work' })
+  const review = await blockThroughReview(f, source)
+  const dead = strandOnReviewer(f)
+  await f.runtime.settle(f.mission.id)
+  await ticks(f, 3)
+  const subject = task => `${task.id}@${taskOf(f.runtime, task.id).epoch}`
+  const [rejection] = ownerRows(f).filter(delivery => delivery.notice.trigger === 'task/rejected')
+  assert.deepEqual(rejection?.subjects, [subject(source)], 'the rejection decision names the source')
+  const stalls = ownerRows(f).filter(delivery => noticeFamily(delivery) === 'board-stall')
+  assert.deepEqual(stalls.map(delivery => delivery.subjects), [[subject(dead)]], 'the W3 stall names only the work no decision holds')
+  assert.match(stalls[0].content, new RegExp(`Unschedulable: ${dead.id} \\(research, pending\\)\\. Subjects: ${subject(dead)}\\.`), 'its body lists that work alone')
+  assert.deepEqual(stalls[0].notice.statement.counts, { unschedulable: 1 }, 'and counts it')
+  assert.deepEqual(boardStallEvents(f).map(event => event.data.unschedulable), [[dead.id]], 'and its event states the same set')
+  // The completion diagnostic it records still lists every unfinished task; the stuck work it tells is the rest.
+  const told = stalls[0].content.slice(stalls[0].content.indexOf('Unschedulable:'))
+  assert.ok(![source.id, review.id].some(id => told.includes(id)), 'the rejected source and its rejecting review, the rejection\'s verdict, are not restated')
+  assert.deepEqual(ownerRows(f).filter(delivery => noticeFamily(delivery) === 'stall-root'), [], 'and no stall root restates the rejection')
+})
+
 test('a W3 stall is told once per identity: a board that changes and returns to it writes no second row and no second event, and its row is outstanding again', async t => {
   const f = await setup({ clock: new FakeClock() })
   t.after(f.cleanup)
-  await blockThroughReview(f, f.propose({ title: 'Dead end' }))
+  strandOnReviewer(f)
   await f.runtime.settle(f.mission.id)
   await ticks(f, 1)
   const stall = stallRow(f)
@@ -657,7 +683,7 @@ test('a review-blocked decision an older build wrote for a submission without an
 test('a queued W3 stall is withheld once its board can progress, and coverage-complete reminds the owner while the board stays coverage-complete', async t => {
   const stalled = await setup({ clock: new FakeClock() })
   t.after(stalled.cleanup)
-  await blockThroughReview(stalled, stalled.propose({ title: 'Dead end' }))
+  strandOnReviewer(stalled)
   await stalled.runtime.settle(stalled.mission.id)
   await ticks(stalled, 1)
   const stall = stallRow(stalled)
@@ -709,7 +735,8 @@ test('a mission blocked on its budget keeps its board decision: a told W3 stall 
   }
   const stalled = await setup({ clock: new FakeClock() })
   t.after(stalled.cleanup)
-  await blockThroughReview(stalled, stalled.propose({ title: 'Dead end' }))
+  const extra = stalled.propose({ title: 'More reviewer-only work', kind: 'research', checks: [], assigneeId: stalled.reviewer.id })
+  strandOnReviewer(stalled)
   await stalled.runtime.settle(stalled.mission.id)
   await ticks(stalled, 1)
   const stall = stallRow(stalled)
@@ -724,7 +751,6 @@ test('a mission blocked on its budget keeps its board decision: a told W3 stall 
   assert.equal(reminders(), before + 1, 'and reminds the owner of it')
   // Work withdrawn while the mission is blocked changes the stall's identity: a blocked mission is told no new board fact.
   const told = () => ownerRows(stalled).filter(delivery => noticeFamily(delivery) === 'board-stall').length
-  const extra = stalled.runtime.store.list('tasks', stalled.mission.id).find(task => task.kind === 'verification')
   stalled.runtime.cancel(stalled.owner, stalled.mission.id, { taskId: extra.id, reason: 'Not needed' })
   await stalled.runtime.settle(stalled.mission.id)
   await ticks(stalled, 3)

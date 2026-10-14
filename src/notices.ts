@@ -1039,21 +1039,24 @@ export class Notices {
    * The board's one fact while its condition holds, with the body and the
    * identity it is told under. Completion refused: a stalled board's W3
    * stall, keyed by the completion diagnostic and its stuck work (the
-   * unschedulable tasks, else every unfinished one), one set that its subjects,
-   * body, count and event state; not told while a submission the review
+   * unschedulable tasks, else every unfinished one, less what open decisions
+   * hold), one set that its subjects, body, count and event state; not told
+   * when open decisions hold it all, or while a submission the review
    * admission speaks for is unreviewable, whose own record or decision then
    * speaks for the board. Completion allowed: coverage-complete of an
    * owner-assembled mission (no start request), keyed by its terminal work.
    */
-  private boardFact(view: MissionInterpretation): { key: string; subjects: string[]; reason: string; content: string; statement: NoticeStatement } | undefined {
+  private boardFact(view: MissionInterpretation): { key: string; subjects: string[]; reason: string; content: string; statement: NoticeStatement; unschedulable?: Task[] } | undefined {
     const fact = (body: { content: string; statement: NoticeStatement }, subjects: string[], reason: string) =>
       ({ ...body, subjects, reason, key: factKey(view.missionId, { trigger: NOTICE_TEMPLATES[body.statement.family].trigger, reason, subjects, statement: body.statement }) })
     const refusal = this.rt.completionError(view.mission)
     if (refusal === undefined) return this.rt.store.list('starts', view.missionId).length > 0 ? undefined
       : fact(renderNotice('coverage-complete', { missionTitle: view.mission.title }), view.subjectsOf(view.tasks.filter(task => TERMINAL_STATES.has(task.status))), 'every acceptance criterion is independently covered')
     if (!view.stalled || view.unreviewed.length > 0) return undefined
-    const subjects = view.subjectsOf(view.unschedulable.length ? view.unschedulable : view.nonTerminal)
-    return fact(renderNotice('board-stall', { reason: refusal, unschedulable: view.unschedulable, subjects }), subjects, refusal)
+    const decided = this.decided(view), work = view.unschedulable.length ? view.unschedulable : view.nonTerminal, stuck = work.filter(task => !decided(task))
+    if (work.length && !stuck.length) return undefined
+    const unschedulable = view.unschedulable.length ? stuck : [], subjects = view.subjectsOf(stuck)
+    return { ...fact(renderNotice('board-stall', { reason: refusal, unschedulable, subjects }), subjects, refusal), unschedulable }
   }
 
   /** A W3 stall or coverage-complete decision is outstanding while it is the board's fact under the identity it was told with; a mission blocked on its budget keeps it, like every decision (`ownerDeliveryMoot`), and only an active one is told a new fact (`ensureWitness`). */
@@ -1269,7 +1272,7 @@ export class Notices {
       if (options.wedged !== true && !members.some(member => member.status === 'waiting' || (member.status === 'idle' && this.rt.workers.isIdle(member.id)))) return
       // R20: a task an open decision holds (a start failure while its member's failures stand) is that decision's.
       const decided = this.decided(view)
-      const question = this.rt.dispatchQuestion(missionId, tasks, members, dispatchable.filter(task => !decided([taskSubject(task)])))
+      const question = this.rt.dispatchQuestion(missionId, tasks, members, dispatchable.filter(task => !decided(task)))
       // The dedup key belongs to the task and its epoch, so every pass end and
       // the wedged path re-ask it without repeating the same wake.
       if (question !== undefined) this.tell(missionId, question.message, view.subjectsOf([question.task]), { dedupKey: question.dedupKey })
@@ -1300,7 +1303,7 @@ export class Notices {
     // A stall root, and a task an open decision holds (R20), is recognised: the
     // fall-through names only what no other witness speaks for.
     const roots = new Set(view.stallRoots.map(task => task.id)), decided = this.decided(view)
-    const unrecognised = nonTerminal.filter(task => !roots.has(task.id) && !this.waitsLegitimately(task, tasks) && !decided([taskSubject(task)]))
+    const unrecognised = nonTerminal.filter(task => !roots.has(task.id) && !this.waitsLegitimately(task, tasks) && !decided(task))
     if (!unrecognised.length) return
     // R17-G3: the fact is the named subjects and the recorded reason (the
     // classifier's verdict), never the board digest.
@@ -1333,9 +1336,8 @@ export class Notices {
           ? `its stop carries no recorded start, so the declared bound (${this.rt.stallPassTimeoutMs}ms) cannot be shown to hold`
           : `its stop has been awaited for ${Math.max(0, this.rt.now() - stop.at)}ms, past the declared bound (${this.rt.stallPassTimeoutMs}ms)`)
         : 'no live replacement exists anywhere in its lineage'
-      // R20: a root whose work an open decision names (its rejection, its ceiling, its fence) is that
-      // decision's; its rejecting reviews are the verdict the decision states. A dependent no decision names is told.
-      if (decided(view.subjectsOf([root, ...dependents.filter(task => task.reviewOf !== root.id || task.status !== 'blocked')]))) continue
+      // R20: a root whose work open decisions hold (its rejection, its ceiling, its fence) is theirs. A dependent none holds is told.
+      if ([root, ...dependents].every(decided)) continue
       const { content: body, statement } = renderNotice('stall-root', { rootId: root.id, title: root.title, epoch: root.epoch, cause,
         dependents: dependents.map(task => task.id), ...(root.output === undefined ? {} : { recordedReason: root.output }) })
       // The event exists only with the delivery row that carries the fact (its
@@ -1357,20 +1359,22 @@ export class Notices {
   }
 
   /**
-   * R20, one condition, one owner decision: whether every task subject@epoch a
-   * board-level naming would tell is held by an open decision (its own row,
-   * open by `ownerDeliveryRelevant`) that names it and whose cause the board
-   * still shows (`decisionCause`). The naming tells nothing such a decision
+   * R20, one condition, one owner decision: whether a task a board-level
+   * naming would tell is held by an open decision (its own row, open by
+   * `ownerDeliveryRelevant`) that names it at its epoch and whose cause the
+   * board still shows (`decisionCause`). The naming tells nothing such a decision
    * holds: it is the owner's record of that work and its reminders carry it.
    * Once the decision closes or its cause ends, the naming is told at the next
    * judgement, so no state is silent. The rows are read only when a naming is due.
    */
-  private decided(view: MissionInterpretation): (subjects: readonly string[]) => boolean {
+  private decided(view: MissionInterpretation): (task: Task) => boolean {
     let open: Delivery[] | undefined
-    const held = (task: Task | undefined): boolean => task !== undefined && (open ??= this.rt.store.list('deliveries', view.missionId).filter(delivery => delivery.to === 'owner'
+    const decided = (task: Task): boolean => (open ??= this.rt.store.list('deliveries', view.missionId).filter(delivery => delivery.to === 'owner'
       && decisionCause(noticeRow(delivery)?.trigger) !== undefined && this.ownerDeliveryRelevant(view.mission, delivery)))
       .some(delivery => (delivery.subjects ?? []).includes(taskSubject(task)) && decisionCause(noticeRow(delivery)?.trigger)!(task, view.members))
-    return subjects => subjects.every(subject => held(taskFromSubject(subject, view.tasks)))
+      // A blocked verdict record is its source's: the decision on the source states that verdict.
+      || (task.status === 'blocked' && task.reviewOf !== undefined && view.tasks.some(source => source.id === task.reviewOf && decided(source)))
+    return decided
   }
 
   /**
@@ -1436,18 +1440,17 @@ export class Notices {
    * Tell the owner the board's fact (`boardFact`: the W3 stall, or R10-14's
    * coverage-complete, since owner-assembled plans do not auto-complete) once
    * per identity. The deliveries ledger is the record: a fact already on it
-   * writes nothing, a W3 stall whose stuck work open decisions name is theirs
-   * (`decided`), and the W3 stall's event, which carries the row's key, exists
-   * only with its row.
+   * writes nothing, and the W3 stall's event, which carries the row's key,
+   * exists only with its row.
    */
   private notifyBoard(view: MissionInterpretation): void {
     const missionId = view.missionId
     const fact = this.boardFact(view)
-    if (fact === undefined || (fact.statement.family === 'board-stall' && this.decided(view)(fact.subjects))) return
-    const { content, subjects, key, reason, statement } = fact
+    if (fact === undefined) return
+    const { content, subjects, key, reason, statement, unschedulable = [] } = fact
     // F(S), the board digest the W3 stall was told on, is an audit field of its event.
     this.tell(missionId, content, subjects, { dedupKey: key, trigger: NOTICE_TEMPLATES[statement.family].trigger, reason, statement }, statement.family !== 'board-stall' ? undefined
-      : () => this.rt.store.event(missionId, 'mission/stalled', 'runtime', { reason, fingerprint: this.rt.fingerprint(missionId), unschedulable: view.unschedulable.map(task => task.id), noticeKey: key }))
+      : () => this.rt.store.event(missionId, 'mission/stalled', 'runtime', { reason, fingerprint: this.rt.fingerprint(missionId), unschedulable: unschedulable.map(task => task.id), noticeKey: key }))
   }
 
   /**
