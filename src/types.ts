@@ -294,6 +294,9 @@ export interface Member {
    * a successful start or a successful operation.
    */
   providerOutage?: MemberProviderOutage
+  /** S5c: consecutive `workers.start` failures and the last one's error, cleared by the next successful start; a restart continues the count. */
+  startFailures?: number
+  startError?: string
 }
 /**
  * R17-G12 (mission acceptance 12): the fixed pool a worker name is drawn from,

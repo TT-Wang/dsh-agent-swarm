@@ -844,6 +844,26 @@ test('a member whose starts are failing is spoken for by its start-failure notic
   assert.deepEqual(questions(), [], 'and no question was ever owed')
 })
 
+test('a provider outage\'s notice names the member\'s open work or the mission root, never the pending work it is assigned: the dispatch question about that work is asked, once, on an unchanged board', async t => {
+  const f = await setup({ clock: new FakeClock(), workers: new FakeWorkers({ autoIdle: true }) })
+  t.after(f.cleanup)
+  const start = f.workers.start.bind(f.workers)
+  f.workers.start = async spec => { if (spec.member.id === f.author.id) throw Object.assign(new Error('429 Too Many Requests: rate limit'), { status: 429 }); return start(spec) }
+  f.runtime.commit(f.mission.id, () => f.runtime.store.put('members', { ...f.runtime.store.get('members', f.reviewer.id), phase: 'stopped' }))
+  const task = f.propose({ title: 'Work for the author' })
+  await f.runtime.settle(f.mission.id)
+  await ticks(f, 3)
+  await f.runtime.settle(f.mission.id)
+  const subject = `${task.id}@${taskOf(f.runtime, task.id).epoch}`
+  const outage = ownerRows(f).filter(delivery => /provider rate-limit outage/.test(delivery.content))
+  assert.deepEqual(outage.map(delivery => delivery.subjects), [[`mission:${f.mission.id}`]], 'the outage is told, naming the mission root: the author holds no open work')
+  assert.notEqual(f.runtime.store.get('members', f.author.id).providerOutage, undefined, 'the outage is recorded')
+  const board = f.runtime.fingerprint(f.mission.id)
+  await ticks(f, 3)
+  assert.equal(f.runtime.fingerprint(f.mission.id), board, 'the board did not change')
+  assert.deepEqual(ownerRows(f).filter(delivery => noticeFamily(delivery) === 'dispatch-question').map(delivery => delivery.subjects), [[subject]], 'the dispatch question about the pending work is asked, once')
+})
+
 test('a judgement of a board whose fact the owner holds commits nothing, and a tick judges the board at most twice: the dispatch question, the fall-through, the W3 stall', async t => {
   const boards = {
     'dispatch-question': async () => {

@@ -245,15 +245,6 @@ interface OwnerCursor {
   rows: Record<keyof OwnerRows, Map<string, string>>
 }
 /**
- * S5c: consecutive `workers.start` failures, carried on the member row so the
- * count survives a lost map or a restart instead of handing a failing route a
- * fresh budget. `Member` (src/types.ts) is outside this task's write scope, so
- * the field is declared here and travels as a plain JSON property on the same
- * durable row; the integration task records the one-line schema addition.
- */
-interface MemberStartFailureFields { startFailures?: number; startError?: string }
-const startFailureFields = (member: Member): Member & MemberStartFailureFields => member as Member & MemberStartFailureFields
-/**
  * L3: an owner-facing question is delivered with the exact call that answers it.
  * The owner's prose is not part of this store and never reaches the asker, so the
  * envelope states the receipt requirement where the question is read.
@@ -3949,13 +3940,11 @@ export class SwarmRuntime {
     // S5c: a successful start also clears the durable consecutive-failure count
     // (the same event that proves the route recovered proves the failures
     // stopped). `startFailures` stays as the in-process mirror only.
-    const fields = startFailureFields(member)
     const outage = member.providerOutage
-    const failures = fields.startFailures
-    if (outage === undefined && failures === undefined) return
+    if (outage === undefined && member.startFailures === undefined) return
     delete member.providerOutage
-    delete fields.startFailures
-    delete fields.startError
+    delete member.startFailures
+    delete member.startError
     this.commit(missionId, () => {
       this.store.put('members', member)
       if (outage !== undefined) this.store.event(missionId, 'provider/recovered', 'runtime', { memberId })
@@ -4082,10 +4071,10 @@ export class SwarmRuntime {
     // so losing the map — or restarting the runtime — continues the count instead
     // of resetting the route's budget.
     const durable = this.store.get('members', member.id) ?? member
-    const consecutiveFailures = (startFailureFields(durable).startFailures ?? this.startFailures.get(member.id) ?? 0) + 1
+    const consecutiveFailures = (durable.startFailures ?? this.startFailures.get(member.id) ?? 0) + 1
     if (outage === undefined) {
-      startFailureFields(member).startFailures = consecutiveFailures
-      startFailureFields(member).startError = String(error).slice(0, 300)
+      member.startFailures = consecutiveFailures
+      member.startError = String(error).slice(0, 300)
       this.startFailures.set(member.id, consecutiveFailures)
     }
     const reroute = outage === undefined && consecutiveFailures >= START_FAILURE_REROUTE_LIMIT
@@ -4130,14 +4119,14 @@ export class SwarmRuntime {
       const stranded = this.store.list('tasks', missionId).filter(task => task.status === 'pending' && this.scheduling.capable(task, member)
         && (task.assignmentMode === 'pinned' ? task.assigneeId === member.id : this.rerouteTarget(missionId, task, member.id) === undefined))
       const retired = this.store.list('members', missionId).filter(candidate => memberPhaseOf(candidate) === 'stopped'
-        && (startFailureFields(candidate).startFailures ?? 0) >= START_FAILURE_REROUTE_LIMIT && stranded.some(task => this.scheduling.capable(task, candidate)))
+        && (candidate.startFailures ?? 0) >= START_FAILURE_REROUTE_LIMIT && stranded.some(task => this.scheduling.capable(task, candidate)))
       const options = { trigger: 'member/resume-failed', reason: `${member.id} retired after ${consecutiveFailures} consecutive start failures` }
       if (!stranded.length) {
         this.notify(missionId, `${member.name} could not start after ${consecutiveFailures} consecutive failures; its work remains on the board; capable live routes may claim it, or use swarm_control with taskId and action=amend to choose an assignee.`,
           this.noticeSubjectsFor(missionId, { memberId: member.id }), options)
         return
       }
-      const routes = retired.map(candidate => `${candidate.name} (${candidate.id}): ${startFailureFields(candidate).startFailures} consecutive start failures, last error: ${startFailureFields(candidate).startError ?? 'not recorded'}`)
+      const routes = retired.map(candidate => `${candidate.name} (${candidate.id}): ${candidate.startFailures} consecutive start failures, last error: ${candidate.startError ?? 'not recorded'}`)
       this.notify(missionId, `No live member can start ${stranded.map(task => `${task.id} (${task.title})`).join(', ')}: every route that could was retired for start failures. ${routes.join('; ')}. The work stays pending with its recovery allowance preserved and nothing retries it. Admit a working route with swarm_add_member (it claims unpinned work), move pinned work to it with swarm_control(taskId, action: "amend", changes: { assigneeId: "member id" }, reason: "reassign"), or withdraw work that is no longer required with swarm_cancel.`,
         this.interpretation(missionId).subjectsOf(stranded), options)
     })
