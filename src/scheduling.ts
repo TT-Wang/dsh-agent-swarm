@@ -663,16 +663,16 @@ export class Scheduling {
    * live work that held it, and the durable stall event that carries the
    * notice's key.
    *
-   * The deliveries ledger is the one record of the naming. Its fact is the work
-   * the pass never reached, the live work that held it and each member's counted
-   * consecutive start failures, under its own `scheduling-pass` family, so no
-   * other notice about those subjects can consume it. A body whose fact the
-   * owner already holds writes nothing: a wedge that recurs on that fact (a
-   * provider outage counts no start failure) is told once, and a newly counted
-   * failure is a new fact (the member is one failure nearer retirement, which
-   * bounds the renaming). A naming that did not commit (a busy writer on that
-   * tick) throws, so the watchdog leaves the body unnamed and the next tick
-   * retries.
+   * The deliveries ledger is the one record of the naming. Its fact is the
+   * mission's unfinished work (the live work that held the body is part of it)
+   * and each member's counted consecutive start failures, under its own
+   * `scheduling-pass` family, so no other notice about those subjects can
+   * consume it. A body whose fact the owner already holds writes nothing: a
+   * wedge that recurs on that fact (a provider outage counts no start failure)
+   * is told once, and a newly counted failure is a new fact (the member is one
+   * failure nearer retirement, which bounds the renaming). A naming that did
+   * not commit (a busy writer on that tick) throws, so the watchdog leaves the
+   * body unnamed and the next tick retries.
    *
    * This revokes nothing: the operation queue keeps the body as the physical
    * owner until it actually returns, and a later kick is skipped until then.
@@ -689,15 +689,14 @@ export class Scheduling {
     // one board, and each keeps its own subject and dedup key; the mission root is
     // the fallback only when the board has no non-terminal task left.
     const unreached = tasks.filter(task => task.status !== 'accepted' && task.status !== 'cancelled')
-    // R16-D: a naming held to its second bound names the live work that held it
-    // as a subject too. The claim is still "this pass cannot finish", but the
-    // owner must be able to see which subjects made the wait unavoidable, and
+    // R16-D: the live work that held a naming to its second bound is unfinished
+    // (`liveWorkHolders`: running, or blocked on its stop), so it is among these
+    // subjects: the owner sees which subjects made the wait unavoidable, and
     // that the naming preserved them (it cancels no task, drops no attempt and
     // changes no lease). Guard pair: this naming x the off-pass sweep — the sweep
-    // names what no live path advances, this names what the wedged pass never
-    // reached and what held it; both carry task@epoch and neither consumes the
-    // other's dedup key.
-    const subjects = [...new Set([...subjectsOfTasks(unreached, mission), ...holders.map(holder => holder.subject)])]
+    // names what no live path advances, this names every unfinished task; both
+    // carry task@epoch and neither consumes the other's dedup key.
+    const subjects = subjectsOfTasks(unreached, mission)
     const failures = members
       .flatMap(member => { const count = (member as Member & { startFailures?: number }).startFailures; return count === undefined ? [] : [`${member.id}:${count}`] })
     const reason = ['pass-timeout', ...failures].join(' ')
