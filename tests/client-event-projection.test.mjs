@@ -110,7 +110,12 @@ test('a real restart with the human root removed projects the revocation with it
   const summary = eventSummary(event.data)
   assert.match(summary, /grantRoot: /)
   assert.match(summary, /blockedTasks: /)
-  assert.match(renderChinese(LiveWorkOverview, { snapshot }), /任务工作目录授权已撤销/)
+  // The overview shows the three newest events. The revocation blocks the work,
+  // and each owner fact that opens (the workspace terminal, the stall root and,
+  // once the board is judged, the W3 stall) is recorded after it with its own
+  // event, so the overview is rendered as of the revocation.
+  const asRevoked = { ...snapshot, events: snapshot.events.filter(item => item.seq <= event.seq) }
+  assert.match(renderChinese(LiveWorkOverview, { snapshot: asRevoked }), /任务工作目录授权已撤销/)
 })
 
 test('the sanctioned board stays model-tool-only in the client and the declared gap is documented', async t => {
