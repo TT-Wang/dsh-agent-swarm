@@ -507,8 +507,18 @@ export const unreviewedSources = (rt: Pick<LineageRuntime, 'reviewable'>, tasks:
 const reviewBlockedKey =(missionId: string, sourceId: string, need: string, reason: string): string => `review-blocked:${missionId}:${sourceId}:${need}:${reason}`
 /** The families of the board's own fact: the W3 stall, or an owner-assembled mission's coverage-complete (R10-14). */
 const BOARD_FAMILIES: readonly string[] = ['board-stall', 'coverage-complete']
-/** The facts the runtime derives from the board and the plan (each reviewed template, the dispatch question, a wedged pass's naming) and every row's reminders: none is a decision a naming defers to (`decided`). */
-const NAMING_FAMILIES: readonly string[] = [...Object.keys(NOTICE_TEMPLATES), 'dispatch-question', 'scheduling-pass', 'obligation-followup']
+/**
+ * R20: the cause a decision states, by the trigger it is recorded under, read on
+ * the task it names (`Notices.decided`). A guard terminal, a rejection or a
+ * permanent preparation failure: the task is blocked at that epoch, which only a
+ * transition ends. A start failure or retirement: the task is pending and bound
+ * to a member whose counted start failures stand (its next start clears them).
+ * Any other notice has no cause a row shows ending, so it stands for no naming.
+ */
+function decisionCause(trigger: string | undefined): ((task: Task, members: readonly Member[]) => boolean) | undefined {
+  if (trigger === 'member/resume-failed') return (task, members) => task.status === 'pending' && members.some(member => member.id === task.assigneeId && member.startFailures !== undefined)
+  return trigger === 'guard-terminal' || trigger === 'task/rejected' || trigger === 'task/preparation-failed' ? task => task.status === 'blocked' : undefined
+}
 
 export class Notices {
   /**
@@ -1257,7 +1267,7 @@ export class Notices {
       // For a completed pass the T3 rule stands: an all-busy board is working, not
       // silent, and owes no witness.
       if (options.wedged !== true && !members.some(member => member.status === 'waiting' || (member.status === 'idle' && this.rt.workers.isIdle(member.id)))) return
-      // R20: a task an open decision names (a failing dispatch or start, a fence) is that decision's.
+      // R20: a task an open decision holds (a start failure while its member's failures stand) is that decision's.
       const decided = this.decided(view)
       const question = this.rt.dispatchQuestion(missionId, tasks, members, dispatchable.filter(task => !decided([taskSubject(task)])))
       // The dedup key belongs to the task and its epoch, so every pass end and
@@ -1287,7 +1297,7 @@ export class Notices {
     // legitimately waiting, the runtime stays silent; otherwise it escalates
     // UNCONDITIONALLY and names every task its classifier did not recognise, so
     // no state can be silent and unnamed at the same time.
-    // A stall root, and a task an open decision names (R20), is recognised: the
+    // A stall root, and a task an open decision holds (R20), is recognised: the
     // fall-through names only what no other witness speaks for.
     const roots = new Set(view.stallRoots.map(task => task.id)), decided = this.decided(view)
     const unrecognised = nonTerminal.filter(task => !roots.has(task.id) && !this.waitsLegitimately(task, tasks) && !decided([taskSubject(task)]))
@@ -1347,18 +1357,20 @@ export class Notices {
   }
 
   /**
-   * R20, one condition, one owner decision: whether open decisions (each its
-   * own row, open by `ownerDeliveryRelevant`) already name every task
-   * subject@epoch a board-level naming would tell. The board's namings tell
-   * nothing such a decision names: it is the owner's record of that work and
-   * its reminders carry it. Once none names a subject, the naming is told at
-   * the next judgement, so no state is silent. The board reads the rows only
-   * when a naming is due.
+   * R20, one condition, one owner decision: whether every task subject@epoch a
+   * board-level naming would tell is held by an open decision (its own row,
+   * open by `ownerDeliveryRelevant`) that names it and whose cause the board
+   * still shows (`decisionCause`). The naming tells nothing such a decision
+   * holds: it is the owner's record of that work and its reminders carry it.
+   * Once the decision closes or its cause ends, the naming is told at the next
+   * judgement, so no state is silent. The rows are read only when a naming is due.
    */
   private decided(view: MissionInterpretation): (subjects: readonly string[]) => boolean {
-    let named: Set<string> | undefined
-    return subjects => subjects.every(subject => subject !== missionSubject(view.mission) && (named ??= new Set(this.rt.store.list('deliveries', view.missionId).filter(delivery => delivery.to === 'owner'
-      && delivery.notice?.class === 'decision' && !NAMING_FAMILIES.includes(noticeFamily(delivery)) && this.ownerDeliveryRelevant(view.mission, delivery)).flatMap(delivery => delivery.subjects ?? []))).has(subject))
+    let open: Delivery[] | undefined
+    const held = (task: Task | undefined): boolean => task !== undefined && (open ??= this.rt.store.list('deliveries', view.missionId).filter(delivery => delivery.to === 'owner'
+      && decisionCause(noticeRow(delivery)?.trigger) !== undefined && this.ownerDeliveryRelevant(view.mission, delivery)))
+      .some(delivery => (delivery.subjects ?? []).includes(taskSubject(task)) && decisionCause(noticeRow(delivery)?.trigger)!(task, view.members))
+    return subjects => subjects.every(subject => held(taskFromSubject(subject, view.tasks)))
   }
 
   /**
