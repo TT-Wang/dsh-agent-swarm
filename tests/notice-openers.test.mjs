@@ -155,6 +155,8 @@ test('an escalation names its fact like every notice: over the wake budget the w
   assert.deepEqual([part?.class, part?.from, part?.trigger, part?.subjects], ['escalation', f.author.id, 'escalation/raised', [`${work.id}@${taskOf(f.runtime, work.id).epoch}`]],
     'the summary keeps the escalation\'s identity, sender and subjects')
   assert.deepEqual(events(f.runtime, f.mission.id, 'escalation/raised').map(event => event.data.deliveryId), [escalation.deliveryId], 'the event records the same delivery')
+  // The typed record is part of its fact, so the summary keeps it and the arena's escalations list reads it there.
+  assert.deepEqual(f.runtime.observe(f.owner, f.mission.id, { detail: 'full' }).escalations, [escalation], 'the arena lists the escalation the summary carries, named by that summary')
 })
 
 test('a notice that names no fact is refused where it is written: NotifyOptions requires a trigger or an explicit key', () => {

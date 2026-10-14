@@ -15,7 +15,7 @@ import { isolationOpener } from './workspace-admission.ts'
 import { PolicyError } from './policy-error.ts'
 import type { SwarmRuntime } from './runtime.ts'
 import { awaited, type SchedulingPass } from './scheduling.ts'
-import type { Actor, Delivery, Member, Mission, NoticeClass, Task, WorkerAdapter } from './types.ts'
+import type { Actor, Delivery, Escalation, Member, Mission, NoticeClass, Task, WorkerAdapter } from './types.ts'
 
 /** R14-F2(a): the durable identity of one task at one epoch, as notices carry it. */
 export function taskSubject(task: Pick<Task, 'id' | 'epoch'>): string { return `${task.id}@${task.epoch}` }
@@ -150,6 +150,7 @@ interface NoticeFactRecord {
   aggregatedIdentities?: NonNullable<Delivery['notice']>['aggregatedIdentities']
   /** R17-G2: what a reviewed-template body states (`NoticeStatement`). */
   statement?: NoticeStatement
+  escalation?: Escalation
 }
 type NoticeRow = NonNullable<Delivery['notice']> & Partial<NoticeFactRecord>
 /** The fact view of one delivery row, or undefined when it is not a notice. */
@@ -614,12 +615,12 @@ export class Notices {
 
   /**
    * Record one owner-addressed fact durably under the identity its caller found
-   * off the ledger (`noticeIdentity`; an escalation's own, never deduplicated),
-   * with `row`, what only its own row carries. Returns the delivery that carries
-   * the fact (over the wake budget, the window's summary). Callers may already be
-   * inside a transaction; this method never opens one.
+   * off the ledger (`noticeIdentity`; an escalation's own, never deduplicated).
+   * Returns the delivery that carries the fact (over the wake budget, the
+   * window's summary). Callers may already be inside a transaction; this method
+   * never opens one.
    */
-  enqueueOwnerNotice(missionId: string, content: string, identity: { class: NoticeClass; dedupKey: string; from: string }, fact: NoticeFactRecord, row: Pick<Partial<Delivery>, 'id' | 'escalation'> = {}): Delivery {
+  enqueueOwnerNotice(missionId: string, content: string, identity: { class: NoticeClass; dedupKey: string; from: string }, fact: NoticeFactRecord): Delivery {
     const { class: noticeClass, dedupKey, from } = identity
     const at = this.rt.now()
     // R17-G4: one per-owner budget bounds every family together. Over budget, the
@@ -632,7 +633,7 @@ export class Notices {
         class: noticeClass, dedupKey, from, contentDigest: createHash('sha256').update(content).digest('hex'),
       }, ...(fact.aggregatedIdentities ?? [])], at, {
         class: noticeClass, dedupKey, from, subjects: fact.subjects,
-        trigger: fact.trigger, reason: fact.reason, createdAt: at, questionId: fact.questionId, deliveryFailureId: fact.deliveryFailureId,
+        trigger: fact.trigger, reason: fact.reason, createdAt: at, questionId: fact.questionId, deliveryFailureId: fact.deliveryFailureId, escalation: fact.escalation,
       })
     }
     const delivery: Delivery = {
@@ -640,7 +641,7 @@ export class Notices {
       content, createdAt: at,
       notice: { dedupKey, class: noticeClass, sentAt: at, queuedAt: at, subjects: fact.subjects, trigger: fact.trigger, reason: fact.reason, facts: fact.facts, aggregatedIdentities: fact.aggregatedIdentities, questionId: fact.questionId, deliveryFailureId: fact.deliveryFailureId,
         ...(fact.coveredBy === undefined ? {} : { coveredBy: fact.coveredBy }), ...(fact.statement === undefined ? {} : { statement: fact.statement }) } as NonNullable<Delivery['notice']>,
-      ...row, subjects: fact.subjects,
+      escalation: fact.escalation, subjects: fact.subjects,
     }
     const limit = Math.min(MAX_OWNER_NOTICE_CHARS, this.rt.config.maxMessageChars)
     if (content.length > limit) {

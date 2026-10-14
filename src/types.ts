@@ -630,7 +630,7 @@ export interface NoticeEnvelope {
   aggregatedFacts?: Array<{
     class: NoticeClass; dedupKey: string; from: string; factStart: number; factCount: number
     subjects: string[]; trigger: string; reason: string; createdAt: number
-    questionId?: string; deliveryFailureId?: string
+    questionId?: string; deliveryFailureId?: string; escalation?: Escalation
     /** Reminders spent on this constituent: each summarized fact has its own allowance. */
     followupCount?: number
   }>
@@ -655,8 +655,6 @@ export interface Escalation {
   /** Its own identity on the deliveries ledger, `escalation:<id>`: an escalation is never deduplicated. */
   dedupKey: string
   createdAt: number
-  /** Delivery that carries it to the owner: its own row, or over the wake budget the window's summary. */
-  deliveryId: string
 }
 export interface Delivery {
   id: string

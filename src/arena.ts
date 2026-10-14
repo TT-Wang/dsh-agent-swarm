@@ -135,7 +135,7 @@ interface ArenaView {
   status: Mission['status']
   members: ArenaMemberView[]
   notices: NoticeLedgerEntry[]
-  escalations: Escalation[]
+  escalations: Array<Escalation & { deliveryId: string }>
   lastNotice?: { class: NoticeClass; dedupKey: string; at: number }
 }
 
@@ -169,7 +169,7 @@ export function arenaView(input: ArenaInput & { missionId: string; now: number; 
       }
     }),
     notices,
-    escalations: notices.map(entry => entry.escalation).filter((item): item is Escalation => item !== undefined),
+    escalations: notices.map(entry => input.deliveries.find(delivery => delivery.id === entry.deliveryId)!).flatMap(carrier => [carrier.escalation, ...(carrier.notice!.aggregatedFacts ?? []).map(part => part.escalation)].flatMap(record => record === undefined ? [] : [{ ...record, deliveryId: carrier.id }])),
     ...(notices[0] === undefined ? {} : { lastNotice: { class: notices[0].class, dedupKey: notices[0].dedupKey, at: notices[0].sentAt } }),
   }
 }

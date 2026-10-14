@@ -1931,7 +1931,7 @@ export class SwarmRuntime {
    * never deduplicated: its identity is its own id, so two asks are two records,
    * unlike the automatic notices, each deduplicated by its fact.
    */
-  escalate(actor: Actor, missionId: string, input: { body: string; taskId?: string; attemptId?: string }): Escalation {
+  escalate(actor: Actor, missionId: string, input: { body: string; taskId?: string; attemptId?: string }): Escalation & { deliveryId: string } {
     const { mission, member } = this.participant(actor, missionId)
     if (!member) throw new Error('Only a mission member can escalate to the owner; the owner already holds the mission')
     if (terminal(mission) || mission.status === 'staged') throw new Error(`Mission is ${mission.status}; it cannot accept an escalation`)
@@ -1955,21 +1955,22 @@ export class SwarmRuntime {
     const escalation: Escalation = {
       id: escalationId, missionId, fromMemberId: member.id,
       ...(taskId === undefined ? {} : { taskId }), ...(attemptId === undefined ? {} : { attemptId }),
-      body, dedupKey, createdAt: this.now(), deliveryId: id('msg'),
+      body, dedupKey, createdAt: this.now(),
     }
-    this.commit(missionId, () => {
-      // R15-A1: its fact names the task or attempt it is about. Its delivery is the
-      // one that carries it: its own row, or over the wake budget the summary.
-      escalation.deliveryId = this.notices.enqueueOwnerNotice(missionId, body, { class: 'escalation', dedupKey, from: member.id },
-        { subjects: this.noticeSubjectsFor(missionId, { taskId, memberId: member.id }), trigger: 'escalation/raised', reason: '' }, { id: escalation.deliveryId, escalation }).id
+    const deliveryId = this.commit(missionId, () => {
+      // R15-A1: its fact names the task or attempt it is about and carries its record. Its
+      // delivery is the one that carries the fact: its own row, or over the wake budget the summary.
+      const { id: deliveryId } = this.notices.enqueueOwnerNotice(missionId, body, { class: 'escalation', dedupKey, from: member.id },
+        { subjects: this.noticeSubjectsFor(missionId, { taskId, memberId: member.id }), trigger: 'escalation/raised', reason: '', escalation })
       this.store.event(missionId, 'escalation/raised', member.id, {
-        escalationId: escalation.id, memberId: member.id, deliveryId: escalation.deliveryId,
+        escalationId: escalation.id, memberId: member.id, deliveryId,
         ...(taskId === undefined ? {} : { taskId }), ...(attemptId === undefined ? {} : { attemptId }),
         dedupKey, bodyChars: body.length,
       })
+      return deliveryId
     })
     this.kick(missionId)
-    return escalation
+    return { ...escalation, deliveryId }
   }
   /**
    * Create one durable, typed board post. The sender key and the monotonic
