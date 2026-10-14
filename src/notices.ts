@@ -1084,7 +1084,7 @@ export class Notices {
     return { ...fact(renderNotice('board-stall', { reason: refusal, unschedulable: dead, subjects }), subjects, refusal), unschedulable: dead.map(task => task.id) }
   }
 
-  /** A W3 stall or coverage-complete decision is outstanding while it is the board's fact under the identity it was told with; a mission blocked on its budget keeps it, like every decision (`ownerDeliveryMoot`), and only an active one is told a new fact (`ensureWitness`, `completeAutomatic`). */
+  /** A W3 stall or coverage-complete decision is outstanding while it is the board's fact under the identity it was told with; a mission blocked on its budget keeps it, like every decision (`ownerDeliveryMoot`), and only an active one is told a new fact (`ensureWitness`). */
   private boardFactOpen(view: MissionInterpretation, delivery: Pick<Delivery, 'notice'>): boolean {
     return this.boardFact(view)?.key === delivery.notice?.dedupKey
   }
@@ -1326,12 +1326,14 @@ export class Notices {
     // the row-4 expiry recovery) is the next chance to run the queued task.
     const nonTerminal = view.nonTerminal
     if (nonTerminal.length && nonTerminal.every(task => task.status === 'running' && task.attempt !== undefined && task.attempt.leaseUntil >= this.rt.now())) return
-    if (this.rt.reviewPathStalled(tasks, members)) {
-      // No live work: the board's own fact (the W3 stall, or coverage-complete; an automatic mission completes on its pass), told once
-      // every review need is past its grace (`stalled`). Until then the stall candidate is left to that judgement, not to the fall-through.
-      if (view.stalled) this.notifyBoard(view)
-      return
-    }
+    // The board's own fact, of which this is the one emitter: coverage-complete
+    // whenever completion is allowed (an automatic mission completes on its
+    // pass instead), the W3 stall once a stalled board's review needs are past
+    // their grace (`boardFact`).
+    this.notifyBoard(view)
+    // No live work: stuck work is the W3 stall's alone; until it is stalled the
+    // stall candidate is left to that judgement, not to the fall-through.
+    if (this.rt.reviewPathStalled(tasks, members)) return
     // R14-F2(c): the unnamed fallback is replaced. While every unfinished task is
     // legitimately waiting, the runtime stays silent; otherwise it escalates
     // UNCONDITIONALLY and names every task its classifier did not recognise, so
@@ -1485,7 +1487,7 @@ export class Notices {
    * writes nothing, and the W3 stall's event, which carries the row's key,
    * exists only with its row.
    */
-  notifyBoard(view: MissionInterpretation): void {
+  private notifyBoard(view: MissionInterpretation): void {
     const missionId = view.missionId
     const fact = this.boardFact(view)
     if (fact === undefined || hasNotice(this.rt.store.list('deliveries', missionId), { class: 'decision', dedupKey: fact.key, from: 'runtime' })) return

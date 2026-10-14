@@ -3453,16 +3453,12 @@ export class SwarmRuntime {
   }
   /** Automatic completion consumes accepted obligations; it never withdraws unfinished work.
    * Owner-assembled missions retain explicit completion (R10-14: an owner-assembled
-   * mission may still be extending its plan), and the board's own facts tell the
-   * owner of a stalled board or a coverage-complete owner-assembled mission.
+   * mission may still be extending its plan); the board classifier tells the owner
+   * of a stalled board or a coverage-complete owner-assembled mission (`Notices.judgeBoard`).
    */
   private completeAutomatic(missionId: string): boolean {
     const mission = this.mission(missionId)
-    if (mission.status !== 'active') return false
-    if (this.completionError(mission) !== undefined || this.store.list('starts', missionId).length === 0) {
-      this.notices.notifyBoard(this.interpretation(missionId))
-      return false
-    }
+    if (mission.status !== 'active' || this.completionError(mission) !== undefined || this.store.list('starts', missionId).length === 0) return false
     this.control({ sessionId: mission.ownerSessionId }, missionId, 'complete', 'Automatically completed after independent verification satisfied all mission acceptance criteria')
     this.commit(missionId, () => {
       this.store.event(missionId, 'automatic/completed', 'runtime', {})

@@ -12,7 +12,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
-import { FakeClock, FakeWorkers, MISSION_ACCEPTANCE, acceptThroughReview, blockThroughReview, events, setup, taskOf } from './faults/harness.mjs'
+import { FakeClock, FakeWorkers, MISSION_ACCEPTANCE, acceptThroughReview, blockThroughReview, eventually, events, setup, taskOf } from './faults/harness.mjs'
 import { ownerTools } from './refusal-inventory.mjs'
 import { noticeFamily, noticeTemplateKey } from '../lib/notices.js'
 
@@ -291,6 +291,48 @@ test('a coverage-complete board is never reported as a stall: an owner-assembled
     assert.equal(ownerRows(f).filter(delivery => /is ready to complete/.test(delivery.content)).length, automatic ? 0 : 1, `automatic=${automatic}: only an owner-assembled mission is told it may complete, once`)
     assert.equal(f.runtime.mission(f.mission.id).status, automatic ? 'completed' : 'active')
   }
+})
+
+test('the board classifier is the one emitter of the board\'s facts: a pass starts by admitting the host review, so a submission whose review need ripened between passes is never first reported as a stall', async t => {
+  const f = await setup({ clock: new FakeClock() })
+  t.after(f.cleanup)
+  const source = f.propose()
+  f.propose({ title: 'Builds on the source', kind: 'research', checks: [], dependencies: [source.id] })
+  const claimed = await f.runtime.claim(f.actor(f.author), f.mission.id, source.id)
+  await f.runtime.submit(f.actor(f.author), f.mission.id, { taskId: source.id, attemptId: claimed.attempt.id, output: 'candidate' })
+  await f.runtime.settle(f.mission.id)
+  // The review need ripens with no write, and the next pass starts on it.
+  f.clock.advance(Math.max(f.runtime.config.tickMs, 1_000))
+  assert.equal(f.runtime.interpretation(f.mission.id).stalled, true, 'the board the pass starts on is stalled')
+  await f.runtime.tick()
+  await f.runtime.settle(f.mission.id)
+  assert.match(f.runtime.store.list('tasks', f.mission.id).find(task => task.reviewOf === source.id)?.id ?? 'none', /^task_auto_review_/, 'the pass admitted the host review')
+  assert.deepEqual([boardStallEvents(f), ownerRows(f).filter(delivery => noticeFamily(delivery) === 'board-stall')], [[], []], 'no W3 stall was told before it')
+})
+
+test('coverage-complete is told whenever completion is allowed, whatever the stall predicate says: beside an exempt experiment whose worker stop is still settling', async t => {
+  let release
+  const settling = new Promise(resolve => { release = resolve })
+  const f = await setup({ clock: new FakeClock(), budget: { maxExperiments: 1 } })
+  t.after(async () => { release(); await f.cleanup() })
+  const runner = await f.runtime.addMember(f.owner, f.mission.id, { name: 'Runner', role: 'implementation', maxOutputTokens: 5_000 })
+  await f.runtime.settle(f.mission.id)
+  // The experiment blocked while its worker's stop is still settling: exempt from completion, and live work to the stall predicate.
+  const stop = f.workers.stop.bind(f.workers)
+  f.workers.stop = async id => { await stop(id); if (id === runner.id) await settling }
+  const experiment = f.propose({ title: 'Experiment', kind: 'research', checks: [], experiment: true, assigneeId: runner.id })
+  f.runtime.commit(f.mission.id, () => {
+    const row = taskOf(f.runtime, experiment.id)
+    f.runtime.store.put('tasks', { ...row, status: 'blocked', resumeAfterStop: { epoch: row.epoch, memberId: runner.id, reason: 'handoff', at: f.clock.now() } })
+  })
+  await acceptThroughReview(f, f.propose())
+  // The held stop is the one operation left: every pass and publication since has settled.
+  await eventually(() => !f.runtime.passState(f.mission.id).passLive, 'the last pass ends')
+  await ticks(f, 1)
+  await eventually(() => !f.runtime.passState(f.mission.id).passLive, 'the tick\'s pass ends')
+  const view = f.runtime.interpretation(f.mission.id)
+  assert.deepEqual([f.runtime.completionError(view.mission), view.stalled, taskOf(f.runtime, experiment.id).status], [undefined, false, 'blocked'], 'completion is allowed on a board the stall predicate calls live')
+  assert.equal(ownerRows(f).filter(delivery => noticeFamily(delivery) === 'coverage-complete').length, 1, 'coverage-complete is told')
 })
 
 test('an unreviewable submission is the review admission\'s decision alone: the board classifier adds no W3 stall, even for a review of it no live member can take', async t => {
