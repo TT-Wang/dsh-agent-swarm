@@ -7,7 +7,7 @@ import { PolicyError } from './policy-error.ts'
 export { WorkspaceRevokedError } from './authorization.ts'
 import { recordedClaim, type WorkspaceClaim } from './authorization.ts'
 import { WorkspaceAdmission, gitWriteDeniedMessage, TEMP_RENDEZVOUS_WINDOW_MS, type TempMention } from './workspace-admission.ts'
-import { Notices, NOTICE_TEMPLATES, REJECTION_DECISION_TRIGGER, TERMINAL_STATES, ADMIT_REVIEW, BOARD_RUNNING, WITHDRAW_SOURCE, missionSubject, renderNotice, subjectsOfTasks, taskSubject, type NotifyOptions } from './notices.ts'
+import { Notices, NOTICE_TEMPLATES, REJECTION_DECISION_TRIGGER, TERMINAL_STATES, ADMIT_REVIEW, BOARD_RUNNING, WITHDRAW_SOURCE, missionSubject, renderNotice, subjectsOfTasks, taskSubject, unreviewedSources, type NotifyOptions } from './notices.ts'
 import { RefusalRegistry, emitGuardTerminal, queueWriterBusy, requireStrings, requireText, sameChecks, unsupportedEffort, validatedBudget } from './refusals.ts'
 import { Scheduling, progressed, type SchedulingPass } from './scheduling.ts'
 // R17-G6/G7: the one derivation of mission derived state and its host projection.
@@ -2396,9 +2396,7 @@ export class SwarmRuntime {
     const tasks = this.store.list('tasks', mission.id)
     const members = this.store.list('members', mission.id)
     const stalled = this.reviewPathStalled(tasks, members)
-    for (const source of tasks) {
-      if (source.status !== 'submitted' || source.artifact === undefined) continue
-      if (this.reviewable(source, tasks, members)) continue
+    for (const source of unreviewedSources(this, tasks)) {
       const need = this.reviewNeed(source)
       if (!need.ripe) continue
       if (!need.recorded) this.reportMissingReview(mission, source)

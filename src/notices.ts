@@ -325,7 +325,7 @@ export interface MissionInterpretation {
   ready: (task: Task, member: Member, tasks?: Task[]) => boolean
   /** Pending tasks a runnable member can run right now (the dispatcher's question). */
   dispatchable: Task[]
-  /** The review admission's sources: submitted artifacts with no live review path (before the grace is applied). A submission an older build left without an artifact is ordinary stuck work. */
+  /** The review admission's sources (`unreviewedSources`). */
   unreviewed: Task[]
   /** The dispatcher's unschedulable set for this board. */
   unschedulable: Task[]
@@ -521,8 +521,10 @@ export function waitsLegitimately(rt: LineageRuntime, task: Task, tasks: Task[])
 
 const id = (prefix: string) => `${prefix}_${randomUUID()}`
 
+/** The review admission's sources, the one set its admission, its decisions and the interpretation read: submitted artifacts no live review can accept (before the grace is applied). A submission an older build left without an artifact is ordinary stuck work. */
+export const unreviewedSources = (rt: Pick<LineageRuntime, 'reviewable'>, tasks: Task[]): Task[] => tasks.filter(task => task.status === 'submitted' && task.artifact !== undefined && !rt.reviewable(task, tasks))
 /** A review-blocked decision's identity: one per blocker reason of one review need (`SwarmRuntime.reviewNeed`) of a source. */
-const reviewBlockedKey = (missionId: string, sourceId: string, need: string, reason: string): string => `review-blocked:${missionId}:${sourceId}:${need}:${reason}`
+const reviewBlockedKey =(missionId: string, sourceId: string, need: string, reason: string): string => `review-blocked:${missionId}:${sourceId}:${need}:${reason}`
 /** The families of the board's own fact: the W3 stall, or an owner-assembled mission's coverage-complete (R10-14). */
 const BOARD_FAMILIES: readonly string[] = ['board-stall', 'coverage-complete']
 
@@ -837,7 +839,7 @@ export class Notices {
       // so a notice can never describe a board the dispatcher would act on
       // differently (`ready`, `reviewable`, `unschedulable`, `stalled`).
       dispatchable: tasks.filter(task => task.status === 'pending' && runnable.some(member => this.rt.ready(task, member, tasks))),
-      unreviewed: tasks.filter(task => task.status === 'submitted' && task.artifact !== undefined && !this.rt.reviewable(task, tasks)),
+      unreviewed: unreviewedSources(this.rt, tasks),
       unschedulable: this.rt.unschedulable(mission, tasks, members),
       stalled: this.rt.stalled(tasks, members),
       parkedHolders: tasks.filter(task => task.status === 'running' && task.attempt !== undefined
@@ -1046,11 +1048,11 @@ export class Notices {
     return task !== undefined && stallRootsFor(this.rt, tasks).some(candidate => candidate.id === task.id) ? [root!] : []
   }
 
-  /** A review-blocked decision is outstanding while its reason is its source's blocker under the same review need: the one derived now, else the last one recorded (a refused admission). */
+  /** A review-blocked decision is outstanding while its source is one the review admission speaks for (`unreviewedSources`) and its reason is that source's blocker under the same review need: the one derived now, else the last one recorded (a refused admission). */
   private openReviewBlock(missionId: string, delivery: Delivery, tasks: Task[]): string[] {
     return (delivery.subjects ?? []).filter(subject => {
-      const task = taskFromSubject(subject, tasks)
-      if (task?.status !== 'submitted' || this.rt.reviewable(task, tasks)) return false
+      const task = taskFromSubject(subject, unreviewedSources(this.rt, tasks))
+      if (task === undefined) return false
       const need = this.rt.reviewNeed(task)
       const blocker = this.rt.reviewPathBlocker(task, need) ?? this.recordedBlocker(missionId, task.id)
       return blocker !== undefined && delivery.notice?.dedupKey === reviewBlockedKey(missionId, task.id, need.id, blocker)

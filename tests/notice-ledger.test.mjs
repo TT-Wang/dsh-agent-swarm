@@ -14,7 +14,7 @@ import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
 import { FakeClock, FakeWorkers, MISSION_ACCEPTANCE, acceptThroughReview, blockThroughReview, eventually, events, setup, taskOf } from './faults/harness.mjs'
 import { ownerTools } from './refusal-inventory.mjs'
-import { NOTICE_TEMPLATES, factKey, noticeFamily, noticeTemplateKey } from '../lib/notices.js'
+import { BOARD_RUNNING, NOTICE_TEMPLATES, factKey, noticeFamily, noticeTemplateKey } from '../lib/notices.js'
 
 const ownerRows = f => f.runtime.store.list('deliveries', f.mission.id).filter(delivery => delivery.to === 'owner' && delivery.notice !== undefined)
 const stallRow = f => ownerRows(f).find(delivery => delivery.notice.trigger === 'mission/stalled' && delivery.content.startsWith('Mission stalled'))
@@ -603,6 +603,38 @@ test('a legacy source beside dead work and running work is ordinary stuck work: 
   await ticks(f, 150)
   assert.deepEqual(families(source), ['fallthrough'], 'and it is named once')
   assert.deepEqual(events(f.runtime, f.mission.id, 'task/review-blocked'), [], 'no review-path decision names it')
+})
+
+test('a review-blocked decision an older build wrote for a submission without an artifact is not the admission\'s: queued it is withheld, delivered it is never reminded, and the board\'s own namer names the source, beside running work and on a board with nothing else to do', async t => {
+  for (const running of [true, false]) {
+    const f = await setup({ clock: new FakeClock() })
+    t.after(f.cleanup)
+    const source = f.propose()
+    const claimed = await f.runtime.claim(f.actor(f.author), f.mission.id, source.id)
+    await f.runtime.submit(f.actor(f.author), f.mission.id, { taskId: source.id, attemptId: claimed.attempt.id, output: 'candidate' })
+    // The row as an older build left it: a submission without an artifact, beside unrelated work the reviewer runs.
+    f.runtime.store.transaction(() => { const row = taskOf(f.runtime, source.id); delete row.artifact; f.runtime.store.put('tasks', row) })
+    const unrelated = f.propose({ title: 'Unrelated work', kind: 'research', checks: [], assigneeId: f.reviewer.id })
+    await f.runtime.claim(f.actor(f.reviewer), f.mission.id, unrelated.id)
+    await f.runtime.settle(f.mission.id)
+    // The decision 29a0268 wrote for this source past its grace, through the same emitter, with its event: the running board's cause.
+    const row = taskOf(f.runtime, source.id)
+    f.runtime.notices.notifyReviewBlocked(f.runtime.mission(f.mission.id), row, f.runtime.reviewNeed(row).id, BOARD_RUNNING)
+    const [legacy] = ownerRows(f).filter(delivery => noticeFamily(delivery) === 'review-blocked')
+    assert.equal(legacy.notice.dedupKey, `review-blocked:${f.mission.id}:${source.id}:${f.runtime.reviewNeed(row).id}:${BOARD_RUNNING}`, `running=${running}: the older build's key`)
+    // After the upgrade the running work goes on, or the owner withdraws it and the board has nothing else to do.
+    if (!running) { f.runtime.cancel(f.owner, f.mission.id, { taskId: unrelated.id, reason: 'Not needed' }); await f.runtime.settle(f.mission.id) }
+    await ticks(f, Math.ceil(Math.max(f.runtime.config.tickMs, 1_000) / f.runtime.config.tickMs) + 1)
+    const subject = `${source.id}@${row.epoch}`
+    const naming = ownerRows(f).filter(delivery => (delivery.subjects ?? []).includes(subject) && delivery.notice.trigger !== 'owner-decision-unresolved' && relevant(f, delivery))
+    assert.deepEqual(naming.map(delivery => noticeFamily(delivery)), [running ? 'fallthrough' : 'board-stall'], `running=${running}: one outstanding decision names the source, the board's own`)
+    assert.equal(relevant(f, legacy), false, `running=${running}: the older decision is withheld`)
+    // As the older build left it: delivered before the upgrade.
+    f.runtime.commit(f.mission.id, () => f.runtime.store.put('deliveries', { ...f.runtime.store.get('deliveries', legacy.id), deliveredAt: f.clock.now() }))
+    await f.runtime.flushOutbox(f.mission.id)
+    for (let interval = 0; interval < 3; interval += 1) { f.clock.advance(f.runtime.notices.obligationFollowupMs); f.runtime.notices.absenceNet(f.mission.id); await f.runtime.flushOutbox(f.mission.id) }
+    assert.deepEqual(ownerRows(f).filter(delivery => delivery.notice.dedupKey.startsWith(`obligation-followup:${legacy.id}:`)), [], `running=${running}: and it is never reminded`)
+  }
 })
 
 test('a queued W3 stall is withheld once its board can progress, and coverage-complete reminds the owner while the board stays coverage-complete', async t => {

@@ -194,11 +194,12 @@ test('a reminder queued before review admission is retained in the ledger but ne
   f.runtime.notices.absenceNet(f.mission.id)
   const reminder = f.rows().find(row => row.notice?.dedupKey === `obligation-followup:${original.id}:1`)
   assert.ok(reminder)
-  const source = f.runtime.task(f.mission.id, 'blocked-task'); source.status = 'submitted'
+  // Submitted artifacts: the review admission's sources, whose decisions it speaks for.
+  const source = { ...f.runtime.task(f.mission.id, 'blocked-task'), status: 'submitted', artifact: { commit: 'c'.repeat(40), baseCommit: 'b'.repeat(40), workspace: '/isolated', changedPaths: [] } }
   const other = { ...source, id: 'other-submission' }
   f.runtime.store.transaction(() => {
     f.runtime.store.put('tasks', source)
-    f.runtime.store.put('tasks', { ...source, id: 'review', kind: 'verification', reviewOf: source.id, status: 'pending' })
+    f.runtime.store.put('tasks', { ...source, id: 'review', kind: 'verification', reviewOf: source.id, status: 'pending', artifact: undefined })
     f.runtime.store.put('tasks', other)
     f.runtime.notify(f.mission.id, 'Legacy review decision', [`${source.id}@${source.epoch}`])
   })
