@@ -955,6 +955,35 @@ test('a wedged pass\'s naming of several tasks is outstanding for the work still
   }
 })
 
+test('a wedged pass\'s naming fact is the unfinished work and the counted start failures, under the key older builds wrote: other unfinished work under unchanged failures names the next body, and a held fact on a moved board digest names none', async t => {
+  const { f, one, two } = await twoUnreached(t)
+  const scheduling = f.runtime.scheduling
+  const key = (tasks, reason) => `scheduling-pass:${f.mission.id}:${tasks.map(task => subjectOf(f, task)).sort().join('+')}:${createHash('sha256').update(reason).digest('hex').slice(0, 16)}`
+  const told = () => [wedgeRows(f).map(delivery => delivery.notice.dedupKey), wedgeEvents(f).map(event => event.data.noticeKey)]
+  const both = key([one, two], 'pass-timeout')
+  scheduling.closePass(f.mission.id, wedgedBody(t, f, 'operation_wedge_1'))
+  assert.deepEqual(told(), [[both], [both]], 'the key is the family, the mission, the sorted unfinished work at its epochs and the digest of the recorded reason')
+  // The board digest moves under the next body; the work it never reached and the counted failures do not.
+  const second = { id: scheduling.passKey(f.mission.id), operationId: 'operation_wedge_2', missionId: f.mission.id, startedAt: f.clock.now() - 60_000,
+    revisionBefore: f.runtime.store.revision(), fingerprintBefore: f.runtime.fingerprint(f.mission.id) }
+  scheduling.passes.set(f.mission.id, second)
+  stopReviewer(f)
+  assert.notEqual(f.runtime.fingerprint(f.mission.id), second.fingerprintBefore, 'the board digest moved while the body was held')
+  scheduling.checkSchedulingPasses()
+  assert.deepEqual([second.escalatedAt !== undefined, told()], [true, [[both], [both]]], 'the owner holds that fact: the body is named by its row, with no second row and no event, whatever the board digest is')
+  scheduling.closePass(f.mission.id, second)
+  // Less unfinished work under the same (absent) start failures is another fact.
+  f.runtime.cancel(f.owner, f.mission.id, { taskId: two.id, reason: 'Not needed' })
+  await f.runtime.settle(f.mission.id)
+  const third = wedgedBody(t, f, 'operation_wedge_3')
+  assert.deepEqual(told(), [[both, key([one], 'pass-timeout')], [both, key([one], 'pass-timeout')]], 'the work the pass never reached is part of the fact: the next body is named by its own row and event')
+  // A counted start failure is the reason's other component.
+  scheduling.closePass(f.mission.id, third)
+  f.runtime.commit(f.mission.id, () => f.runtime.store.put('members', { ...f.runtime.store.get('members', f.author.id), startFailures: 2 }))
+  wedgedBody(t, f, 'operation_wedge_4')
+  assert.equal(told()[0].at(-1), key([one], `pass-timeout ${f.author.id}:2`), 'each member\'s counted consecutive start failures follow the cause in the reason the key digests')
+})
+
 test('every exit a wedged pass\'s naming names, performed through the owner\'s registered tools: withdrawing the work it named retires it, and a repair beside that work leaves it outstanding', async t => {
   const exits = {
     'admit a repair with swarm_propose': { retires: false, perform: ({ f, tool }) => tool('swarm_propose', { workstreamId: f.stream.id, title: 'Repair', objective: 'Repair the unreached work', kind: 'research', scope: ['**'], outputs: [], acceptance: MISSION_ACCEPTANCE, checks: [] }) },
