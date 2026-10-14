@@ -1707,33 +1707,64 @@ test('the isolation request is outstanding exactly while the invariant lists its
   assert.equal(taskOf(f.runtime, task.id).status, 'running', 'the resumed task is dispatched')
 })
 
-test('a board-level naming defers to an open decision only while it is open: the stall root the isolation request names is told at the next judgement once the worktrees are repaired and the task is still blocked', async t => {
-  const f = await setup({ clock: new FakeClock(), workers: new FakeWorkers({ autoIdle: true }), budget: LONG })
-  t.after(f.cleanup)
-  const own = f.runtime.store.get('members', f.reviewer.id).workspace
-  const worktree = workspace => f.runtime.store.transaction(() => f.runtime.store.put('members', { ...f.runtime.store.get('members', f.reviewer.id), workspace }))
-  // The reviewer is moved into the author's worktree. It holds pending work and a dead end of its own.
-  worktree(f.runtime.store.get('members', f.author.id).workspace)
-  const waiting = f.propose({ title: 'Reviewer work', assigneeId: f.reviewer.id, kind: 'research', checks: [] })
-  const dead = f.propose({ title: 'Reviewer dead end', assigneeId: f.reviewer.id, kind: 'research', checks: [] })
-  f.runtime.commit(f.mission.id, () => f.runtime.store.put('tasks', { ...taskOf(f.runtime, dead.id), status: 'blocked', epoch: taskOf(f.runtime, dead.id).epoch + 1, output: 'blocked for repair' }))
-  await quiet(f)
-  const subject = subjectOf(f, dead)
-  const roots = () => ownerRows(f).filter(delivery => delivery.notice.dedupKey === `stall-root:${f.mission.id}:${subject}`)
-  const [request] = terminalRows(f, 'workspace')
-  assert.ok(request?.subjects.includes(subject), 'the isolation request names the reviewer\'s dead end at its epoch')
-  assert.ok(f.runtime.notices.stallRoots(f.runtime.store.list('tasks', f.mission.id)).some(task => task.id === dead.id), 'the dead end is a stall root')
-  await ticks(f, 3)
-  assert.deepEqual(roots(), [], 'while the request is open, no stall root restates it')
-  // The worktrees are repaired: the request is no longer open, and the dead end is still blocked at that epoch.
-  nextWindow(f)
-  worktree(own)
-  assert.equal(relevant(f, request), false, 'the repair ends the request')
-  await quiet(f)
-  assert.equal(taskOf(f.runtime, waiting.id).status, 'running', 'the repaired worktree runs the reviewer\'s work')
-  assert.equal(subjectOf(f, dead), subject, 'the dead end is still blocked at the epoch the request named')
-  assert.equal(roots().length, 1, 'the stall root is told at the next judgement')
-  assert.equal(relevant(f, roots()[0]), true, 'and it is outstanding')
+test('P1d: a guard request raised for a member states no block of the work it names, so the board still names that member\'s blocked task beside it: a real handoff whose old owner never stops, beside the new assignee\'s failing dispatch; a dead end beside a failing dispatch; a dead end beside an isolation request', async t => {
+  /** The author's dispatch chain throws on every pass: its request names all of the author's unfinished work. */
+  const failDispatch = f => {
+    const isolationAllows = f.runtime.isolationAllows.bind(f.runtime)
+    f.runtime.isolationAllows = (missionId, member) => { if (member.id === f.author.id) throw new Error('worktree probe failed: EIO'); return isolationAllows(missionId, member) }
+  }
+  const deadEnd = (f, assigneeId) => {
+    const dead = f.propose({ title: 'Dead end', assigneeId, kind: 'research', checks: [] })
+    f.runtime.commit(f.mission.id, () => f.runtime.store.put('tasks', { ...taskOf(f.runtime, dead.id), status: 'blocked', epoch: taskOf(f.runtime, dead.id).epoch + 1, output: 'blocked for repair' }))
+    return dead
+  }
+  const boards = {
+    'a real handoff whose old owner never stops, beside the new assignee\'s failing dispatch': async () => {
+      const f = await setup({ clock: new FakeClock(), workers: new FakeWorkers({ autoIdle: true }), config: { stallPassTimeoutMs: 1_000 }, budget: LONG })
+      t.after(f.cleanup)
+      failDispatch(f)
+      const handed = f.propose({ title: 'Reviewer research', kind: 'research', checks: [], assigneeId: f.reviewer.id })
+      const claimed = await f.runtime.claim(f.actor(f.reviewer), f.mission.id, handed.id)
+      // The reviewer's handle never acknowledges its stop.
+      const stop = f.workers.stop.bind(f.workers)
+      f.workers.stop = id => id === f.reviewer.id ? new Promise(() => {}) : stop(id)
+      f.runtime.handoff(f.actor(f.reviewer), f.mission.id, { taskId: handed.id, attemptId: claimed.attempt.id, to: f.author.id, summary: 'Hand to the author' })
+      f.propose({ title: 'Work for the author', kind: 'research', checks: [] })
+      await ticks(f, 3)
+      f.clock.advance(f.runtime.stallPassTimeoutMs + 1)
+      await ticks(f, 6)
+      return { f, stuck: handed, chain: 'attempt_lease' }
+    },
+    'a dead end beside a failing dispatch': async () => {
+      const f = await setup({ clock: new FakeClock(), workers: new FakeWorkers({ autoIdle: true }), budget: LONG })
+      t.after(f.cleanup)
+      failDispatch(f)
+      f.propose({ title: 'Work for the author' })
+      const dead = deadEnd(f, f.author.id)
+      await quiet(f)
+      return { f, stuck: dead, chain: 'attempt_lease' }
+    },
+    'a dead end beside an isolation request': async () => {
+      const f = await setup({ clock: new FakeClock(), workers: new FakeWorkers({ autoIdle: true }), budget: LONG })
+      t.after(f.cleanup)
+      // The reviewer is moved into the author's worktree. It holds pending work and a dead end of its own.
+      f.runtime.store.transaction(() => f.runtime.store.put('members', { ...f.runtime.store.get('members', f.reviewer.id), workspace: f.runtime.store.get('members', f.author.id).workspace }))
+      f.propose({ title: 'Reviewer work', assigneeId: f.reviewer.id, kind: 'research', checks: [] })
+      const dead = deadEnd(f, f.reviewer.id)
+      await quiet(f)
+      return { f, stuck: dead, chain: 'workspace' }
+    },
+  }
+  for (const [board, build] of Object.entries(boards)) {
+    const { f, stuck, chain } = await build()
+    const subject = subjectOf(f, stuck)
+    assert.equal(taskOf(f.runtime, stuck.id).status, 'blocked', `${board}: the task is blocked`)
+    const request = terminalRows(f, chain).find(delivery => delivery.subjects.includes(subject))
+    assert.ok(request !== undefined && relevant(f, request), `${board}: an open request raised for the member names the blocked task at its epoch`)
+    const named = ownerRows(f).filter(delivery => ['stall-root', 'board-stall', 'fallthrough'].includes(noticeFamily(delivery)) && delivery.subjects.includes(subject))
+    assert.deepEqual(named.map(delivery => noticeFamily(delivery)), ['stall-root'], `${board}: the board names the blocked task beside it, once`)
+    assert.equal(relevant(f, named[0]), true, `${board}: and that naming is outstanding`)
+  }
 })
 
 test('a task\'s budget warning is told once per task, dimension, limit and threshold over many ticks: a lower threshold after a higher one is not warned, and the limit the owner raises is a new allocation', async t => {

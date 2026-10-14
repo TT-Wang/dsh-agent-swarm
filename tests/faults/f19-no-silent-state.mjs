@@ -8,8 +8,8 @@
  * record that the owner was told: a W2 or W3 witness is a row of the
  * condition's own family (W3 is family `board-stall`), open while the
  * condition holds (`ownerDeliveryRelevant`) and written once the state held,
- * or, for the board's own namings, the open decision that already names its
- * work (R20, row 7e).
+ * or, for the board's own namings, the open decision that holds its work (R20,
+ * row 7c); a request raised for a member holds none (row 7e).
  * No mission field records a witness. The documented exemptions are asserted
  * as such: a board whose only non-terminal work runs under a live lease
  * (row 3), the owner's own pause (row 16), recorded by its event alone, and the
@@ -339,18 +339,16 @@ await runScenario({
       } finally { await f.cleanup() }
     }
 
-    // Row 7e — R20: a stall root whose work an open decision names is that
-    // decision's. The isolation request names the reviewer's blocked work, so it
-    // is the witness while it is open; once the worktrees are repaired and the
-    // work is still blocked, the stall root is told.
+    // Row 7e — R20: only a decision that states the block of the work it names
+    // holds that work from the board's namings. The isolation request is raised
+    // for a member: it names the reviewer's blocked work but states no block of
+    // it, so the stall root is that work's witness while the request is open.
     {
       const f = await setup()
       try {
         f.workers.autoIdle = true
         const research = { kind: 'research', checks: undefined }
-        const own = f.runtime.store.get('members', f.reviewer.id).workspace
-        const worktree = workspace => f.runtime.store.transaction(() => f.runtime.store.put('members', { ...f.runtime.store.get('members', f.reviewer.id), workspace }))
-        worktree(f.runtime.store.get('members', f.author.id).workspace)
+        f.runtime.store.transaction(() => f.runtime.store.put('members', { ...f.runtime.store.get('members', f.reviewer.id), workspace: f.runtime.store.get('members', f.author.id).workspace }))
         f.propose({ title: 'Reviewer work', assigneeId: f.reviewer.id, ...research })
         const dead = f.propose({ title: 'Reviewer dead end', assigneeId: f.reviewer.id, ...research })
         const since = Date.now()
@@ -358,15 +356,10 @@ await runScenario({
         const subject = `${dead.id}@${taskOf(f.runtime, dead.id).epoch}`
         const request = await eventually(() => ownerNotices(f).find(delivery => delivery.notice?.dedupKey?.startsWith('guard-terminal:workspace:') && delivery.subjects?.includes(subject)),
           'row 7e: the isolation request names the blocked work')
-        assertWitness(f, request, 'guard-terminal', since, 'row 7e: while the request is open')
-        const roots = () => ownerNotices(f).filter(delivery => delivery.notice?.dedupKey === `stall-root:${f.mission.id}:${subject}`)
-        await sleep(120)
-        assert.deepEqual(roots(), [], 'row 7e: no stall root restates the open request')
-        const repaired = Date.now()
-        worktree(own)
-        const root = await eventually(() => roots()[0], 'row 7e: the stall root is told once the request is no longer open')
-        assert.equal(taskOf(f.runtime, dead.id).epoch, Number(subject.split('@')[1]), 'row 7e: at the epoch the request named')
-        assertWitness(f, root, 'stall-root', repaired, 'row 7e: once the request is no longer open')
+        const root = await eventually(() => ownerNotices(f).find(delivery => delivery.notice?.dedupKey === `stall-root:${f.mission.id}:${subject}`),
+          'row 7e: the stall root is told beside the open request')
+        assertWitness(f, request, 'guard-terminal', since, 'row 7e: the request is open')
+        assertWitness(f, root, 'stall-root', since, 'row 7e')
         rows.row7e = { witness: 'W2', taskId: dead.id }
       } finally { await f.cleanup() }
     }

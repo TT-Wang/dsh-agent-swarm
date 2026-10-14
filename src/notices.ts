@@ -508,16 +508,24 @@ const reviewBlockedKey =(missionId: string, sourceId: string, need: string, reas
 /** The families of the board's own fact: the W3 stall, or an owner-assembled mission's coverage-complete (R10-14). */
 const BOARD_FAMILIES: readonly string[] = ['board-stall', 'coverage-complete']
 /**
- * R20: the cause a decision states, by the trigger it is recorded under, read on
- * the task it names (`Notices.decided`). A guard terminal, a rejection or a
- * permanent preparation failure: the task is blocked at that epoch, which only a
- * transition ends. A start failure or retirement: the task is pending and bound
- * to a member whose counted start failures stand (its next start clears them).
- * Any other notice has no cause a row shows ending, so it stands for no naming.
+ * The guard requests raised for a task (and a revocation's, for the work its
+ * fence blocked): each states the block of the work it names. A request raised
+ * for a member (a failed dispatch, an isolation violation, an unanswered
+ * question) names the member's work but states no block of it.
  */
-function decisionCause(trigger: string | undefined): ((task: Task, members: readonly Member[]) => boolean) | undefined {
-  if (trigger === 'member/resume-failed') return (task, members) => task.status === 'pending' && members.some(member => member.id === task.assigneeId && member.startFailures !== undefined)
-  return trigger === 'guard-terminal' || trigger === 'task/rejected' || trigger === 'task/preparation-failed' ? task => task.status === 'blocked' : undefined
+const TASK_REQUESTS: readonly string[] = [...['recovery-exhausted:', 'stop:', 'closeout-failed:', 'closeout-abandoned:', 'checkpoint-failed:'].map(localKey => guardTerminalKey('attempt_lease', { localKey })),
+  guardTerminalKey('task_ceiling', { localKey: 'ceiling:' }), guardTerminalKey('workspace', { localKey: 'workspace-revoked:' })]
+/**
+ * R20: the cause a decision states, read on the task it names (`Notices.decided`).
+ * A guard request raised for a task, a rejection or a permanent preparation
+ * failure: the task is blocked at that epoch, which only a transition ends. A
+ * start failure or retirement: the task is pending and bound to a member whose
+ * counted start failures stand (its next start clears them). Any other notice
+ * has no cause a row shows ending, so it stands for no naming.
+ */
+function decisionCause(row: NoticeRow | undefined): ((task: Task, members: readonly Member[]) => boolean) | undefined {
+  if (row?.trigger === 'member/resume-failed') return (task, members) => task.status === 'pending' && members.some(member => member.id === task.assigneeId && member.startFailures !== undefined)
+  return row?.trigger === 'task/rejected' || row?.trigger === 'task/preparation-failed' || TASK_REQUESTS.some(prefix => row?.dedupKey.startsWith(prefix)) ? task => task.status === 'blocked' : undefined
 }
 
 export class Notices {
@@ -1370,8 +1378,8 @@ export class Notices {
   private decided(view: MissionInterpretation): (task: Task) => boolean {
     let open: Delivery[] | undefined
     const decided = (task: Task): boolean => (open ??= this.rt.store.list('deliveries', view.missionId).filter(delivery => delivery.to === 'owner'
-      && decisionCause(noticeRow(delivery)?.trigger) !== undefined && this.ownerDeliveryRelevant(view.mission, delivery)))
-      .some(delivery => (delivery.subjects ?? []).includes(taskSubject(task)) && decisionCause(noticeRow(delivery)?.trigger)!(task, view.members))
+      && decisionCause(noticeRow(delivery)) !== undefined && this.ownerDeliveryRelevant(view.mission, delivery)))
+      .some(delivery => (delivery.subjects ?? []).includes(taskSubject(task)) && decisionCause(noticeRow(delivery))!(task, view.members))
       // A blocked verdict record is its source's: the decision on the source states that verdict.
       || (task.status === 'blocked' && task.reviewOf !== undefined && view.tasks.some(source => source.id === task.reviewOf && decided(source)))
     return decided
