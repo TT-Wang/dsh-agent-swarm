@@ -3873,10 +3873,10 @@ export class SwarmRuntime {
   }
   /**
    * R11-01: record one classified provider outage inside the caller's
-   * transaction. The durable row is bounded to one per member and class per
-   * window; the owner notice is the outage class on the member's open work. The
-   * affected attempt is preserved (the adapter retries it in place), so nothing
-   * here re-pends or charges recovery credit.
+   * transaction. The window bounds the durable event to one per member and
+   * class; the ledger alone decides the owner notice, the outage class on the
+   * member's open work. The affected attempt is preserved (the adapter retries
+   * it in place), so nothing here re-pends or charges recovery credit.
    */
   private recordProviderOutage(member: Member, outage: ProviderOutage): void {
     const current = this.store.get('members', member.id)
@@ -3886,11 +3886,10 @@ export class SwarmRuntime {
     const duplicate = previous !== undefined && previous.class === outage.class && this.now() - previous.at < PROVIDER_OUTAGE_EVENT_WINDOW_MS
     member.providerOutage = { ...outage, at: this.now() }
     this.store.put('members', member)
-    if (duplicate) return
     // R17-G1: the member's open work comes from the shared interpretation.
     const view = this.interpretation(member.missionId)
     const open = view.tasks.filter(task => task.status === 'running' && task.attempt?.ownerId === member.id)
-    this.store.event(member.missionId, 'provider/outage', 'runtime', { memberId: member.id, class: outage.class, status: outage.status, message: outage.message, taskIds: open.map(task => task.id) })
+    if (!duplicate) this.store.event(member.missionId, 'provider/outage', 'runtime', { memberId: member.id, class: outage.class, status: outage.status, message: outage.message, taskIds: open.map(task => task.id) })
     // The fact is the outage class on the member's open work, so a retry, or a
     // return to a class already told on that work, is that fact again.
     // R15-A1/A4: the subject is the task whose clock the outage holds, never the

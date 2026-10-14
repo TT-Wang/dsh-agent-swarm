@@ -33,7 +33,7 @@ test('each start failure below the bound is its own fact, opened by its event: f
   assert.deepEqual(failures(), [['failure 1 of 3', root], ['failure 2 of 3', root], ['failure 1 of 3', root]], 'a new run\'s first failure is told too')
 })
 
-test('a provider outage is its class on the member\'s open work: a retry, a report after a pass restarted the resident member and a return to a class already told are that fact; another class, or the class over new work, is a new one', async t => {
+test('a provider outage is its class on the member\'s open work, whatever each report\'s text: a retry, a report after a pass restarted the resident member and a return to a class already told are that fact; another class, or the class over new work inside the outage event window, is a new one', async t => {
   const f = await fixture(t)
   const first = f.propose({ title: 'Running work' })
   const claimed = await f.runtime.claim(f.actor(f.author), f.mission.id, first.id)
@@ -41,8 +41,9 @@ test('a provider outage is its class on the member\'s open work: a retry, a repo
   const subject = task => [`${task.id}@${f.runtime.store.get('tasks', task.id).epoch}`]
   const report = (outage, status, message) => f.workers.callbacks.providerOutage(f.author.id, { class: outage, status, message })
   // What the adapter reports while it retries the preserved attempt in place, a scheduling pass between reports: each pass restarts the resident member.
+  // Each report's text differs by its request id.
   for (let pass = 0; pass < 3; pass++) {
-    report('rate-limit', 429, 'Rate limit reached for requests')
+    report('rate-limit', 429, `Rate limit reached for requests. Request id: req_${pass}`)
     f.clock.advance(1_000)
     f.runtime.kick(f.mission.id)
     await f.runtime.settle(f.mission.id)
@@ -57,9 +58,12 @@ test('a provider outage is its class on the member\'s open work: a retry, a repo
   await f.runtime.submit(f.actor(f.author), f.mission.id, { taskId: first.id, attemptId: claimed.attempt.id, output: 'candidate' })
   const second = f.propose({ title: 'Next work' })
   await f.runtime.claim(f.actor(f.author), f.mission.id, second.id)
-  f.clock.advance(31_000)
-  report('rate-limit', 429, 'Rate limit reached for requests')
+  // Inside the window that bounds the outage event: the window paces the event, never the notice.
+  f.clock.advance(1_000)
+  const recorded = events(f.runtime, f.mission.id, 'provider/outage').length
+  report('rate-limit', 429, 'Rate limit reached for requests. Request id: req_next')
   assert.deepEqual(outages(), [['rate-limit', subject(first)], ['unavailable', subject(first)], ['rate-limit', subject(second)]], 'the class over new work is a new fact')
+  assert.equal(events(f.runtime, f.mission.id, 'provider/outage').length, recorded, 'while the repeated class inside the window writes no event')
 })
 
 test('each challenge of a claim is its own fact, opened by its event', async t => {
