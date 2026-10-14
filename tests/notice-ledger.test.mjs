@@ -798,7 +798,7 @@ test('L-25: a task ceiling is one request per task epoch and dimension: the task
   assert.deepEqual(stallEventKeys(f, 'guard-terminal'), requestKeys(f), 'one stall event per request, naming its row')
 })
 
-test('L-25: the close-out requests are keyed by what ended: an abandoned close-out per attempt and an exhausted recovery per task epoch, so the recovery the owner extended with swarm_control is told again when it runs out', async t => {
+test('L-25: the close-out requests are keyed by what ended: an abandoned close-out per attempt and an exhausted recovery per task epoch, so the recovery the owner extended with swarm_control is told again when it runs out; until it is extended, the exits that request names are refused', async t => {
   const f = await setup({ clock: new FakeClock(), workers: new FakeWorkers({ autoIdle: true }), config: { maxIdleCloseouts: 0 } })
   t.after(f.cleanup)
   const tool = await ownerTools(f)
@@ -819,6 +819,17 @@ test('L-25: the close-out requests are keyed by what ended: an abandoned close-o
   const spent = exhausted()
   assert.deepEqual([taskOf(f.runtime, task.id).status, openers(f, 'attempt_lease')], ['blocked', [first, second, spent]],
     'the next attempt\'s abandonment is its own request, and so is the recovery it exhausted, on the one transition')
+  // A recorded limitation (docs/known-limitations.md): the chain's request names the chain's exits, and while this opener's
+  // limit is spent each of them meets the refusal that names the limit. Raising it, below, is the exit that works.
+  const request = terminalRows(f, 'attempt_lease').at(-1)
+  for (const [exit, call] of Object.entries({
+    '`action: amend`, `changes.assigneeId` and `reason` to fence and reassign it': { action: 'amend', changes: { assigneeId: f.reviewer.id }, reason: 'Reassign' },
+    '`action: resume` after repair': { action: 'resume', reason: 'Repaired' },
+  })) {
+    assert.ok(request.content.includes(exit), `the exhausted recovery's request names: ${exit}`)
+    await assert.rejects(tool('swarm_control', { taskId: task.id, ...call }), /Raise maxRecoveryAttempts before resuming exhausted automatic recovery/, `${exit} is refused while the recovery limit is spent`)
+  }
+  assert.deepEqual([taskOf(f.runtime, task.id).status, openers(f, 'attempt_lease'), relevant(f, request)], ['blocked', [first, second, spent], true], 'the refused exits change nothing: the task is blocked and its request outstanding')
   nextWindow(f)
   await tool('swarm_control', { taskId: task.id, action: 'amend', changes: { maxRecoveryAttempts: 3 }, reason: 'One more recovery' })
   await quiet(f)
