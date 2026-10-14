@@ -658,22 +658,21 @@ export class Scheduling {
   }
 
   /**
-   * R16-D: name a body past its bound. One path, from the tick watchdog, for an
-   * active mission's body (`checkSchedulingPasses`): the owner notice that names
-   * the body and the live work that held it, the durable stall event that
-   * carries the notice's key, and the wedged mark the notices publish with.
+   * R16-D: record the naming of a body past its bound, for the tick watchdog
+   * (`checkSchedulingPasses`): the owner notice that names the body and the
+   * live work that held it, and the durable stall event that carries the
+   * notice's key.
    *
    * The deliveries ledger is the one record of the naming. Its fact is the work
    * the pass never reached, the live work that held it and each member's counted
    * consecutive start failures, under its own `scheduling-pass` family, so no
    * other notice about those subjects can consume it. A body whose fact the
-   * owner already holds is marked named and writes nothing: a wedge that recurs
-   * on that fact (a provider outage counts no start failure) is told once,
-   * and a newly counted failure is a new fact (the member is one failure nearer
-   * retirement, which bounds the renaming). A body counts as named only once
-   * that fact is durable (`escalatedAt` is set after the commit, never before):
-   * a naming that did not commit (a busy writer on that tick) leaves the body
-   * unnamed, and the next tick retries.
+   * owner already holds writes nothing: a wedge that recurs on that fact (a
+   * provider outage counts no start failure) is told once, and a newly counted
+   * failure is a new fact (the member is one failure nearer retirement, which
+   * bounds the renaming). A naming that did not commit (a busy writer on that
+   * tick) throws, so the watchdog leaves the body unnamed and the next tick
+   * retries.
    *
    * This revokes nothing: the operation queue keeps the body as the physical
    * owner until it actually returns, and a later kick is skipped until then.
@@ -703,7 +702,7 @@ export class Scheduling {
       .flatMap(member => { const count = (member as Member & { startFailures?: number }).startFailures; return count === undefined ? [] : [`${member.id}:${count}`] })
     const reason = ['pass-timeout', ...failures].join(' ')
     const noticeKey = factKey(missionId, { trigger: 'scheduling-pass', reason, subjects })
-    if (hasNotice(this.rt.store.list('deliveries', missionId), { class: 'decision', dedupKey: noticeKey, from: 'runtime' })) { pass.escalatedAt = now; return }
+    if (hasNotice(this.rt.store.list('deliveries', missionId), { class: 'decision', dedupKey: noticeKey, from: 'runtime' })) return
     const fingerprint = this.rt.fingerprint(missionId)
     const revision = this.rt.store.revision()
     const bound = this.rt.stallPassTimeoutMs
@@ -756,16 +755,6 @@ export class Scheduling {
         liveSubjects: holders.map(holder => holder.subject),
       })
     })
-    pass.escalatedAt = now
-    // R17-G5: the naming is a transition that still owes the wedged pass's own
-    // dispatch question, so the next fact publication runs with the wedged
-    // branch even if the body settles before that publication runs. Marked only
-    // once the naming committed; the publication it marks runs after this
-    // synchronous call returns.
-    this.rt.expectWedgedRelease(missionId)
-    // The notice path must not share the fate of the pass that could not report
-    // it: the queue-external pump delivers it, never the wedged mission queue.
-    this.rt.pumpOutbox()
   }
 
   /**
@@ -816,6 +805,16 @@ export class Scheduling {
       // Past it the window is over, and the notice names the subject that held it.
       if (held && now - pass.startedAt < this.rt.stallPassReleaseBoundMs) continue
       this.escalateWedge(mission, pass, held, held ? this.liveWorkHolders(missionId) : [])
+      // The body counts as named once its naming fact is durable: written just
+      // now, or held by the owner already. R17-G5: naming it is a transition
+      // either way. It owes the wedged pass's own dispatch question and the
+      // board its live window left unpublished, so a publication is queued that
+      // runs with the wedged branch even if the body settles first.
+      pass.escalatedAt = now
+      this.rt.expectWedgedRelease(missionId)
+      // The notice path must not share the fate of the pass that could not report
+      // it: the queue-external pump delivers it, never the wedged mission queue.
+      this.rt.pumpOutbox()
     }
   }
 

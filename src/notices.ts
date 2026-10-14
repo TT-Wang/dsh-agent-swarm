@@ -590,10 +590,10 @@ export class Notices {
   private readonly pendingTransitions = new Set<string>()
   private transitionScheduled = false
   /**
-   * R17-G5: missions whose scheduling pass was just named wedged. The
-   * watchdog's naming commit is the transition that owes the dispatch question
-   * the wedged pass never reached, so the next publication runs with the wedged
-   * branch even if the body settles before that publication runs.
+   * R17-G5: missions whose scheduling pass was just named wedged. The naming is
+   * the transition that owes the dispatch question the wedged pass never
+   * reached, so its publication runs with the wedged branch even if the body
+   * settles before that publication runs.
    */
   private readonly wedgedReleases = new Set<string>()
 
@@ -1235,8 +1235,8 @@ export class Notices {
     })
   }
 
-  /** R17-G5: mark the next publication of a mission whose wedged pass was just named. */
-  expectWedgedRelease(missionId: string): void { this.wedgedReleases.add(missionId) }
+  /** R17-G5: a wedged pass was just named, by a new row or by the one the owner holds: that is a transition, published with the wedged branch. */
+  expectWedgedRelease(missionId: string): void { this.wedgedReleases.add(missionId); this.transition(missionId) }
 
   /** R17-G5: publish one mission's committed transitions against its settled state. */
   private publishTransition(missionId: string): void {

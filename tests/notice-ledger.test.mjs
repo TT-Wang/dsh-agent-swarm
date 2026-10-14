@@ -11,6 +11,7 @@
  */
 import test from 'node:test'
 import assert from 'node:assert/strict'
+import { createHash } from 'node:crypto'
 import { FakeClock, FakeWorkers, MISSION_ACCEPTANCE, acceptThroughReview, blockThroughReview, events, setup, taskOf } from './faults/harness.mjs'
 import { ownerTools } from './refusal-inventory.mjs'
 import { noticeFamily, noticeTemplateKey } from '../lib/notices.js'
@@ -895,6 +896,32 @@ test('the mission admission request\'s exit, performed through the owner\'s regi
   await assert.rejects(tool('swarm_propose', proposal('A third')), /mission_task_budget_exhausted/)
   assert.deepEqual(openers(f, 'task_ceiling'), ['task-budget:1', 'task-budget:2'], 'the limit the owner raised refuses under its own request')
   assert.deepEqual(stallEventKeys(f, 'guard-terminal'), requestKeys(f), 'one stall event per request, naming its row')
+})
+
+const subjectOf = (f, task) => `${task.id}@${taskOf(f.runtime, task.id).epoch}`
+const stopReviewer = f => f.runtime.commit(f.mission.id, () => f.runtime.store.put('members', { ...f.runtime.store.get('members', f.reviewer.id), phase: 'stopped' }))
+
+test('naming a body is the transition its wedged publication belongs to, whether or not the naming writes a row: a board fact committed inside the bound of a body on a held naming fact is told at that bound', async t => {
+  const f = await setup({ clock: new FakeClock() })
+  t.after(f.cleanup)
+  const dead = f.propose({ title: 'Reviewer-only work', kind: 'research', checks: [], assigneeId: f.reviewer.id })
+  await f.runtime.settle(f.mission.id)
+  const scheduling = f.runtime.scheduling
+  // An earlier body wedged on this naming fact, was named, and settled.
+  scheduling.closePass(f.mission.id, wedgedBody(t, f, 'operation_wedge_1'))
+  await Promise.resolve()
+  // The next body is live. Inside its bound the only member that may take the work is stopped: that transition's publication is the pass's.
+  const body = scheduling.openPass(f.mission.id)
+  t.after(() => scheduling.closePass(f.mission.id, body))
+  stopReviewer(f)
+  await Promise.resolve()
+  assert.equal(stallRow(f), undefined, 'a live pass leaves the board to its end')
+  // The body never returns. Past its bound the watchdog names it by the row the owner holds.
+  f.clock.advance(f.runtime.stallPassTimeoutMs)
+  scheduling.checkSchedulingPasses()
+  assert.deepEqual([body.escalatedAt !== undefined, wedgeRows(f).length, wedgeEvents(f).length], [true, 1, 1], 'the body is named, and the naming writes neither a row nor an event')
+  await Promise.resolve()
+  assert.deepEqual(stallRow(f)?.subjects, [subjectOf(f, dead)], 'the board the body left unpublished is judged at its bound: the stuck work is told while the body is still wedged, with no other commit')
 })
 
 test('every exit a wedged pass\'s naming names, performed through the owner\'s registered tools: withdrawing the work it named retires it, and a repair beside that work leaves it outstanding', async t => {
