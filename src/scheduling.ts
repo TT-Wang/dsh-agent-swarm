@@ -405,6 +405,12 @@ export class Scheduling {
   /** The dispatcher's eligibility, which every reader of a dispatchable task asks: a live member that owes no stop, for which the task is ready. */
   eligible(task: Task, member: Member, tasks: Task[]): boolean { return memberPhaseOf(member) !== 'stopped' && !pendingStopOwner(tasks, member.id) && this.ready(task, member, tasks) }
 
+  /** Spec §2: the dispatchable work, each pending task an idle or waiting member is eligible for; a working member is already busy. */
+  dispatchable(tasks: Task[], members: Member[]): Task[] {
+    const runnable = members.filter(member => member.status === 'idle' || member.status === 'waiting')
+    return tasks.filter(task => task.status === 'pending' && runnable.some(member => this.eligible(task, member, tasks)))
+  }
+
   /** The same readiness decision supplies a concrete refusal without another policy model. */
   readinessBlocker(task: Task, member: Member, tasks?: Task[]): string | undefined {
     if (task.status !== 'pending') return `task ${task.id} is ${task.status}; inspect its current attempt, artifact or recovery condition with swarm_observe(taskId)`

@@ -314,14 +314,12 @@ export interface MissionInterpretation {
   mission: Mission
   tasks: Task[]
   members: Member[]
-  /** The dispatcher's startability set: idle, or parked (the parked-member hatch). */
-  runnable: Member[]
   nonTerminal: Task[]
   stallRoots: Task[]
   replaced: Set<string>
   /** The dispatcher's eligibility (`Scheduling.eligible`), bound to these rows. */
   eligible: (task: Task, member: Member) => boolean
-  /** Pending tasks an eligible runnable member can run right now (the dispatcher's question). */
+  /** The dispatchable work (`Scheduling.dispatchable`), the dispatcher's question. */
   dispatchable: Task[]
   /** The review admission's sources (`unreviewedSources`). */
   unreviewed: Task[]
@@ -829,9 +827,8 @@ export class Notices {
     const mission = this.rt.mission(missionId)
     const tasks = this.rt.store.list('tasks', missionId)
     const members = this.rt.store.list('members', missionId)
-    const runnable = members.filter(member => member.status === 'idle' || member.status === 'waiting')
     return {
-      missionId, mission, tasks, members, runnable,
+      missionId, mission, tasks, members,
       nonTerminal: tasks.filter(task => !TERMINAL_STATES.has(task.status)),
       stallRoots: this.stallRoots(tasks),
       replaced: replacementCoverage(tasks),
@@ -839,7 +836,7 @@ export class Notices {
       // The dispatcher's own question and its own predicates, computed once here
       // so a notice can never describe a board the dispatcher would act on
       // differently (`eligible`, `reviewable`, `unschedulable`, `stalled`).
-      dispatchable: tasks.filter(task => task.status === 'pending' && runnable.some(member => this.rt.eligible(task, member, tasks))),
+      dispatchable: this.rt.dispatchable(tasks, members),
       unreviewed: unreviewedSources(this.rt, tasks),
       unschedulable: this.rt.unschedulable(mission, tasks, members),
       stalled: this.rt.stalled(tasks, members),
@@ -1249,9 +1246,6 @@ export class Notices {
     const mission = view.mission
     const tasks = view.tasks
     const members = view.members
-    // Spec §2 dispatchable: pending, dependencies accepted, and an idle or
-    // waiting member can run it. A working member is busy, not a silent board.
-    const runnable = view.runnable
     // R17-G1: the dispatcher's own `dispatchable` set, from the shared view.
     const dispatchable = options.wedged === true
       ? tasks.filter(task => task.status === 'pending' && members.some(member => view.eligible(task, member)))
@@ -1278,7 +1272,7 @@ export class Notices {
       // tells the owner which member is holding the task while the pass is dead.
       // For a completed pass the T3 rule stands: an all-busy board is working, not
       // silent, and owes no witness.
-      if (options.wedged !== true && !runnable.some(member => member.status === 'waiting' || this.rt.workers.isIdle(member.id))) return
+      if (options.wedged !== true && !members.some(member => member.status === 'waiting' || (member.status === 'idle' && this.rt.workers.isIdle(member.id)))) return
       const question = this.rt.dispatchQuestion(missionId, tasks, members, dispatchable)
       // The dedup key belongs to the task and its epoch, so every pass end and
       // the wedged path re-ask it without repeating the same wake.

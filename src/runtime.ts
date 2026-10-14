@@ -416,6 +416,7 @@ export class SwarmRuntime {
   private readonly scheduling = new Scheduling(this)
   ready(task: Task, member: Member, tasks?: Task[]): boolean { return this.scheduling.ready(task, member, tasks) }
   eligible(task: Task, member: Member, tasks: Task[]): boolean { return this.scheduling.eligible(task, member, tasks) }
+  dispatchable(tasks: Task[], members: Member[]): Task[] { return this.scheduling.dispatchable(tasks, members) }
   unschedulable(mission: Mission, tasks: Task[], members: Member[]): Task[] { return this.scheduling.unschedulable(mission, tasks, members) }
   reviewable(task: Task, tasks: Task[], members?: Member[]): boolean { return this.scheduling.reviewable(task, tasks, members) }
   stalled(tasks: Task[], members: Member[]): boolean { return this.scheduling.stalled(tasks, members) }
