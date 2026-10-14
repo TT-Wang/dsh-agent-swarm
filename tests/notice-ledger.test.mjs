@@ -1233,7 +1233,23 @@ test('L-25: a guard terminal is one request per fact that opened it: the task bu
   assert.deepEqual(stallEventKeys(f, 'guard-terminal'), keys())
 })
 
-test('L-25: a failed dispatch is one request per member, the work it names and the failure, whatever the board digest; the dispatch question about the task it names stays its own fact, told once under its own key', async t => {
+test('a dispatch-failed member with assigned work gives one request, not a request plus a dispatch question: the pass whose dispatch threw identifies the blocker of the work its request names, at its end and at its close', async t => {
+  const f = await setup({ clock: new FakeClock(), workers: new FakeWorkers({ autoIdle: true }), budget: LONG })
+  t.after(f.cleanup)
+  const isolationAllows = f.runtime.isolationAllows.bind(f.runtime)
+  f.runtime.isolationAllows = (missionId, member) => { if (member.id === f.author.id) throw new Error('worktree probe failed: EIO'); return isolationAllows(missionId, member) }
+  const task = f.propose({ title: 'Work for the author' })
+  await quiet(f)
+  // The board digest moves under the same failure: the reviewer is given work of its own.
+  f.propose({ title: 'Work for the reviewer', assigneeId: f.reviewer.id, kind: 'research', checks: [] })
+  await quiet(f)
+  const subject = subjectOf(f, task)
+  assert.equal(taskOf(f.runtime, task.id).status, 'pending', 'the author is never given its work')
+  const named = ownerRows(f).filter(delivery => delivery.subjects.includes(subject) && delivery.notice.trigger !== 'owner-decision-unresolved')
+  assert.deepEqual(named.map(delivery => noticeFamily(delivery)), ['guard-terminal'], 'one request names the work, and no dispatch question beside it')
+})
+
+test('L-25: a failed dispatch is one request per member, the work it names and the failure, whatever the board digest, and the work it names is that request\'s alone: no dispatch question asks about it', async t => {
   const f = await setup({ clock: new FakeClock(), workers: new FakeWorkers({ autoIdle: true }) })
   t.after(f.cleanup)
   // A guard of the author's dispatch chain throws on every pass.
@@ -1264,9 +1280,8 @@ test('L-25: a failed dispatch is one request per member, the work it names and t
   assert.equal(f.runtime.fingerprint(f.mission.id), changed)
   assert.deepEqual(terminals().map(delivery => delivery.notice.reason), ['Error: worktree probe failed: EIO', `Error: ${failure}`], 'a different failure on an unchanged board is told')
   assert.deepEqual(stallEventKeys(f, 'guard-terminal'), terminals().map(delivery => delivery.notice.dedupKey), 'one stall event per request, naming its row')
-  // Open (docs/known-limitations.md): the question is a second wording of the failing chain's condition. No row shows a
-  // failing dispatch chain ending, so the request cannot stand for it (R20); what is pinned here is that it is asked once, under its own key.
-  assert.deepEqual(questions(), [`dispatch-question:${f.mission.id}:${subject}`], 'the undispatched task is the dispatch question\'s own fact at its epoch: asked once, whichever requests the chain holds')
+  // R20: each pass whose dispatch of the author throws identifies the blocker of the work its request names.
+  assert.deepEqual(questions(), [], 'the dispatch question never restates the request: one condition, one owner decision')
 })
 
 /** Every body and deferred operation settles, two ticks run, and what they started settles too. */

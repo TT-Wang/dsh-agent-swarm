@@ -31,6 +31,7 @@ import { tempDirectory } from './temp-root.mjs'
 import { guardBoard } from './guard-model.mjs'
 import { wakePrecision } from './instruments.mjs'
 import { FakeWorkers, SwarmRuntime, budget as sharedBudget, makeRuntime } from './faults/harness.mjs'
+import { Scheduling } from '../lib/scheduling.js'
 
 const budget = { ...sharedBudget, maxTokens: 100000, maxSteps: 100, maxTasks: 20, maxExperiments: 2 }
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
@@ -232,11 +233,14 @@ test('R15-A4 pair: an open attempt stays silent — the close-out path already n
   const task = f.propose('Mid-flight', { assigneeId: builder.id })
   const members = f.runtime.store.list('members', f.mission.id)
   const withoutAttempt = { ...f.runtime.store.get('tasks', task.id) }
-  assert.notEqual(f.runtime.dispatchQuestion(f.mission.id, [withoutAttempt], members, [withoutAttempt]), undefined, 'the question answers for a task with no open attempt')
+  // The question is an open pass's own: asked here over this runtime as the end of a pass would.
+  const scheduling = new Scheduling(f.runtime)
+  scheduling.passes.set(f.mission.id, { identified: [] })
+  assert.notEqual(scheduling.dispatchQuestion(f.mission.id, [withoutAttempt], members, [withoutAttempt]), undefined, 'the question answers for a task with no open attempt')
   const row = f.runtime.store.get('tasks', task.id)
   row.attempt = { id: 'attempt_open', epoch: row.epoch, ownerId: builder.id, leaseUntil: Date.now() + 60000 }
   f.runtime.store.put('tasks', row)
-  assert.equal(f.runtime.dispatchQuestion(f.mission.id, [f.runtime.store.get('tasks', task.id)], members, [f.runtime.store.get('tasks', task.id)]), undefined, "an open attempt is the close-out path business, not a dispatch question")
+  assert.equal(scheduling.dispatchQuestion(f.mission.id, [f.runtime.store.get('tasks', task.id)], members, [f.runtime.store.get('tasks', task.id)]), undefined, "an open attempt is the close-out path business, not a dispatch question")
   await sleep(250)
   const question = f.notices().find(delivery => typeof delivery.notice?.dedupKey === 'string' && delivery.notice.dedupKey.startsWith('dispatch-question:'))
   assert.equal(question, undefined, 'no owner decision is recorded while an open attempt exists')

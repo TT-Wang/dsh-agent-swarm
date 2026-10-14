@@ -1186,12 +1186,10 @@ export class Notices {
     if (this.publishingTransition) return
     this.publishingTransition = true
     try {
-      // A live pass owns the dispatcher's "ready but not dispatched" question
-      // (R15-D3: generation must not invent the cause the pass is about to
-      // resolve); the question is asked by the transition that ends or names
-      // the pass, and by a wedged pass, which never reached its own question; a
-      // body that made progress of its own within the last bound past its bound
-      // is running, not wedged (`Scheduling.passState`).
+      // The dispatcher's "ready but not dispatched" question is the open pass's
+      // own (R15-D3, `Scheduling.dispatchQuestion`): asked at its end, and here
+      // only for a wedged pass, which never reached it; a body that made progress
+      // of its own within the last bound past its bound is running, not wedged.
       const state = this.rt.passState(missionId)
       const released = this.wedgedReleases.delete(missionId)
       // A live, un-wedged pass owns generation: it will publish at its own close

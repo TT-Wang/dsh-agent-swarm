@@ -85,18 +85,21 @@ test('M2-2: submission grace survives newer unrelated events without aging a new
   assert.equal(scheduling.unreviewedStall([submitted('new')]), false)
 })
 
-test('M2-3: the dispatch question leaves a task whose every startable member the isolation invariant refuses to the workspace terminal, without inventing budget refusals', () => {
-  // The question is a predicate of the board and the handles: this runtime has no store to read.
+test('M2-3: the dispatch question is the open pass\'s own: none between passes; it leaves to the pass\'s own request the work that request names, and asks about work no request names, the isolation invariant\'s refusal included, without inventing budget refusals', () => {
+  // The question is a predicate of the board, the handles and the pass: this runtime has no store to read.
   const rt = makeRuntimeStub({ workers: new FakeWorkers({ autoIdle: true }), scopesOverlap: () => true })
   const scheduling = new Scheduling(rt); scheduling.ready = () => true
   const member = { id: 'one', name: 'One', phase: 'ready', status: 'idle', workspace: '/one' }
   const independent = { id: 't', title: 'Work', epoch: 0, objective: 'Write a new file from the baseline.', acceptance: [], dependencies: [], scope: ['**'] }
-  // The isolation invariant refuses the only startable member: the workspace terminal is that cause's one emitter.
+  assert.equal(scheduling.dispatchQuestion('m', [independent], [member], [independent]), undefined, 'no pass is open: nothing asks')
+  const pass = { id: 'pass', operationId: 'one', missionId: 'm', startedAt: 0, fingerprintBefore: 'same', revisionBefore: 0, identified: ['t@0'] }
+  scheduling.passes.set('m', pass)
+  // The isolation invariant refuses the only startable member, and the pass's own request names the task: its blocker is identified.
   assert.equal(scheduling.dispatchQuestion('m', [independent], [{ ...member, workspace: '' }], [independent]), undefined)
-  const unknown = scheduling.dispatchQuestion('m', [independent], [member], [independent])
-  assert.match(unknown.message, /idle handle alone does not identify the dispatch blocker/)
-  // A second startable member the invariant does not refuse leaves the gap unexplained: the question is asked.
-  assert.match(scheduling.dispatchQuestion('m', [independent], [{ ...member, workspace: '' }, { ...member, id: 'two', name: 'Two', workspace: '/two' }], [independent]).message, /idle handle alone does not identify the dispatch blocker/)
+  // No request of this pass names the task: the refusal does not identify its dispatch blocker, so the question is asked.
+  pass.identified = []
+  assert.match(scheduling.dispatchQuestion('m', [independent], [{ ...member, workspace: '' }], [independent]).message, /idle handle alone does not identify the dispatch blocker/)
+  assert.match(scheduling.dispatchQuestion('m', [independent], [member], [independent]).message, /idle handle alone does not identify the dispatch blocker/)
 })
 
 test('stop recovery owns its member until quiescence, including before native startup', async () => {
@@ -108,6 +111,7 @@ test('stop recovery owns its member until quiescence, including before native st
   const scheduling = new Scheduling(rt); scheduling.ready = () => true
   assert.equal(await scheduling.dispatch({ status: 'active' }, 'm'), true)
   assert.equal(starts, 0)
+  scheduling.passes.set('m', { id: 'pass', operationId: 'one', missionId: 'm', startedAt: 0, fingerprintBefore: 'same', revisionBefore: 0, identified: [] })
   assert.equal(scheduling.dispatchQuestion('m', [stopping, ready], [member], [ready]), undefined)
 })
 
