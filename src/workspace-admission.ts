@@ -10,7 +10,7 @@
 import { tmpdir } from 'node:os'
 import { stopPending } from './attempts.ts'
 import { claimFor, isContained, reauthorizeWorkspace, WorkspaceRevokedError, WORKSPACE_AUTHORIZATION_CODE, type WorkspaceClaim } from './authorization.ts'
-import { reasonDigest } from './notices.ts'
+import { reasonDigest, subjectsOfTasks } from './notices.ts'
 import { emitGuardTerminal, guardTerminalHeld, guardTerminalKey } from './refusals.ts'
 import type { SwarmRuntime } from './runtime.ts'
 import { progressed, type SchedulingPass } from './scheduling.ts'
@@ -435,7 +435,8 @@ export class WorkspaceAdmission {
     // S4b: the fence reaches the shared coded workspace terminal. A revocation
     // is a local fault, not a board state, so the decision is keyed by it and
     // the owner is woken once per revocation however the board moves afterwards.
-    emitGuardTerminal(this.rt, missionId, 'workspace', { detail: reason, localKey: revocation })
+    // It names the work the fence blocked, which the board's namings then leave to it.
+    emitGuardTerminal(this.rt, missionId, 'workspace', { detail: reason, localKey: revocation, subjects: subjectsOfTasks(blocked, mission) })
   }
 
   /**

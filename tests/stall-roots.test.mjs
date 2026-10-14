@@ -226,13 +226,14 @@ test('pending stop waits remain bounded and use the same owner scope as dispatch
   assert.equal(waitsLegitimately(rt, { ...pending, dependencies: [accepted.id] }, [pending, accepted, running]), true, 'accepted prerequisites remain ready while the member is busy')
 })
 
-test('a real review rejection names its stall root exactly once, with exactly one stall-root event', async t => {
+test('a real review rejection\'s stall root is its rejection decision\'s: no stall-root row or event restates it on any tick, and the decision reaches the owner', async t => {
   // 2026-09-18 review: after a real rejection the emission-time refusal refused
   // every stall-root notice (the rejecting review, a blocked verdict record, is
   // a dependent that is not itself a root), while the stall event was written on
-  // every tick: ~62 events and 0 deliveries. The event now exists only with its
-  // delivery row, and delivery judges the root the key names, not its dependents.
-  // The clock and the ticks are driven by hand.
+  // every tick: ~62 events and 0 deliveries. One condition is one owner decision
+  // (R20): a root whose only dependents are its rejecting reviews is the open
+  // rejection decision's, so the classifier writes neither a row nor an event
+  // for it. The clock and the ticks are driven by hand.
   const f = await fixture(t, { clock: new FakeClock(), tickMs: 10 })
   const reviewer = await f.runtime.addMember(f.owner, f.mission.id, { name: 'Reviewer', role: 'verification' })
   await f.runtime.settle(f.mission.id)
@@ -247,28 +248,20 @@ test('a real review rejection names its stall root exactly once, with exactly on
   assert.equal(rejected.status, 'blocked', 'the reviewed source is blocked by the rejection')
   await f.runtime.settle(f.mission.id)
   await ticks(f, 150)
-  const key = `stall-root:${f.mission.id}:${source.id}@${rejected.epoch}`
-  const deliveries = f.stallRoots().filter(delivery => delivery.notice.dedupKey === key)
-  const events = f.runtime.store.events(f.mission.id, 500).filter(event => event.type === 'mission/stalled' && event.data?.cause === 'stall-root')
-  const transitionSite = f.notices().filter(delivery => !delivery.notice?.dedupKey?.startsWith('stall-root:') && delivery.subjects?.includes(`${source.id}@${rejected.epoch}`))
-  t.diagnostic(`stall-root events ${events.length}; owner deliveries naming the rejected source: stall-root ${deliveries.length}, transition-site ${transitionSite.length} (${transitionSite.map(delivery => delivery.notice?.dedupKey).join(', ')})`)
-  assert.equal(deliveries.length, 1, `exactly one stall-root delivery: ${JSON.stringify(f.notices().map(delivery => delivery.notice?.dedupKey))}`)
-  assert.equal(events.length, 1, `exactly one stall-root event, not one per tick: ${events.length}`)
-  assert.equal(events[0].data.taskId, source.id)
-  // The root's obligation reaches the owner, not only the ledger: through the
-  // rejection decision the stall-root row is recorded against (one wake, not two).
-  const cover = f.runtime.store.get('deliveries', deliveries[0].notice.coveredBy)
-  assert.equal(cover?.notice?.trigger, 'task/rejected', 'the stall root is recorded against the verify-site rejection decision')
-  assert.ok(cover.deliveredAt !== undefined, 'the stall-root decision reaches the owner, not only the ledger')
+  assert.ok(f.runtime.notices.stallRoots(f.runtime.store.list('tasks', f.mission.id)).some(task => task.id === source.id), 'the source is a stall root')
+  assert.deepEqual(f.stallRoots(), [], 'no stall-root row restates the rejection decision')
+  assert.deepEqual(f.runtime.store.events(f.mission.id, 500).filter(event => event.type === 'mission/stalled' && event.data?.cause === 'stall-root'), [], 'and no stall-root event is written, on any tick')
+  const decision = f.notices().find(delivery => delivery.notice?.trigger === 'task/rejected')
+  assert.deepEqual(decision?.subjects, [`${source.id}@${rejected.epoch}`], 'the rejection decision names the root at its epoch')
+  assert.ok(decision.deliveredAt !== undefined, 'and it reaches the owner, not only the ledger')
 })
 
-test('one rejection is one owner wake for its root: the stall root is recorded against the rejection decision', async t => {
+test('one rejection is one owner wake for its root: the rejection decision speaks for it, and no stall root is written', async t => {
   // 5347f5b: one rejection delivered three owner notices within ~10 ms that all
   // asked for the same repair (the verify-site decision, the W3 board stall and
   // the stall root), and the stall root spent a wake-budget slot of its own.
-  // Decision: the stall root stays the durable fact (row, event, reminders) but is
-  // not a second wake when the verify site already decided this subject@epoch.
-  // The clock and the ticks are driven by hand.
+  // The stall root is not told while the verify site's decision names this
+  // subject@epoch (R20). The clock and the ticks are driven by hand.
   const f = await fixture(t, { clock: new FakeClock(), tickMs: 10 })
   // Exactly the decision and the board stall fit; a third wake would be summarized.
   f.runtime.notices.wakeBudget = 2
@@ -281,36 +274,22 @@ test('one rejection is one owner wake for its root: the stall root is recorded a
     title: 'Review', objective: 'Independent review', kind: 'verification', reviewOf: source.id, scope: ['src/'], acceptance: ['works'], assigneeId: reviewer.id })
   const reviewing = await f.runtime.claim({ sessionId: reviewer.sessionId }, f.mission.id, review.id)
   await f.runtime.verify({ sessionId: reviewer.sessionId }, f.mission.id, { taskId: review.id, attemptId: reviewing.attempt.id, verdict: 'reject', reason: 'The candidate does not work' })
-  const stallRootEvents = () => f.runtime.store.events(f.mission.id, 500).filter(event => event.type === 'mission/stalled' && event.data?.cause === 'stall-root')
   await f.runtime.settle(f.mission.id)
-  await ticksUntil(f, () => stallRootEvents().length > 0, 'the stall-root fact is recorded', 800)
+  const delivered = () => f.notices().filter(delivery => delivery.deliveredAt !== undefined)
+  await ticksUntil(f, () => delivered().length >= 2, 'the decision and the board stall are delivered', 800)
   await ticks(f, 50)
-  const delivered = f.notices().filter(delivery => delivery.deliveredAt !== undefined)
-  const families = delivered.map(delivery => delivery.notice?.dedupKey?.split(':')[0])
-  t.diagnostic(`owner notices delivered for one rejection: ${delivered.length} (${families.join(', ')})`)
-  assert.equal(delivered.length, 2, `two owner wakes per rejection, the decision and the board stall: ${families.join(', ')}`)
-  assert.deepEqual(f.notices().filter(delivery => delivery.notice?.dedupKey?.startsWith('wake-budget:')).map(delivery => delivery.notice.aggregatedFacts?.map(part => part.dedupKey)), [],
-    'the stall root spends no wake-budget slot')
-  const decision = f.notices().find(delivery => delivery.notice?.trigger === 'task/rejected')
-  assert.ok(decision?.deliveredAt !== undefined, 'the verify-site rejection decision reaches the owner under its recorded trigger')
-  assert.deepEqual(delivered.map(delivery => delivery.notice.trigger).sort(), ['mission/stalled', 'task/rejected'])
-  const [root, ...extra] = f.stallRoots()
-  assert.deepEqual(extra, [], 'one stall-root row')
-  assert.equal(root.notice.dedupKey, `stall-root:${f.mission.id}:${source.id}@${f.runtime.store.get('tasks', source.id).epoch}`)
-  assert.equal(root.notice.coveredBy, decision.id, 'the stall root is recorded against the rejection decision')
-  assert.equal(root.deliveredAt, undefined, 'the stall root is not a second wake')
-  assert.equal(stallRootEvents().length, 1, 'the stall root stays a durable fact')
-  // The covered row is no notice on any owner instrument: not a wake or false
-  // wake in the precision projection, not queued, not the last notice.
+  const families = delivered().map(delivery => delivery.notice?.dedupKey?.split(':')[0])
+  t.diagnostic(`owner notices delivered for one rejection: ${delivered().length} (${families.join(', ')})`)
+  assert.deepEqual(delivered().map(delivery => delivery.notice.trigger).sort(), ['mission/stalled', 'task/rejected'], `two owner wakes per rejection, the decision and the board stall: ${families.join(', ')}`)
+  assert.deepEqual(f.notices().filter(delivery => delivery.notice?.dedupKey?.startsWith('wake-budget:')), [], 'nothing is summarized')
+  assert.deepEqual(f.stallRoots(), [], 'no stall-root row')
+  // Nothing on any owner instrument stands for the root beside its decision.
   const precision = wakePrecision(f.runtime, f.mission.id)
-  assert.equal(precision.decisions.byFamily['stall-root'], undefined, `the covered row is no wake: ${JSON.stringify(precision.decisions.byFamily)}`)
-  assert.equal(precision.falseWakes.total, 0, `its listed rejecting review is no false wake: ${JSON.stringify(precision.falseWakes)}`)
+  assert.equal(precision.decisions.byFamily['stall-root'], undefined, `no stall-root wake: ${JSON.stringify(precision.decisions.byFamily)}`)
+  assert.equal(precision.falseWakes.total, 0, `no false wake: ${JSON.stringify(precision.falseWakes)}`)
   const ledger = f.runtime.noticeLedger(f.owner, f.mission.id).ledger
-  assert.equal(ledger.some(entry => entry.deliveryId === root.id), false, 'the covered row is not a ledger entry')
   assert.deepEqual(ledger.filter(entry => entry.state === 'queued').map(entry => entry.dedupKey), [], 'nothing is left queued')
-  const observed = f.runtime.observe(f.owner, f.mission.id)
-  assert.equal(observed.pendingDeliveries, 0, 'the covered row is not a pending delivery')
-  assert.notEqual(observed.lastWitness?.dedupKey, root.notice.dedupKey, 'the covered row is not the last notice')
+  assert.equal(f.runtime.observe(f.owner, f.mission.id).pendingDeliveries, 0, 'nothing is pending')
 })
 
 test('a rejected root that strands a dependent names it in a delivered notice, not first in a reminder', async t => {
@@ -342,8 +321,7 @@ test('a rejected root that strands a dependent names it in a delivered notice, n
   const naming = await ticksUntil(f, () => f.notices().find(delivery => delivery.deliveredAt !== undefined && delivery.content.includes(dependent.id)), 'a delivered notice names the stranded dependent', 200)
   assert.equal(f.runtime.store.get('tasks', sibling.id).status, 'running', 'other work is running')
   assert.equal(f.runtime.store.get('tasks', dependent.id).status, 'pending')
-  assert.ok(naming.notice.dedupKey.startsWith(`stall-root:${f.mission.id}:${source.id}@`), `the root's own stall-root notice names it: ${naming.notice.dedupKey}`)
-  assert.equal(naming.notice.coveredBy, undefined, 'a root that strands other work is not recorded against the rejection decision')
+  assert.ok(naming.notice.dedupKey.startsWith(`stall-root:${f.mission.id}:${source.id}@`), `the root's own stall-root notice names it, beside the rejection decision that names only the root: ${naming.notice.dedupKey}`)
   assert.ok(naming.subjects.includes(`${dependent.id}@${f.runtime.store.get('tasks', dependent.id).epoch}`), 'the dependent is a subject of the delivered notice')
   assert.deepEqual(f.notices().filter(delivery => delivery.notice?.dedupKey?.startsWith('obligation-followup:')), [], 'no reminder was needed')
 })
@@ -406,10 +384,10 @@ test('a rejected root whose decision was summarized is its own fact, and is name
   })
   const rootSubject = `${source.id}@${rt.store.get('tasks', source.id).epoch}`
   const facts = () => f.notices().flatMap(delivery => delivery.notice?.aggregatedFacts === undefined
-    ? [{ delivery, dedupKey: delivery.notice?.dedupKey ?? '', subjects: delivery.subjects ?? [], createdAt: delivery.createdAt, coveredBy: delivery.notice?.coveredBy }]
+    ? [{ delivery, dedupKey: delivery.notice?.dedupKey ?? '', subjects: delivery.subjects ?? [], createdAt: delivery.createdAt }]
     : delivery.notice.aggregatedFacts.map(part => ({ delivery, dedupKey: part.dedupKey, subjects: part.subjects, createdAt: part.createdAt })))
-  const root = await eventually(() => facts().find(fact => fact.dedupKey === `stall-root:${f.mission.id}:${rootSubject}`), 'the stall root is recorded')
-  assert.equal(root.coveredBy, undefined, 'a rejection decision carried by a summary covers nothing: the root is its own fact')
+  // A rejection decision a summary carries is no row of its own, so no decision names the root: it is its own fact.
+  await eventually(() => facts().find(fact => fact.dedupKey === `stall-root:${f.mission.id}:${rootSubject}`), 'the stall root is recorded')
   // The owner repairs the root before the notices arrive; the unrelated fact
   // stays open while the repair runs, and is reminded until its allowance is spent.
   await noBody()
@@ -427,9 +405,10 @@ test('a rejected root whose decision was summarized is its own fact, and is name
   assert.ok(naming.dedupKey.startsWith('obligation-followup:'), `a reminder names the root: ${naming.dedupKey}`)
 })
 
-test('a stall root with no rejection decision (a permanent preparation failure) is still its own owner wake', async t => {
-  // The scheduler's permanent preparation failure notice: it never covers a stall root.
-  // The clock and the ticks are driven by hand.
+test('a stall root a permanent preparation failure\'s decision names is that decision\'s: no stall root restates it', async t => {
+  // The scheduler's permanent preparation failure notice names the blocked task
+  // at its epoch: one condition, one owner decision (R20). The clock and the
+  // ticks are driven by hand.
   const f = await fixture(t, { clock: new FakeClock() })
   const research = { kind: 'research', checks: undefined }
   const sibling = f.propose('Healthy sibling', research)
@@ -444,17 +423,21 @@ test('a stall root with no rejection decision (a permanent preparation failure) 
     f.runtime.notify(f.mission.id, row.output, [`${row.id}@${row.epoch}`], { trigger: 'task/preparation-failed', reason: row.preparationFailure.reason })
   })
   await f.runtime.settle(f.mission.id)
-  const root = await ticksUntil(f, () => f.stallRoots().find(delivery => delivery.deliveredAt !== undefined), 'the stall root is delivered as its own wake', 320)
-  assert.equal(root.notice.coveredBy, undefined, 'only a verify-site rejection decision covers a stall root')
+  await ticksUntil(f, () => f.notices().find(delivery => delivery.notice?.trigger === 'task/preparation-failed' && delivery.deliveredAt !== undefined), 'the preparation failure reaches the owner', 320)
+  await ticks(f, 20)
+  assert.ok(f.runtime.notices.stallRoots(f.runtime.store.list('tasks', f.mission.id)).some(task => task.id === failing.id), 'the failed task is a stall root')
+  assert.deepEqual(f.stallRoots(), [], 'no stall root restates the open preparation-failure decision')
 })
 
 for (const repaired of [true, false]) {
-  test(`stall-root reminders judge the root the key names: ${repaired ? 'none while the repair runs' : 'one arrives when no repair is proposed'}`, async t => {
+  test(`a rejected root's reminders judge the root: ${repaired ? 'none while the repair runs' : 'one arrives when no repair is proposed'}`, async t => {
     // 5347f5b: delivery judged a stall-root by its root alone, but its reminders
     // judged every listed subject; the rejecting review (a listed dependent) is
     // never a live wait, so two "still unresolved" reminders reached the owner
-    // while the root's repair was already running. The clock and the ticks are
-    // driven by hand: each reminder interval is one clock step and one tick.
+    // while the root's repair was already running. The rejected root is its
+    // rejection decision's (R20), whose reminders are judged here, beside the W3
+    // stall's, which lists the review. The clock and the ticks are driven by hand:
+    // each reminder interval is one clock step and one tick.
     const clock = new FakeClock()
     const f = await fixture(t, { clock })
     const followupMs = f.runtime.notices.obligationFollowupMs = 300
@@ -472,18 +455,16 @@ for (const repaired of [true, false]) {
     await f.runtime.settle(f.mission.id)
     await f.runtime.tick()
     const rootSubject = `${source.id}@${f.runtime.store.get('tasks', source.id).epoch}`
-    // Delivered itself, or (a rejected root) through the decision it is recorded against.
-    const handed = delivery => (delivery.notice.coveredBy === undefined ? delivery : f.runtime.store.get('deliveries', delivery.notice.coveredBy))?.deliveredAt !== undefined
-    const stallRoot = f.stallRoots().find(handed)
-    assert.ok(stallRoot !== undefined, 'the stall-root decision reaches the owner')
-    assert.ok(stallRoot.subjects.includes(`${review.id}@${f.runtime.store.get('tasks', review.id).epoch}`), 'the rejecting review is a listed dependent')
+    const rejection = f.notices().find(delivery => delivery.notice?.trigger === 'task/rejected')
+    assert.ok(rejection?.deliveredAt !== undefined, 'the root\'s decision reaches the owner')
+    assert.deepEqual([rejection.subjects, f.stallRoots()], [[rootSubject], []], 'it names the root, and no stall root restates it')
     const reviewSubject = `${review.id}@${f.runtime.store.get('tasks', review.id).epoch}`
     // Every owner fact: its own row, or each wake-budget constituent.
     const facts = () => f.notices().flatMap(delivery => delivery.notice?.aggregatedFacts === undefined
       ? [{ delivery, dedupKey: delivery.notice?.dedupKey ?? '', subjects: delivery.subjects ?? [], createdAt: delivery.createdAt }]
       : delivery.notice.aggregatedFacts.map(part => ({ delivery, dedupKey: part.dedupKey, subjects: part.subjects, createdAt: part.createdAt })))
     const remindersOf = original => facts().filter(fact => fact.dedupKey.startsWith(`obligation-followup:${original.id}:`))
-    const reminders = () => remindersOf(stallRoot)
+    const reminders = () => remindersOf(rejection)
     if (repaired) {
       const proposedAt = clock.now()
       const repair = f.propose('Repair', { replaces: [source.id] })
@@ -493,19 +474,16 @@ for (const repaired of [true, false]) {
       assert.equal(f.runtime.store.get('tasks', repair.id).status, 'running', 'the repair runs')
       await reminderIntervals(4)
       assert.equal(f.runtime.store.get('tasks', repair.id).status, 'running', 'the repair is still running')
-      assert.deepEqual(reminders().map(item => item.subjects), [], 'no stall-root reminder while the repair runs')
+      assert.deepEqual(reminders().map(item => item.subjects), [], 'no reminder of the root\'s decision while the repair runs')
       // 12b12a6: the W3 stall's reminders and the fall-through still named the
       // rejecting review (a blocked verdict record) while the repair ran.
       const naming = facts().filter(fact => fact.createdAt >= proposedAt && /^(obligation-followup|fallthrough):/.test(fact.dedupKey) && fact.subjects.includes(reviewSubject))
       assert.deepEqual(naming.map(fact => fact.dedupKey.split(':')[0]), [], 'no reminder or fall-through names the rejecting review while the repair runs')
       return
     }
-    // The rejected root is recorded against its rejection decision, whose own
-    // reminders carry the root.
-    const cover = f.runtime.store.get('deliveries', stallRoot.notice.coveredBy)
-    assert.ok(cover !== undefined, 'the rejected root is recorded against the rejection decision')
+    // The rejection decision's own reminders carry the root.
     await reminderIntervals(f.runtime.notices.maxObligationFollowups + 1)
-    const reminder = remindersOf(cover).find(item => item.delivery.deliveredAt !== undefined)
+    const reminder = reminders().find(item => item.delivery.deliveredAt !== undefined)
     assert.ok(reminder !== undefined, 'the rejection decision\'s reminder reaches the owner')
     assert.deepEqual(reminder.subjects, [rootSubject], 'the reminder names the root, not the rejecting review')
     // The W3 board stall lists the review too; its reminders judge the same rule.
@@ -513,12 +491,10 @@ for (const repaired of [true, false]) {
     assert.ok(stall?.subjects.includes(reviewSubject), 'the W3 stall lists the rejecting review')
     assert.equal(remindersOf(stall).length, f.runtime.notices.maxObligationFollowups, 'every W3 reminder is recorded')
     assert.deepEqual(remindersOf(stall).map(fact => fact.subjects), remindersOf(stall).map(() => [rootSubject]), 'the W3 reminders name the root only')
-    // 12b12a6: the covered row reminded on its own, beside the decision's
-    // reminder, citing an "original delivery" the owner never received.
-    assert.deepEqual(reminders(), [], 'the covered stall root has no reminders of its own')
+    // 12b12a6: a row the owner never received reminded on its own, citing an "original delivery" that was never sent.
     const cited = facts().filter(fact => fact.dedupKey.startsWith('obligation-followup:')).map(fact => fact.dedupKey.split(':')[1])
     assert.deepEqual(cited.filter(id => f.runtime.store.get('deliveries', id)?.deliveredAt === undefined), [], 'every reminder cites a delivery the owner received')
-    // cc5bb56: an uncovered stall-root decision reminds while the root its key
+    // cc5bb56: a stall-root decision reminds while the root its key
     // names is still a root. This root waits on a live prerequisite, which the
     // subject rule of every other decision reads as a legitimate wait.
     const prerequisite = f.propose('Live prerequisite')
@@ -529,7 +505,7 @@ for (const repaired of [true, false]) {
     const rootKey = `stall-root:${f.mission.id}:${root.id}@${root.epoch}`
     // Its own row, or a wake-budget summary that carries it.
     const decision = f.notices().find(delivery => delivery.notice?.dedupKey === rootKey || delivery.notice?.aggregatedFacts?.some(part => part.dedupKey === rootKey))
-    assert.ok(decision?.deliveredAt !== undefined && decision.notice.coveredBy === undefined, 'the stall-root decision reaches the owner')
+    assert.ok(decision?.deliveredAt !== undefined, 'the stall-root decision reaches the owner')
     await reminderIntervals(1)
     assert.ok(remindersOf(decision).some(fact => fact.subjects.includes(`${root.id}@${root.epoch}`)), 'its reminder names the root, however the root waits')
   })

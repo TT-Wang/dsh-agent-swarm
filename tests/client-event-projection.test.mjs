@@ -101,10 +101,15 @@ test('a real restart with the human root removed projects the revocation with it
   t.after(async () => { await restarted.dispose() })
   await restarted.start(after)
   await eventually(() => restarted.store.list('tasks', mission.id).find(task => task.status === 'blocked'), 'the running mission was not fenced', 15000)
-  // The fence opens three owner facts after the revocation, each told with its
-  // mission/stalled event: the workspace terminal, the stall root of the work it
-  // blocked and the W3 stall (three wordings of one condition, a documented gap).
-  await eventually(() => restarted.store.list('deliveries', mission.id).some(delivery => delivery.notice?.dedupKey.startsWith('board-stall:')), 'the fenced board was not judged', 15000)
+  // R20: the fence's request names the work it blocked, so the stall root and the W3 stall the board owes are that request's.
+  const request = await eventually(() => restarted.store.list('deliveries', mission.id).find(delivery => delivery.to === 'owner' && delivery.notice?.dedupKey.startsWith('guard-terminal:workspace:')), 'the revocation wakes the owner', 15000)
+  const blocked = restarted.store.list('tasks', mission.id).find(task => task.status === 'blocked')
+  assert.deepEqual(request.subjects, [`${blocked.id}@${blocked.epoch}`], 'the request names the work the fence blocked')
+  // Once its stop settles the blocked work is a stall root, and the next pass judges that board.
+  await eventually(() => restarted.notices.stallRoots(restarted.store.list('tasks', mission.id)).some(task => task.id === blocked.id), 'the blocked work is a stall root', 15000)
+  await restarted.tick()
+  await restarted.settle(mission.id)
+  assert.deepEqual(restarted.store.list('deliveries', mission.id).filter(delivery => delivery.to === 'owner').map(delivery => delivery.id), [request.id], 'one revocation wakes the owner once')
   const snapshot = restarted.snapshot(owner, mission.id)
   const revoked = recentProgress(snapshot, 20).find(event => event.label === 'Mission workspace authorization revoked')
   assert.ok(revoked, 'the compact panel labels the revocation')
@@ -114,12 +119,8 @@ test('a real restart with the human root removed projects the revocation with it
   const summary = eventSummary(event.data)
   assert.match(summary, /grantRoot: /)
   assert.match(summary, /blockedTasks: /)
-  // The overview shows the three newest events, so it shows those facts, the stall
-  // root's with the revocation's reason; the revocation itself is read in the
-  // panel's progress (above) and the Activity view, under its zh label.
-  const overview = renderChinese(LiveWorkOverview, { snapshot })
-  assert.deepEqual(overview.match(/任务已停滞|任务工作目录授权已撤销/g), ['任务已停滞', '任务已停滞', '任务已停滞'], 'the overview shows the facts the revocation opened')
-  assert.match(overview, /workspace_not_authorized/, 'the stall root names the revocation\'s reason')
+  // The overview's newest events are the request's own record and the revocation it follows; nothing the board tells comes after them.
+  assert.deepEqual(renderChinese(LiveWorkOverview, { snapshot }).match(/任务已停滞|任务工作目录授权已撤销/g), ['任务已停滞', '任务工作目录授权已撤销'], 'the overview shows the revocation')
   assert.equal(zh[revoked.label], '任务工作目录授权已撤销', 'the revocation is labelled through the real zh table')
 })
 

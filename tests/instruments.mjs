@@ -32,8 +32,7 @@ import { ATTEMPT_FENCING_EVENTS } from '../lib/types.js'
 export function wakePrecision(runtime, missionId) {
   const notices = runtime.notices
   const tasks = runtime.store.list('tasks', missionId)
-  // A covered fact (`coveredBy`) is never sent: the delivery covering it is the wake.
-  const deliveries = runtime.store.list('deliveries', missionId).filter(delivery => delivery.to === 'owner' && delivery.notice?.coveredBy === undefined
+  const deliveries = runtime.store.list('deliveries', missionId).filter(delivery => delivery.to === 'owner'
     && (delivery.notice?.class === 'decision' || delivery.notice?.class === 'escalation' || delivery.kind === 'escalation'))
   const roots = new Set(notices.stallRoots(tasks).map(task => taskSubject(task)))
   const byFamily = {}

@@ -161,6 +161,7 @@ test('the board classifier tells what a live pass left unpublished: the pass end
       const scheduling = f.runtime.scheduling
       const pass = scheduling.openPass(f.mission.id)
       t.after(() => scheduling.closePass(f.mission.id, pass))
+      // The rejected root is its rejection decision's (R20), so the stalled board's own fact is the W3 stall.
       if (board === 'stall') await blockThroughReview(f, f.propose({ title: 'Dead end' }))
       else await acceptThroughReview(f, f.propose())
       await Promise.resolve()
@@ -169,10 +170,10 @@ test('the board classifier tells what a live pass left unpublished: the pass end
       if (end === 'pass end') {
         scheduling.closePass(f.mission.id, pass)
         await Promise.resolve()
-        assert.ok(told().includes(board === 'stall' ? 'stall-root' : 'coverage-complete'), `${board}: the pass end judged the board`)
+        assert.deepEqual(told(), [board === 'stall' ? 'board-stall' : 'coverage-complete'], `${board}: the pass end judged the board`)
       } else {
         f.runtime.notices.ensureWitness(f.mission.id, { wedged: true })
-        assert.deepEqual(told(), board === 'stall' ? ['board-stall', 'stall-root'] : ['coverage-complete'], `${board}: the wedged judgement told the board facts`)
+        assert.deepEqual(told(), [board === 'stall' ? 'board-stall' : 'coverage-complete'], `${board}: the wedged judgement told the board facts`)
       }
     }
   }
@@ -876,6 +877,30 @@ test('a start failure leaves to its notice only the work that notice names: unas
   assert.deepEqual(ownerRows(f).filter(delivery => noticeFamily(delivery) === 'dispatch-question').map(delivery => delivery.subjects), [[`${task.id}@${taskOf(f.runtime, task.id).epoch}`]], 'the dispatch question about the work is asked, once')
 })
 
+test('a start failure over the work bound to its member is that work\'s one request: no dispatch question names the holder beside it, on any board digest', async t => {
+  const f = await setup({ clock: new FakeClock() })
+  t.after(f.cleanup)
+  // The author's handle is never idle and its start keeps failing; only the reviewer's handle is idle, so the board looks dispatchable.
+  f.workers.idle.add(f.reviewer.id)
+  const start = f.workers.start.bind(f.workers)
+  f.workers.start = async spec => { if (spec.member.id === f.author.id) throw Object.assign(new Error('worker start failed'), { code: 'EMFILE' }); return start(spec) }
+  const task = f.propose({ title: 'Bound to the failing author' })
+  await f.runtime.settle(f.mission.id)
+  await ticks(f, 1)
+  await f.runtime.settle(f.mission.id)
+  const subject = `${task.id}@${taskOf(f.runtime, task.id).epoch}`
+  const requests = () => ownerRows(f).filter(delivery => (delivery.subjects ?? []).includes(subject)).map(delivery => noticeFamily(delivery) === 'dispatch-question' ? 'dispatch question' : delivery.content.slice(0, delivery.content.indexOf(';')))
+  assert.equal(taskOf(f.runtime, task.id).status, 'pending')
+  assert.equal(requests()[0], 'Author could not start (failure 1 of 3)', 'the start failure names the work it could not start')
+  assert.deepEqual(requests().filter(request => request === 'dispatch question'), [], 'and no dispatch question names it beside the failure')
+  // The board digest moves: a third member joins with an idle handle, and the author is still failing.
+  const board = f.runtime.fingerprint(f.mission.id)
+  f.workers.idle.add((await f.runtime.addMember(f.owner, f.mission.id, { name: 'Third', role: 'implementation', maxOutputTokens: 5_000 })).id)
+  await f.runtime.settle(f.mission.id)
+  assert.notEqual(f.runtime.fingerprint(f.mission.id), board)
+  assert.deepEqual(requests().filter(request => request === 'dispatch question'), [], 'no dispatch question asks about the work the start failure names')
+})
+
 test('a cancellation that strands a dependent leaves it to the board classifier: one decision names it at its epoch, the fall-through beside running work and the W3 stall on a board with nothing else to do', async t => {
   for (const running of [true, false]) {
     const f = await setup({ clock: new FakeClock() })
@@ -1026,7 +1051,7 @@ test('L-25: a guard terminal is one request per fact that opened it: the task bu
   assert.deepEqual(stallEventKeys(f, 'guard-terminal'), keys())
 })
 
-test('L-25: a failed dispatch is one request per member, the work it names and the failure, whatever the board digest; the dispatch question about the task it names stays its own fact, told once under its own key', async t => {
+test('L-25: a failed dispatch is one request per member, the work it names and the failure, whatever the board digest; the task it names is never asked about beside it', async t => {
   const f = await setup({ clock: new FakeClock(), workers: new FakeWorkers({ autoIdle: true }) })
   t.after(f.cleanup)
   // A guard of the author's dispatch chain throws on every pass.
@@ -1057,9 +1082,8 @@ test('L-25: a failed dispatch is one request per member, the work it names and t
   assert.equal(f.runtime.fingerprint(f.mission.id), changed)
   assert.deepEqual(terminals().map(delivery => delivery.notice.reason), ['Error: worktree probe failed: EIO', `Error: ${failure}`], 'a different failure on an unchanged board is told')
   assert.deepEqual(stallEventKeys(f, 'guard-terminal'), terminals().map(delivery => delivery.notice.dedupKey), 'one stall event per request, naming its row')
-  // Open (docs/known-limitations.md): the question is a second wording of the failing chain's condition. It has no predicate
-  // for a failing chain, so it is asked too; what is pinned here is that it is asked once, under its own key.
-  assert.deepEqual(questions(), [`dispatch-question:${f.mission.id}:${subject}`], 'the undispatched task is the dispatch question\'s own fact at its epoch: asked once, whichever requests the chain holds')
+  // R20: one condition, one owner decision. The open request names the undispatched task, so no dispatch question restates it.
+  assert.deepEqual(questions(), [], 'the undispatched task is the failing chain\'s request, on every board digest')
 })
 
 /** Every body and deferred operation settles, two ticks run, and what they started settles too. */
@@ -1579,6 +1603,35 @@ test('the isolation request is outstanding exactly while the invariant lists its
   await tool('swarm_control', { taskId: task.id, action: 'resume', reason: 'Repaired' })
   await quiet(f)
   assert.equal(taskOf(f.runtime, task.id).status, 'running', 'the resumed task is dispatched')
+})
+
+test('a board-level naming defers to an open decision only while it is open: the stall root the isolation request names is told at the next judgement once the worktrees are repaired and the task is still blocked', async t => {
+  const f = await setup({ clock: new FakeClock(), workers: new FakeWorkers({ autoIdle: true }), budget: LONG })
+  t.after(f.cleanup)
+  const own = f.runtime.store.get('members', f.reviewer.id).workspace
+  const worktree = workspace => f.runtime.store.transaction(() => f.runtime.store.put('members', { ...f.runtime.store.get('members', f.reviewer.id), workspace }))
+  // The reviewer is moved into the author's worktree. It holds pending work and a dead end of its own.
+  worktree(f.runtime.store.get('members', f.author.id).workspace)
+  const waiting = f.propose({ title: 'Reviewer work', assigneeId: f.reviewer.id, kind: 'research', checks: [] })
+  const dead = f.propose({ title: 'Reviewer dead end', assigneeId: f.reviewer.id, kind: 'research', checks: [] })
+  f.runtime.commit(f.mission.id, () => f.runtime.store.put('tasks', { ...taskOf(f.runtime, dead.id), status: 'blocked', epoch: taskOf(f.runtime, dead.id).epoch + 1, output: 'blocked for repair' }))
+  await quiet(f)
+  const subject = subjectOf(f, dead)
+  const roots = () => ownerRows(f).filter(delivery => delivery.notice.dedupKey === `stall-root:${f.mission.id}:${subject}`)
+  const [request] = terminalRows(f, 'workspace')
+  assert.ok(request?.subjects.includes(subject), 'the isolation request names the reviewer\'s dead end at its epoch')
+  assert.ok(f.runtime.notices.stallRoots(f.runtime.store.list('tasks', f.mission.id)).some(task => task.id === dead.id), 'the dead end is a stall root')
+  await ticks(f, 3)
+  assert.deepEqual(roots(), [], 'while the request is open, no stall root restates it')
+  // The worktrees are repaired: the request is no longer open, and the dead end is still blocked at that epoch.
+  nextWindow(f)
+  worktree(own)
+  assert.equal(relevant(f, request), false, 'the repair ends the request')
+  await quiet(f)
+  assert.equal(taskOf(f.runtime, waiting.id).status, 'running', 'the repaired worktree runs the reviewer\'s work')
+  assert.equal(subjectOf(f, dead), subject, 'the dead end is still blocked at the epoch the request named')
+  assert.equal(roots().length, 1, 'the stall root is told at the next judgement')
+  assert.equal(relevant(f, roots()[0]), true, 'and it is outstanding')
 })
 
 test('a task\'s budget warning is told once per task, dimension, limit and threshold over many ticks: a lower threshold after a higher one is not warned, and the limit the owner raises is a new allocation', async t => {

@@ -70,8 +70,11 @@ test('a covered swarm_create mission retains blocked work until the owner explic
   const review = f.propose({ kind: 'verification', reviewOf: cover.id, checks: [], title: 'Review' })
   const reviewing = await f.runtime.claim(f.actor(f.reviewer), f.mission.id, review.id)
   await f.runtime.verify(f.actor(f.reviewer), f.mission.id, { taskId: review.id, attemptId: reviewing.attempt.id, verdict: 'accept', reason: 'Independent host checks pass' })
-  const notice = await eventually(() => f.control(/Mission stalled/).find(item => item.delivery.content.includes(blocked.id)), 'blocked required work wakes the owner', 2500)
+  await f.runtime.settle(f.mission.id)
+  // R20: the ceiling request names the blocked work at its epoch, so the W3 stall the board owes is that request's.
+  const notice = await eventually(() => f.control(/\[task_ceiling_terminal\]/).find(item => item.delivery.content.includes(blocked.id)), 'blocked required work wakes the owner', 2500)
   assert.equal(notice.delivery.to, 'owner')
+  assert.deepEqual(f.runtime.store.list('deliveries', f.mission.id).filter(delivery => delivery.to === 'owner' && /Mission stalled/.test(delivery.content)), [], 'no W3 stall restates the request')
   assert.equal(f.current(cover.id).status, 'accepted')
   assert.equal(f.current(blocked.id).status, 'blocked')
   assert.equal(f.runtime.snapshot(f.owner, f.mission.id).completion.eligible, false)
@@ -117,7 +120,7 @@ test('a submitted task with no live review is given the host\'s review, and the 
   }
 })
 
-test('a create-path stall notice names the parked work, and admitting the follow-up wakes its member', async t => {
+test('a create-path ceiling request names the parked work, and admitting the follow-up wakes its member', async t => {
   const f = await fixture(t)
   const parked = f.propose({ title: 'Ceiling-bound work', maxSteps: 1 })
   await f.runtime.claim(f.actor(f.author), f.mission.id, parked.id)
@@ -127,8 +130,8 @@ test('a create-path stall notice names the parked work, and admitting the follow
   // R20: the host no longer parks the member; the stop the fenced handle owes is
   // what refuses its steps, and the member itself reads idle between attempts.
   assert.equal(f.runtime.store.get('members', f.author.id).status, 'idle')
-  // Nothing is dispatchable: the create-path mission must wake the owner.
-  const stall = await eventually(() => f.control(/Mission stalled/)[0], 'a parked create-path mission is reported stalled', 2500)
+  // Nothing is dispatchable: the create-path mission must wake the owner, by the ceiling's request (R20: it names the parked work).
+  const stall = await eventually(() => f.control(/\[task_ceiling_terminal\]/)[0], 'a parked create-path mission wakes the owner', 2500)
   assert.match(stall.delivery.content, new RegExp(parked.id))
   // Without a new assignment the park persists: no assignment was delivered.
   assert.deepEqual(f.workers.deliveries.filter(item => item.delivery.kind === 'assignment'), [])
