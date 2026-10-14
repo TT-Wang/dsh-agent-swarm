@@ -23,7 +23,7 @@ function plan(workspace) {
   return { title: 'Saved request', objective: 'Deliver verified code', workspace, scope: ['src/'], acceptance: ['works'], budget: { ...budget },
     members: [{ key: 'builder', name: 'Builder', role: 'implementation', maxOutputTokens: 4096 }, { key: 'reviewer', name: 'Reviewer', role: 'verification', maxOutputTokens: 2048 }],
     workstreams: [{ key: 'main', title: 'Delivery', objective: 'Complete change' }],
-    tasks: [{ key: 'code', workstreamKey: 'main', title: 'Code', objective: 'Implement final change', kind: 'implementation', outputs: [], scope: ['src/'], acceptance: ['works'], assigneeKey: 'builder', checks: ['node old.cjs'], maxRecoveryAttempts: 2, checkTimeoutMs: 1000 },
+    tasks: [{ key: 'code', workstreamKey: 'main', title: 'Code', objective: 'Implement final change', kind: 'implementation', outputs: [], scope: ['src/'], acceptance: ['works'], covers: ['c1'], assigneeKey: 'builder', checks: ['node old.cjs'], maxRecoveryAttempts: 2, checkTimeoutMs: 1000 },
       { key: 'review', workstreamKey: 'main', title: 'Review', objective: 'Verify artifact', kind: 'verification', outputs: [], scope: ['src/'], acceptance: ['works'], assigneeKey: 'reviewer', reviewOf: 'code', maxRecoveryAttempts: 2 }] }
 }
 async function fixture(t) {
@@ -101,14 +101,14 @@ test('R08 member configuration changes await stop acknowledgement and retain com
   assert.deepEqual(f.workers.stopped, [builder.id]); assert.equal(f.workers.prepared.length, 2)
 })
 
-test('R08 repairing a failed draft cannot rewrite a submitted artifact or drop acceptance', async t => {
+test('R08 repairing a failed draft cannot rewrite a submitted artifact or change the mission criteria', async t => {
   const f = await fixture(t), restore = failAfterAdmission(f), draft = f.runtime.createDraft(f.owner, f.input, { grantRoot: f.input.workspace, source: 'session' })
   await assert.rejects(f.runtime.launchDraft(f.owner, draft.id, draft.revision), /assembly fixture/); restore()
   const failed = f.runtime.drafts(f.owner)[0], code = f.runtime.store.list('tasks', failed.missionId).find(task => task.kind === 'implementation')
   code.status = 'submitted'; code.artifact = { commit: 'immutable', baseCommit: 'base', workspace: f.directory, changedPaths: ['src/x'] }; f.runtime.store.put('tasks', code)
   const changed = structuredClone(f.input); changed.tasks[0].checks = ['node different.cjs']
   assert.throws(() => f.runtime.updateDraft(f.owner, failed.id, failed.revision, changed, { grantRoot: changed.workspace, source: 'session' }), /immutable evidence/)
-  assert.throws(() => f.runtime.updateDraft(f.owner, failed.id, failed.revision, { ...f.input, acceptance: ['different'] }, { grantRoot: f.input.workspace, source: 'session' }), /original acceptance/)
+  assert.throws(() => f.runtime.updateDraft(f.owner, failed.id, failed.revision, { ...f.input, acceptance: ['different'] }, { grantRoot: f.input.workspace, source: 'session' }), /draft_repair_criteria_changed/)
   assert.deepEqual(f.runtime.store.get('tasks', code.id).artifact, code.artifact)
 })
 
@@ -133,7 +133,7 @@ test('R20 reference paths neither refuse nor widen actual scope; R10 findings pr
 })
 
 const task = (id, kind, status, extra = {}) => ({ id, missionId: 'm', workstreamId: 's', title: id, objective: id, kind, status, dependencies: [], scope: ['src/'], acceptance: ['works'], checks: [], priority: 50, experiment: false, epoch: 0, evidenceIds: [], proposedBy: 'owner', createdAt: 1, ...extra })
-const accepted = (id, kind = 'implementation', dependencies = []) => task(id, kind, 'accepted', { dependencies, artifact: { commit: id, baseCommit: 'base', workspace: '/repo', changedPaths: ['src/x'] } })
+const accepted = (id, kind = 'implementation', dependencies = []) => task(id, kind, 'accepted', { dependencies, covers: ['c1'], artifact: { commit: id, baseCommit: 'base', workspace: '/repo', changedPaths: ['src/x'] } })
 
 test('R25 all projections reject ambiguity and cross-kind replacements, with exact review sources', () => {
   const source = task('source', 'implementation', 'cancelled'), repair = accepted('repair'), second = accepted('second')

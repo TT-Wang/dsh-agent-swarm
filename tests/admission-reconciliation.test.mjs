@@ -156,7 +156,7 @@ test('existing cycle, missing-review, uncovered-acceptance and integration-topol
     members: [{ key: 'builder', name: 'Builder', role: 'implementation', maxOutputTokens: 4096 }, { key: 'reviewer', name: 'Reviewer', role: 'verification', maxOutputTokens: 2048 }],
     workstreams: [{ key: 'main', title: 'Delivery', objective: 'Complete the change' }],
     tasks: [
-      { key: 'deliver', workstreamKey: 'main', title: 'Deliver', objective: 'Implement final change', kind: 'implementation', outputs: [], scope: ['src/'], acceptance: ['works'], assigneeKey: 'builder', checks: ['node check.cjs'], maxRecoveryAttempts: 5, checkTimeoutMs: 45000 },
+      { key: 'deliver', workstreamKey: 'main', title: 'Deliver', objective: 'Implement final change', kind: 'implementation', outputs: [], scope: ['src/'], acceptance: ['works'], covers: ['c1'], assigneeKey: 'builder', checks: ['node check.cjs'], maxRecoveryAttempts: 5, checkTimeoutMs: 45000 },
       { key: 'review', workstreamKey: 'main', title: 'Review', objective: 'Verify immutable artifact', kind: 'verification', outputs: [], scope: ['src/'], acceptance: ['works'], assigneeKey: 'reviewer', reviewOf: 'deliver', maxRecoveryAttempts: 5 },
     ],
   })
@@ -166,7 +166,7 @@ test('existing cycle, missing-review, uncovered-acceptance and integration-topol
   }
   const uncovered = automatic()
   uncovered.acceptance = ['works', 'the extra criterion is covered']
-  await attempt(uncovered, /Missing exact acceptance strings/, 'command-uncovered')
+  await attempt(uncovered, /\[plan_criterion_uncovered\] No deliverable covers c2 "the extra criterion is covered"/, 'command-uncovered')
 
   const topology = automatic()
   topology.tasks.push(

@@ -27,7 +27,7 @@ async function fixture(t) {
   f.author = await f.runtime.addMember(owner, f.mission.id, { name: 'Author', role: 'implementation', maxOutputTokens: 5_000 })
   f.reviewer = await f.runtime.addMember(owner, f.mission.id, { name: 'Reviewer', role: 'verification', maxOutputTokens: 5_000 })
   f.propose = (extra = {}) => f.runtime.propose(owner, f.mission.id, { outputs: [], workstreamId: f.stream.id, title: 'Implement', objective: 'Implement the scoped change',
-    kind: 'implementation', scope: ['**'], acceptance: MISSION_ACCEPTANCE, checks: ['test -d .'], assigneeId: f.author.id, ...extra })
+    kind: 'implementation', scope: ['**'], acceptance: MISSION_ACCEPTANCE, ...(extra.kind === 'verification' ? {} : { covers: ['c1'] }), checks: ['test -d .'], assigneeId: f.author.id, ...extra })
   f.status = id => taskOf(f.runtime, id).status
   f.superseded = () => events(f.runtime, f.mission.id, 'task/superseded').map(event => event.data)
   f.write = (id, change) => { const row = taskOf(f.runtime, id); f.runtime.store.transaction(() => f.runtime.store.put('tasks', { ...row, ...change })) }

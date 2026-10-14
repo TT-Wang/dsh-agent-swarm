@@ -6,7 +6,7 @@ import { scopeSubset, validScope, withinScope } from './scope.ts'
 // Declared outputs are checked against the same toolchain names the workspace
 // engine excludes from capture; both sides must never drift apart.
 import { DEFAULT_VERIFICATION_DEPENDENCY_DIRS, SWARM_SCRATCH_DIRNAME } from './workspaces.ts'
-import type { TaskCeiling, TaskCeilingDimension, TaskCeilingProvenance } from './types.ts'
+import { criterionId, type TaskCeiling, type TaskCeilingDimension, type TaskCeilingProvenance } from './types.ts'
 import { PolicyError, type PolicyErrorCategory } from './policy-error.ts'
 
 /** Accept equivalent notation without guessing a wider path or a repository root. */
@@ -31,14 +31,11 @@ export function assertScopeSelectors(scopes: readonly string[], location: string
   }
 }
 
-/**
- * The criteria a repair's stored `acceptance` holds beyond the list its
- * proposal supplied: what the host inherited from the replaced tasks. An
- * omitted or malformed proposal list supplied nothing.
- */
-export function inheritedAcceptance(acceptance: readonly string[], proposed: unknown): string[] {
-  const supplied: readonly unknown[] = Array.isArray(proposed) ? proposed : []
-  return acceptance.filter(criterion => !supplied.includes(criterion))
+/** `covers` as every plan task and task row holds it: its own list of distinct ids of the mission's `count` acceptance criteria (see `criterionId`), and no list at all when it cites none, however the plan or proposal wrote that. */
+export function citedCovers(covers: unknown, count: number, location: string): string[] | undefined {
+  const valid = Array.from({ length: count }, (_, index) => criterionId(index)), cited = covers === undefined ? [] : covers
+  if (!Array.isArray(cited) || !cited.every((id, index) => valid.includes(id) && cited.indexOf(id) === index)) throw new AdmissionError('covers_invalid', 'validation_error', `[covers_invalid] ${location} must list distinct ids of the mission acceptance criteria, c1 for the first through ${valid.at(-1)} for the last; it has ${JSON.stringify(covers)}. Pass \`covers\` with each id this task satisfies once, never the criterion text, and retry the same task/request.`, location)
+  return cited.length ? cited : undefined
 }
 
 /** reviewOf already waits for submission; an ordinary edge would wait for acceptance. */

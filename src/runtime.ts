@@ -21,12 +21,12 @@ export { TEMP_RENDEZVOUS_WINDOW_MS, sharedTempPaths, tempRendezvousDecision, typ
 import { awaitsDelivery } from './arena.ts'
 import { AdmissionRefusedError, classifyProviderOutage, LIMIT_LEVELS, scopeKeysOverlap, TASK_CLASSES, type AdmissionCandidate, type AdmissionDecision, type AdmissionReason, type AdmissionRecord, type LimitLevel, type LimitRule } from './scheduler.ts'
 import { validScope, scopeSubset } from './scope.ts'
-import { AdmissionError, assertDeclaredOutputs, assertScopeSelectors, dependencyAssumptions, formatDiagnostic, inheritedAcceptance, isNoopCheck, loadPackageScripts, normalizeReviewDependencies, normalizeScopeSelectors, normalizeTaskCeilings, reconcileTaskAdmission, requireHostChecks, taskCeilingBlock, taskGraphDefects, TaskGraphAdmissionError, type TaskGraphNode } from './admission.ts'
+import { AdmissionError, assertDeclaredOutputs, assertScopeSelectors, citedCovers, dependencyAssumptions, formatDiagnostic, isNoopCheck, loadPackageScripts, normalizeReviewDependencies, normalizeScopeSelectors, normalizeTaskCeilings, reconcileTaskAdmission, requireHostChecks, taskCeilingBlock, taskGraphDefects, TaskGraphAdmissionError, type TaskGraphNode } from './admission.ts'
 import { authorIdsOf, canBorrowTask, canOwnReview, strandedReview } from './assignment.ts'
 import { executionClock, executionElapsed } from './resource-time.ts'
-import { completionExempt, taskGraphIndex, type TaskGraphIndex } from './task-graph.ts'
+import { completionExempt, taskGraphIndex, uncoveredCriteria } from './task-graph.ts'
 import { checkSyntaxDetail, declaredPlanChecks, orderedTasks, pairReviews, planAdvisories, validatePlan } from './plans.ts'
-import { OWNER_ONLY_TOOLS, type Actor, type AutoStart, BoardQuery, Budget, CheckAttribution, CheckEnvelope, CheckEnvironment, CheckResult, CreateMissionInput, CriticalPath, Delivery, DraftPlan, Escalation, Evidence, EvidenceStatus, Member, MemberStatus, Mission, NoticeClass, nextWorkerName, ObserveQuery, MessageInput, PlanInput, Post, PostInput, PostKind, ProposeTaskInput, ProviderOutage, PublishInput, RecoveryFallback, RequestStartInput, RuntimeConfig, Snapshot, Task, TaskAmendment, TaskRejection, TaskCeiling, ToolRun, UsageBuckets, UsageSnapshotSource, VerificationCleanupFailure, WorkerAdapter, WorkerActivity, Workstream } from './types.ts'
+import { OWNER_ONLY_TOOLS, type Actor, type AutoStart, BoardQuery, Budget, CheckAttribution, CheckEnvelope, CheckEnvironment, CheckResult, CreateMissionInput, CriticalPath, criterionId, Delivery, DraftPlan, Escalation, Evidence, EvidenceStatus, Member, MemberStatus, Mission, NoticeClass, nextWorkerName, ObserveQuery, MessageInput, PlanInput, Post, PostInput, PostKind, ProposeTaskInput, ProviderOutage, PublishInput, RecoveryFallback, RequestStartInput, RuntimeConfig, Snapshot, Task, TaskAmendment, TaskRejection, TaskCeiling, ToolRun, UsageBuckets, UsageSnapshotSource, VerificationCleanupFailure, WorkerAdapter, WorkerActivity, Workstream } from './types.ts'
 import { requireArtifactChecks } from './artifact-policy.ts'
 
 const id = (prefix: string) => `${prefix}_${randomUUID()}`
@@ -860,6 +860,8 @@ export class SwarmRuntime {
     if (mission.executionTime !== undefined && !terminal(mission)) executionClock(mission, mission.executionTime.since !== undefined, this.now())
     return mission
   }
+  /** One projection per reader. A member reads this wherever the runtime hands it a task, in its assignment, in `swarm_observe` and in the result of its own propose, claim, submit and verify: `acceptance` is its derived checklist, which holds the text of every criterion it cites, never the bare ids. The owner reads the stored row at every exit and resolves its `covers` through the mission's criteria. */
+  private memberTask({ covers: _cited, ...task }: Task, mission = this.mission(task.missionId), graph = taskGraphIndex(this.store.list('tasks', task.missionId))): Task { return { ...task, acceptance: graph.checklist(task.id, mission.acceptance) } }
   participant(actor: Actor, missionId: string): { mission: Mission; member?: Member; key: string; owner: boolean } {
     const mission = this.mission(missionId)
     if (mission.ownerSessionId === actor.sessionId) return { mission, key: 'owner', owner: true }
@@ -1211,7 +1213,7 @@ export class SwarmRuntime {
       return prior
     }
     // A worker repair's policy origin indexes `replaces` before any field is
-    // checked, and the inherited acceptance iterates it: a malformed list is
+    // checked, and the inherited outputs iterate it: a malformed list is
     // refused here, typed, before either reads it.
     if (input.replaces != null && (!Array.isArray(input.replaces) || !input.replaces.every(previousId => typeof previousId === 'string' && previousId.trim() !== ''))) throw new PolicyError('task_replaces_invalid', 'validation_error', '[task_replaces_invalid] `replaces` must list task ids. Pass `replaces` as an array of the blocked or cancelled task ids this repair replaces with `swarm_propose`, or omit it for new work, then retry.')
     if (this.store.list('starts', missionId).length) {
@@ -1233,11 +1235,11 @@ export class SwarmRuntime {
       if (input.kind !== 'verification' && input.checks?.length && input.checkTimeoutMs === undefined) throw new PolicyError('task_check_timeout_required', 'validation_error', '[task_check_timeout_required] Automatic task checks require a timeout chosen by the primary agent. Pass `checkTimeoutMs` in milliseconds on this task with `swarm_propose` (or `swarm_launch` for a new plan), then retry the same task.')
     }
     requireText(input.title, 'title'); requireText(input.objective, 'objective')
-    if (input.acceptance === undefined && !input.replaces?.length) throw new PolicyError('task_acceptance_required', 'validation_error', '[task_acceptance_required] A new task needs its own acceptance criteria. Pass `acceptance` as nonempty strings with `swarm_propose`, or name the rejected task in `replaces` to inherit its criteria, then retry.')
-    // The proposal's own criteria are checked before any replaced task is read;
-    // a repair may supply none.
-    const proposed = input.acceptance ?? []
-    if (!input.replaces?.length || !Array.isArray(proposed) || proposed.length > 0) requireStrings(proposed, 'acceptance')
+    const acceptance = input.acceptance ?? []
+    if (!Array.isArray(acceptance) || acceptance.length) requireStrings(acceptance, 'acceptance')
+    const covers = citedCovers(input.covers, mission.acceptance.length, 'covers')
+    if (covers && input.kind === 'verification') throw new PolicyError('covers_invalid', 'validation_error', '[covers_invalid] A verification task checks what its source covers and cannot cover a criterion itself. Omit `covers` on the review; name the criterion in `covers` of a deliverable, or of a repair naming `replaces`, with `swarm_propose`, then retry.')
+    if (!acceptance.length && !covers && !input.replaces?.length && input.kind !== 'verification') throw new PolicyError('task_acceptance_required', 'validation_error', '[task_acceptance_required] A new deliverable needs criteria. Pass `covers` with the ids of the mission criteria it satisfies (c1 is the mission\'s first acceptance item), or `acceptance` as its own nonempty criteria, with `swarm_propose`; or name the rejected task in `replaces` to inherit its criteria, then retry.')
     if (!['research', 'implementation', 'verification', 'integration'].includes(input.kind)) throw new PolicyError('task_kind_invalid', 'validation_error', 'Unknown task kind')
     // The tool path's schema types these first; the browser propose RPC and the
     // exported runtime API reach here without it, and a stored string priority
@@ -1255,17 +1257,10 @@ export class SwarmRuntime {
     // declarations, which are read below once those tasks are known to exist.
     if (input.outputs === undefined && !input.replaces?.length) throw new PolicyError('outputs_required', 'validation_error', '[outputs_required] `outputs` is required: a new task must declare the files it writes. Pass `outputs` with `swarm_propose` as the repository-relative files this task writes inside its `scope`, or [] for analysis-only work, then retry.')
     if (input.outputs !== undefined) input = { ...input, outputs: assertDeclaredOutputs(input.outputs, input.scope, 'task', { dependencyDirs: this.config.verificationDependencyDirs }) }
-    // A repair inherits the acceptance of every task it replaces: the host holds
-    // those obligations, so the proposal never has to copy them. The stored list
-    // is each replaced task's criteria in order, then any criteria the proposal
-    // adds, without duplicates; the admission guard below reads the same list.
-    // The replaced tasks are read only after this proposal's own fields passed,
-    // so an unknown `replaces` id never hides a field error.
-    const acceptance = input.replaces?.length ? [...new Set([...input.replaces.flatMap(previousId => this.task(missionId, previousId).acceptance), ...proposed])] : proposed
-    requireStrings(acceptance, 'acceptance')
     // A repair carries the obligations it replaces: omitting `outputs` inherits
-    // every replaced task's declaration, in order and without duplicates like
-    // the acceptance above, so a replacement cannot quietly drop a deliverable
+    // every replaced task's declaration, in order and without duplicates, read
+    // only after this proposal's own fields passed so an unknown `replaces` id
+    // never hides a field error, and a replacement cannot quietly drop a deliverable
     // an original promised. Explicit `outputs` replace the inherited list. The
     // union is still checked against this task's own scope, because a repair
     // may narrow that scope. A repair whose replaced tasks declared nothing has
@@ -1275,10 +1270,6 @@ export class SwarmRuntime {
       if (!declared.length) throw new PolicyError('outputs_required', 'validation_error', '[outputs_required] `outputs` is required: no task in `replaces` declared outputs for this repair to inherit. Pass `outputs` with `swarm_propose` as the repository-relative files this repair writes inside its `scope`, or [] for analysis-only work, then retry.')
       input = { ...input, outputs: assertDeclaredOutputs([...new Set(declared.flat())], input.scope, 'task', { dependencyDirs: this.config.verificationDependencyDirs }) }
     }
-    // What the host added beyond the proposal's own list is recorded on the
-    // admission event and named in the swarm_propose result, so a criterion the
-    // proposal left out is carried visibly, never silently.
-    const inheritedCriteria = input.replaces?.length ? inheritedAcceptance(acceptance, input.acceptance) : []
     // D1: the admission refusals (an assumed dependency, a dangling graph edge)
     // at the production admission point, so a plan error is rejected here
     // instead of at submit. The check preflight hints are advisory and belong
@@ -1333,7 +1324,7 @@ export class SwarmRuntime {
       if (input.assigneeId !== undefined && !canOwnReview(source, input.assigneeId)) throw new PolicyError('review_assignee_not_independent', 'validation_error', `assigneeId ${input.assigneeId} authored ${source.id}; an independent review must be assigned to a member who never owned it, or left unassigned`)
     } else if (input.reviewOf) throw new PolicyError('review_source_not_verification', 'tool_error', 'Only verification tasks may set reviewOf')
     // Round 9-C: a repair may keep the original acceptance while changing the
-    // declared check. Acceptance is already inherited above; a check
+    // declared check. Acceptance is inherited through the lineage; a check
     // change is recorded durably so an owner can see that the new check no
     // longer matches the original obligation. A repair that merely supplies
     // checks the replaced task never declared is not a change.
@@ -1386,6 +1377,7 @@ export class SwarmRuntime {
     // written before `outputs` existed: it reads as [] ("this task writes
     // nothing"), and no output is inferred from its objective or acceptance.
     if (input.outputs !== undefined) task.outputs = [...input.outputs]
+    if (covers) task.covers = covers
     if (input.assigneeId !== undefined) task.plannedAssigneeId = input.assigneeId
     if (input.assignmentMode !== undefined) task.assignmentMode = input.assignmentMode
     if (input.maxRecoveryAttempts !== undefined) task.maxRecoveryAttempts = input.maxRecoveryAttempts
@@ -1393,13 +1385,13 @@ export class SwarmRuntime {
     this.assertEffectiveTaskGraph(missionId, task, tasks)
     this.commit(missionId, () => {
       this.store.put('tasks', task)
-      this.store.event(missionId, 'task/proposed', key, inheritedCriteria.length ? { ...task, inheritedAcceptance: inheritedCriteria } : task)
+      this.store.event(missionId, 'task/proposed', key, task)
       for (const change of checkChanges) this.store.event(missionId, 'task/check-changed', key, { taskId: task.id, reason: 'replacement', ...change })
     })
     this.warnBudget(this.mission(missionId))
     this.warnIntegrationGap(mission, task)
     this.kick(missionId)
-    return task
+    return owner ? task : this.memberTask(task)
   }
 
   /** ENV: the adapter's measured envelope, widened to the environment facts it also reports. */
@@ -1441,19 +1433,21 @@ export class SwarmRuntime {
     return { envelope, selfRun: measured, source: 'host-check', at: this.now(), comparison: compareCheckEnvironments(envelope, measured) }
   }
   /**
-   * ENV: the check environment facts an assignment delivery carries. Public so
-   * every module that writes an assignment delivery (the claim path here and the
-   * budget-resume path in src/gates.ts) delivers the same envelope: one
-   * assignee that is not told the environment is the defect this closes.
+   * The one writer of an assignment delivery, at a claim and at a budget resume
+   * alike. Its worker reads the task as `memberTask` renders it, without the
+   * preparation record (this attempt's workspace was prepared), beside the facts
+   * the host runs its declared checks under (ENV). Returns the task as delivered.
    */
-  assignmentCheckEnvironment(): { checkEnvironment?: { note: string; environment: CheckEnvironment; selfRun?: CheckEnvironment } } {
-    const envelope = this.declaredCheckEnvelope()
-    if (envelope?.environment === undefined) return {}
-    return { checkEnvironment: {
+  deliverAssignment(task: Task, mission: Mission, instructions = ASSIGNMENT_INSTRUCTIONS): Task {
+    const { preparationFailure: _retried, ...assigned } = this.memberTask(task, mission), envelope = this.declaredCheckEnvelope()
+    const checkEnvironment = envelope?.environment === undefined ? undefined : {
       note: 'These are the facts the host runs this task\'s declared checks under. Acceptance compares the supporting host checks with this envelope; unrelated diagnostics do not determine the verdict. The scoped cache roots are provided inside the disposable verification checkout; the user cache roots and HOME are what a self-run inherits.',
       environment: envelope.environment,
       ...(envelope.selfRunEnvironment === undefined ? {} : { selfRun: envelope.selfRunEnvironment }),
-    } }
+    }
+    this.store.put('deliveries', { id: id('msg'), missionId: mission.id, from: 'runtime', to: task.attempt!.ownerId, kind: 'assignment', taskId: task.id, attemptId: task.attempt!.id,
+      content: JSON.stringify({ missionId: mission.id, task: assigned, checkEnvironment, instructions }), createdAt: this.now() })
+    return assigned
   }
   /** ENV: render a blocking mismatch as the refusal the member must act on. */
   private checkEnvironmentMismatchMessage(comparison: CheckEnvironmentComparison, source: string): string {
@@ -1496,15 +1490,12 @@ export class SwarmRuntime {
     // a block cause.
     const admitted = this.admissionRecord(candidate, decision, latencyMs)
     try {
-      this.commit(task.missionId, () => {
+      return this.commit(task.missionId, () => {
         this.store.put('tasks', task); this.store.put('members', member)
-        // The worker's assignment omits that record (this attempt's workspace
-        // was prepared) and is otherwise the row as just stored.
-        const { preparationFailure: _retried, ...assigned } = task
         this.store.recordAdmission(admitted)
-        this.store.put('deliveries', { id: id('msg'), missionId: task.missionId, from: 'runtime', to: member.id, kind: 'assignment', taskId: task.id, attemptId: task.attempt!.id,
-          content: JSON.stringify({ missionId: task.missionId, task: assigned, ...this.assignmentCheckEnvironment(), instructions: ASSIGNMENT_INSTRUCTIONS }), createdAt: this.now() })
+        const assigned = this.deliverAssignment(task, mission)
         this.store.event(task.missionId, 'task/claimed', member.id, { taskId: task.id, attempt: task.attempt })
+        return assigned
       })
     } catch (error) {
       // A classified writer conflict is an admission refusal, not a task failure:
@@ -1515,7 +1506,6 @@ export class SwarmRuntime {
       }
       throw error
     }
-    return task
   }
   /** Explicit member self-claim; scheduling uses the same atomic transition. */
   async claim(actor: Actor, missionId: string, taskId: string): Promise<Task> {
@@ -1624,7 +1614,7 @@ export class SwarmRuntime {
           ...(missingReview === undefined ? {} : { reviewPath: { missing: true, reason: missingReview } }) })
       })
       this.kick(missionId)
-      return task
+      return this.memberTask(task)
     })
   }
   /**
@@ -1725,7 +1715,7 @@ export class SwarmRuntime {
           this.notify(missionId, reason, this.interpretation(missionId).subjectsOf([source, task]), { from: member.id })
         })
         this.kick(missionId)
-        return task
+        return this.memberTask(task)
       }
       const runIds: string[] = []
       const released = new Set<string>()
@@ -1815,7 +1805,7 @@ export class SwarmRuntime {
       // A verdict closes a unit of work for both sessions: let the adapter trim history it no longer needs.
       for (const memberId of new Set([source.attempt?.ownerId, member.id])) if (memberId) this.workers.compactAtBoundary(memberId)
       this.kick(missionId)
-      return task
+      return this.memberTask(task)
     })
   }
   /**
@@ -2462,7 +2452,7 @@ export class SwarmRuntime {
       this.propose({ sessionId: mission.ownerSessionId }, mission.id, {
         workstreamId: source.workstreamId, title: `Independent review of ${source.title}`,
         objective: `Independently verify the submitted artifact of ${source.id} (${source.title}) against its acceptance criteria.`,
-        kind: 'verification', scope: [...source.scope], acceptance: [...source.acceptance], checks: [...source.checks],
+        kind: 'verification', scope: [...source.scope], acceptance: [], checks: [...source.checks],
         // The host-admitted review reads an artifact and records a verdict; it
         // owes no file.
         outputs: [],
@@ -2763,8 +2753,8 @@ export class SwarmRuntime {
       if (task.kind !== 'verification' && task.checks?.length && task.checkTimeoutMs === undefined) issues.push(`tasks[${task.key}].checkTimeoutMs is required because it has checks`)
     }
     for (const source of sources) if (source.assigneeKey === undefined) issues.push(`tasks[${source.key}].assigneeKey is required: choose the member who delivers this task`)
-    const missingCriteria = plan.acceptance.filter(criterion => !sources.some(task => task.acceptance.includes(criterion)))
-    if (missingCriteria.length) issues.push(`Deliverables must cover every mission acceptance criterion. Missing exact acceptance strings: ${JSON.stringify(missingCriteria)}. Copy each missing string into the acceptance array of the deliverable task that satisfies it; a paraphrase does not match.`)
+    const uncovered = uncoveredCriteria(plan.acceptance, new Set(sources.flatMap(task => task.covers ?? [])))
+    if (uncovered.length) issues.push(`[plan_criterion_uncovered] No deliverable covers ${uncovered.join(', ')}. Add each id to \`covers\` of the deliverable that satisfies it; keep the mission acceptance list unchanged.`)
     const implementations = sources.filter(task => task.kind === 'implementation')
     const byKey = new Map(plan.tasks.map(task => [task.key, task]))
     const dependsOn = (key: string, dependency: string): boolean => {
@@ -2893,7 +2883,7 @@ export class SwarmRuntime {
       const tasks = this.store.list('tasks', mission.id)
       for (const task of tasks) {
         const identity = { missionId: mission.id, missionTitle: mission.title, missionStatus: mission.status, missionAcceptance: mission.acceptance,
-          taskId: task.id, taskTitle: task.title, taskKind: task.kind, taskStatus: task.status, acceptance: task.acceptance }
+          taskId: task.id, taskTitle: task.title, taskKind: task.kind, taskStatus: task.status, acceptance: task.acceptance, covers: task.covers, replaces: task.replaces }
         for (const rejection of task.rejections ?? []) {
           if (task.kind !== 'verification') rows.push({ ...identity, artifact: { commit: rejection.commit }, archived: true,
             review: { taskId: rejection.reviewTaskId, verdict: 'refuted', reason: excerpt(rejection.reason, 400) } })
@@ -3001,19 +2991,13 @@ export class SwarmRuntime {
     if (!mission) return
     if (mission.status !== 'staged') throw new PolicyError('draft_repair_not_staged', 'conflict_error', 'Only a staged mission can repair its saved draft')
     if (input.workspace !== mission.workspace) throw new PolicyError('draft_repair_workspace_changed', 'validation_error', 'A staged plan must retain its saved workspace and baseline')
-    const missing = draft.input.acceptance.filter(criterion => !input.acceptance.includes(criterion))
-    if (missing.length) throw new PolicyError('draft_repair_acceptance_dropped', 'validation_error', `Draft repair must retain the original acceptance obligations: ${JSON.stringify(missing)}`)
+    if (JSON.stringify(input.acceptance) !== JSON.stringify(mission.acceptance)) throw new PolicyError('draft_repair_criteria_changed', 'validation_error', `[draft_repair_criteria_changed] Mission ${mission.id} is staged, so its acceptance criteria are fixed: ${JSON.stringify(mission.acceptance)}. Resend \`acceptance\` unchanged and in this order; change task \`covers\` or task \`acceptance\` instead, and relaunch.`)
     for (const original of draft.input.tasks) {
       const next = input.tasks.find(task => task.key === original.key)
       const admitted = mission ? this.store.get('tasks', `task_${draft.id}_${original.key}`) : undefined
       const immutable = admitted && (admitted.artifact || admitted.attempt || admitted.evidenceIds.length || ['submitted', 'accepted', 'running'].includes(admitted.status))
       if (immutable && JSON.stringify(next) !== JSON.stringify(original)) throw new PolicyError('draft_repair_task_immutable', 'conflict_error', `Task ${admitted.id} has execution or immutable evidence; preserve it and revise separate unsubmitted work`)
       if (next && original.kind !== next.kind && admitted) throw new PolicyError('draft_repair_kind_changed', 'validation_error', `Task ${admitted.id} must retain its kind; use a new plan key for incompatible work`)
-      const carriers = next ? [next] : input.tasks.filter(task => task.kind === original.kind)
-      const obligations = [...original.acceptance, ...(admitted?.acceptance ?? [])]
-      if (original.kind !== 'verification' && obligations.some(criterion => !carriers.some(task => task.acceptance.includes(criterion)))) {
-        throw new PolicyError('draft_repair_acceptance_dropped', 'validation_error', `Draft repair must retain the acceptance obligations of task ${original.key}`)
-      }
       if (admitted?.status === 'cancelled' && next) throw new PolicyError('draft_repair_task_cancelled', 'conflict_error', `Task ${admitted.id} was cancelled by the owner; use a new key instead of reviving it`)
     }
   }
@@ -3065,7 +3049,7 @@ export class SwarmRuntime {
     mission = this.mission(mission.id)
     const tasks = new Map(input.tasks.map(task => [`task_${draft.id}_${task.key}`, task]))
     this.commit(mission.id, () => {
-      Object.assign(mission!, { title: input.title, objective: input.objective, scope: [...input.scope], acceptance: [...input.acceptance], budget: { ...input.budget }, updatedAt: this.now() })
+      Object.assign(mission!, { title: input.title, objective: input.objective, scope: [...input.scope], budget: { ...input.budget }, updatedAt: this.now() })
       this.store.put('missions', mission!)
       for (const stream of input.workstreams) {
         const previous = this.store.get('workstreams', `stream_${draft.id}_${stream.key}`)
@@ -3082,7 +3066,7 @@ export class SwarmRuntime {
         const previous = { ...task }
         Object.assign(task, { title: next.title, objective: next.objective, workstreamId: `stream_${draft.id}_${next.workstreamKey}`,
           dependencies: normalizeReviewDependencies(next.kind, next.reviewOf, next.dependencies).map(key => `task_${draft.id}_${key}`),
-          scope: [...next.scope], acceptance: [...next.acceptance], checks: [...(next.checks ?? [])],
+          scope: [...next.scope], acceptance: [...next.acceptance], covers: next.covers, checks: [...(next.checks ?? [])],
           priority: next.priority ?? 50, experiment: next.experiment ?? false,
           assigneeId: next.assigneeKey ? `member_${draft.id}_${next.assigneeKey}` : undefined,
           plannedAssigneeId: next.assigneeKey ? `member_${draft.id}_${next.assigneeKey}` : undefined,
@@ -3228,14 +3212,14 @@ export class SwarmRuntime {
     // it for worker sessions while the owner path keeps the complete view.
     if (member && query.detail === 'full') throw new ObserveDetailRefusedError()
     const tasks = this.store.list('tasks', missionId), members = this.projectedMembers(missionId)
-    let dependencyGraph: TaskGraphIndex | undefined
+    const graph = taskGraphIndex(tasks)
     const runRef = (run: ToolRun) => ({ id: run.id, seq: run.seq ?? 0, taskId: run.taskId, attemptId: run.attemptId, memberId: run.memberId, tool: run.tool, isError: run.isError, arguments: excerpt(run.arguments, 240) })
     const evidenceRef = (evidence: Evidence, full = false) => ({ id: evidence.id, taskId: evidence.taskId, authorId: evidence.authorId, claim: full ? evidence.claim : excerpt(evidence.claim, 400), outcome: evidence.outcome, status: evidence.status, toolRunIds: evidence.toolRunIds,
       ...(evidence.challenges.length ? { challenges: full ? evidence.challenges : evidence.challenges.length } : {}), ...(evidence.supersedes.length ? { supersedes: evidence.supersedes } : {}) })
     const taskRef = (task: Task) => ({ id: task.id, title: task.title, kind: task.kind, status: task.status, ...(task.assigneeId ? { assigneeId: task.assigneeId } : {}), ...(task.assignmentMode ? { assignmentMode: task.assignmentMode } : {}), ...(task.attempt ? { attemptOwner: task.attempt.ownerId } : {}),
       ...(task.reviewOf ? { reviewOf: task.reviewOf } : {}), ...(task.dependencies.length ? { dependencies: task.dependencies } : {}), ...(task.replaces?.length ? { replaces: task.replaces } : {}), ...(task.artifact ? { artifact: task.artifact.commit } : {}), ...(task.reviewArtifact ? { reviewArtifact: task.reviewArtifact.commit } : {}),
       ...(task.recovery ? { recovery: task.recovery } : {}) })
-    const taskRecord = (task: Task, outputLimit: number) => ({ ...task, ...(task.output !== undefined ? { output: excerpt(task.output, outputLimit) } : {}), ...(task.handoff !== undefined ? { handoff: excerpt(task.handoff, outputLimit) } : {}) })
+    const taskRecord = (task: Task, outputLimit: number) => ({ ...(member ? this.memberTask(task, mission, graph) : task), ...(task.output !== undefined ? { output: excerpt(task.output, outputLimit) } : {}), ...(task.handoff !== undefined ? { handoff: excerpt(task.handoff, outputLimit) } : {}) })
     const evidenceOf = (task: Task, full = false) => task.evidenceIds.map(evidenceId => this.store.get('evidence', evidenceId)).filter((item): item is Evidence => item !== undefined).map(item => evidenceRef(item, full))
     const runsWindow = (filter: { memberId?: string; taskId?: string; attemptId?: string }, limit: number, afterSeq?: number) => {
       const all = this.store.toolRuns(missionId, { ...filter, ...(afterSeq === undefined ? {} : { afterSeq }) })
@@ -3264,7 +3248,7 @@ export class SwarmRuntime {
     if (query.taskId !== undefined) {
       const task = this.task(missionId, query.taskId)
       return { task: taskRecord(task, 6000), evidence: evidenceOf(task, true), reviews: tasks.filter(item => item.reviewOf === task.id).map(taskRef),
-        dependencies: task.dependencies.map(dep => this.lineage(missionId, dep, tasks, dependencyGraph ??= taskGraphIndex(tasks))).map(chain => ({ ...taskRef(chain.at(-1)!), ...(chain.length > 1 ? { replacementOf: chain.slice(0, -1).map(item => item.id) } : {}) })),
+        dependencies: task.dependencies.map(dep => this.lineage(missionId, dep, tasks, graph)).map(chain => ({ ...taskRef(chain.at(-1)!), ...(chain.length > 1 ? { replacementOf: chain.slice(0, -1).map(item => item.id) } : {}) })),
         ...(task.reviewOf ? { reviewSource: taskRef(this.task(missionId, task.reviewOf)) } : {}), ...runsWindow({ taskId: task.id }, 40, query.afterRun) }
     }
     // A member's delivered position is the default cursor; an explicit
@@ -3309,7 +3293,7 @@ export class SwarmRuntime {
         // unchanged one stays in the cached prefix and is not re-sent.
         ...(delivered.current === currentKey ? {} : { current: current === undefined ? null : {
           task: taskRecord(current!, 2400), attemptId: current!.attempt!.id,
-          dependencies: current!.dependencies.map(dep => this.lineage(missionId, dep, tasks, dependencyGraph ??= taskGraphIndex(tasks))).map(chain => ({ ...taskRef(chain.at(-1)!), output: excerpt(chain.at(-1)!.output ?? '', 600), ...(chain.length > 1 ? { replacementOf: chain.slice(0, -1).map(item => item.id) } : {}) })),
+          dependencies: current!.dependencies.map(dep => this.lineage(missionId, dep, tasks, graph)).map(chain => ({ ...taskRef(chain.at(-1)!), output: excerpt(chain.at(-1)!.output ?? '', 600), ...(chain.length > 1 ? { replacementOf: chain.slice(0, -1).map(item => item.id) } : {}) })),
           ...(source ? { reviewSource: { ...taskRecord(source, 2400), evidence: evidenceOf(source) } } : {}),
         } }),
         events, ...eventCursor, ...runs,
@@ -3322,7 +3306,7 @@ export class SwarmRuntime {
         member: { id: member.id, name: member.name, role: member.role, status: member.status },
         current: current ? {
           task: taskRecord(current, 2400), attemptId: current.attempt!.id,
-          dependencies: current.dependencies.map(dep => this.lineage(missionId, dep, tasks, dependencyGraph ??= taskGraphIndex(tasks))).map(chain => ({ ...taskRef(chain.at(-1)!), output: excerpt(chain.at(-1)!.output ?? '', 600), ...(chain.length > 1 ? { replacementOf: chain.slice(0, -1).map(item => item.id) } : {}) })),
+          dependencies: current.dependencies.map(dep => this.lineage(missionId, dep, tasks, graph)).map(chain => ({ ...taskRef(chain.at(-1)!), output: excerpt(chain.at(-1)!.output ?? '', 600), ...(chain.length > 1 ? { replacementOf: chain.slice(0, -1).map(item => item.id) } : {}) })),
           ...(source ? { reviewSource: { ...taskRecord(source, 2400), evidence: evidenceOf(source) } } : {}),
         } : null,
         evidence: current ? evidenceOf(current) : [],
@@ -3372,7 +3356,7 @@ export class SwarmRuntime {
       cursorView = { ...cursorView, ...(ownerCursor ? { delta: true, removed } : query.cursor === undefined ? {} : { cursorReset: true }) }
     }
     return {
-      mission: { id: mission.id, title: mission.title, status: mission.status, ...(mission.reason ? { reason: mission.reason } : {}), ...budget, criticalPath: this.criticalPath(missionId), workerUsage: mission.workerUsage ?? emptyUsage(), ownerUsage: mission.ownerUsage ?? emptyUsage() },
+      mission: { id: mission.id, title: mission.title, status: mission.status, ...(mission.reason ? { reason: mission.reason } : {}), ...(ownerCursor ? {} : { criteria: Object.fromEntries(mission.acceptance.map((text, index) => [criterionId(index), text])) }), ...budget, criticalPath: this.criticalPath(missionId), workerUsage: mission.workerUsage ?? emptyUsage(), ownerUsage: mission.ownerUsage ?? emptyUsage() },
       ...rows, ...cursorView,
       unschedulable: this.unschedulable(mission, tasks, members).map(task => task.id),
       pendingDeliveries: this.store.list('deliveries', missionId).filter(awaitsDelivery).length,
@@ -3428,15 +3412,11 @@ export class SwarmRuntime {
     if (!tasks.length) return 'Mission still has unfinished or blocked required work'
     const unfinished = tasks.filter(task => !['accepted', 'cancelled'].includes(task.status) && !completionExempt(task, tasks))
     if (unfinished.length) return `Mission still has unfinished or blocked required work: ${unfinished.map(task => `${task.id} (${task.status})`).join(', ')}`
-    const accepted = tasks.filter(task => task.status === 'accepted')
-    // Verification acceptance text is free-form review criteria; only deliverable
-    // work can cover a mission criterion, and code deliverables need an artifact.
-    const deliverables = accepted.filter(task => task.kind !== 'verification' && (task.kind === 'research' || task.artifact !== undefined))
-    const uncovered = mission.acceptance.filter(criterion => !deliverables.some(task => Array.isArray(task.acceptance) && task.acceptance.includes(criterion)))
-    if (uncovered.length) {
-      const blocked = tasks.filter(task => task.status === 'blocked' && !completionExempt(task, tasks)).map(task => task.id)
-      return `Accepted tasks do not cover every mission acceptance criterion: ${JSON.stringify(uncovered)}${blocked.length ? `. Blocked work still needs repair: ${blocked.join(', ')}` : ''}`
-    }
+    // Only accepted deliverable work covers a mission criterion, by the ids its
+    // replacement lineage cites; code deliverables need an artifact.
+    const graph = taskGraphIndex(tasks), deliverables = tasks.filter(task => task.status === 'accepted' && task.kind !== 'verification' && (task.kind === 'research' || task.artifact !== undefined))
+    const uncovered = uncoveredCriteria(mission.acceptance, new Set(deliverables.flatMap(task => [...graph.criteriaOf(task.id)])))
+    if (uncovered.length) return `Accepted tasks do not cover every mission acceptance criterion: ${uncovered.join(', ')}. Propose a deliverable that names them in \`covers\` with \`swarm_propose\`; an accepted task cannot gain covers`
     if (tasks.some(task => ['implementation', 'integration'].includes(task.kind) && task.status !== 'cancelled')) {
       try { this.selectDeliveryTarget(mission.id, tasks) }
       catch (error) { return error instanceof Error ? error.message : String(error) }

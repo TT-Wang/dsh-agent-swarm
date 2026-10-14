@@ -95,6 +95,8 @@ test('one natural-language command saves bounded request and wakes exact owner w
   assert.match(message.content[0].text, /planningEpoch: 1/)
   assert.match(message.content[0].text, /Planning deadline:/)
   assert.match(message.content[0].text, /maxSteps, maxFindings/)
+  assert.ok(message.content[0].text.includes('choose the team, task graph, scopes, the criterion ids each deliverable covers, real check commands,'), 'the planner is told to cite criteria by id')
+  assert.doesNotMatch(message.content[0].text, /verbatim|paraphrase/)
   assert.equal(f.runtime.list(f.agent.id).length, 0, 'planning has not yet admitted workers')
   f.pending.resolve(); await new Promise(resolve => setImmediate(resolve))
   assert.equal(f.runtime.starts({ sessionId: f.agent.id })[0].status, 'failed', 'idle without a launch is a durable actionable failure')
@@ -317,7 +319,7 @@ test('a native request launches its validated plan with the session authorizatio
     budget: { maxTokens: 100000, maxSteps: 100, maxWorkers: 2, maxDurationMs: 3600000, maxTasks: 6, maxExperiments: 0 },
     members: [{ key: 'builder', role: 'implementation', maxOutputTokens: 4096 }, { key: 'reviewer', role: 'verification', maxOutputTokens: 2048 }],
     workstreams: [{ key: 'main', title: 'Delivery', objective: 'Complete the change' }],
-    tasks: [{ key: 'code', workstreamKey: 'main', title: 'Code', objective: 'Implement the change', kind: 'implementation', outputs: [], scope: ['src/'], acceptance: ['works'], assigneeKey: 'builder', checks: ['test -d .'], maxRecoveryAttempts: 1, checkTimeoutMs: 1000 }] }
+    tasks: [{ key: 'code', workstreamKey: 'main', title: 'Code', objective: 'Implement the change', kind: 'implementation', outputs: [], scope: ['src/'], acceptance: ['works'], covers: ['c1'], assigneeKey: 'builder', checks: ['test -d .'], maxRecoveryAttempts: 1, checkTimeoutMs: 1000 }] }
   const { mission } = await f.runtime.startPlan({ sessionId: f.agent.id }, request.id, plan, request.planningEpoch)
   assert.equal(mission.status, 'active', 'the validated plan launched')
   assert.deepEqual([mission.workspaceAuthorizationSource, mission.workspaceGrantRoot], ['session', f.root], 'the mission records the request authorization')

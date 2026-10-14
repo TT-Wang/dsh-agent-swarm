@@ -26,7 +26,7 @@ async function setup(t, overrides = {}, options = {}) {
   const a = await runtime.addMember(owner,mission.id,{name:'Builder',role:'implementation'})
   const b = await runtime.addMember(owner,mission.id,{name:'Reviewer',role:'verification'})
   const actorA = {sessionId:a.sessionId}, actorB = {sessionId:b.sessionId}
-  const propose = (actor=actorA, extra={}) => runtime.propose(actor,mission.id,{ outputs: [],workstreamId:stream.id,title:'Fix',objective:'Fix module',kind:'implementation',scope:['src/'],acceptance:['works'],checks:['test'],...extra})
+  const propose = (actor=actorA, extra={}) => runtime.propose(actor,mission.id,{ outputs: [],workstreamId:stream.id,title:'Fix',objective:'Fix module',kind:'implementation',scope:['src/'],acceptance:['works'],...(extra.kind === 'verification' ? {} : { covers: ['c1'] }),checks:['test'],...extra})
   return {dir,runtime,workers,config,owner,mission,stream,a,b,actorA,actorB,propose}
 }
 test('participants propose work within the same scope and budget, without captain relaying',async t=>{
@@ -242,9 +242,11 @@ test('an independently accepted repair retires blocked obligations and can conve
   const original=f.propose(); const oldReview=await submitAndReview(original,true)
   const oldVerdict=structuredClone(f.runtime.snapshot(f.owner,f.mission.id).tasks.find(t=>t.id===oldReview.id))
   assert.equal(oldVerdict.status,'blocked')
-  // The repair inherits the replaced obligations; a new criterion is appended, never substituted.
+  // The repair stores its own criteria; the replaced obligations reach it through the lineage, never substituted.
   const repaired=f.propose(f.actorA,{title:'Repair',replaces:[original.id],acceptance:['unrelated','works']})
-  assert.deepEqual(repaired.acceptance,[...original.acceptance,'unrelated'],'replaced criteria first, in order, without duplicates')
+  assert.deepEqual(f.runtime.store.get('tasks',repaired.id).acceptance,['unrelated','works'])
+  assert.deepEqual(repaired.acceptance,[...original.acceptance,'unrelated'],'the member who proposed it reads the covered criterion first, then the lineage\'s own, without duplicates')
+  assert.deepEqual(f.runtime.observe(f.owner,f.mission.id,{taskId:repaired.id}).task.acceptance,['unrelated','works'],'the owner reads the stored row')
   await submitAndReview(repaired)
   const repairedBoard=f.runtime.snapshot(f.owner,f.mission.id)
   assert.equal(repairedBoard.tasks.find(t=>t.id===original.id).status,'cancelled')

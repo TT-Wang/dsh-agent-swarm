@@ -18,7 +18,7 @@ import { createRightSidebarAdapter } from '../lib/types/client/sidebar.js'
 import { AgentAvatar, AGENT_AVATAR_CSS } from '../lib/types/client/AgentAvatar.js'
 import { LIVE_WORK_CSS } from '../lib/types/client/LiveWorkPanel.js'
 import { DisposalRegistry } from '../lib/types/client/lifecycle.js'
-import { DraftEditor, cleanPlan, newPlan } from '../lib/types/client/DraftEditor.js'
+import { DraftEditor, cleanPlan, newPlan, removeCriterion } from '../lib/types/client/DraftEditor.js'
 import { CopyContext, zh } from '../lib/types/client/locale.js'
 import { validatePlan } from '../lib/plans.js'
 import { selectedOperation } from '../lib/types/client/selection.js'
@@ -266,9 +266,12 @@ test('draft defaults preserve independent verification and line editing', () => 
   assert.equal(input.tasks[0].checks.length > 0, true, 'code task template carries the required host checks')
   input.title = 'Template test'; input.objective = 'Deliver the test objective'
   assert.doesNotThrow(() => validatePlan(input))
-  assert.equal(input.acceptance.every(criterion => input.tasks[0].acceptance.includes(criterion) && input.tasks[1].acceptance.includes(criterion)), true, 'template task acceptance covers the mission contract')
+  assert.deepEqual(input.tasks.map(task => [task.acceptance, task.covers]), [[[], ['c1']], [[], undefined]], 'no task copies the template criterion: its deliverable cites it by id, and its review checks the deliverable\'s')
   input.scope = ['src/', '', ' tests/ ']
   assert.deepEqual(cleanPlan(input).scope, ['src/', 'tests/'])
+  input.acceptance = [' works ', '', 'is documented']
+  assert.deepEqual(cleanPlan(input).acceptance, ['works', '', 'is documented'], 'criteria are trimmed, never dropped, so no id shifts')
+  input.acceptance = ['The delivered change satisfies the objective and passes independent verification.']
   assert.deepEqual(input.scope, ['src/', '', ' tests/ '], 'normalization does not change an in-progress field')
   // Saving never declares outputs on the owner's behalf: an Outputs field the
   // owner never touched stays absent, so launch still refuses that task with
@@ -281,6 +284,30 @@ test('draft defaults preserve independent verification and line editing', () => 
   input.tasks[1].outputs = ['']
   assert.deepEqual(cleanPlan(input).tasks.map(task => task.outputs), [['src/value.cjs'], []])
   assert.doesNotThrow(() => validatePlan({ ...cleanPlan(input), scope: ['**'] }, { launch: true }), 'a plan whose every Outputs field was set launches')
+})
+
+test('the draft editor numbers the mission criteria, cites them by id on each deliverable, and renumbers covers when one is removed', () => {
+  const input = newPlan('/repo', uiSnapshot().mission.budget)
+  input.title = 'Cited plan'; input.objective = 'Cite criteria by id'
+  input.acceptance.push('The README documents the change.')
+  input.tasks[0].covers = ['c1', 'c2']
+  const render = draft => renderToStaticMarkup(React.createElement(DraftEditor, { sessionId: 'owner', workspace: '/repo', budget: input.budget, draft, request: async () => ({}), onSaved() {}, onLaunched() {}, onDiscarded() {} }))
+  const html = render({ id: 'draft-ids', ownerSessionId: 'owner', revision: 1, status: 'draft', input, createdAt: 1, updatedAt: 1 })
+  assert.match(html, /<fieldset class="sw-prereqs sw-criteria"><span>Acceptance<\/span><div><code>c1<\/code><input aria-label="Acceptance c1"[^>]*><button type="button">Remove<\/button><\/div><div><code>c2<\/code><input aria-label="Acceptance c2" required="" value="The README documents the change."\/>/)
+  assert.match(html, />Add criterion<\/button><\/fieldset>/)
+  assert.equal(html.match(/<span>Covers<\/span>/g).length, 1, 'only the deliverable cites criteria; its review checks them')
+  assert.match(html, /<input type="checkbox" checked=""\/>c1 The delivered change[^<]*<\/label><label><input type="checkbox" checked=""\/>c2 The README documents the change\.<\/label>/)
+  assert.doesNotThrow(() => validatePlan(cleanPlan(input)))
+  // Removing c1 keeps the deliverable citing the README criterion, now c1.
+  const removed = removeCriterion(input, 0)
+  assert.deepEqual([removed.acceptance, removed.tasks.map(task => task.covers)], [['The README documents the change.'], [['c1'], undefined]])
+  const third = removeCriterion({ ...input, acceptance: [...input.acceptance, 'third'], tasks: [{ ...input.tasks[0], covers: ['c1', 'c3'] }, input.tasks[1]] }, 1)
+  assert.deepEqual(third.tasks[0].covers, ['c1', 'c2'], 'a later id moves down by one')
+  // A staged mission fixes its criteria: the rows are read-only.
+  assert.match(render({ id: 'draft-staged', ownerSessionId: 'owner', revision: 2, status: 'failed', missionId: 'mission_draft-staged', input, createdAt: 1, updatedAt: 1 }), /<fieldset class="sw-prereqs sw-criteria" disabled="">/)
+  // The board's mission contract names each criterion by the id a completion reason quotes.
+  const snapshot = uiSnapshot()
+  assert.match(renderToStaticMarkup(React.createElement(SwarmBoard, { snapshot, initialView: 'board' })), new RegExp(`<h3>Acceptance</h3><ul><li><code>c1</code> ${snapshot.mission.acceptance[0]}</li>`))
 })
 
 test('graph and Chinese card render real task/evidence projections and worker links', () => {

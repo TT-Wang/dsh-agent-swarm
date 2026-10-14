@@ -92,7 +92,7 @@ async function fixture(t, options = {}) {
   const peer = await runtime.addMember(owner, mission.id, { role: 'research' })
   const reviewer = await runtime.addMember(owner, mission.id, { role: 'verification' })
   const actor = member => ({ sessionId: member.sessionId })
-  const propose = extra => runtime.propose(owner, mission.id, { outputs: [], workstreamId: stream.id, title: 'Report', objective: 'Inspect the repository', scope: ['docs/', 'notes/'], acceptance: ['Reviewed'], kind: 'research', checks: [], ...extra })
+  const propose = extra => runtime.propose(owner, mission.id, { outputs: [], workstreamId: stream.id, title: 'Report', objective: 'Inspect the repository', scope: ['docs/', 'notes/'], acceptance: ['Reviewed'], kind: 'research', ...(extra?.kind === 'verification' ? {} : { covers: ['c1'] }), checks: [], ...extra })
   const readEvidence = async (member, task, file) => {
     const result = await readFile(path.join(member.workspace, file), 'utf8')
     await workers.callbacks.toolRun(member.id, { tool: 'read', arguments: { path: file }, result, isError: false })

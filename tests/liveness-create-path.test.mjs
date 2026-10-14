@@ -42,7 +42,7 @@ async function fixture(t) {
   await runtime.start()
   const actor = member => ({ sessionId: member.sessionId })
   const propose = (extra = {}) => runtime.propose(owner, mission.id, { outputs: [], workstreamId: stream.id, title: 'Deliver',
-    objective: 'Deliver the change', kind: 'implementation', scope: ['src/'], acceptance: ['works'], checks: ['node check.cjs'], ...extra })
+    objective: 'Deliver the change', kind: 'implementation', scope: ['src/'], acceptance: ['works'], ...(extra.kind === 'verification' ? {} : { covers: ['c1'] }), checks: ['node check.cjs'], ...extra })
   const current = task => runtime.store.get('tasks', typeof task === 'string' ? task : task.id)
   const events = type => runtime.store.events(mission.id, 500).filter(event => event.type === type)
   const control = pattern => workers.deliveries.filter(item => item.delivery.kind === 'control' && pattern.test(item.delivery.content))

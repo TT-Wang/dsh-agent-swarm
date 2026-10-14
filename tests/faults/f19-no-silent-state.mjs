@@ -389,7 +389,7 @@ await runScenario({
     {
       const f = await setup({ acceptance: ['fault recovery is proven from durable state', 'second uncovered criterion'] })
       try {
-        const task = f.propose({ acceptance: ['fault recovery is proven from durable state'] })
+        const task = f.propose({ acceptance: ['fault recovery is proven from durable state'], covers: ['c1'] })
         await acceptThroughReview(f, task)
         const stall = await eventually(() => events(f.runtime, f.mission.id, 'mission/stalled').at(-1),
           'row 9: an uncovered criterion must stall')
