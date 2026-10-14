@@ -80,6 +80,17 @@ test('L-21: the W3 stall, coverage-complete, duplicate-carrier and wedged-pass r
   assert.deepEqual(names(coverage), { prefix: 'coverage-complete', family: 'coverage-complete', template: 'coverage-complete', statement: 'coverage-complete' })
 })
 
+test('a coverage-complete board writes no stall event: the owner-assembled mission is told coverage-complete as its one record, over every tick', async t => {
+  const f = await setup({ clock: new FakeClock() })
+  t.after(f.cleanup)
+  await acceptThroughReview(f, f.propose({ title: 'The whole deliverable' }))
+  await f.runtime.settle(f.mission.id)
+  await ticks(f, 3)
+  assert.ok(coverageRow(f), 'the owner is told the mission is ready to complete')
+  assert.equal(f.runtime.mission(f.mission.id).status, 'active', 'and decides: an owner-assembled mission does not complete itself')
+  assert.deepEqual(events(f.runtime, f.mission.id, 'mission/stalled'), [], 'coverage is no stall: no mission/stalled event is written with its row')
+})
+
 test('queued board decisions are withheld once the mission completes: coverage-complete, a duplicate carrier and a wedged pass\'s naming', async t => {
   const clock = new FakeClock()
   const f = await setup({ clock })
