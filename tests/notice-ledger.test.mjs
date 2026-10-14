@@ -14,6 +14,7 @@ import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
 import { FakeClock, FakeWorkers, MISSION_ACCEPTANCE, acceptThroughReview, blockThroughReview, eventually, events, setup, taskOf } from './faults/harness.mjs'
 import { ownerTools } from './refusal-inventory.mjs'
+import { emitGuardTerminal } from '../lib/refusals.js'
 import { BOARD_RUNNING, NOTICE_TEMPLATES, factKey, noticeFamily, noticeTemplateKey } from '../lib/notices.js'
 
 const ownerRows = f => f.runtime.store.list('deliveries', f.mission.id).filter(delivery => delivery.to === 'owner' && delivery.notice !== undefined)
@@ -903,7 +904,7 @@ test('a start failure leaves to its notice only the work that notice names: unas
   assert.deepEqual(ownerRows(f).filter(delivery => noticeFamily(delivery) === 'dispatch-question').map(delivery => delivery.subjects), [[`${task.id}@${taskOf(f.runtime, task.id).epoch}`]], 'the dispatch question about the work is asked, once')
 })
 
-test('a start failure over the work bound to its member is that work\'s one request while its failures stand: no dispatch question names the holder beside it, on any board digest, and once the member starts the question is asked', async t => {
+test('a start failure over the work bound to its member is that work\'s one request while its failures stand: no dispatch question names the holder beside it, on any board digest; once the member starts, the request is closed, nothing reminds the owner of it, and the question is asked', async t => {
   const f = await setup({ clock: new FakeClock() })
   t.after(f.cleanup)
   // The author's handle is never idle and its start fails until it is allowed; only the reviewer's handle is idle, so the board looks dispatchable.
@@ -932,7 +933,8 @@ test('a start failure over the work bound to its member is that work\'s one requ
   await f.runtime.settle(f.mission.id)
   assert.equal(f.runtime.store.get('members', f.author.id).startFailures, undefined, 'the start cleared the counted failures')
   assert.equal(`${task.id}@${taskOf(f.runtime, task.id).epoch}`, subject, 'the work waits at the epoch the request named')
-  assert.equal(relevant(f, ownerRows(f).find(delivery => delivery.content.startsWith('Author could not start'))), true, 'the request itself is still open')
+  const request = ownerRows(f).find(delivery => delivery.content.startsWith('Author could not start'))
+  assert.deepEqual([relevant(f, request), await remind(f, request)], [false, []], 'its cause ended: the request is closed and no reminder follows it, though the work it named still waits')
   assert.deepEqual(requests().filter(request => request === 'dispatch question'), ['dispatch question'], 'the dispatch question names the holder at the next pass end')
 })
 
@@ -959,6 +961,60 @@ test('P3: a start that adopts the member\'s running session ends its counted sta
   await f.runtime.settle(f.mission.id)
   assert.deepEqual([taskOf(f.runtime, task.id).status, subjectOf(f, task), f.runtime.store.get('members', f.author.id).startFailures], ['pending', subject, undefined], 'the adoption cleared the counted failures; the work waits at the epoch the failure named')
   assert.deepEqual(ownerRows(f).filter(delivery => noticeFamily(delivery) === 'dispatch-question').map(delivery => delivery.subjects), [[subject]], 'the dispatch question names it, once')
+})
+
+test('a start failure is reminded while its member\'s counted start failures stand, and its reminders stop once the member starts, though the work it named still waits behind the busy handle', async t => {
+  const f = await setup({ clock: new FakeClock(), budget: LONG })
+  t.after(f.cleanup)
+  // Only the reviewer's handle is idle; the author's start fails until it is allowed, and its handle then stays mid-turn.
+  f.workers.idle.add(f.reviewer.id)
+  const start = f.workers.start.bind(f.workers)
+  let failing = true
+  f.workers.start = async spec => { if (failing && spec.member.id === f.author.id) throw Object.assign(new Error('worker start failed'), { code: 'EMFILE' }); return start(spec) }
+  const task = f.propose({ title: 'Bound to the failing author' })
+  const pass = async () => { await f.runtime.settle(f.mission.id); await ticks(f, 1); await f.runtime.settle(f.mission.id) }
+  await pass()
+  const subject = subjectOf(f, task)
+  const failure = ownerRows(f).find(delivery => delivery.content.startsWith('Author could not start (failure 1 of 3)'))
+  assert.deepEqual([f.runtime.store.get('members', f.author.id).phase === 'stopped', failure?.subjects], [false, [subject]], 'the author is failing, not retired, and its failure names the work bound to it')
+  assert.deepEqual((await remind(f, failure)).map(delivery => delivery.subjects), [[subject]], 'while the author fails, the owner is reminded of that work')
+  assert.ok(f.runtime.store.get('deliveries', failure.id).deliveredAt !== undefined, 'the failure reached the owner')
+  failing = false
+  await pass()
+  assert.deepEqual([f.runtime.store.get('members', f.author.id).startFailures, taskOf(f.runtime, task.id).status, subjectOf(f, task)], [undefined, 'pending', subject], 'the author started; the work waits at the epoch the failure named')
+  assert.deepEqual([relevant(f, failure), await remind(f, failure)], [false, []], 'the failure\'s cause ended: it is closed and its reminders stop')
+})
+
+test('a rejection holds its task at the epoch it names: blocked again at the next epoch by a cause no decision states, the task is named by the board at that epoch', async t => {
+  const f = await setup({ clock: new FakeClock() })
+  t.after(f.cleanup)
+  const source = f.propose({ title: 'Rejected work' })
+  await blockThroughReview(f, source)
+  await quiet(f)
+  const rejection = ownerRows(f).find(delivery => delivery.notice.trigger === 'task/rejected')
+  const roots = () => ownerRows(f).filter(delivery => noticeFamily(delivery) === 'stall-root').map(delivery => delivery.notice.dedupKey)
+  assert.deepEqual([rejection.subjects, relevant(f, rejection), roots()], [[subjectOf(f, source)], true, []], 'the rejection names its task at its epoch and holds it: no stall root restates it')
+  // The task moves to the next epoch and is blocked there by a cause no decision states.
+  f.runtime.commit(f.mission.id, () => f.runtime.store.put('tasks', { ...taskOf(f.runtime, source.id), epoch: taskOf(f.runtime, source.id).epoch + 1, output: 'blocked for repair' }))
+  await quiet(f)
+  assert.deepEqual([relevant(f, rejection), roots()], [false, [`stall-root:${f.mission.id}:${subjectOf(f, source)}`]], 'the rejection holds nothing at the new epoch: the board names the task there')
+})
+
+test('the fall-through leaves to an open request raised for a task the pending work that request names: beside running work, no fall-through names it', async t => {
+  const f = await setup({ clock: new FakeClock(), budget: LONG })
+  t.after(f.cleanup)
+  // The author's running work keeps the board from stalling, so the fall-through is the board's namer.
+  await f.runtime.claim(f.actor(f.author), f.mission.id, f.propose({ title: 'Running work', kind: 'research', checks: [] }).id)
+  const stranded = strandOnReviewer(f)
+  emitGuardTerminal(f.runtime, f.mission.id, 'attempt_lease', { taskId: stranded.id, localKey: 'closeout-abandoned:attempt_abandoned', detail: 'idle close-out abandoned attempt attempt_abandoned and re-pended the task' })
+  await quiet(f)
+  // The board digest moves: work queued behind the author's live lease.
+  f.propose({ title: 'Queued work', kind: 'research', checks: [] })
+  await quiet(f)
+  const subject = subjectOf(f, stranded)
+  const [request] = terminalRows(f, 'attempt_lease')
+  assert.deepEqual([request.subjects, taskOf(f.runtime, stranded.id).status, relevant(f, request)], [[subject], 'pending', true], 'the open request raised for the task names it, pending, at its epoch')
+  assert.deepEqual(ownerRows(f).filter(delivery => noticeFamily(delivery) === 'fallthrough').map(delivery => delivery.subjects), [], 'no fall-through restates it')
 })
 
 test('work pinned to a member retired for start failures is the retirement\'s while those failures stand: beside running work no fall-through names it', async t => {
@@ -996,7 +1052,7 @@ test('an older build\'s W3 row holds no work: a stall an earlier build recorded 
   assert.deepEqual(ownerRows(f).filter(delivery => noticeFamily(delivery) === 'board-stall').map(delivery => delivery.subjects), [[subject]], 'the board names its stuck work under the W3 stall\'s own key')
 })
 
-test('a notice whose cause no row shows ending stands for no naming: after a start failure the member recovered from, or a member\'s failure, a dependent a cancellation strands at the epoch it named is told by the board, the fall-through beside running work and the W3 stall on a board with nothing else to do', async t => {
+test('a notice whose cause has ended, or that holds no work, stands for no naming: after a start failure the member recovered from (closed), or a member\'s failure (open, outside the decisions that hold work), a dependent a cancellation strands at the epoch it named is told by the board, the fall-through beside running work and the W3 stall on a board with nothing else to do', async t => {
   for (const cause of ['recovered start failure', 'member failure']) {
     for (const running of [true, false]) {
       const f = await setup({ clock: new FakeClock(), workers: new FakeWorkers({ autoIdle: true }) })
@@ -1020,7 +1076,7 @@ test('a notice whose cause no row shows ending stands for no naming: after a sta
       await ticks(f, 20)
       await f.runtime.settle(f.mission.id)
       assert.equal(`${dependent.id}@${taskOf(f.runtime, dependent.id).epoch}`, subject, `${cause}, running=${running}: the dependent is stranded at the epoch the notice named`)
-      assert.equal(relevant(f, notice), true, `${cause}, running=${running}: the notice is still open`)
+      assert.equal(relevant(f, notice), cause === 'member failure', `${cause}, running=${running}: a member failure stays open; a start failure ends with the start`)
       const board = ownerRows(f).filter(delivery => (delivery.subjects ?? []).includes(subject) && ['fallthrough', 'board-stall'].includes(noticeFamily(delivery)))
       assert.deepEqual(board.map(delivery => noticeFamily(delivery)), [running ? 'fallthrough' : 'board-stall'], `${cause}, running=${running}: the board names the stranded dependent`)
     }

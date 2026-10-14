@@ -364,7 +364,7 @@ export class Scheduling {
    *   is someone else's witness, not this notice's); or
    * - every startable eligible member is refused by the isolation invariant: the
    *   workspace terminal is the one emitter of that cause (`isolationAllows`).
-   * A task an open owner decision holds is never passed in (`Notices.decided`).
+   * A task an open owner decision holds is never passed in (`Notices.held`).
    *
    * Otherwise the notice names a handle holder or an unexplained dispatch gap.
    * An idle handle alone proves no budget refusal.

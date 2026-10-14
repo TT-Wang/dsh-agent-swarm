@@ -503,7 +503,7 @@ export class WorkspaceAdmission {
    * violation's (`isolationOpener`), naming the unfinished work of every member
    * it lists: one decision per distinct violation however many members it
    * refuses and however often, outstanding while the invariant still lists it
-   * (`Notices.openGuardTerminal`), and a changed violation is a new one.
+   * (`Notices.openSubjects`), and a changed violation is a new one.
    */
   isolationAllows(missionId: string, member: Member): boolean {
     const violation = this.isolationIssues(missionId).find(entry => entry.memberIds.includes(member.id))
