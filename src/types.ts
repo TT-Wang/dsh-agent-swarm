@@ -601,19 +601,16 @@ export interface BoardQuery {
   postId?: string
 }
 /**
- * Closed owner-notice classes. The runtime dedups its own budget/ceiling
- * refusals per (class, mission-state fingerprint, sender) so an unchanged board
- * cannot spam the owner; decision notices carry the liveness engine's own
- * witness dedup and are always recorded, so a state that changes and returns
- * can re-notify. Escalations are never deduplicated.
+ * Closed owner-notice classes. A notice is deduplicated on the deliveries
+ * ledger by (class, key, sender); escalations are never deduplicated.
  */
 export type NoticeClass = 'decision' | 'blocker' | 'failure' | 'budget' | 'stall' | 'progress' | 'completion' | 'escalation'
 /**
  * Delivery lifecycle of one owner notice. `sent` is the durable record,
  * `queued` is the outbox entry awaiting the owner session, and `claimed` is the
  * adapter delivery that put it in front of the owner. The dedup key is the
- * mission-state fingerprint the notice was emitted for, so the ledger proves
- * which states were announced and which are still silent.
+ * identity of the fact the notice tells (an escalation, never deduplicated,
+ * carries the board digest), so the ledger proves which facts were announced.
  */
 export interface NoticeEnvelope {
   dedupKey: string
