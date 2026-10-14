@@ -209,8 +209,9 @@ test('R5-02: when every route fails to start, starts stop at k per route and the
   assert.match(notice.content, /swarm_add_member/, 'the notice names the add-member exit')
   assert.match(notice.content, /swarm_control\(taskId, action: "amend"/, 'the notice names the reassign exit')
   assert.ok((notice.notice?.subjects ?? notice.subjects ?? []).some(subject => subject.startsWith(`${proposed.id}@`)), 'the notice is attributed to the task')
-  // Open (docs/known-limitations.md): the retirement released the work, so no member binds it and no row shows the
-  // retirement's cause ending; the W3 stall names it too, once (R20 leaves it to a decision only while its cause is on the board).
+  // The open item "the retirement co-fire" (docs/known-limitations.md): the retirement released the work, so it holds
+  // only the pending work bound to its member, and the W3 stall names the released work too, once, until a live-route
+  // predicate is judged where the deferral is judged.
   const facts = f.ownerNotices().flatMap(delivery => delivery.notice.aggregatedFacts ?? [{ dedupKey: delivery.notice.dedupKey, subjects: delivery.subjects }])
   const families = facts.filter(fact => (fact.subjects ?? []).includes(`${proposed.id}@${stranded.epoch}`)).map(fact => fact.dedupKey.split(':')[0])
   assert.deepEqual([...new Set(families)].sort(), ['board-stall', 'member/resume-failed'], `the stranded task is named by its notices and the W3 stall: ${families}`)
