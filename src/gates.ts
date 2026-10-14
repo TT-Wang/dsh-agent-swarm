@@ -13,6 +13,7 @@ import { excerpt } from './declared-checks.ts'
 import { executionElapsed } from './resource-time.ts'
 import { memberPhaseOf } from './projection.ts'
 import { emitGuardTerminal } from './refusals.ts'
+import { noticeFamily } from './notices.ts'
 import type { SwarmRuntime } from './runtime.ts'
 import type { Delivery, Evidence, Member, Mission, Post, Task, UsageBuckets, UsageSnapshotSource } from './types.ts'
 
@@ -128,11 +129,10 @@ export class RuntimeGates {
 
   constructor(private readonly rt: SwarmRuntime) {}
 
-  /** Current `F(S)`: the board digest the no-silent-state witness and the owner instruments carry. */
+  /** Current `F(S)`: the board digest the owner instruments and the audit fields of the stall events carry. */
   fingerprint(missionId: string): string {
     // Cache per store revision: F(S) is pure over durable state, so a tick that
-    // changed nothing cannot change it, and the scheduler's per-tick witness
-    // check stays cheap under a large board. Never trust the cache inside an open
+    // changed nothing cannot change it. Never trust the cache inside an open
     // transaction: the revision has not advanced yet while the board is mutating.
     if (this.rt.commitDepth > 0) return missionFingerprint(this.fingerprintBoard(missionId))
     const revision = this.rt.store.revision()
@@ -190,7 +190,7 @@ export class RuntimeGates {
 
   /**
    * Read-only owner instruments (docs/no-silent-state-spec.md §6): the current
-   * no-silent-state fingerprint `F(S)`, the last witness class and time, the
+   * board digest `F(S)`, the last witness (the newest ledger row) with its family and time, the
    * pending-dispatchable count, the notice-delivery ledger and durable
    * escalations. `full` adds the per-member arena rows and the ledger page; the
    * compact form keeps the owner's routine observe response small. A pure
@@ -201,12 +201,11 @@ export class RuntimeGates {
     const view = projectArenaView({ ...records, missionId, now: this.rt.now(), leaseMs: this.rt.config.leaseMs })
     const counts = { sent: view.notices.length, queued: view.notices.filter(entry => entry.state === 'queued').length, claimed: view.notices.filter(entry => entry.state === 'claimed').length }
     return {
-      // T3d: the owner-visible fingerprint is the no-silent-state F(S) the
-      // witness record and F19 use, never the arena ledger's dedup digest.
+      // T3d: the owner-visible fingerprint is the board digest F(S), never the arena ledger's dedup digest.
       fingerprint: this.fingerprint(missionId),
       noticeDedupKey: this.rt.noticeKey(missionId),
       pendingDispatchable: this.fingerprintBoard(missionId).tasks.filter(task => task.ready).length,
-      ...(view.lastNotice === undefined ? {} : { lastWitness: view.lastNotice }),
+      ...(view.lastNotice === undefined ? {} : { lastWitness: { ...view.lastNotice, family: noticeFamily(records.deliveries.find(delivery => delivery.id === view.notices[0]!.deliveryId)!) } }),
       notices: counts,
       // L3: the receipts nobody has settled yet. A question with no answer is a
       // silent state by the same argument the board uses, so it is named here

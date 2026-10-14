@@ -119,7 +119,7 @@ test('one enforcement point: a no-live-path decision is withheld at delivery whi
   await f.runtime.claim({ sessionId: builder.sessionId }, f.mission.id, repair.id)
   const covered = `${original.id}@${original.epoch}`
   f.emit('covered fall-through', [covered], { statement: { family: 'fallthrough', counts: {} }, trigger: 'mission/stalled', reason: 'no live path advances it' })
-  f.emit('covered stall root', [covered], { dedupKey: `stall-root:${f.mission.id}:${covered}`, stampWitness: false })
+  f.emit('covered stall root', [covered], { dedupKey: `stall-root:${f.mission.id}:${covered}` })
   const fallthrough = f.ownerNotices().find(delivery => delivery.notice.dedupKey.startsWith('fallthrough:'))
   const coveredRoot = f.ownerNotices().find(delivery => delivery.notice.dedupKey === `stall-root:${f.mission.id}:${covered}`)
   assert.ok(fallthrough && coveredRoot, 'emission records the facts; it no longer judges them')

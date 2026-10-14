@@ -627,50 +627,113 @@ test('a wedged pass is named once per naming fact, on the ledger alone: a body o
   assert.equal(Object.hasOwn(f.runtime.store.get('missions', f.mission.id), 'schedulingWedgeNotice'), false, 'nothing on the mission row records a naming')
 })
 
-test('a wedged pass\'s naming is the W2 witness of the board digest it was told on, like every owner decision and never the board\'s W3 stall: once the body settles, a publication on that digest judges nothing again, a body on a held fact witnesses nothing, and a moved digest is judged', async t => {
+test('M-1: a notice is its ledger row and nothing else: the same fact on another board digest is no second row and nothing on the mission row records it, and a notice committed with the board change that owes another family\'s fact does not stand for that fact', async t => {
   const f = await setup({ clock: new FakeClock() })
   t.after(f.cleanup)
-  // All of the mission's work runs under a live lease, so the board classifier owes it nothing (row 3): only the naming witnesses this board.
-  const task = f.propose({ title: 'Held by live work' })
-  await f.runtime.claim(f.actor(f.author), f.mission.id, task.id)
-  await f.runtime.settle(f.mission.id)
-  const scheduling = f.runtime.scheduling, notices = f.runtime.notices
-  const witness = () => f.runtime.store.get('missions', f.mission.id).witness
+  const unrelated = () => f.runtime.notify(f.mission.id, 'An unrelated owner decision', [`mission:${f.mission.id}`], { trigger: 'test/unrelated', reason: 'one fact' })
+  f.runtime.commit(f.mission.id, unrelated)
   const board = f.runtime.fingerprint(f.mission.id)
-  assert.notEqual(witness()?.fingerprint, board, 'nothing has witnessed this board digest yet')
-  /** Every run of the classifiers past the witness dedup, by the branch that ran them. */
-  const judged = []
-  const judge = notices.judgeBoard.bind(notices)
-  notices.judgeBoard = (view, options, roots) => { judged.push(options.wedged === true ? 'wedged' : 'unwedged'); return judge(view, options, roots) }
-  /** A body past the bound live work holds a naming to, as the tick watchdog finds and marks it. */
-  const body = operationId => {
-    const pass = { id: scheduling.passKey(f.mission.id), operationId, missionId: f.mission.id, startedAt: f.clock.now() - f.runtime.stallPassReleaseBoundMs,
-      revisionBefore: f.runtime.store.revision(), fingerprintBefore: f.runtime.fingerprint(f.mission.id) }
-    scheduling.passes.set(f.mission.id, pass)
-    t.after(() => scheduling.closePass(f.mission.id, pass))
-    scheduling.checkSchedulingPasses()
-    return pass
-  }
-  const first = body('operation_wedge_witness_1')
-  assert.equal(wedgeRows(f).length, 1, 'the body is named')
-  const stamped = witness()
-  assert.deepEqual(stamped, { fingerprint: board, kind: 'W2', at: f.clock.now() }, 'the naming is the W2 witness of the board digest it was told on')
-  await Promise.resolve()
-  assert.deepEqual(judged, ['wedged'], 'the naming\'s own publication judges the board past the witness, with the wedged branch')
-  // The hung call returns: the pass end is a publication on the digest the naming witnessed.
-  scheduling.closePass(f.mission.id, first)
-  await Promise.resolve()
-  await f.runtime.flushOutbox(f.mission.id)
-  assert.equal(f.runtime.fingerprint(f.mission.id), board)
-  assert.deepEqual([judged, witness(), ownerRows(f).length], [['wedged'], stamped, 1], 'that digest is witnessed: the classifier is not run again, and nothing is told or stamped')
-  // The board digest moves, and a second body wedges on the naming fact the owner holds.
+  f.propose({ title: 'A board change', kind: 'research', checks: [], assigneeId: f.reviewer.id })
+  await f.runtime.settle(f.mission.id)
+  assert.notEqual(f.runtime.fingerprint(f.mission.id), board, 'the board digest moved')
+  f.runtime.commit(f.mission.id, unrelated)
+  assert.equal(ownerRows(f).filter(delivery => delivery.notice.trigger === 'test/unrelated').length, 1, 'the same fact is one row, whatever the board digest is')
+  assert.equal(Object.hasOwn(f.runtime.store.get('missions', f.mission.id), 'witness'), false, 'nothing on the mission row records a notice')
+
+  // Beside running work, the board change that leaves work dead is committed with an unrelated notice.
+  const dead = await setup({ clock: new FakeClock() })
+  t.after(dead.cleanup)
+  await dead.runtime.claim(dead.actor(dead.author), dead.mission.id, dead.propose({ title: 'Running work', kind: 'research', checks: [] }).id)
+  const stranded = dead.propose({ title: 'Reviewer-only work', kind: 'research', checks: [], assigneeId: dead.reviewer.id })
+  await dead.runtime.settle(dead.mission.id)
+  dead.runtime.commit(dead.mission.id, () => {
+    dead.runtime.store.put('members', { ...dead.runtime.store.get('members', dead.reviewer.id), phase: 'stopped' })
+    dead.runtime.notify(dead.mission.id, 'An unrelated owner decision', [`mission:${dead.mission.id}`], { trigger: 'test/unrelated', reason: 'co-committed' })
+  })
+  await dead.runtime.settle(dead.mission.id)
+  await ticks(dead, 3)
+  assert.deepEqual(ownerRows(dead).filter(delivery => noticeFamily(delivery) === 'fallthrough').map(delivery => delivery.subjects), [[`${stranded.id}@${taskOf(dead.runtime, stranded.id).epoch}`]], 'the fall-through names the dead work')
+
+  // A ready task pinned to a busy handle is admitted, and an unrelated notice is committed before any judgement.
+  const pinned = await setup({ clock: new FakeClock() })
+  t.after(pinned.cleanup)
+  pinned.workers.idle.add(pinned.reviewer.id)
+  const task = pinned.propose({ title: 'Pinned to a busy handle' })
+  pinned.runtime.commit(pinned.mission.id, () => pinned.runtime.notify(pinned.mission.id, 'An unrelated owner decision', [`mission:${pinned.mission.id}`], { trigger: 'test/unrelated', reason: 'co-committed' }))
+  await pinned.runtime.settle(pinned.mission.id)
+  await ticks(pinned, 3)
+  assert.equal(taskOf(pinned.runtime, task.id).status, 'pending', 'the task was not dispatched')
+  assert.deepEqual(ownerRows(pinned).filter(delivery => noticeFamily(delivery) === 'dispatch-question').map(delivery => delivery.subjects), [[`${task.id}@${taskOf(pinned.runtime, task.id).epoch}`]], 'the dispatch question is asked')
+})
+
+test('a member whose starts are failing is spoken for by its start-failure notice: no dispatch question asks about the work it cannot start, whatever the board digest, until it starts', async t => {
+  const f = await setup({ clock: new FakeClock(), workers: new FakeWorkers({ autoIdle: true }) })
+  t.after(f.cleanup)
+  let failing = true
+  const start = f.workers.start.bind(f.workers)
+  f.workers.start = async spec => { if (failing && spec.member.id === f.author.id) throw Object.assign(new Error('worker start failed'), { code: 'EMFILE' }); return start(spec) }
+  const task = f.propose({ title: 'Work for the author' })
+  await f.runtime.settle(f.mission.id)
+  await ticks(f, 1)
+  await f.runtime.settle(f.mission.id)
+  const questions = () => ownerRows(f).filter(delivery => noticeFamily(delivery) === 'dispatch-question')
+  const failure = ownerRows(f).find(delivery => /^Author could not start \(failure 1 of 3\)/.test(delivery.content))
+  assert.deepEqual(failure?.subjects, [`${task.id}@${taskOf(f.runtime, task.id).epoch}`], 'the start failure is told, naming the work it re-pended')
+  assert.equal(taskOf(f.runtime, task.id).status, 'pending')
+  // The board digest moves while the author's start is still failing.
+  const board = f.runtime.fingerprint(f.mission.id)
   f.runtime.commit(f.mission.id, () => f.runtime.store.put('members', { ...f.runtime.store.get('members', f.reviewer.id), phase: 'stopped' }))
   await Promise.resolve()
-  const moved = f.runtime.fingerprint(f.mission.id)
-  assert.notEqual(moved, board, 'the board digest moved')
-  assert.deepEqual(judged, ['wedged', 'unwedged'], 'a publication on a digest no notice witnessed is judged')
-  const second = body('operation_wedge_witness_2')
-  assert.deepEqual([second.escalatedAt !== undefined, wedgeRows(f).length, witness()], [true, 1, stamped], 'a body on a held naming fact writes nothing, so it witnesses nothing: the moved digest is not stamped')
+  assert.notEqual(f.runtime.fingerprint(f.mission.id), board)
+  assert.deepEqual(questions(), [], 'no dispatch question restates the start failure')
+  // The route recovers: its next start succeeds and the work runs.
+  failing = false
+  await ticks(f, 2)
+  await f.runtime.settle(f.mission.id)
+  assert.equal(taskOf(f.runtime, task.id).status, 'running', 'the work runs once the author starts')
+  assert.deepEqual(questions(), [], 'and no question was ever owed')
+})
+
+test('a judgement of a board whose fact the owner holds commits nothing, and a tick judges the board at most twice: the dispatch question, the fall-through, the W3 stall', async t => {
+  const boards = {
+    'dispatch-question': async () => {
+      const f = await setup({ clock: new FakeClock() })
+      t.after(f.cleanup)
+      // Only the reviewer's handle is idle: the author's holds the task pinned to it.
+      f.workers.idle.add(f.reviewer.id)
+      f.propose({ title: 'Pinned to a busy handle' })
+      return f
+    },
+    fallthrough: async () => {
+      const f = await setup({ clock: new FakeClock() })
+      t.after(f.cleanup)
+      await f.runtime.claim(f.actor(f.author), f.mission.id, f.propose({ title: 'Running work', kind: 'research', checks: [] }).id)
+      // Work only the reviewer may take, dead behind the running work once the reviewer is gone.
+      f.propose({ title: 'Reviewer-only work', kind: 'research', checks: [], assigneeId: f.reviewer.id })
+      f.runtime.commit(f.mission.id, () => f.runtime.store.put('members', { ...f.runtime.store.get('members', f.reviewer.id), phase: 'stopped' }))
+      return f
+    },
+    'board-stall': async () => (await deadAssigneeBoard(t)).f,
+  }
+  for (const [family, build] of Object.entries(boards)) {
+    const f = await build()
+    await f.runtime.settle(f.mission.id)
+    await ticks(f, 2)
+    await f.runtime.flushOutbox(f.mission.id)
+    assert.equal(ownerRows(f).filter(delivery => noticeFamily(delivery) === family).length, 1, `${family}: the board's fact is told`)
+    const judged = [], committed = []
+    let judging = false
+    const ensure = f.runtime.notices.ensureWitness.bind(f.runtime.notices)
+    f.runtime.notices.ensureWitness = (missionId, options) => { judged.push(f.clock.now()); judging = true; try { return ensure(missionId, options) } finally { judging = false } }
+    const commit = f.runtime.commit.bind(f.runtime)
+    f.runtime.commit = (missionId, fn) => { if (judging) committed.push(missionId); return commit(missionId, fn) }
+    const board = f.runtime.fingerprint(f.mission.id), rows = ownerRows(f).length
+    await ticks(f, 10)
+    assert.equal(f.runtime.fingerprint(f.mission.id), board, `${family}: the board did not change`)
+    const perTick = [...new Set(judged)].map(at => judged.filter(when => when === at).length)
+    assert.ok(perTick.length === 10 && perTick.every(count => count <= 2), `${family}: every tick judges the board, at most twice: ${perTick}`)
+    assert.deepEqual([committed.length, ownerRows(f).length], [0, rows], `${family}: a judgement of a board whose fact the owner holds commits nothing and tells nothing`)
+  }
 })
 
 test('a wedged pass\'s naming is outstanding while the work it named is unfinished at the epochs it named, whatever a body does now: it stays the owner\'s to read once the body settles, a later body on the same fact is told by that row, and it ends when the named work moves on', async t => {
@@ -774,7 +837,7 @@ test('L-25: a failed dispatch is one request per member, the work it names and t
   assert.deepEqual(terminals().map(delivery => delivery.notice.reason), ['Error: worktree probe failed: EIO', `Error: ${failure}`], 'a different failure on an unchanged board is told')
   assert.deepEqual(stallEventKeys(f, 'guard-terminal'), terminals().map(delivery => delivery.notice.dedupKey), 'one stall event per request, naming its row')
   // Open (docs/known-limitations.md): the question is a second wording of the failing chain's condition. It has no predicate
-  // for a failing chain, so it is asked once the board digest moves; what is pinned here is that it is asked once, under its own key.
+  // for a failing chain, so it is asked too; what is pinned here is that it is asked once, under its own key.
   assert.deepEqual(questions(), [`dispatch-question:${f.mission.id}:${subject}`], 'the undispatched task is the dispatch question\'s own fact at its epoch: asked once, whichever requests the chain holds')
 })
 

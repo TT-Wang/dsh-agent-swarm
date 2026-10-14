@@ -485,9 +485,8 @@ export class Attempts {
     const what = silent.tool === undefined ? `a ${silent.kind} operation` : `a ${silent.kind} operation \`${silent.tool}\``
     const message = `${name} has held ${what} for ${formatElapsed(silent.elapsedMs)} (${silent.elapsedMs}ms) without recording anything, past its declared bound of ${formatElapsed(silent.boundMs)}: task ${task.id} "${task.title}", attempt ${silent.attemptId}. The operation no longer counts as liveness, so the lease is not renewed and the attempt expires into the existing recovery, which stops the worker and re-pends the task. Owner actions: inspect the stuck call with swarm_observe (taskId ${task.id}), raise operationBoundMs if the operation is genuinely long, or withdraw the work with swarm_cancel. [witness: activity ${silent.activityId}, kind ${silent.kind}${silent.tool === undefined ? '' : `, tool ${silent.tool}`}, attempt ${silent.attemptId}, startedAt ${silent.startedAt}, lastRecordedAt ${silent.lastRecordedAt}, elapsedMs ${silent.elapsedMs}, boundMs ${silent.boundMs}]`
     this.rt.commit(mission.id, () => {
-      // The durable witness is the no-silent-state W2 row `notify` records on
-      // the mission, together with the durable owner delivery itself — this
-      // runtime's witness for an owner notice. A dedicated
+      // The durable witness is the owner delivery row itself, on the
+      // deliveries ledger. A dedicated
       // `task/operation-silent` event type would need its own registry row in
       // src/events.ts, outside this task's write scope; that exact change is
       // named as a hand-off in the submission.

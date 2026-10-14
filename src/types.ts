@@ -230,14 +230,6 @@ export interface Mission {
   workerUsage?: UsageBuckets
   /** Owner-session usage attributed by time window (planning and coordination). Outside the worker pool budget. */
   ownerUsage?: UsageBuckets
-  /**
-   * No-silent-state witness (docs/no-silent-state-spec.md §2): the fingerprint
-   * `F(S)` of the board state at the moment the last owner-decision notice was
-   * emitted, and its witness class. A notice is fresh only for the fingerprint
-   * it was emitted for, so an unchanged board never re-notifies and a board that
-   * changes and changes back does. Wall-clock `at` is never part of `F(S)`.
-   */
-  witness?: { fingerprint: string; kind: 'W2' | 'W3'; at: number }
   /** When the owner last set the mission budget: a mission-root budget notice recorded before it is resolved. */
   budgetReviewedAt?: number
   /** Last successful delivery application; projected for the client after the event window scrolls. */

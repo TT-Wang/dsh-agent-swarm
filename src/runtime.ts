@@ -706,8 +706,8 @@ export class SwarmRuntime {
    * sweep stays out of its way), `kick` (which opens the next pass in the same
    * tick, after this sweep), the pass watchdog (which names a wedged pass that
    * still holds the mission queue — exactly the state this sweep exists for)
-   * and the notice dedup (`hasNotice` / the mission witness), which keeps a
-   * second generation path from duplicating a decision.
+   * and the notice dedup (`hasNotice`), which keeps a second generation path
+   * from duplicating a decision.
    */
   private sweepDecisions(): void {
     if (this.closed || this.shuttingDown) return
@@ -723,7 +723,7 @@ export class SwarmRuntime {
         // dispatch path acts on without a write in between. Co-firing guards the
         // deleted write used to name are now readers of that one derivation: the
         // W6 idle close-out, the parked-member hatch and the coverage/stall
-        // notices, whose F(S) key no status write can move.
+        // notices.
         // R16-D: the attempt reporting bound runs BEFORE the pass guard below, so
         // an attempt that has stopped reporting is named whether the pass is
         // running, wedged or absent. Co-firing guards: F1's operation silence
@@ -3720,14 +3720,9 @@ export class SwarmRuntime {
       }
       if (terminal(mission) && mission.budgetPause) { delete mission.budgetPause; this.store.put('missions', mission) }
       if (mission.status !== 'active') for (const member of this.store.list('members', missionId)) { delete member.activity; this.store.put('members', member) }
+      // No-silent-state row 16: a pause is the owner's own decision, recorded by
+      // this event, with no notice to the owner about its own action.
       this.store.event(missionId, `mission/${action}`, 'owner', { reason, coordinatorId: coordinatorId ?? null })
-      // No-silent-state row 16: pausing is a durable owner decision. Record the
-      // witness for the paused fingerprint so the transition is machine-checkable
-      // without waking the owner with a notice about its own action.
-      if (action === 'pause') {
-        mission.witness = { fingerprint: this.fingerprint(missionId), kind: 'W2', at: this.now() }
-        this.store.put('missions', mission)
-      }
     })
     if (mission.status !== 'active') {
       for (const member of this.store.list('members', missionId)) {

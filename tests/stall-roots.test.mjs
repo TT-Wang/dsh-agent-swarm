@@ -5,7 +5,7 @@
  */
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { waitsLegitimately } from '../lib/notices.js'
+import { factKey, waitsLegitimately } from '../lib/notices.js'
 import { wakePrecision } from './instruments.mjs'
 import { FakeClock, FakeWorkers, eventually, makeRuntime } from './faults/harness.mjs'
 
@@ -546,13 +546,14 @@ test('a pending task in preparation back-off is a bounded live wait, and a named
   assert.equal(waitsLegitimately(f.runtime, { ...f.runtime.store.get('tasks', backoff.id), preparationFailure: { ...permanent, transient: false } }, board()), false)
 })
 
-for (const coStamp of ['stall-root', 'permanent-preparation-failure']) {
-  test(`a W2 witness stamped during a preparation back-off (${coStamp}) does not hide the back-off once its bound passes`, async t => {
-    // 5347f5b: the back-off wait ends on a timer that changes nothing in F(S), so
-    // a W2 stamped inside the window (the row-7b stamp after a stall-root notice,
-    // or another task's permanent preparation-failure notice) matched F(S) forever
-    // and the fall-through never named the task nothing would retry. The clock
-    // and the ticks are driven by hand.
+for (const coNotice of ['stall-root', 'permanent-preparation-failure']) {
+  test(`an expired preparation back-off is named by the first judgement after its bound, exactly once, by its fall-through key, whatever another notice told inside its window (${coNotice})`, async t => {
+    // 5347f5b: the back-off wait ends on a timer that changes nothing on the
+    // board, and an owner decision told inside the window (a stall-root notice,
+    // another task's permanent preparation-failure notice) once stood for the
+    // whole board, so nothing named the task nothing would retry. Each family
+    // now tells only its own fact, and every judgement reads the clock. The
+    // clock and the ticks are driven by hand.
     const f = await fixture(t, { clock: new FakeClock() })
     const tickMs = f.runtime.config.tickMs
     const second = await f.runtime.addMember(f.owner, f.mission.id, { name: 'Second', role: 'implementation' })
@@ -570,7 +571,7 @@ for (const coStamp of ['stall-root', 'permanent-preparation-failure']) {
       f.runtime.store.put('tasks', row)
       const dead = f.runtime.store.get('tasks', other.id)
       dead.status = 'blocked'; dead.epoch++
-      if (coStamp === 'permanent-preparation-failure') {
+      if (coNotice === 'permanent-preparation-failure') {
         // The scheduler's own permanent-failure shape (src/scheduling.ts), notice included.
         dead.preparationFailure = { reason: 'Workspace or worker preparation failed: EACCES', transient: false, attempts: 1 }
         dead.output = 'Workspace or worker preparation failed: EACCES'
@@ -585,32 +586,32 @@ for (const coStamp of ['stall-root', 'permanent-preparation-failure']) {
       f.runtime.store.put('members', member)
     })
     const epoch = f.runtime.store.get('tasks', backoff.id).epoch
-    const named = () => f.fallthroughs().filter(delivery => delivery.subjects?.includes(`${backoff.id}@${epoch}`))
-    // The co-stamp happened inside the window and the board did not change after it.
-    const stamped = await ticksUntil(f, () => {
-      const witness = f.runtime.store.get('missions', f.mission.id).witness
-      return witness?.kind === 'W2' && witness.at <= retryAt + tickMs && witness.fingerprint === f.runtime.fingerprint(f.mission.id) ? witness : undefined
-    }, 'a W2 witness is stamped during the back-off window')
-    assert.ok(stamped.at <= retryAt, `stamped inside the window (${retryAt - stamped.at} ms before retryAt)`)
+    const subject = `${backoff.id}@${epoch}`
+    const named = () => f.fallthroughs().filter(delivery => delivery.subjects?.includes(subject))
+    const judged = []
+    const ensure = f.runtime.notices.ensureWitness.bind(f.runtime.notices)
+    f.runtime.notices.ensureWitness = (missionId, options) => { judged.push(f.clock.now()); return ensure(missionId, options) }
+    // The other notice is told inside the window.
+    const told = await ticksUntil(f, () => f.notices().find(delivery => delivery.subjects?.includes(`${other.id}@${f.runtime.store.get('tasks', other.id).epoch}`)), 'the other dead end is told')
+    assert.ok(told.createdAt <= retryAt, `told inside the window (${retryAt - told.createdAt} ms before retryAt)`)
     assert.equal(named().length, 0, 'the live back-off is not named')
-    const notice = await ticksUntil(f, () => named()[0], 'the expired back-off is named despite the earlier W2 for the same F(S)', 120)
-    assert.ok(notice.createdAt > retryAt + tickMs, `named only after retryAt plus one tick (${notice.createdAt - retryAt} ms after retryAt)`)
-    assert.deepEqual(notice.subjects, [`${backoff.id}@${epoch}`], 'only the expired back-off is named')
+    const notice = await ticksUntil(f, () => named()[0], 'the expired back-off is named', 120)
+    const bound = retryAt + tickMs
+    assert.equal(notice.createdAt, judged.find(at => at > bound), 'named by the first judgement after its bound')
+    assert.deepEqual(notice.subjects, [subject], 'only the expired back-off is named')
+    assert.equal(notice.notice.dedupKey, factKey(f.mission.id, { trigger: 'mission/stalled', reason: `no live path advances ${subject}`, subjects: [subject], statement: { family: 'fallthrough' } }), 'by its own fall-through key')
     assert.equal(f.runtime.store.get('tasks', backoff.id).status, 'pending', 'no retry happened')
     await ticks(f, 6)
-    assert.equal(named().length, 1, 'named exactly once: the fall-through re-stamps the witness past the bound')
-    const witness = f.runtime.store.get('missions', f.mission.id).witness
-    assert.equal(witness.fingerprint, f.runtime.fingerprint(f.mission.id), 'the witness is still keyed by F(S) alone')
-    assert.ok(witness.at > retryAt + tickMs, 'the current witness post-dates the bound')
+    assert.equal(named().length, 1, 'named exactly once')
   })
 }
 
-test('an expired back-off that still waits (queued behind a live lease) is judged once, then the witness dedup holds again', async t => {
-  // 12b12a6: once a back-off expired after the witness was stamped, the F(S)
-  // dedup stayed bypassed for as long as the task legitimately waited, so the
-  // whole classifier ran on every pass and transition (~40 per second here).
-  // The clock and the ticks are driven by hand; the instants below are the
-  // runtime's clock.
+test('an expired back-off that still waits (queued behind a live lease) is never named, and a board whose facts the owner holds is judged at most twice a tick and commits nothing', async t => {
+  // 12b12a6: the expired back-off once bypassed the board-digest dedup for as
+  // long as the task legitimately waited. There is no such dedup now: every
+  // pass end and the publication that closes it judge the board, and each
+  // family's own ledger check keeps a held fact from writing anything. The
+  // clock and the ticks are driven by hand.
   const f = await fixture(t, { clock: new FakeClock() })
   const tickMs = f.runtime.config.tickMs
   const research = { kind: 'research', checks: undefined }
@@ -629,27 +630,25 @@ test('an expired back-off that still waits (queued behind a live lease) is judge
     dead.status = 'blocked'; dead.epoch++; dead.output = 'blocked for repair'
     f.runtime.store.put('tasks', dead)
   })
-  // The unrelated stall root stamps the W2 witness inside the back-off window.
-  const stamped = await ticksUntil(f, () => {
-    const witness = f.runtime.store.get('missions', f.mission.id).witness
-    return witness?.kind === 'W2' && witness.at <= retryAt && witness.fingerprint === f.runtime.fingerprint(f.mission.id) ? witness : undefined
-  }, 'a W2 witness is stamped during the back-off window')
+  await ticksUntil(f, () => f.stallRoots()[0], 'the unrelated stall root is told')
+  await ticks(f, Math.ceil((Math.max(0, retryAt + tickMs - f.clock.now()) + 100) / tickMs))
+  await f.runtime.flushOutbox(f.mission.id)
   const notices = f.runtime.notices
-  const judged = [], passes = []
-  const waits = notices.waitsLegitimately.bind(notices)
-  notices.waitsLegitimately = (task, tasks) => { if (task.id === backoff.id) judged.push(f.clock.now()); return waits(task, tasks) }
+  const judged = [], commits = []
   const ensure = notices.ensureWitness.bind(notices)
-  notices.ensureWitness = (missionId, options) => { passes.push(f.clock.now()); return ensure(missionId, options) }
-  await ticks(f, Math.ceil((Math.max(0, retryAt + tickMs - f.clock.now()) + 800) / tickMs))
-  const bound = retryAt + tickMs
-  const after = judged.filter(at => at > bound)
-  t.diagnostic(`witness passes after the bound: ${passes.filter(at => at > bound).length}; back-off judgements after the bound: ${after.length}`)
-  assert.ok(passes.filter(at => at > bound).length >= 5, `the witness path kept running after the bound: ${passes.filter(at => at > bound).length}`)
-  assert.ok(after.length >= 1, 'the expired back-off is judged after its bound')
-  assert.ok(after.length <= 2, `the expired back-off is judged once, not on every pass: ${after.length}`)
-  const witness = f.runtime.store.get('missions', f.mission.id).witness
-  assert.equal(witness.fingerprint, stamped.fingerprint, 'the same F(S) is re-stamped')
-  assert.ok(witness.at > bound, 'the witness now post-dates the expired bound')
+  notices.ensureWitness = (missionId, options) => { judged.push(f.clock.now()); return ensure(missionId, options) }
+  const commit = f.runtime.commit.bind(f.runtime)
+  f.runtime.commit = (missionId, fn) => { commits.push(new Error().stack.split('\n')[2]?.trim()); return commit(missionId, fn) }
+  const board = f.runtime.fingerprint(f.mission.id)
+  const rows = f.notices().length
+  const count = 20
+  await ticks(f, count)
+  t.diagnostic(`judgements over ${count} ticks: ${judged.length}`)
+  assert.equal(f.runtime.fingerprint(f.mission.id), board, 'the board did not change')
+  assert.ok(judged.length >= count, 'every tick judges the board')
+  for (const at of new Set(judged)) assert.ok(judged.filter(when => when === at).length <= 2, `at most two judgements a tick: ${judged.filter(when => when === at).length} at ${at}`)
+  assert.deepEqual(commits, [], 'a judgement of a board whose facts the owner holds commits nothing')
+  assert.equal(f.notices().length, rows, 'and tells nothing')
   assert.equal(f.runtime.store.get('tasks', backoff.id).status, 'pending', 'the back-off still waits behind the live lease')
   assert.deepEqual(f.fallthroughs().map(delivery => delivery.subjects), [], 'a legitimately waiting back-off is not named')
 })
@@ -658,8 +657,8 @@ test('a back-off whose bound passes while a pass judges the board is still judge
   // 24ee7ce re-stamped the witness at the end of the judging pass. Back-off B
   // was judged still waiting early in that pass; its bound passed before the
   // pass ended, and the re-stamp then post-dated it, so every later pass read
-  // the same F(S) as already judged and B's fall-through was never owed. The
-  // re-stamp now carries the instant the judgement began. The clock and the
+  // the same F(S) as already judged and B's fall-through was never owed. No
+  // judgement is recorded now, so a later pass judges B again. The clock and the
   // ticks are driven by hand: the slow judgement moves the clock past B's bound
   // itself instead of spinning on real time.
   const f = await fixture(t, { clock: new FakeClock() })
@@ -670,8 +669,8 @@ test('a back-off whose bound passes while a pass judges the board is still judge
   const sibling = f.propose('Healthy sibling', research)
   await f.runtime.claim(f.actor, f.mission.id, sibling.id)
   const other = f.propose('Unrelated dead end', research)
-  // A waits behind the live lease once expired (judged, nothing to publish:
-  // the re-stamp); B's assignee is stopped, so once expired a fall-through is owed.
+  // A waits behind the live lease once expired (judged, nothing to publish);
+  // B's assignee is stopped, so once expired a fall-through is owed.
   const a = f.propose('Backoff A', research)
   const b = f.propose('Backoff B', { ...research, assigneeId: second.id })
   const retryA = f.clock.now() + 400
@@ -692,10 +691,8 @@ test('a back-off whose bound passes while a pass judges the board is still judge
   })
   const boundA = retryA + tickMs, boundB = retryB + tickMs
   const bSubject = `${b.id}@${f.runtime.store.get('tasks', b.id).epoch}`
-  await ticksUntil(f, () => {
-    const witness = f.runtime.store.get('missions', f.mission.id).witness
-    return witness?.kind === 'W2' && witness.at <= retryA && witness.fingerprint === f.runtime.fingerprint(f.mission.id) ? witness : undefined
-  }, 'a W2 witness is stamped inside both back-off windows')
+  const told = await ticksUntil(f, () => f.stallRoots()[0], 'the unrelated stall root is told inside both back-off windows')
+  assert.ok(told.createdAt <= retryA)
   const notices = f.runtime.notices
   let spun
   const judgedB = []
