@@ -12,7 +12,7 @@ import { hostContextOf, memberPhaseOf } from './projection.ts'
 import { formatDiagnostic, missingReviewDiagnostic } from './admission.ts'
 import { guardTerminalKey, requireText } from './refusals.ts'
 import { taskGraphIndex } from './task-graph.ts'
-import { blockCauses, stopFaultKey } from './attempts.ts'
+import { blockCauses, pendingStopOwner, stopFaultKey } from './attempts.ts'
 import { isolationOpener } from './workspace-admission.ts'
 import { PolicyError } from './policy-error.ts'
 import type { SwarmRuntime } from './runtime.ts'
@@ -323,7 +323,7 @@ export interface MissionInterpretation {
   replaced: Set<string>
   /** The dispatcher's own readiness predicate, bound to these rows. */
   ready: (task: Task, member: Member, tasks?: Task[]) => boolean
-  /** Pending tasks a runnable member can run right now (the dispatcher's question). */
+  /** Pending tasks a runnable member that owes no stop can run right now (the dispatcher's question and eligibility). */
   dispatchable: Task[]
   /** The review admission's sources (`unreviewedSources`). */
   unreviewed: Task[]
@@ -838,7 +838,7 @@ export class Notices {
       // The dispatcher's own question and its own predicates, computed once here
       // so a notice can never describe a board the dispatcher would act on
       // differently (`ready`, `reviewable`, `unschedulable`, `stalled`).
-      dispatchable: tasks.filter(task => task.status === 'pending' && runnable.some(member => this.rt.ready(task, member, tasks))),
+      dispatchable: tasks.filter(task => task.status === 'pending' && runnable.some(member => !pendingStopOwner(tasks, member.id) && this.rt.ready(task, member, tasks))),
       unreviewed: unreviewedSources(this.rt, tasks),
       unschedulable: this.rt.unschedulable(mission, tasks, members),
       stalled: this.rt.stalled(tasks, members),
@@ -1277,7 +1277,7 @@ export class Notices {
     const runnable = view.runnable
     // R17-G1: the dispatcher's own `dispatchable` set, from the shared view.
     const dispatchable = options.wedged === true
-      ? tasks.filter(task => task.status === 'pending' && members.some(member => memberPhaseOf(member) !== 'stopped' && view.ready(task, member)))
+      ? tasks.filter(task => task.status === 'pending' && members.some(member => memberPhaseOf(member) !== 'stopped' && !pendingStopOwner(tasks, member.id) && view.ready(task, member)))
       : view.dispatchable
     if (dispatchable.length) {
       // R15-D3: between passes the dispatcher's branch owns this state, and it may

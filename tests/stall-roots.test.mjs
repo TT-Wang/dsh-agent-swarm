@@ -95,6 +95,33 @@ test('R14-F2(b/d): a stop awaited past the declared bound is a stall root', asyn
   assert.match(roots[0].content, /awaited/, `the notice names the awaited stop: ${roots[0].content}`)
 })
 
+test('a pending task whose only eligible member still owes a stop past its bound is named by the fall-through, beside the stopping task\'s stall-root decision', async t => {
+  // The board the dispatcher sees: the member that owes the stop is not
+  // eligible, so the task is not dispatchable, and no dispatch question can be
+  // asked about it. The classifier reads the same eligibility.
+  const f = await fixture(t, { clock: new FakeClock(), stallPassTimeoutMs: 40 })
+  let release
+  const held = new Promise(resolve => { release = resolve })
+  const stop = f.runtime.workers.stop.bind(f.runtime.workers)
+  f.runtime.workers.stop = async id => { if (id === f.member.id) await held; return stop(id) }
+  const stopping = f.propose('Stopping work')
+  const queued = f.propose('Queued behind the stop')
+  f.runtime.commit(f.mission.id, () => {
+    const row = f.runtime.store.get('tasks', stopping.id)
+    row.status = 'blocked'; row.epoch++
+    row.resumeAfterStop = { epoch: row.epoch, memberId: f.member.id, reason: 'handoff', at: f.clock.now() }
+    f.runtime.store.put('tasks', row)
+  })
+  // The stop starts outside a tick, so no tick waits for it; while it is in flight no tick starts another.
+  f.runtime.attempts.resumeStoppedAttempt(f.mission.id, f.runtime.store.get('tasks', stopping.id))
+  await ticks(f, 6)
+  const epochOf = task => f.runtime.store.get('tasks', task.id).epoch
+  assert.deepEqual(f.stallRoots().map(delivery => delivery.notice.dedupKey), [`stall-root:${f.mission.id}:${stopping.id}@${epochOf(stopping)}`], 'the stop past its bound is a stall root')
+  assert.deepEqual(f.fallthroughs().map(delivery => delivery.subjects), [[`${queued.id}@${epochOf(queued)}`]], 'the task queued behind it is named')
+  assert.equal(f.runtime.store.get('tasks', queued.id).status, 'pending', 'and it was never dispatched')
+  release()
+})
+
 test('R14-F2(c): the runtime stays silent while every unfinished task is legitimately waiting', async t => {
   const f = await fixture(t, { clock: new FakeClock() })
   // Research kind keeps the integration-gap diagnostic off the board, whose
