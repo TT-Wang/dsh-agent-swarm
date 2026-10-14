@@ -956,6 +956,21 @@ test('work pinned to a member retired for start failures is the retirement\'s wh
   assert.deepEqual(named.map(delivery => noticeFamily(delivery)).filter(family => family === 'fallthrough'), [], 'no fall-through restates it')
 })
 
+test('an older build\'s W3 row holds no work: a stall an earlier build recorded under its own key is not a decision the board\'s naming defers to', async t => {
+  const f = await setup({ clock: new FakeClock() })
+  t.after(f.cleanup)
+  const dead = strandOnReviewer(f)
+  const subject = `${dead.id}@${taskOf(f.runtime, dead.id).epoch}`
+  // The row 29a0268 wrote for this board: key prefix mission/stalled, class decision, delivered and never answered.
+  const at = f.clock.now()
+  f.runtime.commit(f.mission.id, () => f.runtime.store.put('deliveries', { id: 'msg_legacy_stall', missionId: f.mission.id, from: 'runtime', to: 'owner', kind: 'control',
+    content: 'Mission stalled: no task can be scheduled and workers are idle.', createdAt: at, deliveredAt: at, subjects: [subject],
+    notice: { dedupKey: `mission/stalled:${f.mission.id}:${subject}:0123456789abcdef`, class: 'decision', sentAt: at, queuedAt: at, subjects: [subject], trigger: 'mission/stalled', reason: 'legacy', statement: { family: 'stall', counts: {} } } }))
+  await f.runtime.settle(f.mission.id)
+  await ticks(f, 2)
+  assert.deepEqual(ownerRows(f).filter(delivery => noticeFamily(delivery) === 'board-stall').map(delivery => delivery.subjects), [[subject]], 'the board names its stuck work under the W3 stall\'s own key')
+})
+
 test('a notice whose cause no row shows ending stands for no naming: after a start failure the member recovered from, or a member\'s failure, a dependent a cancellation strands at the epoch it named is told by the board, the fall-through beside running work and the W3 stall on a board with nothing else to do', async t => {
   for (const cause of ['recovered start failure', 'member failure']) {
     for (const running of [true, false]) {
