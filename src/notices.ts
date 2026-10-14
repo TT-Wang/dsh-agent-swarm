@@ -912,7 +912,7 @@ export class Notices {
     if (delivery.notice?.aggregatedFacts !== undefined) {
       return [...new Set(delivery.notice.aggregatedFacts.flatMap(fact => this.unresolvedSubjects(view, this.summaryFactDelivery(mission.id, delivery.id, fact))))]
     }
-    const terminal = this.openGuardTerminal(mission.id, delivery)
+    const terminal = this.openGuardTerminal(mission, delivery)
     if (terminal !== undefined) return terminal
     // A stall-root decision is outstanding exactly while its root still is one;
     // the dependents it lists (a rejecting review) never keep it open.
@@ -942,7 +942,7 @@ export class Notices {
   ownerDeliveryRelevant(mission: Mission, delivery: Delivery): boolean {
     if (ownerDeliveryMoot(mission, delivery)) return false
     if (delivery.replyExpected === true && delivery.answeredBy !== undefined) return false
-    const terminal = this.openGuardTerminal(mission.id, delivery)
+    const terminal = this.openGuardTerminal(mission, delivery)
     if (terminal !== undefined) return mission.status !== 'completed' && terminal.length > 0
     const fact = noticeRow(delivery)
     // A receipt-linked action expires when that exact question is settled;
@@ -1053,18 +1053,22 @@ export class Notices {
 
   /**
    * The subjects a guard terminal still holds open, for the openers whose
-   * condition has its own end; undefined for every other request, judged by the
-   * subjects it names. An isolation violation is outstanding while the invariant
-   * still lists it. A cancelled task can still owe preservation; its exact stop
-   * fault ends when cleanup succeeds.
+   * condition has its own end; undefined while it is judged by the subjects it
+   * names. An isolation violation is outstanding while the invariant still
+   * lists it. A refused admission is a decision only while the limit it met is
+   * the mission's current one: a raised limit answers it. A cancelled task can
+   * still owe preservation; its exact stop fault ends when cleanup succeeds.
    */
-  private openGuardTerminal(missionId: string, delivery: Delivery): string[] | undefined {
+  private openGuardTerminal(mission: Mission, delivery: Delivery): string[] | undefined {
     const key = delivery.notice?.dedupKey
+    if (['task-budget:', 'experiment-budget:'].some(limit => key?.startsWith(guardTerminalKey('task_ceiling', { localKey: limit })))) {
+      return [`task-budget:${mission.budget.maxTasks}`, `experiment-budget:${mission.budget.maxExperiments}`].some(localKey => key === guardTerminalKey('task_ceiling', { localKey })) ? undefined : []
+    }
     if (key?.startsWith(guardTerminalKey('workspace', { localKey: 'isolation:' }))) {
-      return this.rt.isolationViolations(missionId).some(violation => key === guardTerminalKey('workspace', { localKey: isolationOpener(violation) })) ? delivery.subjects ?? [] : []
+      return this.rt.isolationViolations(mission.id).some(violation => key === guardTerminalKey('workspace', { localKey: isolationOpener(violation) })) ? delivery.subjects ?? [] : []
     }
     if (!key?.startsWith(guardTerminalKey('attempt_lease', { localKey: 'stop:' }))) return undefined
-    const tasks = this.rt.store.list('tasks', missionId)
+    const tasks = this.rt.store.list('tasks', mission.id)
     return (delivery.subjects ?? []).filter(subject => {
       const task = taskFromSubject(subject, tasks)
       const marker = task?.resumeAfterStop

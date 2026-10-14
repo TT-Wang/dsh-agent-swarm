@@ -1335,8 +1335,8 @@ test('the mission admission requests\' exit, performed through the owner\'s regi
     nextWindow(f)
     await tool('swarm_budget', { budget: { ...f.runtime.mission(f.mission.id).budget, [limit]: 2 }, reason: 'Room for one more' })
     assert.equal((await tool('swarm_propose', proposal('One too many'))).title, 'One too many', `${opener}: the retried admission goes through`)
-    // A refusal has no end of its own: its request stays the owner's to read until the mission completes.
-    assert.equal(relevant(f, request), true)
+    // The raised limit answers the request: it is a decision only while the limit it met is the current one.
+    assert.equal(relevant(f, request), false, `${opener}: the raised limit ends the request`)
     await assert.rejects(tool('swarm_propose', proposal('A third')), refusal)
     assert.deepEqual(openers(f, 'task_ceiling'), [`${opener}:1`, `${opener}:2`], `${opener}: the limit the owner raised refuses under its own request`)
     assert.deepEqual(stallEventKeys(f, 'guard-terminal'), requestKeys(f), 'one stall event per request, naming its row')

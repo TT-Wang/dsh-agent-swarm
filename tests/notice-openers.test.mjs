@@ -125,6 +125,32 @@ test('a refused proposal is one request per limit, whoever proposed it, and its 
   assert.deepEqual(admissionRequests(f).map(([opener]) => opener), ['task-budget:1', 'task-budget:2'], 'the refusal under the raised limit is a new request')
 })
 
+test('a refused admission is a decision only while the limit it met is current: the raised limit answers it, so it is neither delivered nor reminded', async t => {
+  const f = await fixture(t, { budget: { maxTasks: 1, maxExperiments: 1 } })
+  const owner = await ownerTools(f)
+  const worker = await sessionTools(f, f.author.sessionId)
+  const held = f.propose({ title: 'Admitted', kind: 'research', checks: [], experiment: true })
+  const proposal = (title, extra) => ({ outputs: [], workstreamId: f.stream.id, title, objective: 'More work', kind: 'research', scope: ['**'], acceptance: MISSION_ACCEPTANCE, checks: [], ...extra })
+  await assert.rejects(worker('swarm_propose', proposal('More')), /task budget exhausted \(1\/1 tasks admitted\)/)
+  await assert.rejects(owner('swarm_propose', proposal('The owner\'s own')), /mission_task_budget_exhausted/)
+  await owner('swarm_budget', { budget: { ...f.runtime.mission(f.mission.id).budget, maxTasks: 3 }, reason: 'Room for tasks' })
+  await assert.rejects(worker('swarm_propose', proposal('An experiment', { experiment: true })), /experiment budget exhausted \(1\/1 experiments admitted\)/)
+  const requests = () => admissionRequests(f).map(([opener]) => opener)
+    .map(opener => [opener, f.runtime.ownerDeliveryRelevant(f.runtime.mission(f.mission.id), ownerRows(f, /^\[task_ceiling_terminal\]/).find(delivery => delivery.notice.dedupKey.endsWith(opener)))])
+  assert.deepEqual(requests(), [['task-budget:1', false], ['experiment-budget:1', true]], 'the raised task limit answers its request; the experiment limit still holds')
+  const more = await worker('swarm_propose', proposal('More after the raise'))
+  // Nothing unfinished remains, which a decision naming the mission root is reminded on.
+  for (const task of [held, more]) await owner('swarm_cancel', { taskId: task.id, reason: 'Withdrawn' })
+  for (let round = 0; round < 8; round += 1) {
+    f.clock.advance(200_000)
+    await f.runtime.tick()
+    await f.runtime.settle(f.mission.id)
+  }
+  const reminded = ownerRows(f, /^Owner decision still unresolved/).map(delivery => f.runtime.store.get('deliveries', delivery.notice.reason))
+    .filter(original => /^\[task_ceiling_terminal\]/.test(original.content)).map(original => original.notice.dedupKey.split(':').slice(3).join(':'))
+  assert.deepEqual([...new Set(reminded)], ['experiment-budget:1'], 'of the two requests, only the one whose limit still holds is reminded')
+})
+
 test('a worker\'s refused proposal is keyed by the limit it met: a task-budget and an experiment-budget refusal at one limit value are two requests', async t => {
   const f = await fixture(t, { budget: { maxTasks: 2, maxExperiments: 2 } })
   f.propose({ title: 'First experiment', experiment: true })
