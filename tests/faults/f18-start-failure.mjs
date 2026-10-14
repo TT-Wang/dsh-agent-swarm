@@ -48,9 +48,11 @@ async function allRoutesFail() {
     assert.equal(current.status, 'pending', 'a start failure never blocks the task')
     assert.equal(current.recoveryCount ?? 0, 0, 'I18: no start failure spends task execution credit')
     assert.equal(events(f.runtime, f.mission.id, 'task/blocked').length, 0)
-    const named = ownerNotices(f).filter(delivery => /No live member can start/.test(delivery.content))
+    // Its own row, or recorded in full in the wake-budget summary that carries it: the dispatch question about the task
+    // spends a slot of the window beside the start failures (two wordings, the open item R20).
+    const named = ownerNotices(f).flatMap(delivery => delivery.notice?.facts ?? [delivery.content]).filter(text => /No live member can start/.test(text))
     assert.equal(named.length, 1, 'I18: exactly one owner notice names the stranded task')
-    const content = named[0].content
+    const content = named[0]
     assert.ok(content.includes(task.id), 'the notice names the task')
     for (const member of [f.author, f.reviewer]) {
       assert.ok(content.includes(`${member.name} (${member.id}): ${K} consecutive start failures, last error: Error: injected bootstrap failure for ${member.name}`),

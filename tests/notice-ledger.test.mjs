@@ -832,7 +832,7 @@ test('M-1: a notice is its ledger row and nothing else: the same fact on another
   assert.deepEqual(ownerRows(pinned).filter(delivery => noticeFamily(delivery) === 'dispatch-question').map(delivery => delivery.subjects), [[`${task.id}@${taskOf(pinned.runtime, task.id).epoch}`]], 'the dispatch question is asked')
 })
 
-test('a member whose starts are failing is spoken for by its start-failure notice: no dispatch question asks about the work it cannot start, whatever the board digest, until it starts', async t => {
+test('a member whose starts are failing does not stand in for the dispatch question: the work it cannot start is asked about once beside its start failure, whatever the board digest, and runs once it starts', async t => {
   const f = await setup({ clock: new FakeClock(), workers: new FakeWorkers({ autoIdle: true }) })
   t.after(f.cleanup)
   let failing = true
@@ -842,25 +842,29 @@ test('a member whose starts are failing is spoken for by its start-failure notic
   await f.runtime.settle(f.mission.id)
   await ticks(f, 1)
   await f.runtime.settle(f.mission.id)
-  const questions = () => ownerRows(f).filter(delivery => noticeFamily(delivery) === 'dispatch-question')
+  const subject = `${task.id}@${taskOf(f.runtime, task.id).epoch}`
+  const questions = () => ownerRows(f).filter(delivery => noticeFamily(delivery) === 'dispatch-question').map(delivery => delivery.subjects)
   const failure = ownerRows(f).find(delivery => /^Author could not start \(failure 1 of 3\)/.test(delivery.content))
-  assert.deepEqual(failure?.subjects, [`${task.id}@${taskOf(f.runtime, task.id).epoch}`], 'the start failure is told, naming the work it re-pended')
+  assert.deepEqual(failure?.subjects, [subject], 'the start failure is told, naming the work it re-pended')
   assert.equal(taskOf(f.runtime, task.id).status, 'pending')
+  // A durable member field is no record that the owner was told: the question is asked on its own condition, a second
+  // wording of the start failure's (the open item R20).
+  assert.deepEqual(questions(), [[subject]], 'the dispatch question about the work is asked beside the start failure')
   // The board digest moves while the author's start is still failing.
   const board = f.runtime.fingerprint(f.mission.id)
   f.runtime.commit(f.mission.id, () => f.runtime.store.put('members', { ...f.runtime.store.get('members', f.reviewer.id), phase: 'stopped' }))
   await Promise.resolve()
   assert.notEqual(f.runtime.fingerprint(f.mission.id), board)
-  assert.deepEqual(questions(), [], 'no dispatch question restates the start failure')
+  assert.deepEqual(questions(), [[subject]], 'once, at the task\'s epoch')
   // The route recovers: its next start succeeds and the work runs.
   failing = false
   await ticks(f, 2)
   await f.runtime.settle(f.mission.id)
   assert.equal(taskOf(f.runtime, task.id).status, 'running', 'the work runs once the author starts')
-  assert.deepEqual(questions(), [], 'and no question was ever owed')
+  assert.deepEqual(questions(), [[subject]], 'and the question is not asked again')
 })
 
-test('a start failure leaves to its notice only the work that notice names: unassigned work its member cannot start is asked about, once, beside the failure that names the mission root', async t => {
+test('a start failure over unassigned work names the mission root, and the work its member cannot start is asked about, once, beside it', async t => {
   const f = await setup({ clock: new FakeClock(), workers: new FakeWorkers({ autoIdle: true }) })
   t.after(f.cleanup)
   const start = f.workers.start.bind(f.workers)

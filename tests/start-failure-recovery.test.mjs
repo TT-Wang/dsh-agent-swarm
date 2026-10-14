@@ -197,24 +197,26 @@ test('R5-02: when every route fails to start, starts stop at k per route and the
   assert.equal(stranded.assigneeId, undefined, 'the work is released to any route the owner admits')
   assert.equal(stranded.recoveryCount ?? 0, 0, 'a start failure spends no task execution credit')
   assert.equal(f.events('task/blocked').length, 0)
-  // The named, undeduplicated owner notice.
-  const named = f.ownerNotices().filter(delivery => /No live member can start/.test(delivery.content))
+  // The named, undeduplicated owner fact: its own row, or recorded in full in the wake-budget summary that carries it
+  // (the dispatch question about the task spends a slot of the window beside the start failures, the open item R20).
+  const facts = f.ownerNotices().flatMap(delivery => delivery.notice.aggregatedFacts?.map(part => ({ ...part, text: delivery.notice.facts.slice(part.factStart, part.factStart + part.factCount).join('\n') }))
+    ?? [{ dedupKey: delivery.notice.dedupKey, subjects: delivery.subjects, text: delivery.content }])
+  const named = facts.filter(fact => /No live member can start/.test(fact.text))
   assert.equal(named.length, 1, 'exactly one owner notice names the stranded task')
-  const [notice] = named
-  assert.ok(notice.content.includes(proposed.id), 'the notice names the task')
+  const [{ text: notice, subjects }] = named
+  assert.ok(notice.includes(proposed.id), 'the notice names the task')
   for (const retired of [f.alpha, f.beta]) {
-    assert.ok(notice.content.includes(`${retired.name} (${retired.id}): ${K} consecutive start failures, last error: Error: worker bootstrap failed for ${retired.name}`),
+    assert.ok(notice.includes(`${retired.name} (${retired.id}): ${K} consecutive start failures, last error: Error: worker bootstrap failed for ${retired.name}`),
       `the notice names ${retired.name} with its consecutive start failures and last error`)
   }
-  assert.match(notice.content, /swarm_add_member/, 'the notice names the add-member exit')
-  assert.match(notice.content, /swarm_control\(taskId, action: "amend"/, 'the notice names the reassign exit')
-  assert.ok((notice.notice?.subjects ?? notice.subjects ?? []).some(subject => subject.startsWith(`${proposed.id}@`)), 'the notice is attributed to the task')
-  // No stuck task is without a notice: the board names the released work too, once, beside the start and retirement
-  // notices (two wordings of one condition, the open item R20 in docs/known-limitations.md).
-  const facts = f.ownerNotices().flatMap(delivery => delivery.notice.aggregatedFacts ?? [{ dedupKey: delivery.notice.dedupKey, subjects: delivery.subjects }])
+  assert.match(notice, /swarm_add_member/, 'the notice names the add-member exit')
+  assert.match(notice, /swarm_control\(taskId, action: "amend"/, 'the notice names the reassign exit')
+  assert.ok((subjects ?? []).some(subject => subject.startsWith(`${proposed.id}@`)), 'the notice is attributed to the task')
+  // No stuck task is without a notice: the dispatch question and the W3 stall name the work too, each once, beside the
+  // start and retirement notices (wordings of one condition, the open item R20 in docs/known-limitations.md).
   const families = facts.filter(fact => (fact.subjects ?? []).includes(`${proposed.id}@${stranded.epoch}`)).map(fact => fact.dedupKey.split(':')[0])
-  assert.deepEqual([...new Set(families)].sort(), ['board-stall', 'member/resume-failed'], `the stranded task is named by its notices and the W3 stall: ${families}`)
-  assert.equal(families.filter(family => family === 'board-stall').length, 1, 'the W3 stall names it once')
+  assert.deepEqual([...new Set(families)].sort(), ['board-stall', 'dispatch-question', 'member/resume-failed'], `the stranded task is named by its notices, the dispatch question and the W3 stall: ${families}`)
+  assert.deepEqual(['board-stall', 'dispatch-question'].map(family => families.filter(named => named === family).length), [1, 1], 'the W3 stall and the dispatch question name it once each')
   // The exit works: a route the owner admits claims the released work.
   const gamma = await f.runtime.addMember(f.owner, f.mission.id, { name: 'Gamma', role: 'implementation' })
   const running = await eventually(() => f.task(proposed.id).status === 'running' && f.task(proposed.id), 'the admitted route did not claim the released work')
