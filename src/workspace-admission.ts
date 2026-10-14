@@ -435,7 +435,6 @@ export class WorkspaceAdmission {
     // S4b: the fence reaches the shared coded workspace terminal. A revocation
     // is a local fault, not a board state, so the decision is keyed by it and
     // the owner is woken once per revocation however the board moves afterwards.
-    // It names the work the fence blocked, which the board's namings then leave to it.
     emitGuardTerminal(this.rt, missionId, 'workspace', { detail: reason, localKey: revocation, subjects: subjectsOfTasks(blocked, mission) })
   }
 
@@ -503,7 +502,7 @@ export class WorkspaceAdmission {
    * violation's (`isolationOpener`), naming the unfinished work of every member
    * it lists: one decision per distinct violation however many members it
    * refuses and however often, outstanding while the invariant still lists it
-   * (`Notices.openSubjects`), and a changed violation is a new one.
+   * (`Notices.openGuardTerminal`), and a changed violation is a new one.
    */
   isolationAllows(missionId: string, member: Member): boolean {
     const violation = this.isolationIssues(missionId).find(entry => entry.memberIds.includes(member.id))

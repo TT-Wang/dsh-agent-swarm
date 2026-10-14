@@ -15,6 +15,7 @@ import { pendingStopOwner, stopPending } from './attempts.ts'
 import { factKey, subjectsOfTasks, taskSubject } from './notices.ts'
 import { emitGuardTerminal } from './refusals.ts'
 import { AdmissionRefusedError } from './scheduler.ts'
+import { isolationIssues } from './workspace-admission.ts'
 // R17-G6/G7: the one derivation of the derived member status.
 import { memberPhaseOf } from './projection.ts'
 import { PolicyError } from './policy-error.ts'
@@ -99,8 +100,6 @@ export interface SchedulingPass {
   chainFrom?: string
   /** Set when this body stopped early at a member boundary: the first member it did not sweep. */
   stoppedBefore?: string
-  /** The work this body's own requests name (a dispatch that threw, an isolation refusal): its dispatch blocker is identified. */
-  identified?: string[]
 }
 
 /** R16-D: the dedup-key family of the attempt reporting-bound escalation. */
@@ -214,7 +213,6 @@ export class Scheduling {
           }
           memberSince = this.rt.now()
           progressed(pass, this.rt.now())
-          const identify = (subjects = this.rt.noticeSubjectsFor(missionId, { memberId: member.id })) => pass?.identified?.push(...subjects)
           if (memberPhaseOf(member) === 'stopped') continue
           if (pendingStopOwner(this.rt.store.list('tasks', missionId), member.id)) continue
           // Round 14: one member's guard chain must never abort the whole sweep.
@@ -226,7 +224,7 @@ export class Scheduling {
           // element's input: escalate with a coded decision request, then keep
           // dispatching the other members.
           try {
-          if (!this.rt.isolationAllows(missionId, member)) { identify(); continue }
+          if (!this.rt.isolationAllows(missionId, member)) continue
           try { await awaited(pass, this.rt.startWorker(mission, member, { pass }), this.rt.now) }
           catch (error) {
             // Disposing the adapter cancels in-flight starts. This is recoverable host
@@ -286,7 +284,7 @@ export class Scheduling {
             // S7: re-read the isolation invariant after the external preparation
             // await. A state change during it (a member added into this worktree, a
             // second running task admitted) is refused here, never dispatched.
-            if (!this.rt.isolationAllows(missionId, member)) { identify(); continue }
+            if (!this.rt.isolationAllows(missionId, member)) continue
             this.rt.assign(fresh, member)
           } catch (error) {
             // Admission control already wrote the durable refusal; the task stays
@@ -327,7 +325,6 @@ export class Scheduling {
             // request the owner already holds; other work or another failure is another.
             const detail = String(error), subjects = this.rt.noticeSubjectsFor(missionId, { memberId: member.id })
             emitGuardTerminal(this.rt, missionId, 'attempt_lease', { memberId: member.id, detail, subjects, localKey: factKey(missionId, { trigger: `dispatch-failed:${member.id}`, reason: detail, subjects }) })
-            identify(subjects)
             continue
           }
         }
@@ -360,14 +357,16 @@ export class Scheduling {
    * the member whose handle holds the task instead of claiming an admission
    * refusal that was never recorded.
    *
-   * It is the open pass's own (asked at its end, or for a wedged pass): work not
-   * dispatched this tick whose blocker the runtime does not identify. Returns
-   * undefined — no owner decision — when no pass is open, or when:
-   * - every dispatchable task carries an open attempt (W6's close-out nudges it)
-   *   or a blocker the pass's own request names (`SchedulingPass.identified`); or
+   * Returns undefined — no owner decision — when:
+   * - every dispatchable task carries an open attempt (the close-out path is
+   *   already nudging it; W6 owns that state);
    * - no eligible member exists at all (nothing is ready for a member; the board
-   *   is someone else's witness, not this notice's).
-   * A task an open owner decision holds is never passed in (`Notices.held`).
+   *   is someone else's witness, not this notice's); or
+   * - every startable eligible member is refused by the isolation invariant, or
+   *   has counted start failures (cleared by its next successful start) and is
+   *   the task's assignee: the workspace terminal, and the start-failure notice
+   *   naming the work assigned to that member (`noticeSubjectsFor`), are the one
+   *   emitters of those causes (`isolationAllows`, `SwarmRuntime.onStartFailure`).
    *
    * Otherwise the notice names a handle holder or an unexplained dispatch gap.
    * An idle handle alone proves no budget refusal.
@@ -376,19 +375,21 @@ export class Scheduling {
    *   is pinned, else the first eligible member whose handle is busy;
    */
   dispatchQuestion(missionId: string, tasks: Task[], members: Member[], dispatchable: Task[]): DispatchQuestion | undefined {
-    const pass = this.passes.get(missionId)
-    if (pass === undefined) return undefined
     for (const task of dispatchable) {
       // An open attempt is not a dispatch candidate: the close-out path nudges it
       // (W6) or the lease path recovers it, and a second owner wake would be noise.
-      if (task.attempt !== undefined || pass.identified?.includes(taskSubject(task))) continue
+      if (task.attempt !== undefined) continue
       const eligible = members.filter(member => this.eligible(task, member, tasks))
       if (!eligible.length) continue
       const subjects = [taskSubject(task)]
       const dedupKey = `dispatch-question:${missionId}:${task.id}@${task.epoch}`
       const startable = eligible.filter(member => this.startBlocker(member) === undefined)
-      if (startable.length) return { task, subjects, dedupKey,
-        message: `Task ${task.id} (${task.title}, epoch ${task.epoch}) has an eligible idle member but was not dispatched this tick. An idle handle alone does not identify the dispatch blocker. Inspect the task and recorded admission/preparation diagnostics with swarm_observe; repair the reported cause or withdraw the task with swarm_cancel.` }
+      if (startable.length) {
+        const issues = isolationIssues(members, tasks, (left, right) => this.rt.scopesOverlap(left, right))
+        if (startable.every(member => issues.some(issue => issue.memberIds.includes(member.id)) || (member.startFailures !== undefined && task.assigneeId === member.id))) continue
+        return { task, subjects, dedupKey,
+          message: `Task ${task.id} (${task.title}, epoch ${task.epoch}) has an eligible idle member but was not dispatched this tick. An idle handle alone does not identify the dispatch blocker. Inspect the task and recorded admission/preparation diagnostics with swarm_observe; repair the reported cause or withdraw the task with swarm_cancel.` }
+      }
       const pinned = task.assigneeId === undefined ? undefined : eligible.find(member => member.id === task.assigneeId)
       const holder = pinned ?? eligible[0]!
       return { task, holder, subjects, dedupKey,
@@ -655,7 +656,7 @@ export class Scheduling {
     if (this.passes.has(missionId)) return undefined
     const pass: SchedulingPass = {
       id: this.passKey(missionId), operationId: id('operation'), missionId, startedAt: this.rt.now(),
-      revisionBefore: this.rt.store.revision(), fingerprintBefore: this.rt.fingerprint(missionId), identified: [],
+      revisionBefore: this.rt.store.revision(), fingerprintBefore: this.rt.fingerprint(missionId),
     }
     this.passes.set(missionId, pass)
     return pass

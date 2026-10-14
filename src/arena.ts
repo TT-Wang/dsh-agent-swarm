@@ -23,6 +23,14 @@ interface ArenaInput {
 
 const byId = <T extends { id: string }>(left: T, right: T): number => (left.id < right.id ? -1 : left.id > right.id ? 1 : 0)
 
+/** A covered owner fact (`coveredBy`, src/notices.ts) is never sent: the delivery covering it carried the obligation. */
+export const covered = (delivery: Pick<Delivery, 'notice'>): boolean => (delivery.notice as { coveredBy?: string } | undefined)?.coveredBy !== undefined
+
+/** Whether a delivery is still owed to its recipient; a covered fact never is. */
+export function awaitsDelivery(delivery: Pick<Delivery, 'deliveredAt' | 'notice'>): boolean {
+  return delivery.deliveredAt === undefined && !covered(delivery)
+}
+
 /** One owner notice as the ledger exposes it: immutable, read-only projection. */
 interface NoticeLedgerEntry {
   id: string
@@ -62,10 +70,14 @@ function noticeEntry(delivery: Delivery): NoticeLedgerEntry | undefined {
   }
 }
 
-/** Newest-first bounded ledger page. Read-only: the caller receives copies. */
+/**
+ * Newest-first bounded ledger page. Read-only: the caller receives copies. A
+ * covered fact is no notice the owner was sent, so it is not a ledger entry
+ * (never `queued`, never the last notice); `hasNotice` still dedups on it.
+ */
 export function noticeLedger(deliveries: readonly Delivery[], limit = 20): NoticeLedgerEntry[] {
   const bounded = Math.max(1, Math.trunc(limit))
-  return deliveries.map(noticeEntry).filter((entry): entry is NoticeLedgerEntry => entry !== undefined).slice(-bounded).reverse()
+  return deliveries.filter(delivery => !covered(delivery)).map(noticeEntry).filter((entry): entry is NoticeLedgerEntry => entry !== undefined).slice(-bounded).reverse()
 }
 
 /**

@@ -317,8 +317,7 @@ test('a delivered summary does not revive a resolved review request because unre
   const f = await fixture(t)
   await stalledDecision(f)
   t.mock.timers.enable({ apis: ['Date'], now: Date.now() })
-  // A submission with its artifact, so the review request is the admission's own: its constituent alone carries the summary.
-  const source = { ...f.runtime.task(f.mission.id, 'blocked-task'), id: 'submitted-source', status: 'submitted', artifact: { ...f.runtime.workers.artifact } }
+  const source = { ...f.runtime.task(f.mission.id, 'blocked-task'), id: 'submitted-source', status: 'submitted' }
   f.runtime.store.transaction(() => {
     f.runtime.store.put('tasks', source)
     f.runtime.store.event(f.mission.id, 'task/submitted', f.member.id, { taskId: source.id, epoch: source.epoch })

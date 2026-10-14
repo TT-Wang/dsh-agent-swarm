@@ -30,6 +30,7 @@ import { join } from 'node:path'
 import { ObserveDetailRefusedError } from '../lib/runtime.js'
 import { registerTools, SWARM_TOOLS, MEMBER_TOOLS, hiddenToolsFor } from '../lib/tools.js'
 import { TRACE_STEPS } from '../lib/trace.js'
+import { hasNotice, noticeLedger } from '../lib/arena.js'
 import { FakeWorkers, budget as sharedBudget, eventually, makeRuntime } from './faults/harness.mjs'
 
 const DEFAULT_BUDGET = { ...sharedBudget, maxTokens: 100000, maxSteps: 100, maxWorkers: 2, maxTasks: 6, maxExperiments: 1 }
@@ -240,6 +241,14 @@ test('swarm_escalate is a typed durable owner escalation that grants no authorit
   await assert.rejects(escalate.execute({ missionId: f.mission.id, taskId: source.id, attemptId: 'attempt_forged', body: 'hostile' }, execution(f.bob.sessionId)), /does not belong to that task/)
   await assert.rejects(escalate.execute({ missionId: f.mission.id, body: 'owner escalation' }, execution(f.owner.sessionId)), /Only a mission member/)
   assert.equal(authorityRecords(f).includes('hostile'), false, 'a refused escalation records no content')
+})
+
+test('a covered fact is neither a queued entry nor the last notice, and still deduplicates', () => {
+  const notice = { id: 'd1', missionId: 'm', from: 'runtime', to: 'owner', kind: 'control', content: 'x', createdAt: 1, notice: { dedupKey: 'k', class: 'decision', sentAt: 1, queuedAt: 1 } }
+  // A covered fact (recorded against the delivery that carried it) is never sent.
+  const covered = { ...notice, id: 'd3', createdAt: 2, notice: { ...notice.notice, dedupKey: 'k3', sentAt: 2, queuedAt: 2, coveredBy: notice.id } }
+  assert.deepEqual(noticeLedger([{ ...notice, deliveredAt: 1 }, covered]).map(entry => [entry.id, entry.state]), [['d1', 'claimed']], 'a covered fact is neither a queued entry nor the last notice')
+  assert.equal(hasNotice([covered], { class: 'decision', dedupKey: 'k3', from: 'runtime' }), true, 'a covered fact still deduplicates')
 })
 
 test('swarm_escalate joins the single registry, the closed trace vocabulary and the member surface', async t => {

@@ -7,9 +7,7 @@
  * notice, or W3 the board's stall notice. The deliveries ledger is the one
  * record that the owner was told: a W2 or W3 witness is a row of the
  * condition's own family (W3 is family `board-stall`), open while the
- * condition holds (`ownerDeliveryRelevant`) and written once the state held,
- * or, for the board's own namings, the open decision that holds its work (R20,
- * row 7c); a request raised for a member holds none (row 7e).
+ * condition holds (`ownerDeliveryRelevant`) and written once the state held.
  * No mission field records a witness. The documented exemptions are asserted
  * as such: a board whose only non-terminal work runs under a live lease
  * (row 3), the owner's own pause (row 16), recorded by its event alone, and the
@@ -303,11 +301,10 @@ await runScenario({
     }
 
     // Row 7c — a BLOCKED prerequisite under running work. The prerequisite hits
-    // its own step ceiling, whose request names it at its epoch; the root also
-    // strands a dependent no open decision names (R20), so its stall-root
-    // decision is the owner's wake: it must be DELIVERED, not only written to
-    // the ledger, and name the dependent it strands. The dependent waits on the
-    // root, so no fall-through re-names either task.
+    // its own step ceiling (no verify-site rejection decision covers it), so its
+    // stall-root decision is the owner's wake: it must be DELIVERED, not only
+    // written to the ledger, and name the dependent it strands. The dependent
+    // waits on the root, so no fall-through re-names either task.
     {
       const f = await setup({ config: { leaseMs: 60_000 } })
       try {
@@ -330,37 +327,11 @@ await runScenario({
         const key = `stall-root:${f.mission.id}:${prerequisite.id}@${blocked.epoch}`
         const root = await eventually(() => ownerNotices(f).find(delivery => delivery.notice?.dedupKey === key && delivery.deliveredAt !== undefined),
           'row 7c: the stall-root decision for a blocked prerequisite under running work must be delivered')
-        const ceiling = ownerNotices(f).find(delivery => delivery.notice?.dedupKey?.startsWith('guard-terminal:task_ceiling:'))
-        assert.deepEqual(ceiling?.subjects, [`${prerequisite.id}@${blocked.epoch}`], 'row 7c: the ceiling request names the root at its epoch, and not the dependent')
+        assert.equal(root.notice.coveredBy, undefined, 'row 7c: no rejection decision carries this root; it is its own wake')
         assert.ok(root.subjects.includes(`${dependent.id}@0`), `row 7c: the stranded dependent is named: ${JSON.stringify(root.subjects)}`)
         assert.deepEqual(ownerNotices(f).filter(delivery => delivery.notice?.dedupKey?.startsWith('fallthrough:')), [], 'row 7c: the root speaks for its dependent')
         assertWitness(f, root, 'stall-root', since, 'row 7c')
         rows.row7c = { witness: 'W2', taskId: prerequisite.id, delivered: true }
-      } finally { await f.cleanup() }
-    }
-
-    // Row 7e — R20: only a decision that states the block of the work it names
-    // holds that work from the board's namings. The isolation request is raised
-    // for a member: it names the reviewer's blocked work but states no block of
-    // it, so the stall root is that work's witness while the request is open.
-    {
-      const f = await setup()
-      try {
-        f.workers.autoIdle = true
-        const research = { kind: 'research', checks: undefined }
-        f.runtime.store.transaction(() => f.runtime.store.put('members', { ...f.runtime.store.get('members', f.reviewer.id), workspace: f.runtime.store.get('members', f.author.id).workspace }))
-        f.propose({ title: 'Reviewer work', assigneeId: f.reviewer.id, ...research })
-        const dead = f.propose({ title: 'Reviewer dead end', assigneeId: f.reviewer.id, ...research })
-        const since = Date.now()
-        f.runtime.commit(f.mission.id, () => { const row = taskOf(f.runtime, dead.id); row.status = 'blocked'; row.epoch++; row.output = 'blocked by the injected fault'; f.runtime.store.put('tasks', row) })
-        const subject = `${dead.id}@${taskOf(f.runtime, dead.id).epoch}`
-        const request = await eventually(() => ownerNotices(f).find(delivery => delivery.notice?.dedupKey?.startsWith('guard-terminal:workspace:') && delivery.subjects?.includes(subject)),
-          'row 7e: the isolation request names the blocked work')
-        const root = await eventually(() => ownerNotices(f).find(delivery => delivery.notice?.dedupKey === `stall-root:${f.mission.id}:${subject}`),
-          'row 7e: the stall root is told beside the open request')
-        assertWitness(f, request, 'guard-terminal', since, 'row 7e: the request is open')
-        assertWitness(f, root, 'stall-root', since, 'row 7e')
-        rows.row7e = { witness: 'W2', taskId: dead.id }
       } finally { await f.cleanup() }
     }
 
