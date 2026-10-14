@@ -12,7 +12,6 @@ import { selectAcceptedDelivery } from './task-graph.ts'
 import { assignmentAllows, canBorrowTask, canOwnReview, strandedReview } from './assignment.ts'
 import { liveReviewFor } from './admission.ts'
 import { pendingStopOwner, stopPending } from './attempts.ts'
-import { hasNotice } from './arena.ts'
 import { factKey, reasonDigest, subjectsOfTasks, taskSubject } from './notices.ts'
 import { emitGuardTerminal } from './refusals.ts'
 import { AdmissionRefusedError } from './scheduler.ts'
@@ -704,7 +703,6 @@ export class Scheduling {
       .flatMap(member => member.startFailures === undefined ? [] : [`${member.id}:${member.startFailures}`])
     const reason = ['pass-timeout', ...failures].join(' ')
     const noticeKey = factKey(missionId, { trigger: 'scheduling-pass', reason, subjects })
-    if (hasNotice(this.rt.store.list('deliveries', missionId), { class: 'decision', dedupKey: noticeKey, from: 'runtime' })) return
     const fingerprint = this.rt.fingerprint(missionId)
     const revision = this.rt.store.revision()
     const bound = this.rt.stallPassTimeoutMs
@@ -726,9 +724,8 @@ export class Scheduling {
           : `${task.id} is blocked and its stop has been awaited for ${Math.max(0, now - stop.at)}ms, past its declared bound`
       })
     const stopText = stopFacts.length ? ` Stop state: ${stopFacts.join('; ')}.` : ''
-    this.rt.commit(missionId, () => {
-      this.rt.notify(missionId, `Scheduling pass ${pass.id} (run ${pass.operationId}) for mission ${missionId} did not return within ${bound}ms and produced no durable state change (fingerprint ${fingerprint.slice(0, 12)}). This pass keeps the mission's scheduling until the call it awaits returns at its own bound; the next pass then resumes from lease recovery. Unschedulable: ${unschedulable.join(', ') || 'none'}.${heldText} Work the pass never reached: ${unreachedText}.${stopText} Decide: inspect the named tasks, admit a repair with swarm_propose, or withdraw the blocking work with swarm_cancel.`, subjects,
-        { dedupKey: noticeKey, reason })
+    this.rt.tell(missionId, `Scheduling pass ${pass.id} (run ${pass.operationId}) for mission ${missionId} did not return within ${bound}ms and produced no durable state change (fingerprint ${fingerprint.slice(0, 12)}). This pass keeps the mission's scheduling until the call it awaits returns at its own bound; the next pass then resumes from lease recovery. Unschedulable: ${unschedulable.join(', ') || 'none'}.${heldText} Work the pass never reached: ${unreachedText}.${stopText} Decide: inspect the named tasks, admit a repair with swarm_propose, or withdraw the blocking work with swarm_cancel.`, subjects,
+      { dedupKey: noticeKey, reason }, () => {
       // Reuse the registered board-stall event rather than inventing a new type:
       // `cause: 'scheduling-pass'` and `wedged` make the pass-level escalation
       // distinguishable in the durable log and in every existing read path. It
@@ -922,8 +919,6 @@ export class Scheduling {
 
   /** One durable owner escalation per silence; returns false when it was already named. */
   private escalateSilentAttempt(mission: Mission, task: Task, silent: SilentAttempt): boolean {
-    const dedupKey = `${ATTEMPT_SILENCE_PREFIX}${silent.attemptId}:${silent.lastDurableAt}`
-    if (hasNotice(this.rt.store.list('deliveries', mission.id), { class: 'stall', dedupKey, from: 'runtime' })) return false
     const member = this.rt.store.get('members', silent.ownerId)
     const name = member === undefined ? silent.ownerId : `${member.name} (${member.id})`
     const since = silent.lastDurableAt === 0 ? 'it was dispatched' : `durable row at ${silent.lastDurableAt}`
@@ -935,8 +930,7 @@ export class Scheduling {
       ? ` The mission's scheduling pass ${pass.operationId} is wedged past its ${this.rt.stallPassTimeoutMs}ms bound, so the in-pass recovery sweep cannot run either.`
       : ''
     const message = `${name} has held task ${task.id} "${task.title}" at epoch ${task.epoch} (attempt ${silent.attemptId}) for ${formatSpan(silent.silentMs)} (${silent.silentMs}ms) with no durable report past its declared bound of ${formatSpan(silent.boundMs)} (${silent.boundMs}ms): no durable event, no task state transition and no recorded tool run names this attempt since ${since}; no operation is in flight and the idle close-out is not handling it.${passState} Nothing was stopped or re-pended by this notice: the attempt may still be working. Owner actions: inspect it with swarm_observe (taskId ${task.id}), send it input or finish it with swarm_handoff, raise attemptSilenceBoundMs if this silence is healthy, or withdraw the work with swarm_cancel. [witness: attempt-silent, subject ${silent.subject}, attempt ${silent.attemptId}, member ${silent.ownerId}, lastDurableAt ${silent.lastDurableAt}, silentMs ${silent.silentMs}, boundMs ${silent.boundMs}]`
-    this.rt.commit(mission.id, () => { this.rt.notify(mission.id, message, [taskSubject(task)], { noticeClass: 'stall', dedupe: true, dedupKey }) })
-    return true
+    return this.rt.tell(mission.id, message, [taskSubject(task)], { noticeClass: 'stall', dedupKey: `${ATTEMPT_SILENCE_PREFIX}${silent.attemptId}:${silent.lastDurableAt}` })
   }
 
   /**

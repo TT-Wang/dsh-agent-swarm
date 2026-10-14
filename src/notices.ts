@@ -590,17 +590,28 @@ export class Notices {
    * wake-budget summary constituent); false when the notice dedup suppressed it.
    */
   notify(missionId: string, content: string, subjects: string[], options: NotifyOptions = {}): boolean {
-    const from = options.from ?? 'runtime'
+    const { fact, identity } = this.noticeIdentity(missionId, subjects, options)
+    return this.enqueueOwnerNotice(missionId, content, identity.from, identity.class, { subjects: fact.subjects, fact }, options.dedupe ?? true, identity.dedupKey) !== undefined
+  }
+
+  /** Tell the owner one fact in a transaction of its own: a fact the ledger already holds (its class, key and sender) commits nothing; otherwise one commit writes its row, then `then`, the record that exists only with that row. */
+  tell(missionId: string, content: string, subjects: string[], options: NotifyOptions, then?: () => void): boolean {
+    if (hasNotice(this.rt.store.list('deliveries', missionId), this.noticeIdentity(missionId, subjects, options).identity)) return false
+    return this.rt.commit(missionId, () => { const told = this.notify(missionId, content, subjects, options); if (told) then?.(); return told })
+  }
+
+  /**
+   * R17-G3: the fact a notice records, durable on its row, and the identity it
+   * is deduplicated under: an explicit key, else the fact (subject@epoch +
+   * triggering event + recorded reason), so an unrelated board change cannot
+   * re-arm a notice and a new fact cannot be suppressed by an old one.
+   */
+  private noticeIdentity(missionId: string, subjects: string[], options: NotifyOptions): { fact: NoticeFactRecord; identity: { class: NoticeClass; dedupKey: string; from: string } } {
     const noticeClass = options.noticeClass ?? 'decision'
-    const attributed = noticeSubjects(subjects, { id: missionId })
-    // R17-G3: the fact identity is durable and recorded on the row. Dedup is on
-    // the fact (subject@epoch + triggering event + recorded reason), so an
-    // unrelated board change cannot re-arm a notice and a new fact cannot be
-    // suppressed by an old one. A caller can still opt out explicitly.
-    const fact: NoticeFactRecord = { subjects: attributed, trigger: options.trigger ?? options.dedupKey?.split(':')[0] ?? noticeClass, reason: options.reason ?? '', questionId: options.questionId, deliveryFailureId: options.deliveryFailureId,
+    const fact: NoticeFactRecord = { subjects: noticeSubjects(subjects, { id: missionId }), trigger: options.trigger ?? options.dedupKey?.split(':')[0] ?? noticeClass, reason: options.reason ?? '', questionId: options.questionId, deliveryFailureId: options.deliveryFailureId,
       ...(options.facts === undefined ? {} : { facts: options.facts }), ...(options.aggregatedIdentities === undefined ? {} : { aggregatedIdentities: options.aggregatedIdentities }),
       ...(options.coveredBy === undefined ? {} : { coveredBy: options.coveredBy }), ...(options.statement === undefined ? {} : { statement: options.statement }) }
-    return this.enqueueOwnerNotice(missionId, content, from, noticeClass, { subjects: attributed, fact }, options.dedupe ?? true, options.dedupKey) !== undefined
+    return { fact, identity: { class: noticeClass, dedupKey: options.dedupKey ?? factKey(missionId, fact), from: options.from ?? 'runtime' } }
   }
 
   /** The notice dedup key: F(S) with the owner-notice channel excluded. */
@@ -873,13 +884,8 @@ export class Notices {
     // One long operation owns its existing activity bound. Starting another
     // short operation after progress is already overdue cannot hide that gap.
     if (view.members.some(member => member.activity !== undefined && member.activity.startedAt <= lastAt + bound)) return
-    const key = `absence:${missionId}:${lastAt}`
-    if (hasNotice(this.rt.store.list('deliveries', missionId), { class: 'decision', dedupKey: key, from: 'runtime' })) return
-    this.rt.commit(missionId, () => {
-      this.notify(missionId, `No durable task, evidence or owner-decision progress recorded for ${elapsed}ms (declared bound ${bound}ms) on an active mission. The absence net reports the absence and the elapsed clock only; read the board for the state.`, [missionSubject(view.mission)], {
-        dedupe: true, dedupKey: key, trigger: 'absence-net', reason: `no durable progress for ${elapsed}ms`,
-      })
-    })
+    this.tell(missionId, `No durable task, evidence or owner-decision progress recorded for ${elapsed}ms (declared bound ${bound}ms) on an active mission. The absence net reports the absence and the elapsed clock only; read the board for the state.`, [missionSubject(view.mission)],
+      { dedupKey: `absence:${missionId}:${lastAt}`, trigger: 'absence-net', reason: `no durable progress for ${elapsed}ms` })
   }
 
   /**
@@ -1296,8 +1302,7 @@ export class Notices {
       const question = this.rt.dispatchQuestion(missionId, tasks, members, dispatchable)
       // The dedup key belongs to the task and its epoch, so every pass end and
       // the wedged path re-ask it without repeating the same wake.
-      if (question === undefined || hasNotice(this.rt.store.list('deliveries', missionId), { class: 'decision', dedupKey: question.dedupKey, from: 'runtime' })) return
-      this.rt.commit(missionId, () => this.notify(missionId, question.message, view.subjectsOf([question.task]), { dedupKey: question.dedupKey }))
+      if (question !== undefined) this.tell(missionId, question.message, view.subjectsOf([question.task]), { dedupKey: question.dedupKey })
       return
     }
     // Row 3 (documented scope): a board whose *every* non-terminal task is
@@ -1331,10 +1336,7 @@ export class Notices {
     // classifier's verdict), never the board digest.
     const subjects = view.subjectsOf(unrecognised)
     const { content, statement } = renderNotice('fallthrough', { missionTitle: mission.title, subjects: unrecognised })
-    const fact = { trigger: NOTICE_TEMPLATES.fallthrough.trigger, reason: `no live path advances ${subjects.slice().sort().join(', ')}`, statement }
-    const dedupKey = factKey(missionId, { ...fact, subjects })
-    if (hasNotice(this.rt.store.list('deliveries', missionId), { class: 'decision', dedupKey, from: 'runtime' })) return
-    this.rt.commit(missionId, () => this.notify(missionId, content, subjects, { ...fact, dedupKey }))
+    this.tell(missionId, content, subjects, { trigger: NOTICE_TEMPLATES.fallthrough.trigger, reason: `no live path advances ${subjects.slice().sort().join(', ')}`, statement })
   }
 
   /**
@@ -1352,7 +1354,6 @@ export class Notices {
     for (const root of view.stallRoots) {
       const subject = taskSubject(root)
       const key = `stall-root:${mission.id}:${subject}`
-      if (hasNotice(this.rt.store.list('deliveries', mission.id), { class: 'decision', dedupKey: key, from: 'runtime' })) continue
       const dependents = this.dependentsOf(root, tasks)
       const stop = root.resumeAfterStop?.epoch === root.epoch ? root.resumeAfterStop : undefined
       const cause = stop !== undefined
@@ -1371,12 +1372,11 @@ export class Notices {
       // ceiling, exhausted recovery), wakes to name it.
       const cover = dependents.every(task => task.reviewOf === root.id && task.status === 'blocked')
         ? this.rejectionDecisionFor(mission.id, subject) : undefined
-      this.rt.commit(mission.id, () => {
-        // The event exists only with the delivery row that carries the fact (its
-        // own row or the wake-budget summary), in the same transaction: a notice
-        // that was not written must not leave an event per tick behind it.
-        if (!this.notify(mission.id, body, view.subjectsOf([root, ...dependents]), { dedupKey: key, trigger: NOTICE_TEMPLATES['stall-root'].trigger, reason: cause,
-          statement, ...(cover === undefined ? {} : { coveredBy: cover.id }) })) return
+      // The event exists only with the delivery row that carries the fact (its
+      // own row or the wake-budget summary), in the same transaction: a notice
+      // that was not written must not leave an event per tick behind it.
+      this.tell(mission.id, body, view.subjectsOf([root, ...dependents]), { dedupKey: key, trigger: NOTICE_TEMPLATES['stall-root'].trigger, reason: cause,
+        statement, ...(cover === undefined ? {} : { coveredBy: cover.id }) }, () => {
         this.rt.store.event(mission.id, 'mission/stalled', 'runtime', {
           cause: 'stall-root', taskId: root.id, epoch: root.epoch, reason: root.output ?? null, noticeKey: key,
           dependents: dependents.map(task => task.id), boundMs: this.rt.stallPassTimeoutMs,
@@ -1473,13 +1473,11 @@ export class Notices {
   private notifyBoard(view: MissionInterpretation): void {
     const missionId = view.missionId
     const fact = this.boardFact(view)
-    if (fact === undefined || hasNotice(this.rt.store.list('deliveries', missionId), { class: 'decision', dedupKey: fact.key, from: 'runtime' })) return
-    this.rt.commit(missionId, () => {
-      const { content, subjects, key, reason, statement } = fact
-      if (!this.notify(missionId, content, subjects, { dedupKey: key, trigger: NOTICE_TEMPLATES[statement.family].trigger, reason, statement }) || statement.family !== 'board-stall') return
-      // F(S), the board digest it was told on, is an audit field.
-      this.rt.store.event(missionId, 'mission/stalled', 'runtime', { reason, fingerprint: this.rt.fingerprint(missionId), unschedulable: view.unschedulable.map(task => task.id), noticeKey: key })
-    })
+    if (fact === undefined) return
+    const { content, subjects, key, reason, statement } = fact
+    // F(S), the board digest the W3 stall was told on, is an audit field of its event.
+    this.tell(missionId, content, subjects, { dedupKey: key, trigger: NOTICE_TEMPLATES[statement.family].trigger, reason, statement }, statement.family !== 'board-stall' ? undefined
+      : () => this.rt.store.event(missionId, 'mission/stalled', 'runtime', { reason, fingerprint: this.rt.fingerprint(missionId), unschedulable: view.unschedulable.map(task => task.id), noticeKey: key }))
   }
 
   /**
@@ -1490,14 +1488,10 @@ export class Notices {
   notifyParkedHolder(mission: Mission, task: Task): void {
     const view = this.interpretation(mission.id)
     const row = view.tasks.find(candidate => candidate.id === task.id) ?? task
-    const key = `parked:${mission.id}:${row.id}:${row.epoch}`
     // S5: the durable notice ledger is the gate (its row is written in this call).
-    if (hasNotice(this.rt.store.list('deliveries', mission.id), { class: 'decision', dedupKey: key, from: 'runtime' })) return
-    this.rt.commit(mission.id, () => {
-      const { content, statement } = renderNotice('parked', { taskId: row.id, title: row.title })
-      this.notify(mission.id, content, view.subjectsOf([row]),
-        { dedupe: true, dedupKey: key, trigger: NOTICE_TEMPLATES.parked.trigger, reason: 'the owning member is parked', statement })
-    })
+    const { content, statement } = renderNotice('parked', { taskId: row.id, title: row.title })
+    this.tell(mission.id, content, view.subjectsOf([row]),
+      { dedupKey: `parked:${mission.id}:${row.id}:${row.epoch}`, trigger: NOTICE_TEMPLATES.parked.trigger, reason: 'the owning member is parked', statement })
   }
 
   /**
@@ -1510,15 +1504,11 @@ export class Notices {
     const view = this.interpretation(mission.id)
     const implementations = view.implementations
     if (implementations.length < 2 || view.tasks.some(task => task.kind === 'integration')) return
-    const key = `integration-gap:${mission.id}:${implementations.length}`
-    // S5: the durable notice ledger is the gate (its row is written in this call).
-    if (hasNotice(this.rt.store.list('deliveries', mission.id), { class: 'decision', dedupKey: key, from: 'runtime' })) return
     const diagnostic = 'Coding missions require an independently accepted integration artifact, or exactly one independently accepted implementation artifact when the plan has no integration task'
-    this.rt.commit(mission.id, () => {
-      const { content, statement } = renderNotice('integration-gap', { diagnostic, implementations: view.implementations.map(task => task.id) })
-      this.notify(mission.id, content, view.subjectsOf(view.implementations),
-        { dedupe: true, dedupKey: key, trigger: NOTICE_TEMPLATES['integration-gap'].trigger, reason: diagnostic, statement })
-    })
+    // S5: the durable notice ledger is the gate (its row is written in this call).
+    const { content, statement } = renderNotice('integration-gap', { diagnostic, implementations: view.implementations.map(task => task.id) })
+    this.tell(mission.id, content, view.subjectsOf(view.implementations),
+      { dedupKey: `integration-gap:${mission.id}:${implementations.length}`, trigger: NOTICE_TEMPLATES['integration-gap'].trigger, reason: diagnostic, statement })
   }
 
   /** Record an unreviewable submitted deliverable's blocker whenever it changes, and wake the owner once per blocker and review need (`SwarmRuntime.reviewNeed`). */

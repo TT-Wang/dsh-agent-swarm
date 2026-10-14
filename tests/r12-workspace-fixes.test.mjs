@@ -12,6 +12,7 @@ import { FakeWorkers, makeRuntimeStub, workspaceOptions } from './faults/harness
 const sourceMode = process.env.SWARM_TEST_SOURCE === '1'
 const moduleOf = name => import(new URL(`../${sourceMode ? 'src' : 'lib'}/${name}.${sourceMode ? 'ts' : 'js'}`, import.meta.url))
 const { Scheduling } = await moduleOf('scheduling')
+const { Notices } = await moduleOf('notices')
 const { Workspaces, runProcess } = await moduleOf('workspaces')
 const { WorkspaceAdmission, isolationIssues } = await moduleOf('workspace-admission')
 const { SwarmStore } = await moduleOf('store')
@@ -42,11 +43,13 @@ async function fixture(t) {
 
 test('M2-1: a repeated pass-timeout naming is recorded once, through the ledger', () => {
   const mission = { id: 'mission', status: 'active' }, records = [], deliveries = []
-  // The stub store has no `put`: a naming that wrote the mission row would throw.
-  const rt = makeRuntimeStub({ store: { get: () => structuredClone(mission), list: table => table === 'deliveries' ? deliveries : [], event: (_m, _t, _a, data) => records.push(data), revision: () => 0 },
-    stallPassTimeoutMs: 1000, fingerprint: () => 'same', commit: (_id, fn) => fn(), expectWedgedRelease() {}, pumpOutbox() {}, passSettled() {},
-    // The ledger row `notify` writes for a decision from the runtime.
-    notify(missionId, _content, _subjects, options) { deliveries.push({ id: `row-${deliveries.length}`, missionId, from: 'runtime', to: 'owner', notice: { class: 'decision', dedupKey: options.dedupKey } }) } })
+  // The stub store writes only ledger rows: a naming that wrote the mission row would throw.
+  const rt = makeRuntimeStub({ store: { get: () => structuredClone(mission), list: table => table === 'deliveries' ? deliveries : [], event: (_m, _t, _a, data) => records.push(data), revision: () => 0,
+    put: (table, row) => { assert.equal(table, 'deliveries'); deliveries.push(row) } },
+    stallPassTimeoutMs: 1000, fingerprint: () => 'same', commit: (_id, fn) => fn(), expectWedgedRelease() {}, pumpOutbox() {}, passSettled() {} })
+  // The runtime's own telling, over this store.
+  const notices = new Notices(rt)
+  rt.tell = notices.tell.bind(notices)
   const scheduling = new Scheduling(rt)
   // Two bodies wedge in turn on one naming fact. The first naming's row is the
   // record: the second body is marked named and writes neither row nor event.
