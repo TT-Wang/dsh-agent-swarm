@@ -827,6 +827,22 @@ test('a member whose starts are failing is spoken for by its start-failure notic
   assert.deepEqual(questions(), [], 'and no question was ever owed')
 })
 
+test('a start failure leaves to its notice only the work that notice names: unassigned work its member cannot start is asked about, once, beside the failure that names the mission root', async t => {
+  const f = await setup({ clock: new FakeClock(), workers: new FakeWorkers({ autoIdle: true }) })
+  t.after(f.cleanup)
+  const start = f.workers.start.bind(f.workers)
+  f.workers.start = async spec => { if (spec.member.id === f.author.id) throw Object.assign(new Error('worker start failed'), { code: 'EMFILE' }); return start(spec) }
+  f.runtime.commit(f.mission.id, () => f.runtime.store.put('members', { ...f.runtime.store.get('members', f.reviewer.id), phase: 'stopped' }))
+  const task = f.propose({ title: 'Unassigned work', assigneeId: undefined })
+  await f.runtime.settle(f.mission.id)
+  await ticks(f, 1)
+  await f.runtime.settle(f.mission.id)
+  const failure = ownerRows(f).find(delivery => /^Author could not start \(failure 1 of 3\)/.test(delivery.content))
+  assert.deepEqual([failure?.subjects, taskOf(f.runtime, task.id).assigneeId], [[`mission:${f.mission.id}`], undefined], 'the start failure is told, naming the mission root: the work is assigned to no member')
+  assert.notEqual(f.runtime.store.get('members', f.author.id).phase, 'stopped', 'the author is not retired')
+  assert.deepEqual(ownerRows(f).filter(delivery => noticeFamily(delivery) === 'dispatch-question').map(delivery => delivery.subjects), [[`${task.id}@${taskOf(f.runtime, task.id).epoch}`]], 'the dispatch question about the work is asked, once')
+})
+
 test('a cancellation that strands a dependent leaves it to the board classifier: one decision names it at its epoch, the fall-through beside running work and the W3 stall on a board with nothing else to do', async t => {
   for (const running of [true, false]) {
     const f = await setup({ clock: new FakeClock() })

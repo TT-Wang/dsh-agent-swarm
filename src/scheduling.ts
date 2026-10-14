@@ -365,11 +365,11 @@ export class Scheduling {
    * - no eligible member exists at all (nothing is ready for a member; the board
    *   is someone else's witness, not this notice's).
    *
-   * - every startable eligible member is refused by the isolation invariant or
-   *   has counted start failures (cleared by its next successful start): the
-   *   workspace terminal and the start-failure notice, which names the work
-   *   assigned to that member, are the one emitters of those causes
-   *   (`WorkspaceAdmission.isolationAllows`, `SwarmRuntime.onStartFailure`).
+   * - every startable eligible member is refused by the isolation invariant, or
+   *   has counted start failures (cleared by its next successful start) and is
+   *   the task's assignee: the workspace terminal, and the start-failure notice
+   *   naming the work assigned to that member (`noticeSubjectsFor`), are the one
+   *   emitters of those causes (`isolationAllows`, `SwarmRuntime.onStartFailure`).
    *
    * Otherwise the notice names a handle holder or an unexplained dispatch gap.
    * An idle handle alone proves no budget refusal.
@@ -389,7 +389,7 @@ export class Scheduling {
       const startable = eligible.filter(member => this.startBlocker(member) === undefined)
       if (startable.length) {
         const issues = isolationIssues(members, tasks, (left, right) => this.rt.scopesOverlap(left, right))
-        if (startable.every(member => issues.some(issue => issue.memberIds.includes(member.id)) || member.startFailures !== undefined)) continue
+        if (startable.every(member => issues.some(issue => issue.memberIds.includes(member.id)) || (member.startFailures !== undefined && task.assigneeId === member.id))) continue
         return { task, subjects, dedupKey,
           message: `Task ${task.id} (${task.title}, epoch ${task.epoch}) has an eligible idle member but was not dispatched this tick. An idle handle alone does not identify the dispatch blocker. Inspect the task and recorded admission/preparation diagnostics with swarm_observe; repair the reported cause or withdraw the task with swarm_cancel.` }
       }
