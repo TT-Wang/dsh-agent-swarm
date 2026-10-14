@@ -160,7 +160,7 @@ test('the board classifier tells what a live pass left unpublished: the pass end
         await Promise.resolve()
         assert.ok(told().includes(board === 'stall' ? 'stall-root' : 'coverage-complete'), `${board}: the pass end judged the board`)
       } else {
-        f.runtime.notices.ensureWitness(f.mission.id, { offPass: true, wedged: true })
+        f.runtime.notices.ensureWitness(f.mission.id, { wedged: true })
         assert.deepEqual(told(), board === 'stall' ? ['board-stall', 'stall-root'] : ['coverage-complete'], `${board}: the wedged judgement told the board facts`)
       }
     }
@@ -287,7 +287,7 @@ test('a coverage-complete board is never reported as a stall: an owner-assembled
     await f.runtime.verify(f.actor(f.reviewer), f.mission.id, { taskId: review.id, attemptId: reviewing.attempt.id, verdict: 'accept', reason: 'Independent host checks pass' })
     assert.equal(taskOf(f.runtime, task.id).status, 'accepted')
     // A wedged pass judges the whole board before any pass completes it.
-    f.runtime.notices.ensureWitness(f.mission.id, { offPass: true, wedged: true })
+    f.runtime.notices.ensureWitness(f.mission.id, { wedged: true })
     await f.runtime.settle(f.mission.id)
     await ticks(f, 3)
     assert.equal(stallRow(f), undefined, `automatic=${automatic}: a board with nothing left to do is not a stall`)
@@ -733,7 +733,7 @@ test('a wedged pass never pre-empts the review admission: a need that ripened si
   await f.runtime.settle(f.mission.id)
   // The need ripens with no pass since; a wedged publication judges the board first.
   f.clock.advance(Math.max(f.runtime.config.tickMs, 1_000))
-  f.runtime.notices.ensureWitness(f.mission.id, { offPass: true, wedged: true })
+  f.runtime.notices.ensureWitness(f.mission.id, { wedged: true })
   await ticks(f, 1)
   assert.match(f.runtime.store.list('tasks', f.mission.id).find(row => row.reviewOf === task.id)?.id ?? 'none', /^task_auto_review_/, 'the admission admitted the host review')
   assert.deepEqual(ownerRows(f).filter(delivery => delivery.notice.dedupKey.startsWith('review-blocked:')).map(delivery => delivery.content), [], 'no owner decision raced it')

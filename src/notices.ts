@@ -449,7 +449,7 @@ function stallRootsFor(rt: Pick<LineageRuntime, 'stallPassTimeoutMs' | 'now'>, t
  * Co-firing guards, named: this classifier x the stall-root classifier (a blocked
  * predecessor is the ROOT's subject, named by the root notice with its
  * dependents, never re-named here) x the review grace (`reviewable` and the
- * review-blocked emitter) x the off-pass wedged-pass classification.
+ * review-blocked emitter) x the wedged-pass classification.
  */
 export function waitsLegitimately(rt: LineageRuntime, task: Task, tasks: Task[]): boolean {
   if (TERMINAL_STATES.has(task.status)) return false
@@ -1199,11 +1199,10 @@ export class Notices {
     try {
       // A live pass owns the dispatcher's "ready but not dispatched" question
       // (R15-D3: generation must not invent the cause the pass is about to
-      // resolve), so a transition inside a pass classifies with `offPass`; the
-      // question is asked by the transition that ends or names the pass, and
-      // by a wedged pass, which never reached its own question; a body that
-      // made progress of its own within the last bound past its bound is running, not wedged
-      // (`Scheduling.passState`).
+      // resolve); the question is asked by the transition that ends or names
+      // the pass, and by a wedged pass, which never reached its own question; a
+      // body that made progress of its own within the last bound past its bound
+      // is running, not wedged (`Scheduling.passState`).
       const state = this.rt.passState(missionId)
       const released = this.wedgedReleases.delete(missionId)
       // A live, un-wedged pass owns generation: it will publish at its own close
@@ -1211,8 +1210,7 @@ export class Notices {
       // a mid-pass commit cannot describe a board the dispatcher is still acting
       // on — the D3/R15-A4 rule, now applied without sampling.
       if (state.passLive && !state.wedged && !released) return
-      const options = state.wedged || released ? { offPass: true, wedged: true } : {}
-      this.ensureWitness(missionId, options)
+      this.ensureWitness(missionId, state.wedged || released ? { wedged: true } : {})
     } catch {
       // A generation failure must never break the commit that triggered it; the
       // next transition (or the absence net) re-derives the same facts.
@@ -1234,18 +1232,11 @@ export class Notices {
    * whose facts the owner holds writes nothing, and no other family's row
    * stands in for it.
    *
-   * R15-A2: this is the same decision function the tick timer drives when no
-   * live scheduling pass exists (`options.offPass`), so a mission whose pass
-   * never returns (a hung `workers.start`) still names its subjects instead of
-   * staying silent. The one branch that is only meaningful at the end of a pass
-   * — the dispatcher's "ready but not dispatched" question — is skipped
-   * off-pass: before a pass has run, a ready task is not yet a decision.
-   *
    * Every notice below is recorded inside `rt.commit`, so the delivery row that
    * carries the subjects is written in the SAME transaction as the event that
    * accompanies it.
    */
-  ensureWitness(missionId: string, options: { offPass?: boolean; wedged?: boolean } = {}): void {
+  ensureWitness(missionId: string, options: { wedged?: boolean } = {}): void {
     // R17-G1: the shared interpretation is the only input; no generator below
     // re-reads a raw row to decide what the board means.
     const view = this.interpretation(missionId)
@@ -1267,7 +1258,7 @@ export class Notices {
   }
 
   /** The board classifiers past the stall roots and the review admission's sources: each tells its own fact once, and a fact the owner holds commits nothing. */
-  private judgeBoard(view: MissionInterpretation, options: { offPass?: boolean; wedged?: boolean }): void {
+  private judgeBoard(view: MissionInterpretation, options: { wedged?: boolean }): void {
     const missionId = view.missionId
     const mission = view.mission
     const tasks = view.tasks
@@ -1280,12 +1271,6 @@ export class Notices {
       ? tasks.filter(task => task.status === 'pending' && members.some(member => memberPhaseOf(member) !== 'stopped' && !pendingStopOwner(tasks, member.id) && view.ready(task, member)))
       : view.dispatchable
     if (dispatchable.length) {
-      // R15-D3: between passes the dispatcher's branch owns this state, and it may
-      // still dispatch the task in this same tick. The sweep must not invent a
-      // cause the dispatcher's own branch refuses — silently returning here is what
-      // keeps "ready but the only eligible handle is busy" from becoming a false
-      // "no live path will advance" wake (the round-14 dirty-workspace shape).
-      if (options.offPass === true && options.wedged !== true) return
       // A handle that is working is not a silent board: when no runnable member
       // could be started at all, those members are working and no witness is owed
       // (the T3 integration rule; a false stall notice is as bad as a missing
@@ -1470,7 +1455,7 @@ export class Notices {
    * blocked predecessor is the ROOT's subject, named by the root notice with its
    * dependents, never re-named here) x the review grace (`reviewable` and the
    * review-blocked emitter: a pending review follows its SOURCE identity, so a
-   * cancelled source with a live repair still has no review path) x the off-pass
+   * cancelled source with a live repair still has no review path) x the
    * wedged-pass classification (D1/D2: the wedge changes who generates the
    * decision, never which boards are waiting).
    */

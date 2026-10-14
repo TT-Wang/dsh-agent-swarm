@@ -394,7 +394,7 @@ export class SwarmRuntime {
   private enqueueOwnerNotice(missionId: string, content: string, from: string, noticeClass: NoticeClass, extra: Partial<Delivery> = {}, dedupe = noticeClass === 'budget', dedupKeyOverride?: string): Delivery | undefined { return this.notices.enqueueOwnerNotice(missionId, content, from, noticeClass, extra, dedupe, dedupKeyOverride) }
   noticeLedger(actor: Actor, missionId: string, query: { limit?: number } = {}): unknown { return this.notices.noticeLedger(actor, missionId, query) }
   private bounded(text: string): string { return this.notices.bounded(text) }
-  private ensureWitness(missionId: string, options: { offPass?: boolean; wedged?: boolean } = {}): void { return this.notices.ensureWitness(missionId, options) }
+  private ensureWitness(missionId: string): void { return this.notices.ensureWitness(missionId) }
   /**
    * R17-G1: the shared interpretation of one mission's durable state, forwarded
    * so the dispatcher and every generator read the same derived view.
@@ -609,7 +609,7 @@ export class SwarmRuntime {
    * write), the scheduling-pass watchdog (S1/S2, names a pass past its bound
    * with the work it never reached), the budget gates (deadline cancellation
    * must not queue behind a long verification) and `sweepDecisions` (the
-   * off-pass half of the same decision function the pass runs).
+   * attempt reporting bound and the absence net).
    * `checkSchedulingPasses` runs before `sweepDecisions` on purpose: a pass that
    * just expired is named first, and the sweep then sees it wedged rather than
    * racing the watchdog for the same state.
@@ -681,24 +681,12 @@ export class SwarmRuntime {
     }
   }
   /**
-   * R15-A2: decision generation that does not depend on a scheduling pass
-   * finishing. For every active mission whose pass is not live — no pass body
-   * queued or running inside its declared bound — the same classifier the pass
-   * uses (`ensureWitness`:
-   * `stallRoots`, `waitsLegitimately`, the W3 stall predicate) is run with
-   * `offPass: true`.
-   *
-   * The `offPass` flag suppresses only the dispatcher's "ready but not
-   * dispatched" question, which is meaningless before a pass has run; every
-   * other class (a stall root, a fall-through, an unreviewable submission, a W3
-   * stall) is derived from durable rows and is identical off-pass.
-   *
-   * Co-firing guards: `openPass`/`livePass` (a live pass owns generation, so the
-   * sweep stays out of its way), `kick` (which opens the next pass in the same
-   * tick, after this sweep), the pass watchdog (which names a wedged pass that
-   * still holds the mission queue — exactly the state this sweep exists for)
-   * and the notice dedup (`hasNotice`), which keeps a second generation path
-   * from duplicating a decision.
+   * R15-A2: the tick's sampled instruments, which do not depend on a scheduling
+   * pass finishing: for every mission, a stop whose acknowledgement is pending
+   * is resumed, and an active one gets the attempt reporting bound and the
+   * absence net. The board classifier is not run here: every publication and
+   * every pass end runs it (`Notices.ensureWitness`), and a wedged pass is
+   * named by the watchdog, whose naming publishes the board.
    */
   private sweepDecisions(): void {
     if (this.closed || this.shuttingDown) return
@@ -723,13 +711,6 @@ export class SwarmRuntime {
         // the parked member, the budget pause, the wedged-pass watchdog in
         // `checkSchedulingPasses` (same tick, earlier) and the notice dedup key.
         this.scheduling.sweepSilentAttempts(mission.id)
-        // R15-D1/D2: the sweep runs when the pass is WEDGED past its declared
-        // bound even though `livePass` still owns generation because the mission
-        // has live work (a healthy sibling's lease, or a stop acknowledgement in
-        // flight). A sibling's clock must not own another subject's decision: the
-        // classifier below names only what no live path advances. When the pass is
-        // merely inside its bound the sweep stays out of its way, and when no pass
-        // exists at all the next kick opens one in this same tick.
         // R17-G5: the sampled tick path emits exactly two absence instruments and
         // no cause — the attempt-silence escalation above (`sweepSilentAttempts`,
         // bounded by `attemptSilenceBoundMs`) and the absence net here (the

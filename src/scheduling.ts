@@ -695,8 +695,8 @@ export class Scheduling {
     // (`liveWorkHolders`: running, or blocked on its stop), so it is among these
     // subjects: the owner sees which subjects made the wait unavoidable, and
     // that the naming preserved them (it cancels no task, drops no attempt and
-    // changes no lease). Guard pair: this naming x the off-pass sweep — the sweep
-    // names what no live path advances, this names every unfinished task; both
+    // changes no lease). Guard pair: this naming x its wedged publication — the
+    // classifier names what no live path advances, this names every unfinished task; both
     // carry task@epoch and neither consumes the other's dedup key.
     const subjects = subjectsOfTasks(unreached, mission)
     const failures = members
@@ -784,8 +784,8 @@ export class Scheduling {
    * whole board's clock forever, so past `stallPassReleaseBoundMs` it is named
    * anyway, with the live work it was held by named and preserved untouched.
    * Co-firing guards, named: `livePass` (mirrors the same bound, so no notice
-   * stays suppressed after the naming), the off-pass decision sweep (which runs
-   * while the body is wedged and names the subjects no live path advances), the
+   * stays suppressed after the naming), the wedged publication (which judges
+   * the board while the body is wedged and names what no live path advances), the
    * notice dedup (one naming per body and per naming fact) and the
    * lease-renewal path (the naming changes no task, attempt or lease). `now` is
    * the tick's one instant, read once for every body (`pastBound`).

@@ -347,7 +347,7 @@ test('R17-G2c: the fall-through body replays from the unrecognised rows alone', 
   await f.runtime.cancel(f.owner, f.mission.id, { taskId: dead.id, reason: 'withdrawn' })
   const waiting = f.propose('Waiting on the withdrawn task')
   dependOn(f, waiting, dead)
-  f.runtime.notices.ensureWitness(f.mission.id, { offPass: true, wedged: true })
+  f.runtime.notices.ensureWitness(f.mission.id, { wedged: true })
   const notice = ownerNotice(f, 'fallthrough:')
   assert.ok(notice, 'the fall-through was reported')
   const row = f.runtime.store.get('tasks', waiting.id)
@@ -435,11 +435,11 @@ test('R17-G2f: the review-blocked body replays from the submitted source row and
   const review = f.runtime.store.list('tasks', f.mission.id).find(item => item.kind === 'verification' && item.reviewOf === source.id)
   assert.ok(review, 'the automatic review is admitted')
   f.runtime.cancel(f.owner, f.mission.id, { taskId: review.id, reason: 'withdrawn for the replay check' })
-  // The off-pass witness (a tick or a transition between passes) may judge the
+  // A publication between passes may judge the
   // board before the next pass does; under load it did. Nothing else can
   // progress, so the runtime's own review admission owns this board and the
   // witness adds no second, generic review-blocked fact whichever runs first.
-  f.runtime.notices.ensureWitness(f.mission.id, { offPass: true })
+  f.runtime.notices.ensureWitness(f.mission.id)
   await f.pass()
   const blocked = f.ownerNotices().filter(delivery => delivery.notice?.dedupKey?.startsWith('review-blocked:'))
   assert.equal(blocked.length, 1, `one review-blocked fact for one blocked path: ${JSON.stringify(blocked.map(delivery => delivery.content.slice(0, 80)))}`)
@@ -529,14 +529,14 @@ test('pair: the absence net and the off-pass classifier report different facts a
   const task = f.propose('Stalled work', { assigneeId: member.id })
   // A genuine stall root (blocked, no live replacement) plus a zero absence
   // bound so both reports are owed at once. Co-firing guards, named: the
-  // absence net (absence + elapsed clock only) and the off-pass classifier
+  // absence net (absence + elapsed clock only) and the board classifier
   // (its stall-root family), which share the notice ledger but not the fact.
   const row = f.runtime.store.get('tasks', task.id)
   row.status = 'blocked'; row.epoch += 1; row.output = 'blocked for repair'
   f.runtime.store.put('tasks', row)
   f.runtime.notices.absenceBoundMs = 0
   f.runtime.notices.absenceNet(f.mission.id)
-  f.runtime.notices.ensureWitness(f.mission.id, { offPass: true })
+  f.runtime.notices.ensureWitness(f.mission.id)
   const keys = f.ownerNotices().map(delivery => delivery.notice.dedupKey)
   assert.ok(keys.some(key => key.startsWith('absence:')), 'the absence net reported the absence')
   assert.ok(keys.some(key => key.startsWith('stall-root:')), 'the classifier reported the stall root')
