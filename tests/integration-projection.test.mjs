@@ -26,7 +26,7 @@ async function fixture(t) {
   return { runtime, workers, owner, mission, put }
 }
 const record = (mission, id, kind, status, dependencies, commit) => ({ id, missionId: mission.id, workstreamId: 'stream', title: id, objective: id, kind, dependencies,
-  scope: ['src/'], acceptance: ['works'], checks: [], status, priority: 50, experiment: false, epoch: 0, evidenceIds: [],
+  scope: ['src/'], acceptance: ['works'], covers: ['c1'], checks: [], status, priority: 50, experiment: false, epoch: 0, evidenceIds: [],
   ...(commit === undefined ? {} : { artifact: { commit, baseCommit: 'b'.repeat(40), workspace: '/isolated', changedPaths: [] } }) })
 function complete(f) {
   const mission = f.runtime.store.get('missions', f.mission.id)

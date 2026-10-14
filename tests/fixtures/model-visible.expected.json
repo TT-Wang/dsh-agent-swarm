@@ -62,7 +62,8 @@
           "value.cjs"
         ],
         "acceptance": [
-          "value is two"
+          "value is two",
+          "node check.cjs passes"
         ],
         "checks": [
           "node check.cjs"
@@ -87,7 +88,8 @@
           "value.cjs"
         ],
         "acceptance": [
-          "value is two"
+          "value is two",
+          "node check.cjs passes"
         ],
         "checks": [],
         "dependencyCount": 0,

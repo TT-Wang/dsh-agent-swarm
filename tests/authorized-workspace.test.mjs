@@ -910,7 +910,7 @@ test('An accepted source closes the reviews the fence blocked, so the restored m
     async prepareWorkspace(mission, memberId) { return join(mission.workspace, memberId) } })
   const { config, runtime } = await makeRuntime(t, { workers: reviewing(), config: wired(grants), clock })
   const f = await grantedMission(runtime, project, granted, 'owner-restored-review')
-  const source = f.propose({ kind: 'implementation', checks: ['test -d .'], assigneeId: f.author.id })
+  const source = f.propose({ kind: 'implementation', covers: ['c1'], checks: ['test -d .'], assigneeId: f.author.id })
   const claimed = await runtime.claim(f.actor(f.author), f.mission.id, source.id)
   await runtime.submit(f.actor(f.author), f.mission.id, { taskId: source.id, attemptId: claimed.attempt.id, output: 'done' })
   const review = f.propose({ title: 'Review', objective: 'Independent review', kind: 'verification', reviewOf: source.id, assigneeId: f.reviewer.id })

@@ -20,7 +20,7 @@ async function manual(t, overrides = {}, acceptance = ['works']) {
   const a = await runtime.addMember(owner, mission.id, { name: 'Builder', role: 'implementation' })
   const b = await runtime.addMember(owner, mission.id, { name: 'Reviewer', role: 'verification' })
   const actorA = { sessionId: a.sessionId }, actorB = { sessionId: b.sessionId }
-  const propose = (actor = actorA, extra = {}) => runtime.propose(actor, mission.id, { outputs: [], workstreamId: stream.id, title: 'Fix', objective: 'Fix module', kind: 'implementation', scope: ['src/'], acceptance: ['works'], checks: ['test'], ...extra })
+  const propose = (actor = actorA, extra = {}) => runtime.propose(actor, mission.id, { outputs: [], workstreamId: stream.id, title: 'Fix', objective: 'Fix module', kind: 'implementation', scope: ['src/'], acceptance: ['works'], ...(extra.kind === 'verification' ? {} : { covers: ['c1'] }), checks: ['test'], ...extra })
   const current = task => runtime.store.get('tasks', typeof task === 'string' ? task : task.id)
   const controls = () => workers.deliveries.filter(d => d.kind === 'control' && d.to === 'owner')
   async function submitted(extra = {}) {
@@ -173,7 +173,7 @@ test('owner completion preserves unschedulable obligations even when every crite
   const owned = f.runtime.observe(f.owner, f.mission.id)
   assert.deepEqual(new Set(owned.unschedulable), new Set([rejected.id, rejectedReview.id, dependent.id, review.id]), 'blocked work, dead prerequisites and unreachable reviews are reported transitively')
   // Covering the criterion with reviewed research keeps exactly one accepted implementation as the deliverable.
-  const cover = await f.submitted({ kind: 'research', checks: undefined, acceptance: ['works', 'extra'] })
+  const cover = await f.submitted({ kind: 'research', checks: undefined, acceptance: ['works', 'extra'], covers: ['c1', 'c2'] })
   await f.reviewed(cover)
   const before = f.runtime.snapshot(f.owner, f.mission.id)
   assert.equal(before.completion.eligible, false)
@@ -258,7 +258,7 @@ async function automatic(t, tasks, acceptance = ['works']) {
   const request = runtime.requestStart(owner, { commandId: 'command-1', goal: 'Make the change.', workspace: directory }, { grantRoot: directory, source: 'session' })
   return { runtime, workers, owner, plan, request, directory }
 }
-const codeTask = (key, extra = {}) => ({ key, workstreamKey: 'main', title: key, objective: key, kind: 'implementation', outputs: [], scope: ['src/'], acceptance: ['works'], assigneeKey: 'builder', checks: ['node check.cjs'], maxRecoveryAttempts: 3, checkTimeoutMs: 45000, ...extra })
+const codeTask = (key, extra = {}) => ({ key, workstreamKey: 'main', title: key, objective: key, kind: 'implementation', outputs: [], scope: ['src/'], acceptance: ['works'], covers: ['c1'], assigneeKey: 'builder', checks: ['node check.cjs'], maxRecoveryAttempts: 3, checkTimeoutMs: 45000, ...extra })
 const reviewTask = (key, reviewOf) => ({ key, workstreamKey: 'main', title: key, objective: key, kind: 'verification', outputs: [], scope: ['src/'], acceptance: ['works'], assigneeKey: 'reviewer', reviewOf, maxRecoveryAttempts: 3 })
 async function acceptByKey(f, snapshot, key) {
   const missionId = snapshot.mission.id
@@ -303,7 +303,7 @@ test('several implementation branches still require a final integration, and one
 })
 
 test('a stalled automatic board preserves covered leftovers and completes only after explicit withdrawal', async t => {
-  const research = (key, extra = {}) => ({ key, workstreamKey: 'main', title: key, objective: key, kind: 'research', outputs: [], scope: ['src/'], acceptance: ['documented'], assigneeKey: 'builder', maxRecoveryAttempts: 3, ...extra })
+  const research = (key, extra = {}) => ({ key, workstreamKey: 'main', title: key, objective: key, kind: 'research', outputs: [], scope: ['src/'], acceptance: ['documented'], covers: ['c2'], assigneeKey: 'builder', maxRecoveryAttempts: 3, ...extra })
   const f = await automatic(t, [codeTask('impl'), reviewTask('review', 'impl'), research('base'), reviewTask('rbase', 'base'), research('follow', { dependencies: ['base'] }), reviewTask('rfollow', 'follow')], ['works', 'documented'])
   const snapshot = await f.runtime.startPlan(f.owner, f.request.id, f.plan)
   const missionId = snapshot.mission.id
@@ -333,7 +333,7 @@ test('a stalled automatic board preserves covered leftovers and completes only a
   assert.throws(() => f.runtime.control(f.owner, missionId, 'complete', 'try'), /unfinished or blocked required work/)
   // The owner covers the criterion with new reviewed research instead of repairing the blocked chain.
   const stream = f.runtime.store.list('workstreams', missionId)[0]
-  const doc = f.runtime.propose(f.owner, missionId, { outputs: [], workstreamId: stream.id, title: 'doc', objective: 'Document', kind: 'research', scope: ['src/'], acceptance: ['documented'], assigneeId: builder.id, maxRecoveryAttempts: 3 })
+  const doc = f.runtime.propose(f.owner, missionId, { outputs: [], workstreamId: stream.id, title: 'doc', objective: 'Document', kind: 'research', scope: ['src/'], acceptance: ['documented'], covers: ['c2'], assigneeId: builder.id, maxRecoveryAttempts: 3 })
   const rdoc = f.runtime.propose(f.owner, missionId, { outputs: [], workstreamId: stream.id, title: 'rdoc', objective: 'Review doc', kind: 'verification', reviewOf: doc.id, scope: ['src/'], acceptance: ['documented'], assigneeId: reviewer.id, maxRecoveryAttempts: 3 })
   await researchSubmitted(doc)
   await verdict(rdoc, 'accept')

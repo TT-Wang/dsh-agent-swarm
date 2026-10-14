@@ -51,17 +51,19 @@ test('all model plan entry points require their chosen budget; automatic schema 
   assert.equal(properties.budget.properties.maxTokens.default, undefined)
 })
 
-test('swarm_propose leaves acceptance optional for a repair to inherit; every plan entry point still requires it', () => {
+test('a task\'s own acceptance is optional on every entry point, since covers or a repair\'s lineage also give it criteria; the mission\'s list stays required', () => {
   const definitions = tools()
   const propose = definitions.get('swarm_propose').parameters
   assert.deepEqual(propose.required, ['missionId', 'workstreamId', 'title', 'objective', 'kind', 'scope'])
   assert.deepEqual(propose.properties.acceptance.items, { type: 'string' }, 'the property stays declared as a string array')
-  assert.match(propose.properties.acceptance.description, /Required unless replaces is given/)
+  assert.match(propose.properties.acceptance.description, /A new deliverable needs covers or acceptance, a review may omit it, and a repair also answers for the acceptance and covers of the tasks in replaces\./)
   assert(propose.properties.replaces, 'replaces carries the inheritance')
   assert(definitions.get('swarm_create').parameters.required.includes('acceptance'))
   for (const name of ['swarm_launch', 'swarm_stage']) {
     assert(definitions.get(name).parameters.required.includes('acceptance'), `${name} mission acceptance`)
-    assert(definitions.get(name).parameters.properties.tasks.items.required.includes('acceptance'), `${name} task acceptance`)
+    const task = definitions.get(name).parameters.properties.tasks.items
+    for (const field of ['acceptance', 'covers']) assert.equal(task.required.includes(field), false, `${name} task ${field}`)
+    assert.match(task.properties.acceptance.description, /^Optional: this task's own criteria; mission criteria go in covers\. A deliverable needs covers or acceptance/)
   }
 })
 

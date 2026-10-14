@@ -189,7 +189,7 @@ await runScenario({
         assert.equal(f.runtime.store.get('members', f.reviewer.id).status, 'idle', 'the independent reviewer is live and capable')
         const notice = await eventually(() => ownerNotices(f).find(delivery => delivery.content.includes(source.id) && /no live independent review path/.test(delivery.content)),
           'row 5d: a capable idle reviewer behind live work must still produce a witness')
-        assert.ok(notice.content.startsWith(`[review_path_missing] task ${JSON.stringify(source.id)}: `) && notice.content.includes('admit a review with swarm_propose(kind: "verification", reviewOf, acceptance, outputs: [], maxRecoveryAttempts)'), 'the notice tells the owner exactly what to admit')
+        assert.ok(notice.content.startsWith(`[review_path_missing] task ${JSON.stringify(source.id)}: `) && notice.content.includes('admit a review with swarm_propose(kind: "verification", reviewOf, outputs: [], maxRecoveryAttempts)'), 'the notice tells the owner exactly what to admit')
         assertWitness(f, 'W2', 'row 5d')
         assert.equal(reviewsOf(f, source.id).length, 0, 'the deliberate rule is kept: no automatic review while the board can still progress')
         rows.row5_capable_reviewer = { witness: 'W2', taskId: source.id }
@@ -389,7 +389,7 @@ await runScenario({
     {
       const f = await setup({ acceptance: ['fault recovery is proven from durable state', 'second uncovered criterion'] })
       try {
-        const task = f.propose({ acceptance: ['fault recovery is proven from durable state'] })
+        const task = f.propose({ acceptance: ['fault recovery is proven from durable state'], covers: ['c1'] })
         await acceptThroughReview(f, task)
         const stall = await eventually(() => events(f.runtime, f.mission.id, 'mission/stalled').at(-1),
           'row 9: an uncovered criterion must stall')

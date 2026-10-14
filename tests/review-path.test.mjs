@@ -74,7 +74,8 @@ test('a submitted implementation with no live review is recorded and automatical
   assert.equal(review.maxRecoveryAttempts, 2)
   assert.deepEqual(review.checks, source.checks, 'the review inherits the source acceptance commands')
   assert.deepEqual(review.scope, source.scope)
-  assert.deepEqual(review.acceptance, source.acceptance)
+  assert.deepEqual(review.acceptance, [], 'no criterion is copied onto the review')
+  assert.deepEqual(f.runtime.observe(f.actor('reviewer'), f.mission.id, { taskId: review.id }).task.acceptance, source.acceptance, 'it checks its source\'s')
   assert.equal(review.workstreamId, source.workstreamId)
   const admitted = f.events('task/review-admitted')
   assert.equal(admitted.length, 1, 'the automatic admission is durable and names the new review')
@@ -238,7 +239,7 @@ test('automatic plan admission adds the independent review a code deliverable la
     budget,
     members: [{ key: 'builder', name: 'Builder', role: 'implementation', maxOutputTokens: 4096 }, { key: 'reviewer', name: 'Reviewer', role: 'verification', maxOutputTokens: 2048 }],
     workstreams: [{ key: 'main', title: 'Delivery', objective: 'Complete the change' }],
-    tasks: [{ key: 'deliver', workstreamKey: 'main', title: 'Deliver', objective: 'Implement final change', kind: 'integration', outputs: [], scope: ['src/'], acceptance: ['works'],
+    tasks: [{ key: 'deliver', workstreamKey: 'main', title: 'Deliver', objective: 'Implement final change', kind: 'integration', outputs: [], scope: ['src/'], acceptance: ['works'], covers: ['c1'],
       assigneeKey: 'builder', checks: ['node check.cjs'], maxRecoveryAttempts: 5, checkTimeoutMs: 45000 }] }
   const synthesized = await runtime.startPlan(owner, request.id, plan)
   assert.equal(synthesized.mission.status, 'active')

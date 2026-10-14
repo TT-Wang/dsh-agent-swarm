@@ -1,5 +1,5 @@
 /** Pure task identity selectors shared by runtime and read-only projections. */
-import type { Task } from './types.ts'
+import { criterionId, type Task } from './types.ts'
 
 const oldest = (tasks: readonly Task[]): Task | undefined => [...tasks].sort((a, b) => a.createdAt - b.createdAt || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))[0]
 
@@ -124,6 +124,13 @@ export function taskGraphIndex(tasks: readonly Task[]) {
   const dependencyMet = (id: string): boolean => effective(id)?.status === 'accepted'
   // Reviews always name the exact submitted source; replacement lineage is only for ordinary dependencies.
   const reviewSource = (task: Pick<Task, 'reviewOf'>): Task | undefined => task.reviewOf === undefined ? undefined : byId.get(task.reviewOf)
+  /** The mission criteria `id` answers for: its covers and those of every task it replaces. */
+  const criteriaOf = (id: string): Set<string> => new Set(replacedLineage(id).flatMap(row => row.covers ?? []))
+  /** What `id`'s worker and every reviewer check: its review source's checklist, the mission `criteria` it covers in mission order, then its lineage's own criteria. */
+  const checklist = (id: string, criteria: readonly string[]): string[] => {
+    const source = byId.get(id)?.reviewOf, covered = criteriaOf(id)
+    return [...new Set([...(source === undefined ? [] : checklist(source, criteria)), ...criteria.filter((_, index) => covered.has(criterionId(index))), ...replacedLineage(id).flatMap(row => row.acceptance)])]
+  }
   /**
    * Delivered-artifact coverage: is `sourceId`'s accepted content physically in
    * the artifact composed for `task`?
@@ -156,8 +163,12 @@ export function taskGraphIndex(tasks: readonly Task[]) {
       return identities(id).has(sourceId) || covers(endpoint, sourceId, seen)
     })
   }
-  return { byId, lineage, effective, identities, dependencyMet, reviewSource, covers, replacementDescendants, liveReplacement, replacedLineage }
+  return { byId, lineage, effective, identities, dependencyMet, reviewSource, covers, replacementDescendants, liveReplacement, replacedLineage, criteriaOf, checklist }
 }
+
+/** Each mission criterion whose id `covered` lacks, as the id and its quoted text (`c2 "text"`), in mission order. */
+export const uncoveredCriteria = (criteria: readonly string[], covered: ReadonlySet<string>): string[] =>
+  criteria.flatMap((text, index) => covered.has(criterionId(index)) ? [] : [`${criterionId(index)} ${JSON.stringify(text)}`])
 
 /** Reuse only while the indexed task rows remain unchanged within one synchronous read. */
 export type TaskGraphIndex = ReturnType<typeof taskGraphIndex>

@@ -7,6 +7,127 @@ Current **0.7.0** working-tree checks and the historical **0.6.0** baseline are 
 | `0.1.5-rc.3` (npm `latest`, default host) | `a4c74a91e06b00fe0b0937bde982170c526cc842` |
 | `0.1.7-rc.1` (npm `next`) | `46a7f68b0922371ce7144b668b90e377d8e799f4` |
 
+## Batch 12: acceptance criteria by reference (2026-10-14)
+
+**Gate at `c5aa308`** on `batch12/accrefs` (41 commits on `dfc0825`, not merged; batch 10 merges first). On
+0.1.5-rc.3 `npm run typecheck`, `npm run build`, `npm run test:harness` (composition and boundary compaction),
+`npm run test:replay` (digest `sha256:61a921e64088b78b957cd6aeaa563d5436d4a6eae4b0130725d1f3c74c6f971e`, unchanged),
+`node scripts/faults/run.mjs` (24/24), `scripts/smoke-web.mjs` and `scripts/smoke-command-web.mjs` (both
+`passed: true`) passed. On 0.1.7-rc.1, in a detached worktree on that host's link farm, typecheck, build and
+`test:harness` passed, and ten test files ran 128/128 (the eight node:test files the integrator round touched,
+`tests/draft-editor-criteria.test.mjs` and `tests/roles.test.mjs`). The behavioral suite was not run whole: the 115
+test files (of 176) that read a changed symbol ran together once, 1208 tests, 1205 passed and 3 failed as timeouts
+while the load average was above 50 (two 300 s host git deadlines in
+`tests/r24-declared-outputs-capture.test.mjs` and `tests/workspaces.test.mjs`, one `[mission_operation_pending]` in
+`tests/r17-worker-names.test.mjs`); each of the three files passed alone at a load average of 11 (27/27, 36/36,
+5/5). An earlier 26-file run failed once in `tests/owner-decisions.test.mjs` (R15-D2, the bounded `workers.stop`);
+that file then passed 24/24 three times alone and passed in the 115-file run. The eight touched node:test files each
+passed three rounds of two concurrent copies.
+
+**Why.** A mission criterion had no identity, so every row that answered for one stored a copy of its text and every
+coverage decision compared the copies as strings. Of 86 recorded real `swarm_launch` calls, 10 were refused with
+"Missing exact acceptance strings … a paraphrase does not match" (`b2efddc`). A recount over the 80 distinct recorded
+calls (`f775ee1`, reproduced for this entry from the saved extract) finds 12 plans in which some criterion had no
+verbatim copy on a deliverable (21 criteria: 10 sat only on a review, 11 on no task), and a mission criterion repeated
+on 169 of 315 authored reviews, in 50 of the 80 plans.
+
+**What changed.**
+
+- Wrong model: a criterion is a string that must reappear verbatim on a deliverable, on every repair of it and on its
+  review; launch, completion and the staged-draft repair compare those strings, and that repair could rewrite the
+  mission's own list.
+- Right model: criterion *i* is `c{i+1}` (`criterionId`), fixed once the mission exists. A deliverable cites the ids
+  it satisfies in `covers`, and a row stores only its own criteria. Two selectors on the replacement lineage derive
+  the rest (`src/task-graph.ts`): `criteriaOf`, what a task answers for, and `checklist`, what its worker and every
+  reviewer read. Automatic launch (`[plan_criterion_uncovered]`) and completion read ids only. `citedCovers` is the
+  one validator of a plan's and a proposal's `covers` and returns the one stored form, the task's own non-empty list
+  or no field. One projection per reader: a member reads the checklist as text and never an id (`memberTask`: its
+  assignment, `swarm_observe`, the result of its own propose, claim, submit and verify); the owner reads the stored
+  row at every exit and resolves ids through the criteria map of a fresh `swarm_observe` overview.
+- Deleted: the verbatim rule in `automaticPlan`, in `completionError` and in the planner's prompt and schemas; both
+  `draft_repair_acceptance_dropped` checks and the repair's rewrite of `Mission.acceptance`; a repair's stored copy of
+  the lists it replaces with `inheritedAcceptance` and the propose note that listed it; a host-added review's copy of
+  its source's list; the second writer of an assignment delivery (`assignmentCheckEnvironment` and the resume's own
+  `store.put` in `src/gates.ts`); and, in the integrator round, the owner branch of the observe record, the registry's
+  derivation, and the `accepted` intermediate in `completionError`.
+
+**Integrator round** (`7267433` to `c5aa308`).
+
+- `7267433`: the owner read the stored row from `swarm_propose`, `swarm_control`, `swarm_cancel` and the snapshot but
+  the derived checklist from `swarm_observe` and `swarm_registry`. Both now return the row; the registry row also
+  carries `covers` and `replaces`. One test reads a deliverable that only cites ids, and the repair that replaces it,
+  through every owner exit; a second walks every member exit and finds no `covers` key.
+- `3e6a970`: the schema 4 upgrade applies one rule to every task row and draft plan task. Its own `acceptance` drops
+  what its checklist already takes from its review source and from the tasks it replaces, and a deliverable cites the
+  mission criteria left in it, so an upgraded row is the row this version stores for the same proposal and the amend
+  dependency guard no longer answers by row age.
+- `0fd5f9c`: three surviving mutants die, each proved on a scratch build: the upgrade run at every open, completion
+  counting the `covers` of every accepted task, and the upgrade citing only the first draft task that changes.
+- `e534739`, `0e54151`, `5538719`: a reviewer's `observe().current.reviewSource` is its source's checklist with no
+  ids, in the delta and in the focused view; the prior-work guard is pinned through the registered `swarm_propose`
+  for a cited and for an inherited criterion; the Loader composition asserts that no delivery or tool result a worker
+  received carries `covers`. `tests/fixtures/model-visible.expected.json` was regenerated deliberately: the assignment
+  of "Implement value two" and of its review now list `["value is two", "node check.cjs passes"]`, the cited
+  criterion's text and then the deliverable's own, a list no row stores.
+- `2c6a5e7`, `c5aa308`: citing nothing is the absent field through a launch and through a staged repair alike, and a
+  plan that writes `covers: []` validates to the plan that omits it; completion names one set.
+
+**Repair round 2** (`8e89565`, `dafbc4b`, `7825686`; tests only, `src` unchanged). A second mutation pass over the
+integrator round found three rules a test named without holding them. Each mutant passed the previous tests whole and
+now fails, proved on a scratch build.
+
+- `8e89565`: completion's filter without its status condition, so a withdrawn deliverable's ids count. The withdrawn
+  task of the existing test was an implementation without an artifact, which the artifact condition already excluded.
+  `tests/completion-eligibility.test.mjs` now holds one row per condition (an accepted review, an accepted
+  implementation without an artifact, a cancelled research task), and the task withdrawn through `swarm_cancel` in
+  `tests/criteria.test.mjs` is research.
+- `dafbc4b`: `swarm_propose` storing `covers: []` as written, and refusing a review that writes it. The leg named for
+  `swarm_propose` launched a plan, whose validation had already removed the empty list. The registered
+  `swarm_propose` is now handed `covers: []` for a deliverable and for its review; the returned tasks and the stored
+  rows are the launched ones, with no `covers` key.
+- `7825686`: the upgrade saving a draft only when a deliverable changed. `3e6a970` had edited the one fixture of that
+  shape. Both shapes now stand: a v3 draft whose review alone copied its source's own criterion is rewritten (the
+  review holds `[]`), moves to its next revision, refuses the page's stale save and is named in the change's scopes;
+  a draft whose tasks hold only their own criteria is left as it is.
+
+Gate at `7825686`: on 0.1.5-rc.3 typecheck, build, `test:harness`, `test:replay` (digest unchanged),
+`node scripts/faults/run.mjs` (24/24) and both web smokes (`passed: true`) passed; on 0.1.7-rc.1 typecheck, build,
+`test:harness` and the two touched test files (35/35) passed. Each touched file passed three rounds of two concurrent
+copies.
+
+**`src` against `dfc0825`: +160 −155, net +5.**
+
+| File | + | − | net |
+| --- | --- | --- | --- |
+| `src/runtime.ts` | 53 | 73 | −20 |
+| `src/gates.ts` | 1 | 8 | −7 |
+| `src/tools.ts` | 15 | 22 | −7 |
+| `src/admission.ts` | 6 | 9 | −3 |
+| `src/plans.ts` | 13 | 9 | +4 |
+| `src/types.ts` | 10 | 4 | +6 |
+| `src/task-graph.ts` | 13 | 2 | +11 |
+| `src/client/DraftEditor.tsx` | 18 | 12 | +6 |
+| `src/store.ts` | 24 | 9 | +15 |
+| `src/planner.ts`, `src/refusals.ts`, `src/client/SwarmBoard.tsx`, `src/client/locale.tsx`, `src/client/styles.ts` | 7 | 7 | 0 |
+
+The decisions, views and schemas net −16, the draft editor +6 and the one-time store upgrade +15. The total is not
+negative; without the upgrade the branch nets −10.
+
+- The upgrade, +15, is `citeCriteria` (14 lines) and the import of the derivation it applies; its call takes the place
+  of a line of the hand-written BEGIN/COMMIT that `transaction()` replaced. Each line answers a requirement: a task
+  row older than the list shape is left alone; a row drops only what the runtime's own `checklist` supplies from
+  elsewhere, so the upgrade cannot disagree with what a worker reads; a review cites nothing, because its copies never
+  decided a verdict; a staged mission takes its saved draft's criteria, without which a v3 staged draft with an
+  appended criterion could neither relaunch nor be saved; a rewritten draft takes its next revision, without which a
+  page still holding the v3 draft would save the copies back; and only changed rows are written. The alternative to
+  rewriting once at open is a branch in the runtime that keeps comparing criterion text on old rows. That is a
+  compatibility branch that never goes away; the upgrade is a one-time rewrite, and it is accepted as the cost of
+  keeping existing stores.
+- The editor, +6: `removeCriterion` +5, the Covers box +1, the numbered criteria rows +1 over the textarea they
+  replace, the template −1. An id is a position, so removing a criterion shifts every later id, and `removeCriterion`
+  renumbers each task's `covers` in the same edit; the only structure that needs no renumbering stores an id on each
+  criterion, a durable field the design rejected. The Covers box is the one control that writes `covers`.
+
 ## Round-29 simplification batch 9: one authorization rule, one exit table, a derived progress clock (2026-09-25)
 
 **Gate at `27fa353` and `19dbc30`.** Seven branches were merged onto main `75b765a` on `b9-integration` (`96f6db9`

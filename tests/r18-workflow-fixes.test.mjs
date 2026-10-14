@@ -93,7 +93,7 @@ async function fixture(t, config = {}) {
   return Object.assign(f, { directory, owner, mission, stream, author, second, reviewer, actor, reopen })
 }
 const propose = (f, title, extra = {}) => f.runtime.propose(f.owner, f.mission.id, { outputs: [], workstreamId: f.stream.id, title, objective: title,
-  kind: 'implementation', scope: ['src/'], acceptance: ['done'], checks: ['npm test'], ...extra })
+  kind: 'implementation', scope: ['src/'], acceptance: ['done'], ...(extra.kind === 'verification' ? {} : { covers: ['c1'] }), checks: ['npm test'], ...extra })
 const current = (f, id) => f.runtime.store.get('tasks', typeof id === 'string' ? id : id.id)
 const memberStatus = (f, memberId) => f.runtime.snapshot(f.owner, f.mission.id).members.find(member => member.id === memberId).status
 const barrierSettled = (f, task) => eventually(() => current(f, task).resumeAfterStop === undefined, 'the stop barrier settled', 2000)
@@ -466,7 +466,7 @@ test('R18-5b: the syntax refusal names the broken check and pairs each location 
     members: [{ key: 'a', role: 'implementation', maxOutputTokens: 1000 }, { key: 'b', role: 'verification', maxOutputTokens: 1000 }],
     workstreams: [{ key: 'w', title: 'Main', objective: 'Deliver' }],
     tasks: [
-      { key: 't', workstreamKey: 'w', title: 'Feature', objective: 'Write the feature', kind: 'implementation', outputs: [], scope: ['src/'], acceptance: ['done'], checks, assigneeKey: 'a', maxRecoveryAttempts: 1, checkTimeoutMs: 60000 },
+      { key: 't', workstreamKey: 'w', title: 'Feature', objective: 'Write the feature', kind: 'implementation', outputs: [], scope: ['src/'], acceptance: ['done'], covers: ['c1'], checks, assigneeKey: 'a', maxRecoveryAttempts: 1, checkTimeoutMs: 60000 },
       { key: 'r', workstreamKey: 'w', title: 'Review', objective: 'Review the feature', kind: 'verification', outputs: [], scope: ['src/'], acceptance: ['done'], reviewOf: 't', assigneeKey: 'b', maxRecoveryAttempts: 1 },
     ],
   })

@@ -208,7 +208,7 @@ The primary agent receives durable advance warnings for mission resources and ta
 
 Integration workers can resolve listed files in `.swarm-integration-conflicts.json` using ordinary edits, then remove that manifest and submit. The host retains accepted dependency commits and checks the final scoped artifact. Unknown script names or inferred prose paths are planning hints; actual authorization, scoped writes, check execution and independent review remain enforced. Failed saved plans can be edited and relaunched without discarding their request, snapshot, admitted work or recorded consumption.
 
-A mission cannot complete while required synthesis or review work remains unfinished, even if other accepted tasks repeat its acceptance text. A stranded task stays recoverable and notifies the primary; amend its dependencies or assignee in place. Withdraw obsolete work explicitly with `swarm_cancel`. Completion itself never cancels tasks.
+A mission cannot complete while required synthesis or review work remains unfinished, even if accepted deliverables already cover every mission criterion. A stranded task stays recoverable and notifies the primary; amend its dependencies or assignee in place. Withdraw obsolete work explicitly with `swarm_cancel`. Completion itself never cancels tasks.
 
 Check-environment records distinguish the configured `dependencyLinks.dirs` set from the actual relative `materializedPaths` found for that execution. Directory ordering and absent optional dependency folders do not change the configured policy; real policy-set or copy/link-mode changes still reject a mismatched verification.
 

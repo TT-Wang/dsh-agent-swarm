@@ -2,6 +2,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { join } from 'node:path'
+import { registerTools } from '../lib/tools.js'
 import { FakeWorkers, SwarmRuntime, budget as sharedBudget, eventually, makeRuntime } from './faults/harness.mjs'
 
 const budget = { ...sharedBudget, maxTokens: 100000, maxSteps: 100, maxTasks: 12, maxExperiments: 2 }
@@ -24,7 +25,7 @@ function plan(workspace) {
     members: [{ key: 'builder', name: 'Builder', role: 'implementation', maxOutputTokens: 4096 }, { key: 'reviewer', name: 'Reviewer', role: 'verification', maxOutputTokens: 2048 }],
     workstreams: [{ key: 'main', title: 'Delivery', objective: 'Complete the change' }],
     tasks: [
-      { key: 'deliver', workstreamKey: 'main', title: 'Deliver', objective: 'Implement final change', kind: 'integration', outputs: [], scope: ['src/'], acceptance: ['works'], assigneeKey: 'builder', checks: ['node check.cjs'], maxRecoveryAttempts: 5, checkTimeoutMs: 45000 },
+      { key: 'deliver', workstreamKey: 'main', title: 'Deliver', objective: 'Implement final change', kind: 'integration', outputs: [], scope: ['src/'], acceptance: ['works'], covers: ['c1'], assigneeKey: 'builder', checks: ['node check.cjs'], maxRecoveryAttempts: 5, checkTimeoutMs: 45000 },
       { key: 'review', workstreamKey: 'main', title: 'Review', objective: 'Verify immutable artifact', kind: 'verification', outputs: [], scope: ['src/'], acceptance: ['works'], assigneeKey: 'reviewer', reviewOf: 'deliver', maxRecoveryAttempts: 5 },
     ] }
 }
@@ -145,7 +146,7 @@ test('automatic admission rejects incomplete topology before creating workers or
     input => { input.tasks[0].assigneeKey = undefined },
     // One reviewed implementation is deliverable alone; several implementation branches still need a final integration.
     input => { input.tasks[0].kind = 'implementation'; input.tasks.push({ ...input.tasks[0], key: 'second', title: 'Second' }, { ...input.tasks[1], key: 'second-review', title: 'Second review', reviewOf: 'second' }) },
-    input => { input.acceptance = ['uncovered obligation'] },
+    input => { input.acceptance.push('uncovered obligation') },
     input => { delete input.tasks[0].maxRecoveryAttempts },
     input => { delete input.tasks[0].checkTimeoutMs },
     input => { delete input.members[0].maxOutputTokens },
@@ -173,21 +174,86 @@ test('automatic implementation plans require a final integration dependency and 
   assert.equal(snapshot.mission.status, 'active')
 })
 
-test('missing acceptance diagnostics identify the exact strings and a corrected plan launches', async t => {
-  const f = await fixture(t)
+test('an uncovered criterion is named by id and text, copied text never covers it, and citing its id on the deliverable or on its review launches', async t => {
   const exact = 'Keep the existing response shape, including empty results.'
-  f.input.acceptance.push(exact)
-  f.input.tasks[0].acceptance = ['works', 'Keep compatible responses']
-  const request = f.runtime.requestStart(f.owner, f.requestInput, { grantRoot: f.requestInput.workspace, source: 'session' })
-  await assert.rejects(f.runtime.startPlan(f.owner, request.id, f.input), error => {
-    assert.ok(error.message.includes(JSON.stringify([exact])))
-    assert.match(error.message, /Copy each missing string into the acceptance array/)
-    return true
-  })
-  assert.equal(f.workers.prepared.length, 0)
-  f.input.tasks[0].acceptance.push(exact)
-  const snapshot = await f.runtime.startPlan(f.owner, request.id, f.input)
-  assert.equal(snapshot.mission.status, 'active')
+  for (const cite of [input => input.tasks[0].covers.push('c2'), input => { input.tasks[1].covers = ['c2'] }]) {
+    const f = await fixture(t)
+    f.input.acceptance.push(exact)
+    f.input.tasks[0].acceptance = ['works', exact]
+    const request = f.runtime.requestStart(f.owner, f.requestInput, { grantRoot: f.requestInput.workspace, source: 'session' })
+    await assert.rejects(f.runtime.startPlan(f.owner, request.id, f.input), error => {
+      assert.match(error.message, /^Automatic plan rejected; repair every item/)
+      assert.ok(error.message.includes(`[plan_criterion_uncovered] No deliverable covers c2 ${JSON.stringify(exact)}. Add each id to \`covers\``), error.message)
+      return true
+    })
+    assert.equal(f.workers.prepared.length, 0)
+    cite(f.input)
+    const snapshot = await f.runtime.startPlan(f.owner, request.id, f.input)
+    assert.equal(snapshot.mission.status, 'active')
+    assert.deepEqual(snapshot.tasks.find(task => task.kind === 'integration').covers, ['c1', 'c2'], 'a review\'s covers move onto its source')
+    assert.equal(snapshot.tasks.find(task => task.kind === 'verification').covers, undefined, 'a stored review cites nothing')
+  }
+})
+
+test('the covers, coverage and staged-criteria refusals are repaired as they say, through the registered swarm_launch', async t => {
+  // The staged refusal names two exits: resend the plan unchanged, or change task `covers` and task `acceptance` and relaunch.
+  const exits = [
+    [input => input, [['c1', 'c2'], ['works']]],
+    [input => ({ ...input, tasks: input.tasks.map(task => task.kind === 'verification' ? { ...task, covers: ['c1'] } : { ...task, covers: ['c2'], acceptance: ['keeps the API'] }) }), [['c2', 'c1'], ['keeps the API']]],
+  ]
+  for (const [exit, stored] of exits) {
+    const f = await fixture(t)
+    const definitions = new Map()
+    registerTools({ tools: { register: definition => definitions.set(definition.name, definition) } }, f.runtime, budget)
+    const request = f.runtime.requestStart(f.owner, f.requestInput, { grantRoot: f.requestInput.workspace, source: 'session' })
+    const launch = async plan => (await definitions.get('swarm_launch').execute({ requestId: request.id, ...plan }, { signal: new AbortController().signal, agent: { id: f.owner.sessionId } })).result
+    const input = { ...f.input, acceptance: ['works', 'is documented'] }
+    const citing = covers => ({ ...input, tasks: input.tasks.map(task => task.kind === 'verification' ? task : { ...task, covers }) })
+    // An id that is repeated or unknown is refused where the plan wrote it; the exit is each id once.
+    for (const [covers, shown] of [[['c1', 'c1'], '["c1","c1"]'], [['c9'], '["c9"]']]) {
+      await assert.rejects(launch(citing(covers)), error => error.message.includes(`[covers_invalid] tasks[0] (deliver).covers must list distinct ids of the mission acceptance criteria, c1 for the first through c2 for the last; it has ${shown}. Pass \`covers\` with each id this task satisfies once, never the criterion text, and retry the same task/request.`), shown)
+    }
+    await assert.rejects(launch(input), error => error.message.endsWith('\n[plan_criterion_uncovered] No deliverable covers c2 "is documented". Add each id to `covers` of the deliverable that satisfies it; keep the mission acceptance list unchanged.'))
+    // As named: add the id to `covers` of the deliverable; the mission list is unchanged. The first
+    // start then fails, leaving the mission staged with its criteria fixed.
+    input.tasks = citing(['c1', 'c2']).tasks
+    let fail = true
+    f.workers.onStart = async () => { if (fail) throw new Error('Temporary launch failure') }
+    await assert.rejects(launch(input), /Temporary launch failure/)
+    fail = false
+    const staged = f.runtime.starts(f.owner)[0].missionId
+    await assert.rejects(launch({ ...input, acceptance: ['is documented', 'works'] }), error => error.code === 'draft_repair_criteria_changed'
+      && error.message === `[draft_repair_criteria_changed] Mission ${staged} is staged, so its acceptance criteria are fixed: ["works","is documented"]. Resend \`acceptance\` unchanged and in this order; change task \`covers\` or task \`acceptance\` instead, and relaunch.`)
+    const snapshot = await launch(exit(input)), deliver = snapshot.tasks.find(task => task.kind === 'integration')
+    assert.deepEqual([snapshot.mission.id, snapshot.mission.status, snapshot.mission.acceptance], [staged, 'active', ['works', 'is documented']])
+    assert.deepEqual([deliver.covers, deliver.acceptance], stored, 'the staged deliverable holds what the relaunched plan cites')
+  }
+})
+
+test('a plan deliverable with neither covers nor acceptance is refused once, and each exit the refusal names is performed through the registered swarm_launch and swarm_stage', async t => {
+  const bare = ({ acceptance: _own, covers: _cited, ...task }) => task
+  const refused = (index, key) => error => error.message === `[plan_task_acceptance_required] tasks[${index}] (${key}) has neither covers nor acceptance. Add to \`covers\` the ids of the mission criteria it satisfies, or, when it satisfies none, give it its own \`acceptance\`, and relaunch the complete plan.`
+  // The plan's one deliverable must satisfy the mission criterion (covers); a second deliverable beside it satisfies none (its own acceptance).
+  const audit = { key: 'audit', workstreamKey: 'main', title: 'Audit', objective: 'List every caller of the changed function', kind: 'research', outputs: [], scope: ['src/'], assigneeKey: 'builder', maxRecoveryAttempts: 5 }
+  const exits = [
+    [input => ({ ...input, tasks: [bare(input.tasks[0]), input.tasks[1]] }), 'deliver', task => ({ ...task, covers: ['c1'] })],
+    [input => ({ ...input, tasks: [audit, ...input.tasks] }), 'audit', task => ({ ...task, acceptance: ['Every caller is listed with its file'] })],
+  ]
+  for (const [name, admitted] of [['swarm_launch', result => result.mission.status === 'active'], ['swarm_stage', result => result.status === 'draft']]) {
+    for (const [build, key, exit] of exits) {
+      const f = await fixture(t)
+      const definitions = new Map()
+      registerTools({ tools: { register: definition => definitions.set(definition.name, definition) } }, f.runtime, budget)
+      const request = f.runtime.requestStart(f.owner, f.requestInput, { grantRoot: f.requestInput.workspace, source: 'session' })
+      const call = async plan => (await definitions.get(name).execute(name === 'swarm_launch' ? { requestId: request.id, ...plan } : plan,
+        { signal: new AbortController().signal, agent: { id: f.owner.sessionId, session: { header: { cwd: f.directory } } } })).result
+      const input = build(f.input)
+      await assert.rejects(call(input), refused(0, key), `${name} ${key}`)
+      assert.equal(f.runtime.list(f.owner.sessionId).length + f.runtime.drafts(f.owner).length, 0, 'the refusal saved and launched nothing')
+      const result = await call({ ...input, tasks: input.tasks.map(task => task.key === key ? exit(task) : task) })
+      assert.ok(admitted(result), `${name} admits the plan after the ${key} exit`)
+    }
+  }
 })
 
 test('failed assembly and retries retain one deterministic plan and worker roster', async t => {

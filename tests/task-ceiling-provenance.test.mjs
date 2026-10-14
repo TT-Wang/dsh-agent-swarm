@@ -9,7 +9,7 @@ function plan(workspace = '/fixture') {
   return { title: 'Research', objective: 'Investigate the question', workspace, scope: ['**'], acceptance: ['question answered'], budget: { ...budget },
     members: [{ key: 'author', name: 'Author', role: 'research' }, { key: 'reviewer', name: 'Reviewer', role: 'verification' }],
     workstreams: [{ key: 'main', title: 'Research', objective: 'Investigate the question' }],
-    tasks: [{ key: 'research', workstreamKey: 'main', title: 'Research', objective: 'Investigate the question', kind: 'research', outputs: [], scope: ['**'], acceptance: ['question answered'], assigneeKey: 'author' },
+    tasks: [{ key: 'research', workstreamKey: 'main', title: 'Research', objective: 'Investigate the question', kind: 'research', outputs: [], scope: ['**'], acceptance: ['question answered'], covers: ['c1'], assigneeKey: 'author' },
       { key: 'review', workstreamKey: 'main', title: 'Review', objective: 'Review the answer', kind: 'verification', outputs: [], reviewOf: 'research', scope: ['**'], acceptance: ['question answered'], assigneeKey: 'reviewer' }] }
 }
 

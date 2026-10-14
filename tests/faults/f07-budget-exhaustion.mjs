@@ -1,13 +1,14 @@
 /** F7: budget exhausted mid-round, then the ceiling is raised. The reason names the dimension and consumed work survives. */
 import assert from 'node:assert/strict'
-import { setup, budget as defaultBudget, eventually, events, taskOf, runScenario } from './harness.mjs'
+import { setup, budget as defaultBudget, eventually, events, taskOf, runScenario, MISSION_ACCEPTANCE } from './harness.mjs'
 
 await runScenario({
   id: 'F7', title: 'Budget exhaustion names the dimension and preserves consumed work across a raise', invariants: ['I5'],
   body: async () => {
     const f = await setup({ budget: { maxTokens: 40, maxSteps: 100 } })
     try {
-      const task = f.propose()
+      // The deliverable only cites the mission criterion, so its row holds no criterion text.
+      const task = f.propose({ acceptance: [] })
       const claimed = await f.runtime.claim(f.actor(f.author), f.mission.id, task.id)
       // Injection: a provider usage report pushes the mission over maxTokens.
       await f.workers.callbacks.usage(f.author.id, 40)
@@ -32,6 +33,8 @@ await runScenario({
       f.runtime.control(f.owner, f.mission.id, 'resume', 'F7: budget raised')
       const resumed = await eventually(() => events(f.runtime, f.mission.id, 'task/budget-resumed')[0], 'the preserved attempt resumes')
       assert.equal(resumed.data.attemptId, claimed.attempt.id, 'I5: the same attempt resumes, not a fresh one')
+      const assigned = f.runtime.store.list('deliveries', f.mission.id).filter(delivery => delivery.kind === 'assignment' && delivery.taskId === task.id).map(delivery => JSON.parse(delivery.content).task)
+      assert.deepEqual(assigned.map(view => [view.acceptance, 'covers' in view]), [[MISSION_ACCEPTANCE, false], [MISSION_ACCEPTANCE, false]], 'the resume assignment lists the criterion text its first assignment listed, never the bare id')
       const current = taskOf(f.runtime, task.id)
       assert.equal(current.status, 'running')
       assert.equal(current.attempt.id, claimed.attempt.id, 'I5: no recovery credit is spent on a budget resume')
