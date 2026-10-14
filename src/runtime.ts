@@ -3874,9 +3874,9 @@ export class SwarmRuntime {
   /**
    * R11-01: record one classified provider outage inside the caller's
    * transaction. The durable row is bounded to one per member and class per
-   * window; the owner notice fires on a class transition. The affected attempt
-   * is preserved (the adapter retries it in place), so nothing here re-pends or
-   * charges recovery credit.
+   * window; the owner notice is the outage class on the member's open work. The
+   * affected attempt is preserved (the adapter retries it in place), so nothing
+   * here re-pends or charges recovery credit.
    */
   private recordProviderOutage(member: Member, outage: ProviderOutage): void {
     const current = this.store.get('members', member.id)
@@ -3890,16 +3890,14 @@ export class SwarmRuntime {
     // R17-G1: the member's open work comes from the shared interpretation.
     const view = this.interpretation(member.missionId)
     const open = view.tasks.filter(task => task.status === 'running' && task.attempt?.ownerId === member.id)
-    const recorded = this.store.event(member.missionId, 'provider/outage', 'runtime', { memberId: member.id, class: outage.class, status: outage.status, message: outage.message, taskIds: open.map(task => task.id) })
-    // One owner notice per class transition, opened by its event, never one per retry.
-    if (previous?.class !== outage.class) {
-      // R15-A1/A4: a member-scoped notice names that member's open work: the
-      // subject is the task whose clock the outage holds, never the whole board.
-      // The mission root is the fallback only when the member owns no open task.
-      this.notify(member.missionId,
-        `${member.name} provider ${outage.class} outage${outage.status === undefined ? '' : ` (HTTP ${outage.status})`}: ${outage.message}. Its attempt is preserved and no recovery credit is spent while the route is quiescent.`,
-        open.length ? view.subjectsOf(open) : [missionSubject(view.mission)], { from: member.id, trigger: 'provider/outage', reason: `${outage.class} outage ${recorded}` })
-    }
+    this.store.event(member.missionId, 'provider/outage', 'runtime', { memberId: member.id, class: outage.class, status: outage.status, message: outage.message, taskIds: open.map(task => task.id) })
+    // The fact is the outage class on the member's open work, so a retry, or a
+    // return to a class already told on that work, is that fact again.
+    // R15-A1/A4: the subject is the task whose clock the outage holds, never the
+    // whole board; the mission root only when the member owns no open task.
+    this.notify(member.missionId,
+      `${member.name} provider ${outage.class} outage${outage.status === undefined ? '' : ` (HTTP ${outage.status})`}: ${outage.message}. Its attempt is preserved and no recovery credit is spent while the route is quiescent.`,
+      open.length ? view.subjectsOf(open) : [missionSubject(view.mission)], { from: member.id, trigger: 'provider/outage', reason: outage.class })
   }
   /** R11-01: the member's route is quiescent only inside the outage window. */
   private providerQuiescent(member: Member): Member['providerOutage'] {

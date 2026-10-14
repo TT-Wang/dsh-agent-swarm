@@ -12,7 +12,7 @@ import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import { join, resolve } from 'node:path'
 import ts from 'typescript'
-import { FakeClock, PROJECT, setup } from './faults/harness.mjs'
+import { FakeClock, PROJECT, events, setup } from './faults/harness.mjs'
 
 const ownerRows = (f, pattern) => f.runtime.store.list('deliveries', f.mission.id).filter(delivery => delivery.to === 'owner' && delivery.notice !== undefined && pattern.test(delivery.content))
 const fixture = async (t, options = {}) => { const f = await setup({ clock: new FakeClock(), ...options }); t.after(f.cleanup); return f }
@@ -32,17 +32,33 @@ test('each start failure below the bound is its own fact, opened by its event: f
   assert.deepEqual(failures(), [['failure 1 of 3', root], ['failure 2 of 3', root], ['failure 1 of 3', root]], 'a new run\'s first failure is told too')
 })
 
-test('each provider outage class transition is its own fact, opened by its event, over the same open work', async t => {
+test('a provider outage is its class on the member\'s open work: a retry, a report after a pass restarted the resident member and a return to a class already told are that fact; another class, or the class over new work, is a new one', async t => {
   const f = await fixture(t)
-  const task = f.propose({ title: 'Running work' })
-  await f.runtime.claim(f.actor(f.author), f.mission.id, task.id)
+  const first = f.propose({ title: 'Running work' })
+  const claimed = await f.runtime.claim(f.actor(f.author), f.mission.id, first.id)
   const outages = () => ownerRows(f, /^Author provider/).map(delivery => [delivery.content.match(/provider (\S+) outage/)[1], delivery.subjects])
-  const subject = [`${task.id}@${f.runtime.store.get('tasks', task.id).epoch}`]
-  f.workers.callbacks.providerOutage(f.author.id, { class: 'quota', status: 402, message: 'insufficient quota' })
-  f.workers.callbacks.providerOutage(f.author.id, { class: 'quota', status: 402, message: 'insufficient quota' })
-  f.workers.callbacks.providerOutage(f.author.id, { class: 'unavailable', status: 503, message: 'upstream down' })
-  f.workers.callbacks.providerOutage(f.author.id, { class: 'quota', status: 402, message: 'insufficient quota' })
-  assert.deepEqual(outages(), [['quota', subject], ['unavailable', subject], ['quota', subject]], 'one notice per class transition, a retry is none')
+  const subject = task => [`${task.id}@${f.runtime.store.get('tasks', task.id).epoch}`]
+  const report = (outage, status, message) => f.workers.callbacks.providerOutage(f.author.id, { class: outage, status, message })
+  // What the adapter reports while it retries the preserved attempt in place, a scheduling pass between reports: each pass restarts the resident member.
+  for (let pass = 0; pass < 3; pass++) {
+    report('rate-limit', 429, 'Rate limit reached for requests')
+    f.clock.advance(1_000)
+    f.runtime.kick(f.mission.id)
+    await f.runtime.settle(f.mission.id)
+  }
+  assert.ok(events(f.runtime, f.mission.id, 'provider/recovered').length >= 2, 'the passes restarted the member between reports')
+  assert.equal(f.runtime.store.get('tasks', first.id).attempt?.id, claimed.attempt.id, 'on the same preserved attempt')
+  assert.deepEqual(outages(), [['rate-limit', subject(first)]], 'a report after a pass is the fact the owner holds')
+  report('unavailable', 503, 'upstream down')
+  report('rate-limit', 429, 'Rate limit reached for requests')
+  assert.deepEqual(outages(), [['rate-limit', subject(first)], ['unavailable', subject(first)]], 'another class is told; a return to a class told on this work is not')
+  // The member moves to new work with no pass between, still rate-limited.
+  await f.runtime.submit(f.actor(f.author), f.mission.id, { taskId: first.id, attemptId: claimed.attempt.id, output: 'candidate' })
+  const second = f.propose({ title: 'Next work' })
+  await f.runtime.claim(f.actor(f.author), f.mission.id, second.id)
+  f.clock.advance(31_000)
+  report('rate-limit', 429, 'Rate limit reached for requests')
+  assert.deepEqual(outages(), [['rate-limit', subject(first)], ['unavailable', subject(first)], ['rate-limit', subject(second)]], 'the class over new work is a new fact')
 })
 
 test('each challenge of a claim is its own fact, opened by its event', async t => {
