@@ -591,13 +591,13 @@ export class Notices {
    */
   notify(missionId: string, content: string, subjects: string[], options: NotifyOptions = {}): boolean {
     const { fact, identity } = this.noticeIdentity(missionId, subjects, options)
-    return this.enqueueOwnerNotice(missionId, content, identity.from, identity.class, { subjects: fact.subjects, fact }, options.dedupe ?? true, identity.dedupKey) !== undefined
+    return this.enqueueOwnerNotice(missionId, content, identity, options.dedupe ?? true, { subjects: fact.subjects, fact }) !== undefined
   }
 
   /** Tell the owner one fact in a transaction of its own: a fact the ledger already holds (its class, key and sender) commits nothing; otherwise one commit writes its row, then `then`, the record that exists only with that row. */
   tell(missionId: string, content: string, subjects: string[], options: NotifyOptions, then?: () => void): boolean {
-    if (hasNotice(this.rt.store.list('deliveries', missionId), this.noticeIdentity(missionId, subjects, options).identity)) return false
-    return this.rt.commit(missionId, () => { const told = this.notify(missionId, content, subjects, options); if (told) then?.(); return told })
+    const { fact, identity } = this.noticeIdentity(missionId, subjects, options)
+    return !hasNotice(this.rt.store.list('deliveries', missionId), identity) && this.rt.commit(missionId, () => { this.enqueueOwnerNotice(missionId, content, identity, false, { subjects: fact.subjects, fact }); then?.(); return true })
   }
 
   /**
@@ -620,18 +620,16 @@ export class Notices {
   }
 
   /**
-   * Record one owner-addressed notice (or an escalation) durably. Returns the
-   * delivery that carries it (over the wake budget, the window's summary), or
-   * undefined when `dedupe` finds the same class, key and sender on the ledger.
-   * Callers may already be inside a transaction; this method only reads and
-   * writes through the store and never opens one.
+   * Record one owner-addressed notice durably under the identity its caller
+   * derived (`noticeIdentity` for a fact; an escalation names its own). Returns
+   * the delivery that carries it (over the wake budget, the window's summary), or
+   * undefined when `dedupe` finds that identity on the ledger. Callers may already
+   * be inside a transaction; this method never opens one.
    */
-  enqueueOwnerNotice(missionId: string, content: string, from: string, noticeClass: NoticeClass, extra: Partial<Delivery> & { fact?: NoticeFactRecord } = {}, dedupe = noticeClass === 'budget', dedupKeyOverride?: string): Delivery | undefined {
+  enqueueOwnerNotice(missionId: string, content: string, identity: { class: NoticeClass; dedupKey: string; from: string }, dedupe: boolean, extra: Partial<Delivery> & { fact?: NoticeFactRecord }): Delivery | undefined {
     const fact = extra.fact
-    // R17-G3: the fact key is the default identity; the board fingerprint is
-    // kept only for the callers that still pass an explicit key.
-    const dedupKey = dedupKeyOverride ?? (fact === undefined ? this.noticeKey(missionId) : factKey(missionId, fact))
-    if (dedupe && hasNotice(this.rt.store.list('deliveries', missionId), { class: noticeClass, dedupKey, from })) return undefined
+    const { class: noticeClass, dedupKey, from } = identity
+    if (dedupe && hasNotice(this.rt.store.list('deliveries', missionId), identity)) return undefined
     const at = this.rt.now()
     // R17-G4: one per-owner budget bounds every family together. Over budget, the
     // fact is carried by the window's degraded summary instead of being dropped.

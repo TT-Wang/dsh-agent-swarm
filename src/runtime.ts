@@ -26,7 +26,7 @@ import { authorIdsOf, canBorrowTask, canOwnReview, strandedReview } from './assi
 import { executionClock, executionElapsed } from './resource-time.ts'
 import { completionExempt, taskGraphIndex, type TaskGraphIndex } from './task-graph.ts'
 import { checkSyntaxDetail, declaredPlanChecks, orderedTasks, pairReviews, planAdvisories, validatePlan } from './plans.ts'
-import { OWNER_ONLY_TOOLS, type Actor, type AutoStart, BoardQuery, Budget, CheckAttribution, CheckEnvelope, CheckEnvironment, CheckResult, CreateMissionInput, CriticalPath, Delivery, DraftPlan, Escalation, Evidence, EvidenceStatus, Member, MemberStatus, Mission, NoticeClass, nextWorkerName, ObserveQuery, MessageInput, PlanInput, Post, PostInput, PostKind, ProposeTaskInput, ProviderOutage, PublishInput, RecoveryFallback, RequestStartInput, RuntimeConfig, Snapshot, Task, TaskAmendment, TaskRejection, TaskCeiling, ToolRun, UsageBuckets, UsageSnapshotSource, VerificationCleanupFailure, WorkerAdapter, WorkerActivity, Workstream } from './types.ts'
+import { OWNER_ONLY_TOOLS, type Actor, type AutoStart, BoardQuery, Budget, CheckAttribution, CheckEnvelope, CheckEnvironment, CheckResult, CreateMissionInput, CriticalPath, Delivery, DraftPlan, Escalation, Evidence, EvidenceStatus, Member, MemberStatus, Mission, nextWorkerName, ObserveQuery, MessageInput, PlanInput, Post, PostInput, PostKind, ProposeTaskInput, ProviderOutage, PublishInput, RecoveryFallback, RequestStartInput, RuntimeConfig, Snapshot, Task, TaskAmendment, TaskRejection, TaskCeiling, ToolRun, UsageBuckets, UsageSnapshotSource, VerificationCleanupFailure, WorkerAdapter, WorkerActivity, Workstream } from './types.ts'
 import { requireArtifactChecks } from './artifact-policy.ts'
 
 const id = (prefix: string) => `${prefix}_${randomUUID()}`
@@ -392,7 +392,6 @@ export class SwarmRuntime {
    */
   dispatchQuestion(missionId: string, tasks: Task[], members: Member[], dispatchable: Task[]): ReturnType<Scheduling['dispatchQuestion']> { return this.scheduling.dispatchQuestion(missionId, tasks, members, dispatchable) }
   noticeKey(missionId: string): string { return this.notices.noticeKey(missionId) }
-  private enqueueOwnerNotice(missionId: string, content: string, from: string, noticeClass: NoticeClass, extra: Partial<Delivery> = {}, dedupe = noticeClass === 'budget', dedupKeyOverride?: string): Delivery | undefined { return this.notices.enqueueOwnerNotice(missionId, content, from, noticeClass, extra, dedupe, dedupKeyOverride) }
   noticeLedger(actor: Actor, missionId: string, query: { limit?: number } = {}): unknown { return this.notices.noticeLedger(actor, missionId, query) }
   private bounded(text: string): string { return this.notices.bounded(text) }
   private ensureWitness(missionId: string): void { return this.notices.ensureWitness(missionId) }
@@ -1964,7 +1963,7 @@ export class SwarmRuntime {
     this.commit(missionId, () => {
       // R15-A1: the escalation names the task or attempt it is about, so the
       // owner ledger shows the subject without reparsing the body.
-      this.enqueueOwnerNotice(missionId, body, member.id, 'escalation', { id: deliveryId, escalation, subjects: this.noticeSubjectsFor(missionId, { taskId, memberId: member.id }) }, false)
+      this.notices.enqueueOwnerNotice(missionId, body, { class: 'escalation', dedupKey, from: member.id }, false, { id: deliveryId, escalation, subjects: this.noticeSubjectsFor(missionId, { taskId, memberId: member.id }) })
       this.store.event(missionId, 'escalation/raised', member.id, {
         escalationId: escalation.id, memberId: member.id, deliveryId,
         ...(taskId === undefined ? {} : { taskId }), ...(attemptId === undefined ? {} : { attemptId }),
