@@ -72,7 +72,8 @@ resolved: `tests/client-event-projection.test.mjs` "a real restart with the huma
 revocation with its reason" fails from `6f87081` (it passes at `29a0268` and at `6f87081^`). After a revocation the
 board, no longer short-circuited by the stall root's witness stamp, also tells its W3 stall, so the panel's three
 newest events no longer include the revocation; the W3 stall, the stall root and the workspace terminal then name
-the same blocked task, and whether the W3 stall is an owed decision or a same-subject duplicate is not decided here.
+the same blocked task. Whether the W3 stall is an owed decision or a same-subject duplicate is decided in repair round
+2 below.
 
 | Check at `4b2604b` | 0.1.5-rc.3 (`a4c74a91e0`) | 0.1.7-rc.1 (`46a7f68b09`) |
 | --- | --- | --- |
@@ -110,6 +111,41 @@ the same blocked task, and whether the W3 stall is an owed decision or a same-su
 | `node scripts/faults/run.mjs` | 24/24 | 24/24 |
 | `scripts/smoke-web.mjs` / `scripts/smoke-command-web.mjs` | passed, 13 checks / passed, 10 checks | passed / passed |
 | Test files the round touched (6), three rounds of two concurrent copies | 36/36 runs passed | the 7 touched or outage files, once: 64/64 tests |
+
+**Repair round 2 of steps 8 to 10** (`a785c3c` to `f3d4b2c`). `src` net against `29a0268` is now −584 lines
+(+637/−1221); the round is −5.
+- `a785c3c` (fix). The adapter reported a classified provider error twice, through `providerOutage` and through
+  `failure`, and since step 8 the member-failure notice is keyed by the error text. Retries whose text differed by a
+  request id therefore woke the owner once per report with "<member> failed": five reports wrote one outage row and
+  five failure rows. Each cause now has one emitter: a classified error is reported as the outage alone, as the start
+  path already did, and `WorkerCallbacks.providerOutage` is required (`tests/harness-workers.test.mjs`, through the
+  real adapter, fails on `29a0268` and on `bb15d25`).
+- `aeb4d7d` (fix). `f1a14f5` kept an early return inside the 30-second window that bounds the outage event, so the
+  same class over new work inside that window was not told. Repair round 1's statement that the ledger alone decides
+  was false; its test advanced past the window. The window now paces only the `provider/outage` event
+  (`tests/notice-openers.test.mjs` reports the new work 1 s later; fails on `29a0268` and with the return restored).
+- `864f030` (refactor). `enqueueOwnerNotice` loses its `dedupe` flag. notify and tell each read the ledger before they
+  write, and an escalation is written unguarded.
+- `fb98484` (test). A task-budget refusal and an experiment-budget refusal of one proposer at one limit value are two
+  requests. Before this, no test told the reason apart. The test fails on `29a0268` and on a key without the reason.
+- `f3d4b2c` (test). `tests/client-event-projection.test.mjs` fails from `6f87081`, which is on this branch; the
+  failure is not pre-existing. It is the designed change. With the witness gone, the W3 stall is told for its own
+  fact beside the stall root and the workspace terminal on the blocked task. F19 row 7 and the ceiling-bound case in
+  `tests/liveness-create-path.test.mjs` already had that shape at `29a0268`, where the board changed in between. The
+  compact overview's three newest events are therefore those facts, and the assertion now renders the overview as of
+  the revocation.
+- Left open as an owner decision: a worker's refused proposal keeps the budget chain's wording, and the owner's own
+  refusal at the same limit is a separate request. Both gaps are removed by one `task_ceiling` request per limit for
+  every proposer, but that ends the wake per proposer that the design names (known-limitations).
+
+| Check at `f3d4b2c` | 0.1.5-rc.3 (`a4c74a91e0`) | 0.1.7-rc.1 (`46a7f68b09`) |
+| --- | --- | --- |
+| `npm run typecheck` / `npm run build` | passed / passed | passed / passed |
+| `npm run test:harness` | passed; `UPDATE_SMOKE_SNAPSHOT=1` leaves `tests/fixtures/model-visible.expected.json` unchanged | passed |
+| `npm run test:replay` | passed, digest unchanged | passed, digest unchanged |
+| `node scripts/faults/run.mjs` | 24/24 | 24/24 |
+| `scripts/smoke-web.mjs` / `scripts/smoke-command-web.mjs` | passed, 13 checks / passed, 10 checks | passed, 13 checks / passed, 10 checks |
+| Test files the round touched (3), three rounds of two concurrent copies | 18/18 runs passed | the 3 touched files and 3 outage or refusal files, once: 100/100 tests |
 
 ## Round-29 simplification batch 9: one authorization rule, one exit table, a derived progress clock (2026-09-25)
 
