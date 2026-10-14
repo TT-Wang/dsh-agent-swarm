@@ -81,12 +81,18 @@ test('each challenge of a claim is its own fact, opened by its event', async t =
   assert.equal(new Set(challenges.map(delivery => JSON.stringify(delivery.subjects))).size, 1, 'on the same subjects')
 })
 
-test('a member failure is keyed by its recorded message: another failure on the same work is told, a repeat is not', async t => {
+test('a member failure is the member on its open work, whatever the provider text: a failure whose text carries per-request data is that fact again, while another member\'s failure and the member\'s failure over new work are new facts', async t => {
   const f = await fixture(t)
-  f.workers.callbacks.failure(f.author.id, 'session crashed')
+  const failures = () => ownerRows(f, / failed: /).map(delivery => [delivery.content.slice(0, delivery.content.indexOf(' ')), delivery.subjects])
+  const root = [`mission:${f.mission.id}`]
+  // A provider error the outage classifier does not catch, whose text names the tokens each request asked for.
+  for (let turn = 0; turn < 3; turn++) f.workers.callbacks.failure(f.author.id, `This model's maximum context length is 131072 tokens. However, you requested ${131_500 + 700 * turn} tokens. Please reduce the length of the messages.`)
+  f.workers.callbacks.failure(f.reviewer.id, 'session crashed')
+  assert.deepEqual(failures(), [['Author', root], ['Reviewer', root]], 'one fact per member, each naming the mission root while it holds no work')
+  const work = f.propose({ title: 'Assigned work' })
   f.workers.callbacks.failure(f.author.id, 'session crashed')
   f.workers.callbacks.failure(f.author.id, 'provider returned malformed output')
-  assert.deepEqual(ownerRows(f, /^Author failed: /).map(delivery => delivery.content), ['Author failed: session crashed', 'Author failed: provider returned malformed output'])
+  assert.deepEqual(failures(), [['Author', root], ['Reviewer', root], ['Author', [`${work.id}@${taskOf(f.runtime, work.id).epoch}`]]], 'the member\'s failure over its new work is a new fact, told once')
 })
 
 test('a worker\'s refused proposal is one fact per reason and limit, and each exit it names is performed through the registered tools: swarm_control\'s resume and swarm_cancel admit nothing and tell nothing new, swarm_budget admits the work, and a refusal under the raised limit is a new fact', async t => {

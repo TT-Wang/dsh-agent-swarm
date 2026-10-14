@@ -3941,9 +3941,9 @@ export class SwarmRuntime {
       : `${member.name} failed: ${error}`
     this.commit(member.missionId, () => {
       this.store.event(member.missionId, 'member/failure', memberId, { error })
-      // R15-A1: a member failure with no assigned task still names the member's
-      // unfinished work; the mission root is the fallback, never silence.
-      this.notify(member.missionId, message, this.noticeSubjectsFor(member.missionId, { memberId: member.id }), { trigger: 'member/failure', reason: message })
+      // R15-A1: it names the member's unfinished work, else the mission root. The fact
+      // is the member on that work; the provider's text (per-request data) is the body.
+      this.notify(member.missionId, message, this.noticeSubjectsFor(member.missionId, { memberId: member.id }), { trigger: 'member/failure', reason: member.id })
     })
   }
   /**
