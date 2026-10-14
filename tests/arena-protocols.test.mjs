@@ -140,10 +140,10 @@ test('the notice ledger records sent, queued and claimed with the state fingerpr
   assert.equal(queued.consumedAt, undefined, 'transport is never relabelled as consumption')
   assert.ok(Number.isSafeInteger(queued.sentAt) && Number.isSafeInteger(queued.queuedAt))
   assert.equal(queued.sentAt, queued.queuedAt, 'sent and queued are recorded at enqueue')
-  // R17-G3: the identity is the fact — family, subject@epoch and the recorded
-  // reason — not a digest of the whole board, so an unrelated change cannot
-  // re-arm this notice.
-  assert.match(queued.dedupKey, /^budget:mission_[0-9a-f-]+:mission:mission_[0-9a-f-]+:(?:none|[0-9a-f]{16})$/, `the dedup key is the fact key: ${queued.dedupKey}`)
+  // R17-G3: the identity is the fact — the refusal's event, subject@epoch and the
+  // recorded reason with its limit — not a digest of the whole board, so an
+  // unrelated change cannot re-arm this notice.
+  assert.match(queued.dedupKey, /^task\/proposal-refused:mission_[0-9a-f-]+:mission:mission_[0-9a-f-]+:[0-9a-f]{16}$/, `the dedup key is the fact key: ${queued.dedupKey}`)
   assert.equal(queued.deliveryId, queued.id)
   // Read-only: two reads of the same state are identical and mutate nothing.
   const revision = f.runtime.store.revision()

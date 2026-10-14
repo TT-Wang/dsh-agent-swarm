@@ -352,7 +352,7 @@ export class SwarmRuntime {
 
   /** M1a seam 3/7: owner notices, witnesses and the outbox that delivers them. */
   private readonly notices = new Notices(this)
-  notify(missionId: string, content: string, subjects: string[], options: NotifyOptions = {}): boolean { return this.notices.notify(missionId, content, subjects, options) }
+  notify(missionId: string, content: string, subjects: string[], options: NotifyOptions): boolean { return this.notices.notify(missionId, content, subjects, options) }
   tell(missionId: string, content: string, subjects: string[], options: NotifyOptions, then?: () => void): boolean { return this.notices.tell(missionId, content, subjects, options, then) }
   ownerDeliveryRelevant(mission: Mission, delivery: Delivery): boolean { return this.notices.ownerDeliveryRelevant(mission, delivery) }
   ownerDeliveryContent(mission: Mission, delivery: Delivery): string { return this.notices.ownerDeliveryContent(mission, delivery) }
@@ -1698,7 +1698,7 @@ export class SwarmRuntime {
           task.verificationRecovery = { sourceTaskId: source.id, commit: artifact.commit, reason, at: this.now() }
           this.store.put('tasks', task)
           this.store.event(missionId, 'task/verification-deferred', member.id, { sourceTaskId: source.id, verificationTaskId: task.id, commit: artifact.commit, reason, checks: runIds })
-          this.notify(missionId, reason, this.interpretation(missionId).subjectsOf([source, task]), { from: member.id })
+          this.notify(missionId, reason, this.interpretation(missionId).subjectsOf([source, task]), { from: member.id, trigger: 'task/verification-deferred', reason })
         })
         this.kick(missionId)
         return task
@@ -2161,10 +2161,10 @@ export class SwarmRuntime {
           this.store.event(missionId, 'task/invalidated', 'runtime', { taskId: dependent.id, sourceTaskId: source.id, evidenceId: evidence.id })
         }
       }
-      this.store.event(missionId, 'evidence/challenged', key, input)
-      // The challenged claim's own task is the subject; the dependents it
-      // invalidated are named by the `task/invalidated` events, not merged into it.
-      this.notify(missionId, `Evidence ${evidence.id} challenged: ${input.reason}`, this.interpretation(missionId).subjectsOf([source]), { from: key })
+      const challenge = this.store.event(missionId, 'evidence/challenged', key, input)
+      // The challenged claim's own task is the subject and this challenge's event
+      // the fact; the dependents it invalidated are named by `task/invalidated`.
+      this.notify(missionId, `Evidence ${evidence.id} challenged: ${input.reason}`, this.interpretation(missionId).subjectsOf([source]), { from: key, trigger: 'evidence/challenged', reason: `${evidence.id} challenge ${challenge}` })
     })
     for (const dependent of interrupted) this.attempts.resumeStoppedAttempt(missionId, dependent)
     this.kick(missionId)
@@ -3859,7 +3859,7 @@ export class SwarmRuntime {
           windowMs: TEMP_RENDEZVOUS_WINDOW_MS, detection: 'command-mention',
         })
         this.notify(member.missionId, `Two members named the same shared temp path ${rendezvous.path} inside ${Math.round(TEMP_RENDEZVOUS_WINDOW_MS / 60_000)} minute(s): ${rendezvous.first.memberId} then ${rendezvous.second.memberId}. The host temp roots are writable by every workspace-write execution; never use them to pass state between members or missions.`,
-          tempRendezvousSubjects(this, member.missionId, rendezvous), { from: memberId })
+          tempRendezvousSubjects(this, member.missionId, rendezvous), { from: memberId, trigger: 'isolation/temp-rendezvous', reason: rendezvous.path })
       }
       if (typed === undefined) return
       // Durable audit plus a typed delivery, so the worker learns the supported
@@ -3893,15 +3893,15 @@ export class SwarmRuntime {
     // R17-G1: the member's open work comes from the shared interpretation.
     const view = this.interpretation(member.missionId)
     const open = view.tasks.filter(task => task.status === 'running' && task.attempt?.ownerId === member.id)
-    this.store.event(member.missionId, 'provider/outage', 'runtime', { memberId: member.id, class: outage.class, status: outage.status, message: outage.message, taskIds: open.map(task => task.id) })
-    // One owner notice per class transition, never one per retry.
+    const recorded = this.store.event(member.missionId, 'provider/outage', 'runtime', { memberId: member.id, class: outage.class, status: outage.status, message: outage.message, taskIds: open.map(task => task.id) })
+    // One owner notice per class transition, opened by its event, never one per retry.
     if (previous?.class !== outage.class) {
       // R15-A1/A4: a member-scoped notice names that member's open work: the
       // subject is the task whose clock the outage holds, never the whole board.
       // The mission root is the fallback only when the member owns no open task.
       this.notify(member.missionId,
         `${member.name} provider ${outage.class} outage${outage.status === undefined ? '' : ` (HTTP ${outage.status})`}: ${outage.message}. Its attempt is preserved and no recovery credit is spent while the route is quiescent.`,
-        open.length ? view.subjectsOf(open) : [missionSubject(view.mission)], { from: member.id })
+        open.length ? view.subjectsOf(open) : [missionSubject(view.mission)], { from: member.id, trigger: 'provider/outage', reason: `${outage.class} outage ${recorded}` })
     }
   }
   /** R11-01: the member's route is quiescent only inside the outage window. */
@@ -3949,7 +3949,7 @@ export class SwarmRuntime {
       this.store.event(member.missionId, 'member/failure', memberId, { error })
       // R15-A1: a member failure with no assigned task still names the member's
       // unfinished work; the mission root is the fallback, never silence.
-      this.notify(member.missionId, message, this.noticeSubjectsFor(member.missionId, { memberId: member.id }))
+      this.notify(member.missionId, message, this.noticeSubjectsFor(member.missionId, { memberId: member.id }), { trigger: 'member/failure', reason: message })
     })
   }
   /**
@@ -4080,13 +4080,13 @@ export class SwarmRuntime {
         this.store.event(missionId, 'task/start-failed', 'runtime', { taskId: task.id, epoch: task.epoch, reason, recoveryCount: task.recoveryCount ?? 0, maxRecoveryAttempts: task.maxRecoveryAttempts ?? this.config.maxTasksPerMember, status: task.status, consecutiveFailures, quiescent: outage !== undefined })
         if (target !== undefined) this.store.event(missionId, 'task/reassigned', 'runtime', { taskId: task.id, from: member.id, to: target.id, reason, consecutiveFailures })
       }
-      this.store.event(missionId, 'member/resume-failed', 'runtime', { memberId: member.id, error: String(error), consecutiveFailures, rerouted: reroute, ...(outage === undefined ? {} : { outage: outage.class }) })
+      const failure = this.store.event(missionId, 'member/resume-failed', 'runtime', { memberId: member.id, error: String(error), consecutiveFailures, rerouted: reroute, ...(outage === undefined ? {} : { outage: outage.class }) })
       // The outage notice is emitted by `recordProviderOutage`; do not claim a
       // recovery credit that was never spent.
       if (outage !== undefined) return
       if (!reroute) {
         this.notify(missionId, `${member.name} could not start (failure ${consecutiveFailures} of ${START_FAILURE_REROUTE_LIMIT}); its queued work and task recovery allowance are preserved.`,
-          this.noticeSubjectsFor(missionId, { memberId: member.id }))
+          this.noticeSubjectsFor(missionId, { memberId: member.id }), { trigger: 'member/resume-failed', reason: `${member.id} start failure ${failure}` })
         return
       }
       // The retirement is its own fact (never deduplicated into an earlier

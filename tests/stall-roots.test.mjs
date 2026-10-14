@@ -428,8 +428,7 @@ test('a rejected root whose decision was summarized is its own fact, and is name
 })
 
 test('a stall root with no rejection decision (a permanent preparation failure) is still its own owner wake', async t => {
-  // The same generic `decision` notice shape the verify site used before, from
-  // the scheduler's permanent preparation failure: it never covers a stall root.
+  // The scheduler's permanent preparation failure notice: it never covers a stall root.
   // The clock and the ticks are driven by hand.
   const f = await fixture(t, { clock: new FakeClock() })
   const research = { kind: 'research', checks: undefined }
@@ -442,7 +441,7 @@ test('a stall root with no rejection decision (a permanent preparation failure) 
     row.preparationFailure = { reason: 'Workspace or worker preparation failed: EACCES', transient: false, attempts: 1 }
     row.output = 'Workspace or worker preparation failed: EACCES'
     f.runtime.store.put('tasks', row)
-    f.runtime.notify(f.mission.id, row.output, [`${row.id}@${row.epoch}`], { from: 'runtime' })
+    f.runtime.notify(f.mission.id, row.output, [`${row.id}@${row.epoch}`], { trigger: 'task/preparation-failed', reason: row.preparationFailure.reason })
   })
   await f.runtime.settle(f.mission.id)
   const root = await ticksUntil(f, () => f.stallRoots().find(delivery => delivery.deliveredAt !== undefined), 'the stall root is delivered as its own wake', 320)
@@ -613,7 +612,7 @@ for (const coNotice of ['stall-root', 'permanent-preparation-failure']) {
         dead.preparationFailure = { reason: 'Workspace or worker preparation failed: EACCES', transient: false, attempts: 1 }
         dead.output = 'Workspace or worker preparation failed: EACCES'
         f.runtime.store.put('tasks', dead)
-        f.runtime.notify(f.mission.id, dead.output, [`${dead.id}@${dead.epoch}`], { from: 'runtime' })
+        f.runtime.notify(f.mission.id, dead.output, [`${dead.id}@${dead.epoch}`], { trigger: 'task/preparation-failed', reason: dead.preparationFailure.reason })
       } else {
         dead.output = 'blocked for repair'
         f.runtime.store.put('tasks', dead)

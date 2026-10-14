@@ -216,17 +216,14 @@ export class RefusalRegistry {
     // Round 14: the budget chain's terminal element is the *owner decision*, not
     // the worker's tool error. The worker keeps the round-13 refusal text; the
     // owner notice becomes the coded decision request naming the executable
-    // exits. The notice keeps the round-11 ledger invariant — a budget-class
-    // notice is deduplicated by the mission-state fingerprint, not by a custom
-    // key — so one unchanged board never re-wakes the owner.
+    // exits, one per proposer, refusal reason and limit: a refusal the owner
+    // already holds never wakes it again, and a new reason or limit does.
     const terminal = guardTerminal('budget', { memberId: proposer, detail: `the proposal ${JSON.stringify(title)} was refused: ${reason} (limit ${limit})` })
     this.rt.commit(mission.id, () => {
       this.rt.store.event(mission.id, 'task/proposal-refused', proposer, { memberId: proposer, title, reason, limit })
       // R15-A1: a refused proposal has no task to name yet, so the mission root is
-      // the exact lineage root of the decision. Guard pair: budget refusal x
-      // reason-less writer-busy (the `WriterBusyError` catch below) — the subject is
-      // computed before the write, so a busy writer never turns it into silence.
-      this.rt.notify(mission.id, terminal.message, [missionSubject(mission)], { from: proposer, noticeClass: 'budget', dedupe: true })
+      // the exact lineage root of the decision.
+      this.rt.notify(mission.id, terminal.message, [missionSubject(mission)], { from: proposer, noticeClass: 'budget', trigger: 'task/proposal-refused', reason: `${reason} (limit ${limit})` })
     })
     // The owner notice must not wait for the next scheduler tick; flush it now.
     this.rt.kick(mission.id)

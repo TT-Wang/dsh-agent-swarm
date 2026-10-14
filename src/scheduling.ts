@@ -317,7 +317,7 @@ export class Scheduling {
               this.rt.store.event(missionId, 'task/preparation-failed', 'runtime', { taskId: fresh.id, epoch: fresh.epoch, reason, ...fresh.preparationFailure, status: fresh.status })
               if (retry) return
               this.rt.store.event(missionId, 'task/blocked', 'runtime', { taskId: fresh.id, reason: fresh.output })
-              this.rt.notify(missionId, fresh.output!, this.rt.interpretation(missionId).subjectsOf([fresh]), { from: 'runtime' })
+              this.rt.notify(missionId, fresh.output!, this.rt.interpretation(missionId).subjectsOf([fresh]), { trigger: 'task/preparation-failed', reason })
             })
           }
           } catch (error) {

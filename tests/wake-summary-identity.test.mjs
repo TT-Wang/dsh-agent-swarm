@@ -78,7 +78,7 @@ for (const delivered of [false, true]) {
   })
 }
 
-test('summary dedup keeps class, sender, epoch, reason and explicit repeat semantics', async t => {
+test('summary dedup keeps class, sender, epoch and reason, and a new fact after handoff gets a new delivery', async t => {
   const f = await fixture(t)
   f.fillBudget()
   const key = f.emit('decision body', { reason: 'waiting' })
@@ -87,10 +87,9 @@ test('summary dedup keeps class, sender, epoch, reason and explicit repeat seman
   f.emit('decision body', { reason: 'waiting', from: 'member-a' })
   f.emit('decision body', { reason: 'waiting', subject: 'task_delivery@1' })
   f.emit('decision body', { reason: 'new evidence' })
-  // Transition-owned notices can deliberately re-announce a change-and-return.
-  f.emit('decision body', { reason: 'waiting', dedupe: false })
+  f.emit('decision body', { reason: 'waiting again' })
   const summary = f.rows().find(row => row.notice?.facts)
-  assert.equal(summary.notice.facts.length, 6, 'only the ordinary repeat is suppressed')
+  assert.equal(summary.notice.facts.length, 6, 'only the repeat of one fact is suppressed')
   const match = { class: 'decision', from: 'runtime', dedupKey: key }
   assert.equal(hasNotice(f.rows(), { ...match, content: 'decision body' }), true)
   assert.equal(hasNotice(f.rows(), { ...match, content: 'different body' }), false,
@@ -98,8 +97,8 @@ test('summary dedup keeps class, sender, epoch, reason and explicit repeat seman
   assert.equal(hasNotice(f.rows(), { ...match, from: 'member-b' }), false)
   assert.equal(hasNotice(f.rows(), { ...match, class: 'failure' }), false)
   await f.runtime.flushOutbox(f.mission.id)
-  f.emit('decision body', { reason: 'waiting', dedupe: false })
+  f.emit('decision body', { reason: 'still waiting' })
   await f.runtime.flushOutbox(f.mission.id)
   assert.equal(f.workers.sent.filter(row => row.notice?.facts).length, 2,
-    'an explicit new announcement after handoff gets a new immutable delivery')
+    'a new fact after handoff gets a new immutable delivery')
 })

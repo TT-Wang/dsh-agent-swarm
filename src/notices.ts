@@ -66,21 +66,22 @@ function noticeSubjects(subjects: readonly string[] | undefined, mission: Pick<M
 }
 /**
  * R15-A1: the delivery options one notice call site passes. The subjects are a
- * required positional argument; every other field has a documented default, so a
- * new call site cannot inherit "no subject" by omission.
+ * required positional argument, and the fact is named by its trigger or an
+ * explicit key, so a new call site cannot inherit "no subject" or "no fact" by
+ * omission.
  */
-export interface NotifyOptions {
-  from?: string
-  noticeClass?: NoticeClass
-  dedupe?: boolean
-  dedupKey?: string
+export type NotifyOptions = ({
   /**
    * R17-G3: the durable event that triggered this fact (for example
    * `task/blocked`, `dispatch-question`, `absence-net`). With `reason` it is the
    * fact identity the dedup key is built from, so an unrelated board change
    * cannot re-arm the notice and a new fact cannot be suppressed.
    */
-  trigger?: string
+  trigger: string
+  dedupKey?: string
+} | { trigger?: undefined; dedupKey: string }) & {
+  from?: string
+  noticeClass?: NoticeClass
   /** R17-G3: the recorded reason the fact's rows carry (never invented by the body). */
   reason?: string
   /** Full facts and their original identities when one notice presents a batch. */
@@ -190,12 +191,11 @@ export function reasonDigest(reason: string): string {
  * re-arm a notice and a new fact is never suppressed by an old one.
  *
  * Two boundaries, stated here because they cannot be inferred from the call:
- * - The "triggering event" is the event TYPE (`NotifyOptions.trigger`, or the
- *   notice class when no trigger is given). A second, distinct transition of the
- *   same type at the same subject@epoch with the same recorded reason is
- *   therefore the SAME fact and is suppressed — the round's "at most one notice
- *   per fact" rule. A changed reason, a changed subject epoch or a changed
- *   trigger is a new fact and is recorded.
+ * - The "triggering event" is the event TYPE (`NotifyOptions.trigger`). A
+ *   second, distinct transition of the same type at the same subject@epoch with
+ *   the same recorded reason is therefore the SAME fact and is suppressed — the
+ *   round's "at most one notice per fact" rule. A changed reason, a changed
+ *   subject epoch or a changed trigger is a new fact and is recorded.
  * - A body a reviewed template rendered is keyed by that template's family
  *   (`NoticeStatement.family`), and the trigger does NOT participate: one field
  *   names the family, so the key prefix, `noticeFamily`, `noticeTemplateKey` and
@@ -587,11 +587,11 @@ export class Notices {
    * `missionSubject`; it can no longer pass nothing.
    *
    * Returns whether the fact was recorded for the owner (its own row or a
-   * wake-budget summary constituent); false when the notice dedup suppressed it.
+   * wake-budget summary constituent); false when the ledger already holds it.
    */
-  notify(missionId: string, content: string, subjects: string[], options: NotifyOptions = {}): boolean {
+  notify(missionId: string, content: string, subjects: string[], options: NotifyOptions): boolean {
     const { fact, identity } = this.noticeIdentity(missionId, subjects, options)
-    return this.enqueueOwnerNotice(missionId, content, identity, options.dedupe ?? true, { subjects: fact.subjects, fact }) !== undefined
+    return this.enqueueOwnerNotice(missionId, content, identity, true, { subjects: fact.subjects, fact }) !== undefined
   }
 
   /** Tell the owner one fact in a transaction of its own: a fact the ledger already holds (its class, key and sender) commits nothing; otherwise one commit writes its row, then `then`, the record that exists only with that row. */
@@ -608,7 +608,7 @@ export class Notices {
    */
   private noticeIdentity(missionId: string, subjects: string[], options: NotifyOptions): { fact: NoticeFactRecord; identity: { class: NoticeClass; dedupKey: string; from: string } } {
     const noticeClass = options.noticeClass ?? 'decision'
-    const fact: NoticeFactRecord = { subjects: noticeSubjects(subjects, { id: missionId }), trigger: options.trigger ?? options.dedupKey?.split(':')[0] ?? noticeClass, reason: options.reason ?? '', questionId: options.questionId, deliveryFailureId: options.deliveryFailureId,
+    const fact: NoticeFactRecord = { subjects: noticeSubjects(subjects, { id: missionId }), trigger: options.trigger ?? options.dedupKey.split(':')[0]!, reason: options.reason ?? '', questionId: options.questionId, deliveryFailureId: options.deliveryFailureId,
       ...(options.facts === undefined ? {} : { facts: options.facts }), ...(options.aggregatedIdentities === undefined ? {} : { aggregatedIdentities: options.aggregatedIdentities }),
       ...(options.coveredBy === undefined ? {} : { coveredBy: options.coveredBy }), ...(options.statement === undefined ? {} : { statement: options.statement }) }
     return { fact, identity: { class: noticeClass, dedupKey: options.dedupKey ?? factKey(missionId, fact), from: options.from ?? 'runtime' } }
@@ -926,7 +926,7 @@ export class Notices {
         for (const part of currentFact.aggregatedFacts ?? []) if (reminded.includes(part.factStart)) part.followupCount = (part.followupCount ?? 0) + 1
         this.rt.store.put('deliveries', current)
         this.notify(mission.id, `Owner decision still unresolved (reminder ${ordinal} of ${this.maxObligationFollowups}, original delivery ${delivery.id}). Subjects: ${unresolved.join(', ')}. Prior notice: ${compactFact(priorContent, 600)}\nRead the original with swarm_observe({ missionId: "${mission.id}", deliveryId: "${delivery.id}" }) and apply the decision.${ordinal === this.maxObligationFollowups ? '\nReminder limit reached; the unresolved obligation remains on the board.' : ''}`, unresolved,
-          { dedupe: true, dedupKey: `obligation-followup:${delivery.id}:${spent + 1}`, trigger: 'owner-decision-unresolved', reason: delivery.id })
+          { dedupKey: `obligation-followup:${delivery.id}:${spent + 1}`, trigger: 'owner-decision-unresolved', reason: delivery.id })
       })
     }
   }
@@ -1021,16 +1021,6 @@ export class Notices {
         if (family === 'dispatch-question') return task.status === 'pending'
         return this.interpretation(mission.id).parkedHolders.some(holder => holder.task.id === task.id)
       })
-    }
-    // Before review-blocked was explicit, missing-review notices were generic
-    // decisions. Their still-submitted subjects are enough to recognize that
-    // admitting a review fulfilled the request without interpreting prose.
-    if (fact.class === 'decision' && fact.trigger === 'decision' && delivery.subjects?.length) {
-      const tasks = this.rt.store.list('tasks', mission.id)
-      if (delivery.subjects.every(subject => {
-        const task = taskFromSubject(subject, tasks)
-        return task?.status === 'submitted' && this.rt.reviewable(task, tasks)
-      })) return false
     }
     return true
   }
@@ -1523,7 +1513,7 @@ export class Notices {
       if (woken) return
       const { content, statement } = renderNotice('review-blocked', { sourceId: row.id, reason })
       this.notify(mission.id, content, view.subjectsOf([row]),
-        { dedupe: true, dedupKey: key, trigger: NOTICE_TEMPLATES['review-blocked'].trigger, reason, statement })
+        { dedupKey: key, trigger: NOTICE_TEMPLATES['review-blocked'].trigger, reason, statement })
     })
   }
 

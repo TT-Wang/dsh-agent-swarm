@@ -74,4 +74,10 @@ test('R11-15: two members naming the same temp path emit one durable event and o
   await workers.callbacks.toolRun(first.id, { tool: 'bash', arguments: { command: 'cat src/answer.txt' }, result: { exitCode: 0 }, isError: false })
   await workers.callbacks.toolRun(second.id, { tool: 'bash', arguments: { command: 'cat src/answer.txt' }, result: { exitCode: 0 }, isError: false })
   assert.equal(runtime.store.events(mission.id, 500).filter(event => event.type === 'isolation/temp-rendezvous').length, 1)
+  // The same pair on another temp path is another rendezvous, and the owner is told it: the path is the fact's reason.
+  await workers.callbacks.toolRun(first.id, { tool: 'bash', arguments: { command: 'cat /tmp/swarm-rendezvous-other' }, result: { exitCode: 0 }, isError: false })
+  await workers.callbacks.toolRun(second.id, { tool: 'bash', arguments: { command: 'cat /tmp/swarm-rendezvous-other' }, result: { exitCode: 0 }, isError: false })
+  const told = runtime.store.list('deliveries', mission.id).filter(delivery => delivery.to === 'owner' && /shared temp path/.test(delivery.content))
+  assert.deepEqual(told.map(delivery => [delivery.notice.trigger, delivery.notice.reason]), [['isolation/temp-rendezvous', '/tmp/swarm-rendezvous-e2e'], ['isolation/temp-rendezvous', '/tmp/swarm-rendezvous-other']])
+  assert.equal(new Set(told.map(delivery => JSON.stringify(delivery.subjects))).size, 1, 'on the same subjects')
 })
