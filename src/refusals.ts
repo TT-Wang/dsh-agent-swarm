@@ -56,7 +56,7 @@ export function unsupportedEffort(error: unknown): { requested?: string; message
 
 type WriterBusyRecovery = { at: number; attempts: number; detail: string } & (
   { candidate: AdmissionCandidate }
-  | { missionId: string; key: string; chain: GuardChainId; context: GuardTerminalContext }
+  | { missionId: string; chain: GuardChainId; context: GuardTerminalContext }
 )
 const writerRecoveries = new WeakMap<SwarmRuntime, Map<string, WriterBusyRecovery & { count: number }>>()
 
@@ -65,7 +65,7 @@ export function queueWriterBusy(rt: SwarmRuntime, recovery: WriterBusyRecovery):
   const pending = writerRecoveries.get(rt) ?? new Map<string, WriterBusyRecovery & { count: number }>()
   writerRecoveries.set(rt, pending)
   const key = 'candidate' in recovery ? `admission:${recovery.candidate.missionId}:${admissionRowId(recovery.candidate, 'writer_busy')}`
-    : `guard:${recovery.missionId}:${recovery.key}`
+    : `guard:${recovery.missionId}:${guardTerminalKey(recovery.chain, recovery.context)}`
   const previous = pending.get(key)
   pending.set(key, { ...recovery, at: previous?.at ?? recovery.at, count: (previous?.count ?? 0) + 1 })
 }
@@ -187,10 +187,10 @@ export class RefusalRegistry {
             record.count = busy.count; record.firstAt = busy.at
             this.upsertAdmission(record)
           } else {
-            // This was a failed escalation write, never an admission decision.
-            // Record the historical failure of the request `noticeKey` names; normal guards re-evaluate today's state.
+            // This was a failed escalation write, never an admission decision. No row
+            // was written, so its cause and chain name it; the chain re-derives the request.
             this.rt.store.event(missionId, 'mission/stalled', 'runtime', {
-              cause: 'guard-terminal-write-failed', chain: busy.chain, noticeKey: busy.key,
+              cause: 'guard-terminal-write-failed', chain: busy.chain,
               taskId: busy.context.taskId ?? null, memberId: busy.context.memberId ?? null,
               detail: busy.detail, attempts: busy.attempts, count: busy.count, firstAt: busy.at,
             })
@@ -364,8 +364,8 @@ export function guardTerminal(chain: GuardChainId, context: GuardTerminalScope =
 }
 
 /** The identity of one terminal decision request on the deliveries ledger: its chain and the fact that opened it. */
-export function guardTerminalKey(chain: GuardChainId, opener: string): string {
-  return `guard-terminal:${chain}:${GUARD_TERMINAL_CODES[chain]}:${opener}`
+export function guardTerminalKey(chain: GuardChainId, context: GuardTerminalContext): string {
+  return `guard-terminal:${chain}:${GUARD_TERMINAL_CODES[chain]}:${context.localKey ?? `question:${context.questionId}`}`
 }
 
 /** The dedup `emitGuardTerminal` applies: the owner already holds the decision request `key` names. */
@@ -395,7 +395,7 @@ export function emitGuardTerminal(rt: SwarmRuntime, missionId: string, chain: Gu
   // the executable exit most — still emits the terminal.
   if (mission === undefined || rt.isMissionTerminal(mission)) return undefined
   const terminal = guardTerminal(chain, context)
-  const key = guardTerminalKey(chain, context.localKey ?? `question:${context.questionId}`)
+  const key = guardTerminalKey(chain, context)
   if (guardTerminalHeld(rt, missionId, key)) return terminal
   try {
     rt.commit(missionId, () => {
@@ -415,7 +415,7 @@ export function emitGuardTerminal(rt: SwarmRuntime, missionId: string, chain: Gu
     // is recorded once the writer is free (`recordWriterBusyRecovery`), and the
     // chain re-derives its state on the next pass.
     if (error instanceof WriterBusyError) {
-      queueWriterBusy(rt, { at: rt.now(), attempts: error.attempts, missionId, key, chain, context, detail: error.message })
+      queueWriterBusy(rt, { at: rt.now(), attempts: error.attempts, missionId, chain, context, detail: error.message })
       return terminal
     }
     throw error

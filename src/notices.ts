@@ -1083,16 +1083,16 @@ export class Notices {
    */
   private openGuardTerminal(missionId: string, delivery: Delivery): string[] | undefined {
     const key = delivery.notice?.dedupKey
-    if (key?.startsWith(guardTerminalKey('workspace', 'isolation:'))) {
-      return this.rt.isolationViolations(missionId).some(violation => key === guardTerminalKey('workspace', isolationOpener(violation))) ? delivery.subjects ?? [] : []
+    if (key?.startsWith(guardTerminalKey('workspace', { localKey: 'isolation:' }))) {
+      return this.rt.isolationViolations(missionId).some(violation => key === guardTerminalKey('workspace', { localKey: isolationOpener(violation) })) ? delivery.subjects ?? [] : []
     }
-    if (!key?.startsWith(guardTerminalKey('attempt_lease', 'stop:'))) return undefined
+    if (!key?.startsWith(guardTerminalKey('attempt_lease', { localKey: 'stop:' }))) return undefined
     const tasks = this.rt.store.list('tasks', missionId)
     return (delivery.subjects ?? []).filter(subject => {
       const task = taskFromSubject(subject, tasks)
       const marker = task?.resumeAfterStop
       if (task === undefined || marker?.epoch !== task.epoch || marker.failure === undefined) return false
-      return key === guardTerminalKey('attempt_lease', stopFaultKey(task.id, marker, marker.failure.message))
+      return key === guardTerminalKey('attempt_lease', { localKey: stopFaultKey(task.id, marker, marker.failure.message) })
     })
   }
 

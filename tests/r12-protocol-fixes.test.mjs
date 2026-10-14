@@ -116,7 +116,7 @@ test('R12: failed guard writes preserve their origin without manufacturing an ad
   assert.equal(f.events[0].data.cause, 'guard-terminal-write-failed')
   assert.equal(f.events[0].data.chain, 'attempt_lease')
   assert.equal(f.events[0].data.taskId, 'task')
-  assert.equal(f.events[0].data.noticeKey, guardTerminalKey('attempt_lease', 'stop:task'), 'the record names the request that was not written')
+  assert.equal(Object.hasOwn(f.events[0].data, 'noticeKey'), false, 'no row was written, so the record names none: its cause and chain name it')
   assert.equal(Object.hasOwn(f.events[0].data, 'ownerNotified'), false, 'the cause states the condition: no field restates what the ledger did')
 })
 
@@ -133,14 +133,31 @@ test('a busy writer records each guard request it could not write: distinct open
   for (const [chain, context] of failures) emitGuardTerminal(f.rt, 'mission', chain, context)
   f.release()
   f.registry.recordWriterBusyRecovery()
-  assert.deepEqual(f.events.map(event => [event.data.cause, event.data.noticeKey, event.data.count]), [
-    ['guard-terminal-write-failed', guardTerminalKey('attempt_lease', 'closeout-abandoned:attempt_1'), 2],
-    ['guard-terminal-write-failed', guardTerminalKey('attempt_lease', 'recovery-exhausted:task@2'), 1],
-    ['guard-terminal-write-failed', guardTerminalKey('task_ceiling', 'task-budget:1'), 1],
-    ['guard-terminal-write-failed', guardTerminalKey('task_ceiling', 'experiment-budget:0'), 1],
+  assert.deepEqual(f.events.map(event => [event.data.cause, event.data.chain, event.data.taskId, event.data.count]), [
+    ['guard-terminal-write-failed', 'attempt_lease', 'task', 2],
+    ['guard-terminal-write-failed', 'attempt_lease', 'task', 1],
+    ['guard-terminal-write-failed', 'task_ceiling', null, 1],
+    ['guard-terminal-write-failed', 'task_ceiling', null, 1],
   ])
   f.registry.recordWriterBusyRecovery()
   assert.equal(f.events.length, 4, 'a drained record is not written twice')
+})
+
+test('a guard request a busy writer could not write is named by its cause and chain: once the chain fires again and writes it, exactly one stall event carries that row\'s key', async t => {
+  const f = await setup({ clock: new FakeClock() })
+  t.after(f.cleanup)
+  const context = { detail: 'mission task budget exhausted (1/1 tasks admitted)', localKey: 'task-budget:1' }
+  f.runtime.commit = () => { throw new WriterBusyError('database is locked', 3) }
+  emitGuardTerminal(f.runtime, f.mission.id, 'task_ceiling', context)
+  delete f.runtime.commit
+  f.clock.advance(f.runtime.config.tickMs)
+  await f.runtime.tick()
+  const stalls = () => f.runtime.store.events(f.mission.id, 500).filter(event => event.type === 'mission/stalled').map(event => event.data)
+  assert.deepEqual(stalls().map(data => [data.cause, data.chain]), [['guard-terminal-write-failed', 'task_ceiling']], 'the writer\'s refusal is recorded')
+  emitGuardTerminal(f.runtime, f.mission.id, 'task_ceiling', context)
+  const requests = f.runtime.store.list('deliveries', f.mission.id).filter(delivery => delivery.notice?.dedupKey.startsWith('guard-terminal:task_ceiling:'))
+  assert.equal(requests.length, 1, 'the request is written once the writer is free')
+  assert.deepEqual(stalls().filter(data => data.noticeKey === requests[0].notice.dedupKey).map(data => data.cause), ['guard-terminal'], 'one stall event names that row: the one written with it, never the record of the write that failed')
 })
 
 test('R12: a pending review is dispatchable only once its source is submitted, to an idle live member independent of it', async t => {

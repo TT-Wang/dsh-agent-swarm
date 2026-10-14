@@ -414,7 +414,7 @@ export class WorkspaceAdmission {
     const revocation = `workspace-revoked:${this.rt.instanceId}`
     // Idempotent from mission state: nothing left to block, and the owner
     // already holds this revocation's decision, means the mission is fenced.
-    if (blocked.length === 0 && guardTerminalHeld(this.rt, missionId, guardTerminalKey('workspace', revocation))) return
+    if (blocked.length === 0 && guardTerminalHeld(this.rt, missionId, guardTerminalKey('workspace', { localKey: revocation }))) return
     this.rt.commit(missionId, () => {
       for (const task of blocked) {
         // A running task here holds a live attempt and a live handle. Setting the
