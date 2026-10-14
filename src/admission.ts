@@ -35,7 +35,7 @@ export function assertScopeSelectors(scopes: readonly string[], location: string
 export function citedCovers(covers: unknown, count: number, location: string): string[] | undefined {
   const valid = Array.from({ length: count }, (_, index) => criterionId(index)), cited = covers === undefined ? [] : covers
   if (!Array.isArray(cited) || !cited.every((id, index) => valid.includes(id) && cited.indexOf(id) === index)) throw new AdmissionError('covers_invalid', 'validation_error', `[covers_invalid] ${location} must list distinct ids of the mission acceptance criteria, c1 for the first through ${valid.at(-1)} for the last; it has ${JSON.stringify(covers)}. Pass \`covers\` with each id this task satisfies once, never the criterion text, and retry the same task/request.`, location)
-  return cited.length ? [...cited] : undefined
+  return cited.length ? cited : undefined
 }
 
 /** reviewOf already waits for submission; an ordinary edge would wait for acceptance. */

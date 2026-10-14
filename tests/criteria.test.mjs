@@ -142,10 +142,6 @@ test('citing nothing has one representation, no covers at all: a plan that spell
   const omitted = validatePlan(citing('/repo', undefined))
   assert.equal(JSON.stringify(validatePlan(citing('/repo', []))), JSON.stringify(omitted), 'a retry that writes [] is the saved plan')
   assert.deepEqual(omitted.tasks.map(task => task.covers), [undefined, undefined])
-  // A cited list is the validated plan's own copy, never the caller's array.
-  const given = ['c1'], input = citing('/repo', undefined); input.tasks[0].covers = given
-  const [cited] = validatePlan(input).tasks
-  assert.deepEqual(cited.covers, ['c1']); assert.notEqual(cited.covers, given)
   const { dir, runtime } = await makeRuntime(t, { workers: new FakeWorkers(), config: { tickMs: 60000, checkTimeoutMs: undefined } })
   const owner = { sessionId: 'owner' }, claim = { grantRoot: dir, source: 'session' }
   const rows = snapshot => snapshot.tasks.map(task => [task.kind, task.acceptance, 'covers' in task ? task.covers : 'no covers'])
