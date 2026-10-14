@@ -5,10 +5,9 @@ import { OwnerReplyGuard } from '../lib/owner-reply.js'
 import { RoleScoper } from '../lib/roles.js'
 import { RefusalRegistry, emitGuardTerminal, guardTerminalKey } from '../lib/refusals.js'
 import { WriterBusyError } from '../lib/store.js'
-import { pendingReadiness } from '../lib/arena.js'
 import { Attempts, pendingStopOwner } from '../lib/attempts.js'
 import { wakePrecision } from './instruments.mjs'
-import { FakeWorkers, makeRuntime, makeRuntimeStub } from './faults/harness.mjs'
+import { FakeClock, FakeWorkers, MISSION_ACCEPTANCE, makeRuntime, makeRuntimeStub, setup } from './faults/harness.mjs'
 
 function guardFixture() {
   const mission = { id: 'm', ownerSessionId: 'owner', status: 'active' }
@@ -144,15 +143,24 @@ test('a busy writer records each guard request it could not write: distinct open
   assert.equal(f.events.length, 4, 'a drained record is not written twice')
 })
 
-test('R12: pending readiness requires a submitted source and an idle independent reviewer', () => {
-  const source = { id: 'source', status: 'pending', assigneeId: 'author', priorOwnerIds: ['old-author'], dependencies: [] }
-  const review = { id: 'review', status: 'pending', reviewOf: 'source', dependencies: [] }
-  const members = [{ id: 'author', status: 'idle' }, { id: 'old-author', status: 'waiting' }, { id: 'reviewer', status: 'working' }]
-  assert.equal(pendingReadiness([source, review], members).ready, 1, 'only the source can run')
-  source.status = 'submitted'
-  assert.equal(pendingReadiness([source, review], members).ready, 0)
-  members[2].status = 'idle'
-  assert.equal(pendingReadiness([source, review], members).ready, 1)
+test('R12: a pending review is dispatchable only once its source is submitted, to an idle live member independent of it', async t => {
+  const f = await setup({ clock: new FakeClock() })
+  t.after(f.cleanup)
+  const busy = f.propose({ title: 'The reviewer\'s own work', assigneeId: f.reviewer.id })
+  const working = await f.runtime.claim(f.actor(f.reviewer), f.mission.id, busy.id)
+  const source = f.propose({ title: 'Source' })
+  const review = f.runtime.propose(f.owner, f.mission.id, { outputs: [], workstreamId: f.stream.id, title: 'Review', objective: 'Independent review',
+    kind: 'verification', reviewOf: source.id, scope: ['**'], acceptance: MISSION_ACCEPTANCE })
+  // The owner instruments' dispatchable set: the dispatcher's eligibility over idle or waiting members.
+  const dispatchable = () => f.runtime.fingerprintBoard(f.mission.id).tasks.filter(task => task.ready).map(task => task.id)
+  assert.deepEqual(dispatchable(), [source.id], 'only the source can run')
+  const claimed = await f.runtime.claim(f.actor(f.author), f.mission.id, source.id)
+  await f.runtime.submit(f.actor(f.author), f.mission.id, { taskId: source.id, attemptId: claimed.attempt.id, output: 'candidate' })
+  assert.deepEqual(dispatchable(), [], 'the source\'s author may not review it, and the reviewer is working')
+  await f.runtime.submit(f.actor(f.reviewer), f.mission.id, { taskId: busy.id, attemptId: working.attempt.id, output: 'done' })
+  assert.deepEqual(dispatchable(), [review.id], 'the idle independent reviewer can run it')
+  f.runtime.commit(f.mission.id, () => f.runtime.store.put('members', { ...f.runtime.store.get('members', f.reviewer.id), phase: 'stopped' }))
+  assert.deepEqual(dispatchable(), [], 'a stopped member runs nothing')
 })
 
 // Instrument self-test: the decision metric lives in tests/instruments.mjs since

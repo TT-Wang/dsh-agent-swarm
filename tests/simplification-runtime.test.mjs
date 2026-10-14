@@ -4,7 +4,6 @@ import fs from 'node:fs'
 import { writeFile } from 'node:fs/promises'
 import { syncBuiltinESMExports } from 'node:module'
 import { join } from 'node:path'
-import { arenaView, pendingReadiness } from '../lib/arena.js'
 import { formatDiagnostic } from '../lib/admission.js'
 import { budget as sharedBudget, makeRuntime } from './faults/harness.mjs'
 
@@ -58,17 +57,17 @@ test('synchronous graph reuse keeps repair deduplication and sees changed carrie
   const members = [{ id: 'worker', name: 'Worker', role: 'implementation', status: 'idle', subscriptions: [] }]
   for (const row of [original, other, repair, dependent, review]) f.runtime.store.put('tasks', row)
   const rows = () => f.runtime.store.list('tasks', mission.id)
-  const board = () => arenaView({ missionId: mission.id, mission, tasks: rows(), members, evidence: [], deliveries: [], now: 1, leaseMs: 60000 })
+  // The dispatcher's eligibility, asked of the member the store does not hold.
+  const dispatchable = () => rows().filter(row => members.some(member => f.runtime.eligible(row, member, rows()))).map(row => row.id)
   assert.deepEqual(f.runtime.unfinishedDependencies(mission.id, dependent).map(row => row.id), [repair.id])
   assert.deepEqual(f.runtime.effectiveDependencies(mission.id, dependent).map(row => row.id), [repair.id])
-  const before = board()
-  assert.equal(before.pendingDispatchable, 1)
+  assert.deepEqual(dispatchable(), [repair.id])
   repair.status = 'accepted'; f.runtime.store.put('tasks', repair)
   assert.deepEqual(f.runtime.unfinishedDependencies(mission.id, dependent), [])
-  assert.equal(pendingReadiness(rows(), members).ready, 1, 'the dependent becomes ready; exact reviewOf stays cancelled')
+  assert.deepEqual(dispatchable(), [dependent.id], 'the dependent becomes ready; exact reviewOf stays cancelled')
   const competing = task(mission.id, 'competing', 'accepted', { replaces: [original.id] })
   f.runtime.store.put('tasks', competing)
-  assert.equal(pendingReadiness(rows(), members).ready, 0, 'a newly ambiguous carrier cannot satisfy a dependency')
+  assert.deepEqual(dispatchable(), [], 'a newly ambiguous carrier cannot satisfy a dependency')
   assert.deepEqual(f.runtime.unfinishedDependencies(mission.id, dependent).map(row => row.id), [original.id])
   assert.deepEqual(f.runtime.unfinishedDependencies(mission.id, { ...dependent, dependencies: ['missing'] }), [])
   assert.throws(() => f.runtime.effectiveDependencies(mission.id, { ...dependent, dependencies: ['missing'] }), /not in this mission/)

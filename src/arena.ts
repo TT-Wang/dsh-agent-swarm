@@ -1,6 +1,6 @@
 /**
- * Arena protocols: pending readiness and the read-only notice/escalation
- * projections, with the deliveries ledger's one dedup rule (`hasNotice`).
+ * Arena protocols: the read-only notice, escalation and member projections,
+ * with the deliveries ledger's one dedup rule (`hasNotice`).
  *
  * Everything here is a pure function over durable records so the runtime, the
  * tests and the UI projection derive the same answer without a second policy
@@ -9,7 +9,7 @@
  * board digest `F(S)` is the runtime's `missionFingerprint`, an instrument.
  */
 import { createHash } from 'node:crypto'
-import { taskGraphIndex, type TaskGraphIndex } from './task-graph.ts'
+import { taskGraphIndex } from './task-graph.ts'
 import { assignmentAllows, canOwnReview } from './assignment.ts'
 import type { Delivery, Escalation, Member, Mission, NoticeClass, Task } from './types.ts'
 
@@ -22,27 +22,6 @@ interface ArenaInput {
 }
 
 const byId = <T extends { id: string }>(left: T, right: T): number => (left.id < right.id ? -1 : left.id > right.id ? 1 : 0)
-
-/**
- * Count pending tasks that a live member could actually run, versus pending
- * tasks that are blocked by dependencies, a dead assignee or review
- * independence. `waiting` counts as live: dispatch to a waiting member is
- * fresh input (R10-09/S3), so readiness must not call it not-ready.
- */
-export function pendingReadiness(tasks: readonly Task[], members: readonly Member[], graph: TaskGraphIndex = taskGraphIndex(tasks)): { ready: number; notReady: number } {
-  const live = members.filter(member => member.status === 'idle' || member.status === 'waiting')
-  let ready = 0, notReady = 0
-  for (const task of tasks) {
-    if (task.status !== 'pending') continue
-    const source = graph.reviewSource(task)
-    const runnable = task.dependencies.every(graph.dependencyMet)
-      && (task.reviewOf === undefined || source?.status === 'submitted')
-      && live.some(member => assignmentAllows(task, member.id, tasks) && canOwnReview(source, member.id))
-    if (runnable) ready++
-    else notReady++
-  }
-  return { ready, notReady }
-}
 
 /** A covered owner fact (`coveredBy`, src/notices.ts) is never sent: the delivery covering it carried the obligation. */
 export const covered = (delivery: Pick<Delivery, 'notice'>): boolean => (delivery.notice as { coveredBy?: string } | undefined)?.coveredBy !== undefined
@@ -154,7 +133,6 @@ interface ArenaMemberView {
 interface ArenaView {
   missionId: string
   status: Mission['status']
-  pendingDispatchable: number
   members: ArenaMemberView[]
   notices: NoticeLedgerEntry[]
   escalations: Escalation[]
@@ -166,11 +144,9 @@ export function arenaView(input: ArenaInput & { missionId: string; now: number; 
   const notices = noticeLedger(input.deliveries, limit)
   const running = input.tasks.filter(task => task.status === 'running' && task.attempt !== undefined)
   const graph = taskGraphIndex(input.tasks)
-  const readiness = pendingReadiness(input.tasks, input.members, graph)
   return {
     missionId,
     status: input.mission.status,
-    pendingDispatchable: readiness.ready,
     members: [...input.members].sort(byId).map(member => {
       const current = running.find(task => task.attempt!.ownerId === member.id)
       const attemptStart = current === undefined ? undefined : Math.max(0, current.attempt!.leaseUntil - leaseMs)

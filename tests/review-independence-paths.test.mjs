@@ -9,7 +9,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { authorIdsOf, canOwnReview } from '../lib/assignment.js'
-import { arenaView, pendingReadiness } from '../lib/arena.js'
+import { arenaView } from '../lib/arena.js'
 import { validatePlan } from '../lib/plans.js'
 import { boardIndex } from '../lib/types/client/projection.js'
 import { FakeClock, MISSION_ACCEPTANCE, setup, taskOf } from './faults/harness.mjs'
@@ -122,8 +122,6 @@ test('claim and dispatch of an unassigned SOURCE: never to the member its own bo
     assert.ok(error.message.includes(`is the assignee of review ${review.id} of this task`), error.message)
     return true
   })
-  const onlyReviewerIdle = f.runtime.store.list('members', f.mission.id).map(member => ({ ...member, status: member.id === f.reviewer.id ? 'idle' : 'working' }))
-  assert.deepEqual(pendingReadiness(f.runtime.store.list('tasks', f.mission.id), onlyReviewerIdle), { ready: 0, notReady: 2 }, 'the arena counts the source as not ready for the reviewer either')
   // Any other member may take it, and the review stays independent of it.
   const claimed = await f.runtime.claim(f.actor(f.author), f.mission.id, source.id)
   assert.equal(claimed.attempt.ownerId, f.author.id)
@@ -213,10 +211,8 @@ const board = () => {
   return { tasks: [source, review], review, member }
 }
 
-test('arena: readiness and the member projection never offer a review to a prior owner of its source', () => {
+test('arena: the member projection never offers a review to a prior owner of its source', () => {
   const { tasks, member } = board()
-  assert.deepEqual(pendingReadiness(tasks, [member('prior')]), { ready: 0, notReady: 1 })
-  assert.deepEqual(pendingReadiness(tasks, [member('independent')]), { ready: 1, notReady: 0 })
   const view = arenaView({ missionId: 'mission', now: 2, leaseMs: 1_000, mission: { status: 'active' }, tasks, members: [member('prior'), member('independent')], evidence: [], deliveries: [] })
   assert.equal(view.members.find(entry => entry.id === 'prior').pendingTaskId, undefined)
   assert.equal(view.members.find(entry => entry.id === 'independent').pendingTaskId, 'review')
