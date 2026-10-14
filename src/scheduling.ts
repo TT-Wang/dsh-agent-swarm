@@ -323,11 +323,11 @@ export class Scheduling {
           }
           } catch (error) {
             if (this.rt.shuttingDown || this.rt.mission(missionId).status !== 'active') return false
-            // The terminal of this member's chain, opened by the failure itself: the
-            // same throw on a later pass is the request the owner already holds,
-            // and another failure of the chain is another request.
-            const detail = String(error)
-            emitGuardTerminal(this.rt, missionId, 'attempt_lease', { memberId: member.id, detail, localKey: `dispatch-failed:${member.id}:${reasonDigest(detail)}` })
+            // The terminal of this member's chain, opened by this failure of the work
+            // its request names: the same throw over that work on a later pass is the
+            // request the owner already holds; other work or another failure is another.
+            const detail = String(error), work = this.rt.noticeSubjectsFor(missionId, { memberId: member.id }).sort().join('+')
+            emitGuardTerminal(this.rt, missionId, 'attempt_lease', { memberId: member.id, detail, localKey: `dispatch-failed:${member.id}:${work}:${reasonDigest(detail)}` })
             continue
           }
         }

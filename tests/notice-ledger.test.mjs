@@ -696,7 +696,7 @@ test('L-25: a guard terminal is one request per fact that opened it: the task bu
   assert.deepEqual(stallEventKeys(f, 'guard-terminal'), keys())
 })
 
-test('L-25: a failed dispatch is one request per member and failure, whatever the board digest; the dispatch question about the task it names stays its own fact, told once under its own key', async t => {
+test('L-25: a failed dispatch is one request per member, the work it names and the failure, whatever the board digest; the dispatch question about the task it names stays its own fact, told once under its own key', async t => {
   const f = await setup({ clock: new FakeClock(), workers: new FakeWorkers({ autoIdle: true }) })
   t.after(f.cleanup)
   // A guard of the author's dispatch chain throws on every pass.
@@ -711,8 +711,8 @@ test('L-25: a failed dispatch is one request per member and failure, whatever th
   const questions = () => ownerRows(f).filter(delivery => delivery.notice.dedupKey.startsWith('dispatch-question:')).map(delivery => delivery.notice.dedupKey)
   assert.equal(taskOf(f.runtime, task.id).status, 'pending', 'the author is never given its task')
   assert.deepEqual(terminals().map(delivery => [delivery.notice.dedupKey.replace(/[0-9a-f]{16}$/, '<digest>'), delivery.notice.reason, delivery.subjects]),
-    [[`guard-terminal:attempt_lease:attempt_terminal:dispatch-failed:${f.author.id}:<digest>`, `Error: ${failure}`, [subject]]],
-    'the chain\'s terminal is keyed by the member and the failure, records the failure as its reason and names the member\'s unfinished work')
+    [[`guard-terminal:attempt_lease:attempt_terminal:dispatch-failed:${f.author.id}:${subject}:<digest>`, `Error: ${failure}`, [subject]]],
+    'the chain\'s terminal is keyed by the member, its unfinished work and the failure, records the failure as its reason and names that work')
   // The board changes under the same failure: the reviewer is given work.
   const board = f.runtime.fingerprint(f.mission.id)
   f.propose({ title: 'Work for the reviewer', assigneeId: f.reviewer.id, kind: 'research', checks: [] })
@@ -1017,7 +1017,46 @@ test('every exit a wedged pass\'s naming names, performed through the owner\'s r
   }
 })
 
-test('every exit a failed dispatch\'s request names, performed through the owner\'s registered tools: the request has no end of its own and is never told twice, and its reminders follow the task it names', async t => {
+/** The digest a key carries for a recorded reason. */
+const sha16 = text => createHash('sha256').update(text).digest('hex').slice(0, 16)
+
+test('L-25: a failed dispatch\'s request is the failure of the work it names: the same member failing with the same text is the request the owner holds only over that work, and is told again over later work, by a request that names it', async t => {
+  const f = await setup({ clock: new FakeClock(), workers: new FakeWorkers({ autoIdle: true }), budget: LONG })
+  t.after(f.cleanup)
+  const tool = await ownerTools(f)
+  // A guard of the author's dispatch chain throws on every pass, whatever work the author holds.
+  const failure = 'Member has uncommitted commits'
+  const isolationAllows = f.runtime.isolationAllows.bind(f.runtime)
+  f.runtime.isolationAllows = (missionId, member) => { if (member.id === f.author.id) throw new Error(failure); return isolationAllows(missionId, member) }
+  const opener = subjects => `dispatch-failed:${f.author.id}:${[...subjects].sort().join('+')}:${sha16(`Error: ${failure}`)}`
+  const told = () => terminalRows(f, 'attempt_lease').map(delivery => [delivery.notice.dedupKey.split(':').slice(3).join(':'), delivery.subjects, delivery.notice.reason])
+  const request = subjects => [opener(subjects), subjects, `Error: ${failure}`]
+  const first = f.propose({ title: 'First work for the author' })
+  await quiet(f)
+  const one = [subjectOf(f, first)], root = [`mission:${f.mission.id}`]
+  assert.deepEqual(told(), [request(one)], 'the request is keyed by the member, the unfinished work it names at its epoch and the failure')
+  await ticks(f, 3)
+  assert.deepEqual(told(), [request(one)], 'the same throw over the same work is the request the owner holds')
+  // The owner reads the request and withdraws the work. The chain still throws, with nothing of the author's to hold.
+  nextWindow(f)
+  await tool('swarm_cancel', { taskId: first.id, reason: 'Withdrawn' })
+  await quiet(f)
+  assert.deepEqual(told(), [request(one), request(root)], 'a member that holds no work and still fails is told once, at the mission root')
+  // Later work for the same member meets the same throw: no request the owner holds names it.
+  nextWindow(f)
+  const later = f.propose({ title: 'Later work for the author' })
+  await quiet(f)
+  const two = [subjectOf(f, later)]
+  assert.equal(taskOf(f.runtime, later.id).status, 'pending', 'the author is never given the later work')
+  assert.deepEqual(told(), [request(one), request(root), request(two)], 'the same failure of other work is a new fact: its own request, naming that work')
+  await ticks(f, 3)
+  assert.deepEqual(told().length, 3, 'told once')
+  assert.deepEqual(stallEventKeys(f, 'guard-terminal'), requestKeys(f), 'one stall event per request, naming its row')
+  const [withdrawn, , stuck] = terminalRows(f, 'attempt_lease')
+  assert.deepEqual([(await remind(f, withdrawn)).length, (await remind(f, stuck)).map(delivery => delivery.subjects)], [0, [two]], 'and the reminders speak for the work that is stuck now, not for the work the owner withdrew')
+})
+
+test('every exit a failed dispatch\'s request names, performed through the owner\'s registered tools: each lets the task it names run, the request is never told twice over that work, and its reminders follow the task', async t => {
   /** The author's dispatch chain throws on every pass while `fault.on`; its task stays pending and the chain's request names it. */
   const board = async () => {
     const f = await setup({ clock: new FakeClock(), workers: new FakeWorkers({ autoIdle: true }), budget: LONG })
@@ -1031,21 +1070,23 @@ test('every exit a failed dispatch\'s request names, performed through the owner
     assert.deepEqual(namedTools(request.content), ['swarm_control'])
     return { f, task, request, fault, tool: await ownerTools(f) }
   }
+  // The reassignment moves the task off the failing member without repairing it: that member then fails holding no work, which is told once at the mission root.
   const exits = {
-    '`action: resume` after repair': async ({ task, fault, tool }) => { fault.on = false; await tool('swarm_control', { taskId: task.id, action: 'resume', reason: 'Repaired' }) },
-    '`action: amend`, `changes.assigneeId` and `reason` to fence and reassign it': ({ f, task, tool }) => tool('swarm_control', { taskId: task.id, action: 'amend', changes: { assigneeId: f.reviewer.id }, reason: 'Reassign' }),
+    '`action: resume` after repair': { then: [], perform: async ({ task, fault, tool }) => { fault.on = false; await tool('swarm_control', { taskId: task.id, action: 'resume', reason: 'Repaired' }) } },
+    '`action: amend`, `changes.assigneeId` and `reason` to fence and reassign it': { then: [f => [`mission:${f.mission.id}`]], perform: ({ f, task, tool }) => tool('swarm_control', { taskId: task.id, action: 'amend', changes: { assigneeId: f.reviewer.id }, reason: 'Reassign' }) },
   }
-  for (const [exit, perform] of Object.entries(exits)) {
+  for (const [exit, { then, perform }] of Object.entries(exits)) {
     const fixture = await board()
     const { f, task, request } = fixture
     assert.ok(request.content.includes(exit), `the request names: ${exit}`)
+    nextWindow(f)
     await perform(fixture)
     await quiet(f)
     assert.equal(taskOf(f.runtime, task.id).status, 'running', `${exit} lets the task run`)
-    assert.deepEqual([terminalRows(f, 'attempt_lease').length, relevant(f, request), (await remind(f, request)).length], [1, true, 0],
-      'the request stays the record the owner can read, and nothing reminds the owner of a task that moved on')
+    assert.deepEqual([terminalRows(f, 'attempt_lease').map(delivery => delivery.subjects), relevant(f, request), (await remind(f, request)).length], [[request.subjects, ...then.map(subjects => subjects(f))], true, 0],
+      'the request stays the record the owner can read, it is not told again over the task, and nothing reminds the owner of a task that moved on')
   }
-  // The resume without the repair: the chain fails again under the same opener.
+  // The resume without the repair: the chain fails again over the same work, under the same opener.
   const { f, task, request, tool } = await board()
   await tool('swarm_control', { taskId: task.id, action: 'resume', reason: 'Retry' })
   await quiet(f)
