@@ -2441,7 +2441,7 @@ export class SwarmRuntime {
    * is named after those: the one it admitted for this need (it admits one), or
    * one the owner withdrew, an automatic review (host-minted id) with a durable
    * `task/cancelled` row newer than the row that opened the need (a verdict, rework or challenge retires a review without cancelling it).
-   * The host's own admission reviews a captured artifact, on a board with nothing else to do (`stalled`, as the admission pass judged it).
+   * The host's own admission reviews on a board with nothing else to do (`stalled`, as the admission pass judged it).
    */
   reviewPathBlocker(source: Task, need: ReviewNeed, stalled?: boolean): string | undefined {
     const mission = this.mission(source.missionId)
@@ -2454,7 +2454,7 @@ export class SwarmRuntime {
     const automatic = tasks.find(review => review.id === `${AUTOMATIC_REVIEW_PREFIX}${need.id}` || (review.reviewOf === source.id && review.status === 'cancelled'
       && review.id.startsWith(AUTOMATIC_REVIEW_PREFIX) && (this.store.latestTaskEvent(mission.id, review.id, 'task/cancelled')?.seq ?? 0) > need.seq))
     if (automatic !== undefined) return `the automatically admitted review ${automatic.id} ${automatic.status === 'cancelled' ? 'was withdrawn' : `is ${automatic.status} and cannot reach a verdict`}: ${ADMIT_REVIEW}, or ${WITHDRAW_SOURCE}`
-    return source.artifact !== undefined && (stalled ?? this.reviewPathStalled(tasks, members)) ? undefined : BOARD_RUNNING
+    return (stalled ?? this.reviewPathStalled(tasks, members)) ? undefined : BOARD_RUNNING
   }
   /** Admit the bounded independent review of one unreviewable submitted deliverable. Its id is keyed on the review need, and `reviewPathBlocker` names one that exists, so each need is admitted once. */
   private admitAutomaticReview(mission: Mission, source: Task, need: ReviewNeed): void {

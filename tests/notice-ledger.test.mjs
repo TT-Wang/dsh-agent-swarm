@@ -520,7 +520,7 @@ test('a board with no live work is the stall\'s to name: inside a review grace i
   assert.equal(reminded.length, f.runtime.notices.maxObligationFollowups, 'and it is reminded as one obligation')
 })
 
-test('a legacy source beside dead work and running work is named when its grace ends, with no change to the board, and never before', async t => {
+test('a legacy source beside dead work and running work is ordinary stuck work: the fall-through names it when its grace ends, with no change to the board, and never before', async t => {
   const { f, dead, source, naming, families } = await graceBoard(t, { legacy: true, running: true })
   assert.deepEqual([families(dead), families(source)], [['fallthrough'], []], 'inside the grace the dead work behind the running work is named, the source is not')
   const grace = Math.max(f.runtime.config.tickMs, 1_000)
@@ -529,10 +529,12 @@ test('a legacy source beside dead work and running work is named when its grace 
   f.clock.advance(opened + grace - f.clock.now())
   await ticks(f, 1)
   assert.equal(f.runtime.fingerprint(f.mission.id), fingerprint, 'the grace ended with no change to the board')
-  assert.deepEqual(families(source), ['review-blocked'], 'the legacy source is named by the first tick past its grace: the dead work\'s notice did not consume its decision')
+  assert.deepEqual(families(source), ['fallthrough'], 'the legacy source is named by the first tick past its grace: the dead work\'s notice did not stand for it')
   assert.equal(naming(source)[0].createdAt, opened + grace + f.runtime.config.tickMs)
+  assert.deepEqual(naming(source)[0].subjects.sort(), [dead, source].map(task => `${task.id}@${taskOf(f.runtime, task.id).epoch}`).sort(), 'the fall-through names everything no live path advances')
   await ticks(f, 150)
-  assert.deepEqual([families(dead), families(source)], [['fallthrough'], ['review-blocked']], 'and each is named once')
+  assert.deepEqual(families(source), ['fallthrough'], 'and it is named once')
+  assert.deepEqual(events(f.runtime, f.mission.id, 'task/review-blocked'), [], 'no review-path decision names it')
 })
 
 test('a queued W3 stall is withheld once its board can progress, and coverage-complete reminds the owner until the mission completes', async t => {

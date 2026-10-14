@@ -31,6 +31,7 @@ import { join } from 'node:path'
 import { assertNamedCalls, ownerTools, toolSchemaIndex } from './refusal-inventory.mjs'
 import { FakeClock, MISSION_ACCEPTANCE, events, makeRuntime, taskOf } from './faults/harness.mjs'
 import { sidebarState } from '../lib/types/client/progress.js'
+import { noticeFamily } from '../lib/notices.js'
 
 const { definitions } = await toolSchemaIndex()
 
@@ -237,15 +238,6 @@ async function exhausted(f, { running } = {}) {
   const review = taskOf(f.runtime, automatic.id)
   assert.deepEqual([review.status, review.recoveryCount, review.resumeAfterStop], ['blocked', review.maxRecoveryAttempts, undefined], 'the review is blocked at its recovery limit')
   if (running !== undefined) await f.run(running(f))
-  await f.pass()
-  return { source }
-}
-
-/** A submission as an older build left it: no artifact, so the host's admission skips it and only the classifier names it. */
-async function legacy(f) {
-  const source = f.propose()
-  await f.submit(source)
-  f.runtime.store.transaction(() => { const row = taskOf(f.runtime, source.id); delete row.artifact; f.runtime.store.put('tasks', row) })
   await f.pass()
   return { source }
 }
@@ -471,39 +463,6 @@ const FAMILIES = [
     block: f => deferred(f, { running: author }),
     steps: [[DEFERRED, ['swarm_control']]],
   },
-  // The host reviews only a captured artifact, so on a board with nothing else to do a legacy submission still has the owner's exits.
-  {
-    name: 'a submission an older build left without an artifact, on a board with nothing else to do',
-    block: legacy,
-    steps: [[RUNNING, PROPOSE_OR_CANCEL]],
-  },
-  {
-    name: 'a submission an older build left without an artifact, and the task budget is exhausted',
-    options: { budget: { maxTasks: 1 } },
-    block: legacy,
-    // The raise changes no task: the classifier still names the cause that holds next.
-    steps: [[BUDGET(1), ['swarm_budget', 'swarm_cancel']], [RUNNING, PROPOSE_OR_CANCEL]],
-  },
-  {
-    name: 'beside running work, a submission an older build left without an artifact has a blocked review that did not defer',
-    block: async f => {
-      const source = f.propose()
-      await f.submit(source)
-      const review = f.runtime.propose(f.owner, f.mission.id, { outputs: [], workstreamId: f.stream.id, title: 'Review the source', objective: 'Independently review the scoped change',
-        kind: 'verification', reviewOf: source.id, scope: ['**'], acceptance: MISSION_ACCEPTANCE, assigneeId: f.reviewer.id })
-      // The rows as that build left them: no artifact on the submission, and a
-      // review blocked by something other than a deferral (no recovery record).
-      f.runtime.store.transaction(() => {
-        const row = taskOf(f.runtime, source.id); delete row.artifact; f.runtime.store.put('tasks', row)
-        f.runtime.store.put('tasks', { ...taskOf(f.runtime, review.id), status: 'blocked' })
-      })
-      await f.run(f.author)
-      await f.pass()
-      return { source }
-    },
-    // A deferral is a recorded recovery of the source's artifact; neither exists here.
-    steps: [[RUNNING, PROPOSE_OR_CANCEL]],
-  },
 ]
 
 test('beside running work, no reminder repeats the budget cause the owner removed', async t => {
@@ -538,28 +497,45 @@ test('a refused admission, then running work, then a stall: the refusal is again
   blockedNotice(f, source, REFUSED)
 })
 
-test('a wedged pass keeps the host\'s admission from running: the classifier names a legacy source on any pass, and a source with an artifact only once that admission recorded its need', async t => {
+test('a wedged pass keeps the host\'s admission from running: the classifier names a source only once that admission recorded its need', async t => {
   const f = await fixture(t, { budget: { maxTasks: 2 } })
-  const source = f.propose(), legacy = f.propose({ title: 'Implement the rest' })
+  const source = f.propose(), other = f.propose({ title: 'Implement the rest' })
   await f.submit(source)
-  await f.submit(legacy)
-  // The row as an older build left it: a submission without an artifact, which the host's admission skips.
-  f.runtime.store.transaction(() => { const row = taskOf(f.runtime, legacy.id); delete row.artifact; f.runtime.store.put('tasks', row) })
+  await f.submit(other)
   await f.runtime.settle(f.mission.id)
   f.clock.advance(1_500)
   // Past the review grace with no scheduling pass: only the classifier can name the board.
   await publish(f, false)
-  blockedNotice(f, legacy, BUDGET(2))
-  assert.deepEqual(decisionsOn(f, source), [], 'an ordinary pass leaves a source with an artifact to the host\'s admission')
+  assert.deepEqual([decisionsOn(f, source), decisionsOn(f, other)], [[], []], 'an ordinary publication leaves each source to the host\'s admission')
   await publish(f, true)
   assert.deepEqual(decisionsOn(f, source), [], 'a wedged pass never pre-empts an admission that has not recorded the need yet')
   // The host's admission records the need and names its blocker; a wedged pass then restates nothing.
   await f.pass()
   assert.equal(events(f.runtime, f.mission.id, 'task/review-missing').filter(event => event.data.taskId === source.id).length, 1)
+  blockedNotice(f, other, BUDGET(2))
   const told = blockedNotice(f, source, BUDGET(2))
   await publish(f, true)
   assert.deepEqual(decisionsOn(f, source).map(delivery => delivery.id), [told.id], 'the recorded need keeps its one decision')
   await followExits(f, { source }, { steps: [[BUDGET(2), ['swarm_budget', 'swarm_cancel']]] })
+})
+
+test('a submission an older build left without an artifact is ordinary stuck work: no review-path decision names it, the W3 stall does on a board with nothing else to do and the fall-through beside running work, each once its grace ends, so no board that holds one is silent', async t => {
+  for (const running of [false, true]) {
+    const f = await fixture(t)
+    const source = f.propose()
+    await f.submit(source)
+    // The row as an older build left it: a submission without an artifact, which the host's admission does not review.
+    f.runtime.store.transaction(() => { const row = taskOf(f.runtime, source.id); delete row.artifact; f.runtime.store.put('tasks', row) })
+    if (running) await f.run(f.reviewer)
+    await f.runtime.settle(f.mission.id)
+    const subject = `${source.id}@${taskOf(f.runtime, source.id).epoch}`
+    const naming = () => f.runtime.store.list('deliveries', f.mission.id).filter(delivery => delivery.to === 'owner' && delivery.notice !== undefined && (delivery.subjects ?? []).includes(subject))
+    assert.deepEqual(naming(), [], `running=${running}: inside its grace nothing names it`)
+    await f.pass()
+    await f.pass()
+    assert.deepEqual(naming().map(delivery => noticeFamily(delivery)), [running ? 'fallthrough' : 'board-stall'], `running=${running}: past its grace one decision names it`)
+    assert.deepEqual([decisionsOn(f, source), events(f.runtime, f.mission.id, 'task/review-blocked'), f.reviewsOf(source)], [[], [], []], `running=${running}: no review-path decision, blocker or host review`)
+  }
 })
 
 test('while a wedged pass keeps the host\'s admission from running, the classifier names a recorded need by the blocker that holds: the next cause once the owner removed the first, and none when the host would admit its review', async t => {

@@ -232,15 +232,15 @@ test('bounded reminders do not create reminders of reminders', async t => {
 test('review admission retires only the reviewed source\'s decision; the other source\'s decision stays live', async t => {
   const f = await fixture(t)
   await stalledDecision(f)
-  const source = f.runtime.task(f.mission.id, 'blocked-task'); source.status = 'submitted'
+  const source = { ...f.runtime.task(f.mission.id, 'blocked-task'), status: 'submitted', artifact: { commit: 'c'.repeat(40), baseCommit: 'b'.repeat(40), workspace: '/isolated', changedPaths: [] } }
   const other = { ...source, id: 'remaining-submission' }
-  f.runtime.commit(f.mission.id, () => {
-    f.runtime.store.put('tasks', source)
-    f.runtime.store.put('tasks', other)
-  })
-  await flush()
+  // Unrelated running work, so the host's review admission names each source's blocker instead of admitting a review.
+  const running = { ...source, id: 'running-work', status: 'running', artifact: undefined, attempt: { id: 'running-attempt', ownerId: f.member.id, epoch: 1, leaseUntil: Date.now() + 3600000 } }
+  f.runtime.commit(f.mission.id, () => { for (const task of [source, other, running]) f.runtime.store.put('tasks', task) })
+  // The admission a scheduling pass runs, without the pass's outbox flush: both decisions stay queued.
+  f.runtime.admitMissingReviews(f.runtime.mission(f.mission.id))
   const decisionOf = task => f.rows().find(row => row.notice?.dedupKey?.startsWith(`review-blocked:${f.mission.id}:${task.id}:`))
-  assert.ok(decisionOf(source) && decisionOf(other), 'the transition publisher announces each missing review as its own decision')
+  assert.ok(decisionOf(source) && decisionOf(other), 'the review admission announces each missing review as its own decision')
   f.runtime.commit(f.mission.id, () => f.runtime.store.put('tasks', {
     ...source, id: 'admitted-review', kind: 'verification', reviewOf: source.id, status: 'running',
     attempt: { id: 'review-attempt', ownerId: f.member.id, epoch: 1, leaseUntil: Date.now() + 3600000 },

@@ -325,7 +325,7 @@ export interface MissionInterpretation {
   ready: (task: Task, member: Member, tasks?: Task[]) => boolean
   /** Pending tasks a runnable member can run right now (the dispatcher's question). */
   dispatchable: Task[]
-  /** Submitted tasks with no live review path (before the grace is applied). */
+  /** The review admission's sources: submitted artifacts with no live review path (before the grace is applied). A submission an older build left without an artifact is ordinary stuck work. */
   unreviewed: Task[]
   /** The dispatcher's unschedulable set for this board. */
   unschedulable: Task[]
@@ -839,7 +839,7 @@ export class Notices {
       // so a notice can never describe a board the dispatcher would act on
       // differently (`ready`, `reviewable`, `unschedulable`, `stalled`).
       dispatchable: tasks.filter(task => task.status === 'pending' && runnable.some(member => this.rt.ready(task, member, tasks))),
-      unreviewed: tasks.filter(task => task.status === 'submitted' && !this.rt.reviewable(task, tasks)),
+      unreviewed: tasks.filter(task => task.status === 'submitted' && task.artifact !== undefined && !this.rt.reviewable(task, tasks)),
       unschedulable: this.rt.unschedulable(mission, tasks, members),
       stalled: this.rt.stalled(tasks, members),
       parkedHolders: tasks.filter(task => task.status === 'running' && task.attempt !== undefined
@@ -1256,12 +1256,12 @@ export class Notices {
     // A submitted artifact no live review can accept is named, even behind
     // unrelated live work (verifier-1 challenge, evidence_a454a771), by the
     // runtime's own review admission: each pass admits the review or names the
-    // current blocker. This names, through that admission's emitter and blocker rule, only what it
-    // does not reach: a legacy submission without an artifact past the review grace (`ReviewNeed.ripe`)
-    // and, while a wedged pass keeps it from running, a need it recorded (`ReviewNeed.recorded`).
-    for (const task of view.unreviewed) {
+    // current blocker. This names, through that admission's emitter and blocker
+    // rule, only what it does not reach: while a wedged pass keeps it from
+    // running, a need it recorded (`ReviewNeed.recorded`).
+    if (options.wedged === true) for (const task of view.unreviewed) {
       const need = this.rt.reviewNeed(task)
-      const blocker = (task.artifact === undefined ? need.ripe : options.wedged === true && need.recorded) ? this.rt.reviewPathBlocker(task, need) : undefined
+      const blocker = need.recorded ? this.rt.reviewPathBlocker(task, need) : undefined
       if (blocker !== undefined) this.notifyReviewBlocked(view.mission, task, need.id, blocker)
     }
     this.judgeBoard(view, options)
