@@ -47,6 +47,8 @@ test('L-21: the W3 stall, coverage-complete, duplicate-carrier and wedged-pass r
   const stall = stallRow(stalled)
   assert.ok(stall, 'the stalled board told the owner')
   assert.deepEqual(names(stall), { prefix: 'board-stall', family: 'board-stall', template: 'board-stall', statement: 'board-stall' })
+  const { lastWitness } = stalled.runtime.observe(stalled.owner, stalled.mission.id)
+  assert.deepEqual([lastWitness.class, lastWitness.family, lastWitness.dedupKey], ['decision', 'board-stall', stall.notice.dedupKey], 'the owner instruments name the last witness, the newest ledger row, by its family (spec §6)')
   // A wedged pass's naming is its own family, not the class a generic decision reads as.
   const scheduling = stalled.runtime.scheduling
   const pass = { id: scheduling.passKey(stalled.mission.id), operationId: 'operation_ledger_wedge', missionId: stalled.mission.id, startedAt: clock.now() - 60_000,
