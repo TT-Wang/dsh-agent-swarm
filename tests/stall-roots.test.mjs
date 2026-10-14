@@ -633,18 +633,24 @@ for (const coNotice of ['stall-root', 'permanent-preparation-failure']) {
   })
 }
 
-test('an expired back-off that still waits (queued behind a live lease) is never named, and a board whose facts the owner holds is judged at most twice a tick and commits nothing', async t => {
+test('an expired back-off that still waits (queued behind a live lease) is never named, and a board whose facts the owner holds (a stall root and a fall-through) is judged at most twice a tick and commits nothing', async t => {
   // 12b12a6: the expired back-off once bypassed the board-digest dedup for as
   // long as the task legitimately waited. There is no such dedup now: every
   // pass end and the publication that closes it judge the board, and each
   // family's own ledger check keeps a held fact from writing anything. The
-  // clock and the ticks are driven by hand.
+  // board holds two such facts, so every judgement reaches both checks: the
+  // stall root's and the fall-through's. The clock and the ticks are driven by
+  // hand.
   const f = await fixture(t, { clock: new FakeClock() })
   const tickMs = f.runtime.config.tickMs
+  const second = await f.runtime.addMember(f.owner, f.mission.id, { name: 'Second', role: 'implementation' })
+  await f.runtime.settle(f.mission.id)
   const research = { kind: 'research', checks: undefined }
   const running = f.propose('Running work', research)
   await f.runtime.claim(f.actor, f.mission.id, running.id)
   const other = f.propose('Unrelated dead end', research)
+  // Work only the second member may take, dead behind the running work once that member is gone.
+  const stranded = f.propose('Second-only work', { ...research, assigneeId: second.id })
   // Queued behind its own assignee's live lease once the back-off expires.
   const backoff = f.propose('Backing off', research)
   const retryAt = f.clock.now() + 300
@@ -656,8 +662,9 @@ test('an expired back-off that still waits (queued behind a live lease) is never
     const dead = f.runtime.store.get('tasks', other.id)
     dead.status = 'blocked'; dead.epoch++; dead.output = 'blocked for repair'
     f.runtime.store.put('tasks', dead)
+    f.runtime.store.put('members', { ...f.runtime.store.get('members', second.id), phase: 'stopped' })
   })
-  await ticksUntil(f, () => f.stallRoots()[0], 'the unrelated stall root is told')
+  await ticksUntil(f, () => f.stallRoots()[0] && f.fallthroughs()[0], 'the unrelated stall root and the dead work are told')
   await ticks(f, Math.ceil((Math.max(0, retryAt + tickMs - f.clock.now()) + 100) / tickMs))
   await f.runtime.flushOutbox(f.mission.id)
   const notices = f.runtime.notices
@@ -677,7 +684,7 @@ test('an expired back-off that still waits (queued behind a live lease) is never
   assert.deepEqual(commits, [], 'a judgement of a board whose facts the owner holds commits nothing')
   assert.equal(f.notices().length, rows, 'and tells nothing')
   assert.equal(f.runtime.store.get('tasks', backoff.id).status, 'pending', 'the back-off still waits behind the live lease')
-  assert.deepEqual(f.fallthroughs().map(delivery => delivery.subjects), [], 'a legitimately waiting back-off is not named')
+  assert.deepEqual(f.fallthroughs().map(delivery => delivery.subjects), [[`${stranded.id}@${f.runtime.store.get('tasks', stranded.id).epoch}`]], 'the fall-through names the dead work alone: a legitimately waiting back-off is not named')
 })
 
 test('a back-off whose bound passes while a pass judges the board is still judged expired by a later pass', async t => {
