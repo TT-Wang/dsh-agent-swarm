@@ -86,26 +86,35 @@ test('a covered swarm_create mission retains blocked work until the owner explic
   assert.match(f.current(blocked.id).output, /Cancelled by the mission owner/)
 })
 
-test('a submitted task with no live review is given the host\'s review, and the owner is not woken', async t => {
-  const f = await fixture(t, new FakeClock())
-  await f.runtime.settle(f.mission.id)
-  const source = f.propose()
-  const claimed = await f.runtime.claim(f.actor(f.author), f.mission.id, source.id)
-  await f.runtime.submit(f.actor(f.author), f.mission.id, { taskId: source.id, attemptId: claimed.attempt.id, output: 'candidate' })
-  await f.runtime.settle(f.mission.id)
-  // No review was proposed. The idle independent Reviewer can own one, so the
-  // host's review admission repairs the gap at the first pass past the review
-  // grace: no stall and no decision are owed.
-  for (let tick = 0; tick < 3 && !f.runtime.store.list('tasks', f.mission.id).some(task => task.reviewOf === source.id); tick++) {
-    f.clock.advance(1_000)
-    await f.runtime.tick()
+test('a submitted task with no live review is given the host\'s review, and the owner is not woken, whether the pass or a publication between passes judges the board first', async t => {
+  for (const between of [false, true]) {
+    const f = await fixture(t, new FakeClock())
     await f.runtime.settle(f.mission.id)
+    const source = f.propose()
+    const claimed = await f.runtime.claim(f.actor(f.author), f.mission.id, source.id)
+    await f.runtime.submit(f.actor(f.author), f.mission.id, { taskId: source.id, attemptId: claimed.attempt.id, output: 'candidate' })
+    await f.runtime.settle(f.mission.id)
+    // No review was proposed. The idle independent Reviewer can own one, so the
+    // host's review admission repairs the gap at the first pass past the review
+    // grace: no stall and no decision are owed, even when a member's activity
+    // commit publishes the stalled board before that pass runs.
+    for (let tick = 0; tick < 3 && !f.runtime.store.list('tasks', f.mission.id).some(task => task.reviewOf === source.id); tick++) {
+      f.clock.advance(1_000)
+      if (between) {
+        f.workers.reportActivity(f.author.id, { id: `operation_between_${tick}`, kind: 'tool', tool: 'bash', startedAt: f.clock.now(), updatedAt: f.clock.now() })
+        await Promise.resolve()
+        f.workers.reportActivity(f.author.id, undefined)
+        await Promise.resolve()
+      }
+      await f.runtime.tick()
+      await f.runtime.settle(f.mission.id)
+    }
+    const review = f.runtime.store.list('tasks', f.mission.id).find(task => task.reviewOf === source.id)
+    assert.match(review?.id ?? 'none', /^task_auto_review_/, `between=${between}: the host admits its own review of the unreviewable submission`)
+    assert.equal(f.current(source.id).status, 'submitted', `between=${between}: the submission stays under review`)
+    assert.deepEqual(f.events('mission/stalled').filter(event => event.data.cause === undefined), [], `between=${between}: the board was never reported stalled`)
+    assert.deepEqual(f.runtime.store.list('deliveries', f.mission.id).filter(delivery => delivery.to === 'owner' && /Mission stalled|review_path_missing/.test(delivery.content)), [], `between=${between}: and the owner was not woken`)
   }
-  const review = f.runtime.store.list('tasks', f.mission.id).find(task => task.reviewOf === source.id)
-  assert.match(review?.id ?? 'none', /^task_auto_review_/, 'the host admits its own review of the unreviewable submission')
-  assert.equal(f.current(source.id).status, 'submitted', 'the submission stays under review')
-  assert.deepEqual(f.events('mission/stalled').filter(event => event.data.cause === undefined), [], 'the board was never reported stalled')
-  assert.deepEqual(f.runtime.store.list('deliveries', f.mission.id).filter(delivery => delivery.to === 'owner' && /Mission stalled|review_path_missing/.test(delivery.content)), [], 'and the owner was not woken')
 })
 
 test('a create-path stall notice names the parked work, and admitting the follow-up wakes its member', async t => {
