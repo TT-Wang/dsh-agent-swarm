@@ -9,9 +9,9 @@ Current **0.7.0** working-tree checks and the historical **0.6.0** baseline are 
 
 ## Round-30 simplification batch 11: one notice ledger (2026-10-14)
 
-**Head**: `e5ce2e0` and this record (documentation only), branch `batch11/ledger` on `29a0268`, 109 commits.
-`src` net against `29a0268`: −612 lines (+712/−1324). Every design step shrinks it; the integrator rounds and their
-repairs shrink it by 29 (B1 and its repairs are withdrawn, net 0).
+**Head**: `a931ee1` and this record (documentation only), branch `batch11/ledger` on `29a0268`, 115 commits.
+`src` net against `29a0268`: −633 lines (+722/−1355). Every design step shrinks it; the integrator rounds and their
+repairs shrink it by 50 (B1 and its repairs are withdrawn, net 0; the final round is −21).
 
 **One record that the owner was told** (review M-1; design step 7, with the owner's amendment of the no-silent-state
 spec §2, §4 and §6 and of the F19 contract). Wrong model: beside the deliveries ledger row, "told" was a mission-row
@@ -31,8 +31,8 @@ the reviewed template and the recorded statement (`10697eb`), so the W3 stall (`
 `judgeBoard` is the one emitter of the W3 stall and of an owner-assembled mission's coverage-complete; completion
 only completes (`b36bd09`), the no-progress watchdog and `stallPasses` are deleted (`253fbd0`), the isolation
 terminal is the one emitter of an isolation refusal, a cancellation's stranded dependent is named by the board
-classifier (`f6b9c34`), and while a submission the review admission speaks for is unreviewable its decision speaks
-for the board (`d451784`).
+classifier (`f6b9c34`), and an unreviewable submission holds the board only until the review admission has processed
+its need (`b2d4157`, which deleted `d451784`'s board-wide gates).
 
 **The design at the head, step by step.** An item's `src` net counts its own commits and every later repair of it, so
 the items sum to the branch total.
@@ -51,6 +51,7 @@ the items sum to the branch total.
 | Step 8: every notice names its fact | `afce859`; `f1a14f5`, `a785c3c`, `aeb4d7d`, `864f030`, `a44f044`, `2a63505`, `b9e89e4`, `e07d9e4` | −31 |
 | Step 9: one identity domain | `201dd3d`; `8201147`, `604c0ac`, `0853d29` | −101 |
 | Step 10: comments and documentation | `4b2604b` | −2 |
+| Final integrator round: D1's gates, the dispatch question's isolation skip and an unreachable cover term deleted | `b2d4157`, `ec2a892`, `59fcb19` | −21 |
 
 **Step 4 at the head.** A wedged pass's naming is one ledger row per naming fact, under the key shape older builds
 wrote: the mission's unfinished work at its epochs and each member's counted start failures
@@ -73,15 +74,16 @@ A request a busy writer refused is recorded by its cause and chain (`ebc4c90`), 
 `Notices.tell` (`fe9a167`). A proposal refused at an admission limit is one `[task_ceiling_terminal]` request per
 limit, open while that limit is the mission's current one (B2, `b9e89e4`, `e07d9e4`); a workspace revocation's request
 names the work the fence blocked; any start that leaves a member's session running, an adopted one included, ends its
-counted start failures (`35fac1f`). The final rule (`2fab0f1`, `e5ce2e0`): every board-level naming (the W3 stall, a
-stall root, the dispatch question, the fall-through) is told while its own condition holds, and a decision's openness
-governs only its own delivery and reminders. The same stuck task can therefore be named twice in different wordings: a
-failed dispatch beside the dispatch question (critique change 3), a start failure or retirement beside the dispatch
-question and the board's naming, a workspace revocation beside a stall root and the W3 stall. R20 (one wording per
+counted start failures (`35fac1f`). The final rule (`2fab0f1`, `e5ce2e0`, `b2d4157`, `ec2a892`): every board-level
+naming (the W3 stall, a stall root, the dispatch question, the fall-through) is told while its own condition holds, and a
+decision's openness governs only its own delivery and reminders. The same stuck task can therefore be named twice in
+different wordings: a failed dispatch or an isolation request beside the dispatch question (critique change 3), a start
+failure or retirement beside the dispatch question and the W3 stall or fall-through, a workspace revocation beside a
+stall root and the W3 stall, a ceiling or recovery request beside the stall root, a review-blocked decision beside the
+W3 stall (beside running work, the fall-through), and a second W3 stall after a withdrawn review. R20 (one wording per
 condition) is an open item: it needs each decision's openness bound to its cause, which the decide-then-act Notices
-slice (S12) owns. Two older rules remove a wording: a rejected stall root that strands nothing beyond its rejecting
-review is recorded against the rejection decision (`coveredBy`), and the dispatch question is not asked about a task
-whose every startable member the isolation invariant refuses.
+slice (S12) owns. One older rule removes a wording: a rejected stall root that strands nothing beyond its rejecting
+review is recorded against the rejection decision at the same subject@epoch (`coveredBy`).
 
 **Step 6 at the head.** A budget warning is told once per allocation and threshold, from the ledger alone (`43ff5cf`;
 pinned for a task's allocation by `ec9c491`).
@@ -113,7 +115,9 @@ digest, an owner instrument and audit field. Deleted: `noticeFingerprint`, `aren
 relevance and remaining reminders, not announced again; conditions whose key changed are announced once more.
 
 **Recorded open** (known-limitations). R20 above, with each co-fire it lists; in a start-failure storm the dispatch
-question spends a slot of the owner's wake window, so a later fact can ride the window's summary. An isolation
+question spends a slot of the owner's wake window, so a later fact can ride the window's summary. In an all-routes-fail
+storm the retirement notice rides it: the summary names the task and points to `swarm_observe(deliveryId)`, which
+returns the fact in full with its `swarm_add_member` exit. An isolation
 violation whose text recurs after a repair is the same decision. `tests/client-event-projection.test.mjs`'s restart
 test asserts that the revocation's request names the fenced work and that its stall root and the W3 stall name it too,
 on the real overview. The dispatch double bookkeeping that predates this batch was 29a0268's `scheduling.ts:278`: the
@@ -121,7 +125,7 @@ start-failure delete and `clearProviderOutage` after every resolved `startWorker
 start. `2a63505` deleted it on this branch (only a start that opens a member's session clears its outage), and
 `35fac1f` makes every start that leaves the session running, an adoption included, end the counted start failures. The
 owner-held spec (`docs/no-silent-state-spec.md`, untracked) still describes W2 and W3 by the board digest; the amended
-§2 and §3 text for the ledger model and the final rule is returned with the withdrawal round for the integrator to
+§2, §3 rows and §4 for the ledger model and the final rule are returned with the final round for the integrator to
 apply.
 
 **Group 4's checks before its repair rounds** (gate at `4b2604b`, 68 commits):
@@ -339,7 +343,9 @@ tells them from the requests raised for a member; C1 folded it into `HOLDING`.
 - `35fac1f` (fix, C1). 2a63505 put the clearing of a member's counted start failures behind `if (!adopted)`; a start
   that adopts a running session now ends them (`recordStarted`), while only an opening start clears an outage.
   Regression "P3" (an adoption mid-turn after one failed start: the count clears and the dispatch question names the
-  work once) fails on `82f5fd4` and on `29a0268`.
+  work once) fails on `82f5fd4`. On `29a0268` it passes its count assertion (29a0268 cleared the counted failures after
+  every resolved start, an adoption included) and fails at its last: no dispatch question is asked there (corrected in
+  the final round).
 - `a5ac07b` (fix, C1). bec0cc6's `decisionCause` was a second rule beside `ownerDeliveryRelevant`: a recovered start
   failure was still delivered and reminded while holding nothing. One list (`HOLDING`) and one openness rule
   (`openSubjects`, formerly `openGuardTerminal`) now serve delivery, reminders and the deferral (`held`, formerly
@@ -390,9 +396,13 @@ decide-then-act Notices slice's job (S12). The final rule is step 5's above; R20
   B1 changed return to `3e4049c` (F19 loses row 7e, which asserted the deferral's boundary); notice-ledger keeps
   `e07d9e4`'s assertion, P3 (retitled to its property) and P1d's three boards as no-silent-state guards, and loses ten
   deferral cases. Regressions, each failing on `4cd605d` and passing here: the revocation case (its request names the
-  fenced work, and the stall root and the W3 stall name it too, on the real overview; it also fails on `29a0268`,
-  whose request names the mission root) and the restored stall-root, create-path, W3-stall, L-25, M2-3 and covered-row
-  tests (on a `4cd605d` build 18 tests fail in 7 of the 9 touched test files run there, W2's two among them).
+  fenced work, and the stall root and the W3 stall name it too, on the real overview; it also fails on `29a0268`, where
+  it times out before its request assertion waiting for a `board-stall:` row, since 29a0268 keyed the W3 stall
+  `mission/stalled:`; with that key mapped it fails because 29a0268's request names the mission root) and the restored
+  stall-root, create-path, W3-stall, L-25, M2-3 and covered-row tests. On a `4cd605d` build the 10 test files the
+  withdrawal touched fail 18 tests in 7 files: notice-ledger 7, stall-roots 5, liveness-create-path 2, and
+  arena-protocols, client-event-projection, r12-workspace-fixes (M2-3) and start-failure-recovery (R5-02) 1 each, W2's
+  two among them (corrected in the final round).
 - `e5ce2e0` (fix, W2, −3). The dispatch question's start-failure clause (`5ce7354`, `ebccfd5`) treated a durable member
   field as the record that the owner was told. It is deleted: the work a failing member cannot start is asked about
   once beside its start failure (notice-ledger; fails on `4cd605d`, `3e4049c` and `29a0268`). In a start-failure storm
@@ -411,6 +421,75 @@ decide-then-act Notices slice's job (S12). The final rule is step 5's above; R20
 | `scripts/smoke-web.mjs` / `scripts/smoke-command-web.mjs` | passed, 13 checks / passed, 10 checks | passed, 13 checks / passed, 10 checks |
 | Test files the round touched (10), three rounds of two concurrent copies, and F18 and F19 likewise | 60/60 runs passed (1,014 tests), F18 and F19 6/6 | the 10 files and 2 doc-reading files, once: 208/208 tests |
 | Test files reading the changed rules, start failures or docs (40), once, at this record | 598/598 tests | not run |
+
+**Integrator final round: every board-level naming is told while its own condition holds** (`b2d4157` to `a931ee1`,
+and this record). `src` net against `29a0268` is now −633 lines (+722/−1355); the round is −21: E1 −15, E2 −5, E4 −1
+(E3 and the P1d title are tests only). B1's withdrawal left two older deferrals that silenced stuck work, each
+reproduced by a probe; both are deleted.
+- `b2d4157` (fix, E1, −15). D1 (`d451784`): while any submission the review admission speaks for was unreviewable,
+  `boardFact` returned no fact and `judgeBoard` returned before the fall-through, so a dependent a cancellation
+  stranded elsewhere on the board was named by no row, on a board with no live work and beside running work
+  (`29a0268` named it). Deleted: both board-wide gates (`boardFact` is "not stalled, no fact"; the fall-through's guard
+  is the review path's own stall) and `Scheduling.unreviewedStall`. What D1 protected (D3: no W3 stall against a ripe
+  need the host can still satisfy by admitting a review, off-pass or wedged) is now one rule about the submission,
+  `awaitsReviewAdmission`, read by the stall predicate and the waiting classifier alike: an unreviewable submission is
+  work the host can still advance inside its review grace and, for one the admission speaks for, until the admission
+  has recorded its current need (`ReviewNeed.recorded`). A submission an older build left without an artifact is
+  ordinary stuck work once its grace ends, as before. Once the admission names a blocker, the board's W3 stall (beside
+  running work, the fall-through, which then names the source too) is told beside the review-blocked decision, and a
+  withdrawn review that moves the W3 stall's stuck work tells a second W3 stall: R20 wordings. Regressions in
+  `tests/notice-ledger.test.mjs`: the D1 probe (the stranded dependent is named by the W3 stall on a board with no live
+  work and by the fall-through beside running work while the source stays unreviewable; fails on `29a0268` and on
+  `9d5f224`) and the D1 test, which now requires the dead dependent to be named, the second W3 stall after the
+  withdrawn review and only the newest outstanding (fails on both). The D3 test keeps its three routes, its twelve
+  deliverables and their no-W3 assertions; its precondition now states that the need is ripe and unprocessed and that
+  the board is not stalled by it. Four tests that pinned D1's silence now pin the W3 stall told beside the decision,
+  once; a fifth became the D1 probe.
+  `tests/scheduling-pass.test.mjs` reads the grace from `ReviewNeed.ripe`, and its stall-versus-waiting test asserts
+  that both readers move together at the admission's record.
+- `ec2a892` (fix, E2, −5). The dispatch question skipped a task whose every startable member the isolation invariant
+  refused (a rule older than batch 11), and it was always about the first undispatched task, so once that task's row
+  was on the ledger no other was named. The `[workspace_terminal]` request names the work it saw when first told, so
+  work given later to a listed member, or runnable only by listed members, got no notice (the isolation probe; on
+  `29a0268` the unassigned case was silent too). Deleted: the isolation clause, the `isolationIssues` import and the
+  `startable` list. The question is about the first dispatchable task that did not dispatch and is not yet asked about
+  at its epoch on the ledger, so successive judgements ask about each such task once. Beside the isolation request
+  this is one more R20 wording, and while a body is wedged each judgement asks about the next task the wedged sweep has
+  not reached. Regressions, each failing on `29a0268` and on `9d5f224`: the isolation probe (later work, unassigned and
+  given to a listed member, each named once by the dispatch question beside the one open request, which does not name
+  it), the isolation request test's later-work board, and r12-workspace-fixes M2-3. The wedged-body test in
+  `tests/scheduling-pass.test.mjs` now observes the judgements: none runs with the wedged branch once the body sweeps
+  again (the progress-blind `passState` mutant fails it), and each question was asked while the body sat in the wedged
+  await.
+- `59fcb19` (refactor, E4, −1). The reminder loop's `|| covered(delivery)` term is deleted: a covered fact is never
+  sent, so `deliveredAt === undefined` already excluded it. The 47 test files that read covered rows, the rejection
+  decision or the reminder loop pass as before.
+- `1b23674` (test, E3). Pins of the rules the withdrawal restored. The fall-through names stuck work at its epoch,
+  once, beside an open request raised for that task and beside the retirement of the route it is pinned to; a
+  fall-through that defers to any owner row naming the task fails both boards. The rejection cover matches its
+  subject@epoch only (`tests/stall-roots.test.mjs`): blocked again at the next epoch beside running work, the task is
+  named there by an uncovered stall root in a delivered notice; a cover by task id at any epoch fails it. R5-02 and F18
+  assert what the owner is woken with in an all-routes-fail storm (the retirement rides the wake-budget summary, which
+  names the task and points to `swarm_observe` with its `deliveryId`) and, through that call, that the durable fact
+  carries `swarm_add_member`; they no longer rebuild the exit from the summary's stored facts as if delivered. These
+  pass on `9d5f224`; on `29a0268` the fall-through and R5-02 tests fail and the cover test passes.
+- `a931ee1` (test). P1d is titled by its property, without naming B1.
+- Corrections to this entry: the revocation case's failure on `29a0268`, the per-file counts on a `4cd605d` build and
+  P3 on `29a0268` (in the withdrawal and round-3 records above), each measured on detached builds of those commits.
+- Seen once, before the rounds: the real-time R15-D2 case in `tests/owner-decisions.test.mjs` named the blocked task by
+  the fall-through first, when the stall-root and waiting samples read the clock on either side of the stop bound. It
+  passed on four reruns and in all six round runs; known-limitations lists it among the wall-clock cases.
+- Unchanged: the replay digest, `tests/fixtures/model-visible.expected.json` and F19.
+
+| Check at `a931ee1` | 0.1.5-rc.3 (`a4c74a91e0`) | 0.1.7-rc.1 (`46a7f68b09`) |
+| --- | --- | --- |
+| `npm run typecheck` / `npm run build` | passed / passed | passed / passed |
+| `npm run test:harness` | passed; `UPDATE_SMOKE_SNAPSHOT=1` leaves `tests/fixtures/model-visible.expected.json` unchanged | passed |
+| `npm run test:replay` | passed, digest `sha256:61a921e64088b78b957cd6aeaa563d5436d4a6eae4b0130725d1f3c74c6f971e` unchanged | not run |
+| `node scripts/faults/run.mjs` | 24/24 | 24/24 |
+| `scripts/smoke-web.mjs` / `scripts/smoke-command-web.mjs` | passed, 13 checks / passed, 10 checks | not run |
+| Test files the round touched (6), three rounds of two concurrent copies, and F18 likewise | 36/36 runs passed (870 tests), F18 6/6 | the 6 files and F18, once: 145/145 tests, F18 1/1 |
+| Test files reading the changed rules, notices, start failures or docs (84), once | 1,127/1,127 tests | not run |
 
 ## Round-29 simplification batch 9: one authorization rule, one exit table, a derived progress clock (2026-09-25)
 
