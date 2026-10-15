@@ -13,8 +13,10 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { FakeClock, acceptThroughReview, setup } from './faults/harness.mjs'
+import { ownerTools } from './refusal-inventory.mjs'
 
-test('an open challenge of a blocked optional experiment\'s claim is the one reason an otherwise complete mission cannot complete', async t => {
+/** An otherwise complete mission whose blocked optional experiment published a claim the reviewer then challenged. */
+async function challengedExperiment(t) {
   const f = await setup({ clock: new FakeClock(), budget: { maxExperiments: 1 } })
   t.after(f.cleanup)
   const { runtime, mission } = f
@@ -35,9 +37,26 @@ test('an open challenge of a blocked optional experiment\'s claim is the one rea
   runtime.challenge(f.actor(f.reviewer), mission.id, { evidenceId: claim.id, reason: 'The partial result does not hold', toolRunIds: [] })
   assert.equal(runtime.store.get('evidence', claim.id).status, 'challenged')
   assert.equal(runtime.store.get('tasks', experiment.id).status, 'blocked', 'the challenge re-opens no task')
+  return { f, experiment, claim }
+}
+
+test('an open challenge of a blocked optional experiment\'s claim is the one reason an otherwise complete mission cannot complete', async t => {
+  const { f: { runtime, mission, owner }, claim } = await challengedExperiment(t)
   const reason = `Unresolved evidence challenges prevent completion: ${claim.id}`
-  assert.deepEqual(runtime.snapshot(f.owner, mission.id).completion, { eligible: false, reason }, 'the open dispute is the completion refusal')
-  assert.throws(() => runtime.control(f.owner, mission.id, 'complete', 'Every required task is accepted'),
+  assert.deepEqual(runtime.snapshot(owner, mission.id).completion, { eligible: false, reason }, 'the open dispute is the completion refusal')
+  assert.throws(() => runtime.control(owner, mission.id, 'complete', 'Every required task is accepted'),
     error => error.code === 'mission_completion_pending' && error.message === reason)
   assert.equal(runtime.store.get('missions', mission.id).status, 'active', 'the refused completion leaves the mission active')
+})
+
+test('a challenged claim of work the owner cancelled holds nothing open: after swarm_cancel the mission completes', async t => {
+  const { f, experiment, claim } = await challengedExperiment(t)
+  const { runtime, mission, owner } = f
+  const tool = await ownerTools(f)
+  await tool('swarm_cancel', { taskId: experiment.id, reason: 'Withdraw the optional experiment whose claim is disputed' })
+  assert.equal(runtime.store.get('tasks', experiment.id).status, 'cancelled')
+  assert.equal(runtime.store.get('evidence', claim.id).status, 'challenged', 'the cancellation resolves no dispute itself')
+  assert.deepEqual(runtime.snapshot(owner, mission.id).completion, { eligible: true }, 'a claim of cancelled work no longer supports any result, so its dispute blocks nothing')
+  await tool('swarm_control', { action: 'complete', reason: 'Every required task is accepted' })
+  assert.equal(runtime.store.get('missions', mission.id).status, 'completed', 'the owner completes the mission')
 })
