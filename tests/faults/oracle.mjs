@@ -10,13 +10,14 @@
  *    `WorkerAdapter`, in order, with its arguments reduced to identities, and
  *    the answer of every synchronous query (`isIdle`, `currentActivity`, ...).
  *
- * Normalization keeps only what a run decides: ids become ordinal labels by
- * first appearance (`task#3`), digests and commits become `hex#n`, the run's
- * temp directory becomes `<dir>`, a clock field keeps only its presence (`<t>`)
- * and time-derived text (an epoch instant, a rendered span) is masked. The runs
- * themselves use a FakeClock at a fixed epoch with `manualTick` and counter ids
- * (`deterministicIds`), so the masking removes host timing (a measured latency,
- * a real subprocess duration, a git commit's date), never a decision.
+ * The runs use a FakeClock at a fixed epoch with `manualTick` and counter ids
+ * (`deterministicIds`), so everything the runtime decides is the same on every
+ * run and the log keeps it as decided: an instant on the runtime clock as its
+ * offset from ORACLE_EPOCH (`t+60000`), a rendered span (`2m 0s`), and every
+ * digest of deterministic text (a dedup key's, a notice key's) verbatim. Ids
+ * become ordinal labels by first appearance (`task#3`), which keeps every
+ * equality between them. Normalization masks only what the host contributes
+ * (`normalizer`), never a decision.
  */
 import { createHash } from 'node:crypto'
 import { createRequire, syncBuiltinESMExports } from 'node:module'
@@ -70,21 +71,33 @@ export function traceAdapter(workers, calls = []) {
   return { adapter, calls }
 }
 
-/** Fields that hold an instant or a measured span: only whether one is present is compared. */
-const CLOCK_FIELD = /(At|Until|Since)$|^(at|since|until|deadline|latencyMs|durationMs|elapsedMs|silentMs|usedMs|waitMs)$/
+/**
+ * The moment this process started. The oracle clock starts at ORACLE_EPOCH,
+ * years earlier, and no scenario moves it to the present, so an instant at or
+ * after this one was read from the host's wall clock, not the runtime clock.
+ */
+const HOST_NOW = Date.now()
+/** Spans the runtime measures on the host's clocks (an admission's latency, a tool call's duration, a git lock wait). */
+const HOST_SPAN = /^(latencyMs|durationMs|waitMs)$/
 
 const ID = /\b([a-z][a-z0-9]*(?:_[a-z][a-z0-9]*)*)_([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\b/g
 const UUID = /\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/g
-const HEX = /\b[0-9a-f]{12,64}\b/g
+/** A git object id: git stamps every commit with the host's time. */
+const GIT_OBJECT = /\b[0-9a-f]{40}\b/g
 /** An epoch instant in milliseconds, wherever text renders one. */
 const INSTANT = /\b1[0-9]{12}\b/g
-/** A rendered span (`12s`, `3m 4s`, `1h 2m`, `250ms`) or a span witness field (`elapsedMs 1234`). */
-const SPAN = /\b\d+h \d+m\b|\b\d+m \d+s\b|\b\d+(?:\.\d+)?(?:ms|s)\b|\b((?:elapsed|silent|wait|latency|duration)Ms)[ =:]+\d+/g
 
 /**
- * One normalizer per log: the first id seen is `<prefix>#1`, the first digest
- * `hex#1`, and so on, so two runs that make the same decisions in the same
- * order normalize to the same text whatever the ids, digests and paths were.
+ * One normalizer per log. It masks exactly what the host contributes to a run:
+ *  - the run's temp directories (`<dir>`);
+ *  - an instant read from the host's wall clock (`<host-t>`, see HOST_NOW: a
+ *    tool span's bounds, a git snapshot's `createdAt`), and a span measured on
+ *    the host's clocks (`<host-span>`, HOST_SPAN);
+ *  - a git object id, labeled `git#n` by first appearance;
+ *  - a trace span payload's `digest` (`input`/`output`), labeled `digest#n`: it
+ *    hashes tool arguments and results that carry the run's temp paths.
+ * Ids are labeled `<prefix>#n` by first appearance. Everything else is kept as
+ * decided, an instant on the runtime clock as its offset from ORACLE_EPOCH.
  */
 export function normalizer(directories = []) {
   const labels = new Map(), counts = new Map()
@@ -99,28 +112,30 @@ export function normalizer(directories = []) {
     return value
   }
   const roots = [...new Set(directories.filter(Boolean))].sort((a, b) => b.length - a.length)
+  const instant = at => at >= HOST_NOW ? '<host-t>' : `t${at < ORACLE_EPOCH ? '-' : '+'}${Math.abs(at - ORACLE_EPOCH)}`
   const text = value => {
     let result = value
     for (const root of roots) result = result.split(root).join('<dir>')
     return result
       .replace(ID, (raw, prefix) => label(raw, prefix))
       .replace(UUID, raw => label(raw, 'uuid'))
-      .replace(INSTANT, '<t>')
-      .replace(HEX, raw => label(raw, 'hex'))
-      .replace(SPAN, (_raw, field) => field === undefined ? '<span>' : `${field} <span>`)
+      .replace(GIT_OBJECT, raw => label(raw, 'git'))
+      .replace(INSTANT, raw => instant(Number(raw)))
   }
-  const normalize = value => {
+  const normalize = (value, parent) => {
     if (typeof value === 'string') return text(value)
-    if (value === null || typeof value !== 'object') return typeof value === 'number' && value >= 1e12 ? '<t>' : value
-    if (Array.isArray(value)) return value.map(normalize)
+    if (value === null || typeof value !== 'object') return typeof value === 'number' && value >= 1e12 ? instant(value) : value
+    if (Array.isArray(value)) return value.map(item => normalize(item))
     const result = {}
     for (const key of Object.keys(value).sort()) {
       if (value[key] === undefined) continue
-      result[text(key)] = CLOCK_FIELD.test(key) ? '<t>' : normalize(value[key])
+      result[text(key)] = HOST_SPAN.test(key) ? '<host-span>'
+        : key === 'digest' && (parent === 'input' || parent === 'output') ? label(value[key], 'digest')
+          : normalize(value[key], key)
     }
     return result
   }
-  return normalize
+  return value => normalize(value)
 }
 
 /** The store tables the log dumps, every row of each in insertion order. */
