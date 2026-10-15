@@ -1,6 +1,6 @@
 /** F2: lease expiry during an active model stream. Liveness renewal prevents expiry; if it occurs the planned assignee survives. */
 import assert from 'node:assert/strict'
-import { setup, eventually, events, taskOf, runScenario } from './harness.mjs'
+import { setup, eventually, events, now, taskOf, runScenario } from './harness.mjs'
 
 await runScenario({
   id: 'F2', title: 'Lease expiry during a live stream renews, and a stalled stream preserves the planned assignee', invariants: ['I1', 'I2'],
@@ -10,16 +10,16 @@ await runScenario({
       const task = f.propose()
       const claimed = await f.runtime.claim(f.actor(f.author), f.mission.id, task.id)
       // Injection 1: the adapter reports a live model operation.
-      const activity = { id: 'model-op', kind: 'model', startedAt: Date.now(), updatedAt: Date.now() }
+      const activity = { id: 'model-op', kind: 'model', startedAt: now(), updatedAt: now() }
       f.workers.activity = activity
       f.workers.callbacks.activity(f.author.id, activity)
-      const before = Date.now()
+      const before = now()
       const shortened = taskOf(f.runtime, task.id)
-      shortened.attempt.leaseUntil = Date.now() + 10
+      shortened.attempt.leaseUntil = now() + 10
       f.runtime.store.transaction(() => f.runtime.store.put('tasks', shortened))
       const renewed = await eventually(() => {
         const value = taskOf(f.runtime, task.id).attempt?.leaseUntil ?? 0
-        return value > Date.now() + 400 ? value : undefined
+        return value > now() + 400 ? value : undefined
       }, 'a live model stream must renew the lease')
       // src/runtime.ts renews to now + leaseMs + ceil(maxOutputTokens * LEASE_MS_PER_OUTPUT_TOKEN), LEASE_MS_PER_OUTPUT_TOKEN = 20.
       assert(renewed >= before + 400 + 5_000 * 20, 'renewal grants the full output-token allowance')
@@ -28,7 +28,7 @@ await runScenario({
       f.workers.activity = undefined
       f.workers.callbacks.activity(f.author.id, undefined)
       const stale = taskOf(f.runtime, task.id)
-      stale.attempt.leaseUntil = Date.now() + 5
+      stale.attempt.leaseUntil = now() + 5
       f.runtime.store.transaction(() => f.runtime.store.put('tasks', stale))
       const expired = await eventually(() => {
         const current = taskOf(f.runtime, task.id)

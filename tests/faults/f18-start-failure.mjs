@@ -19,11 +19,10 @@
  * bound is pacing: one start probe per route per outage window, one owner notice.
  */
 import assert from 'node:assert/strict'
-import { setup, events, eventually, runScenario, taskOf } from './harness.mjs'
+import { setup, events, eventually, now, runScenario, taskOf, wait } from './harness.mjs'
 
 const K = 3 // START_FAILURE_REROUTE_LIMIT in src/runtime.ts
 const OUTAGE_WINDOW_MS = 5 * 60_000 // PROVIDER_OUTAGE_WINDOW_MS in src/runtime.ts
-const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
 const ownerNotices = f => f.runtime.store.list('deliveries', f.mission.id).filter(delivery => delivery.to === 'owner')
 
 /** Every start of every route fails with `fault(member)`; returns the per-member start counts. */
@@ -42,7 +41,7 @@ async function allRoutesFail() {
     const starts = failEveryStart(f, member => new Error(`injected bootstrap failure for ${member.name}`))
     await eventually(() => [f.author, f.reviewer].every(member => f.runtime.store.get('members', member.id).phase === 'stopped'),
       'every failing route was not retired')
-    await sleep(300) // many ticks after the last retirement
+    await wait(300) // many ticks after the last retirement
     assert.deepEqual(starts, { [f.author.id]: K, [f.reviewer.id]: K }, 'I18: every route is bounded by k failed starts and nothing retries after the last')
     const current = taskOf(f.runtime, task.id)
     assert.equal(current.status, 'pending', 'a start failure never blocks the task')
@@ -75,18 +74,18 @@ async function allRoutesFail() {
 /** Every route is inside a provider outage: one probe per route per window and one notice per route. */
 async function allRoutesInOutage() {
   const clock = { skew: 0 } // the runtime clock can be moved past the outage window
-  const f = await setup({ config: { tickMs: 20, maxTasksPerMember: 100, now: () => Date.now() + clock.skew } })
+  const f = await setup({ config: { tickMs: 20, maxTasksPerMember: 100, now: () => now() + clock.skew } })
   try {
     const task = f.propose({ maxRecoveryAttempts: 2 })
     const starts = failEveryStart(f, () => Object.assign(new Error('provider unavailable (HTTP 503)'), { status: 503 }))
     await eventually(() => [f.author, f.reviewer].every(member => f.runtime.store.get('members', member.id).providerOutage), 'both outages were not recorded')
-    await sleep(300) // many ticks inside the outage window
+    await wait(300) // many ticks inside the outage window
     assert.deepEqual(starts, { [f.author.id]: 1, [f.reviewer.id]: 1 }, 'I18: no start attempt while the outage window is open')
     const told = ownerNotices(f).filter(delivery => /provider unavailable outage/.test(delivery.content)).map(delivery => delivery.from).sort()
     assert.deepEqual(told, [f.author.id, f.reviewer.id].sort(), 'the owner is told once per route outage')
     clock.skew += OUTAGE_WINDOW_MS + 1
     await eventually(() => starts[f.author.id] === 2 && starts[f.reviewer.id] === 2, 'each route did not probe once in the next outage window')
-    await sleep(300)
+    await wait(300)
     assert.deepEqual(starts, { [f.author.id]: 2, [f.reviewer.id]: 2 }, 'I18: one start probe per route per outage window')
     assert.equal(ownerNotices(f).filter(delivery => /provider unavailable outage/.test(delivery.content)).length, 2, 'a continuing outage is not re-announced')
     assert.equal(taskOf(f.runtime, task.id).recoveryCount ?? 0, 0, 'an outage spends no task execution credit')

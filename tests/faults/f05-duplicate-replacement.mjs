@@ -1,6 +1,6 @@
 /** F5: two replacements proposed for one blocked task. The second is rejected and lineage resolves to one task. */
 import assert from 'node:assert/strict'
-import { setup, blockThroughReview, clone, runScenario, MISSION_ACCEPTANCE } from './harness.mjs'
+import { setup, blockThroughReview, clone, now, runScenario, MISSION_ACCEPTANCE } from './harness.mjs'
 
 await runScenario({
   id: 'F5', title: 'A blocked task admits one live replacement and lineage stays deterministic', invariants: ['I6'],
@@ -25,7 +25,7 @@ await runScenario({
       const imported = [0, 1].map(index => ({
         id: `imported_${index}`, missionId: f.mission.id, workstreamId: f.stream.id, title: `Imported ${index}`, objective: 'Imported accepted history',
         kind: 'implementation', dependencies: [], scope: ['**'], acceptance: clone(MISSION_ACCEPTANCE), checks: ['true'], status: 'accepted', priority: 0,
-        experiment: false, epoch: 1, evidenceIds: [], replaces: [task.id], createdAt: Date.now() + index, artifact: { commit: String(index).repeat(40), baseCommit: 'b'.repeat(40), workspace: f.dir, changedPaths: [] },
+        experiment: false, epoch: 1, evidenceIds: [], replaces: [task.id], createdAt: now() + index, artifact: { commit: String(index).repeat(40), baseCommit: 'b'.repeat(40), workspace: f.dir, changedPaths: [] },
       }))
       f.runtime.store.transaction(() => { for (const record of imported) f.runtime.store.put('tasks', record) })
       const ambiguous = f.runtime.lineage(f.mission.id, task.id)

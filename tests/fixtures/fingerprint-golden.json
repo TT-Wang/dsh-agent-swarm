@@ -1,0 +1,435 @@
+[
+  {
+    "name": "members only",
+    "cacheIsLive": true,
+    "board": {
+      "status": "active",
+      "tasks": [],
+      "members": [
+        {
+          "id": "member_1",
+          "status": "idle"
+        },
+        {
+          "id": "member_2",
+          "status": "idle"
+        }
+      ],
+      "pendingDeliveries": 0,
+      "challengedEvidence": 0,
+      "ceilings": []
+    },
+    "digest": "863d2e0ef05c0e838db760b32e72a4a1"
+  },
+  {
+    "name": "pending, every handle busy",
+    "cacheIsLive": true,
+    "board": {
+      "status": "active",
+      "tasks": [
+        {
+          "id": "task_1",
+          "status": "pending",
+          "ready": true,
+          "unreviewed": false
+        }
+      ],
+      "members": [
+        {
+          "id": "member_1",
+          "status": "idle"
+        },
+        {
+          "id": "member_2",
+          "status": "idle"
+        }
+      ],
+      "pendingDeliveries": 0,
+      "challengedEvidence": 0,
+      "ceilings": []
+    },
+    "digest": "0417aa5882b44d108ad66796b1a35cd4"
+  },
+  {
+    "name": "pending, the assignee idle (revision unchanged)",
+    "cacheIsLive": true,
+    "board": {
+      "status": "active",
+      "tasks": [
+        {
+          "id": "task_1",
+          "status": "pending",
+          "ready": true,
+          "unreviewed": false
+        }
+      ],
+      "members": [
+        {
+          "id": "member_1",
+          "status": "idle"
+        },
+        {
+          "id": "member_2",
+          "status": "idle"
+        }
+      ],
+      "pendingDeliveries": 0,
+      "challengedEvidence": 0,
+      "ceilings": []
+    },
+    "digest": "0417aa5882b44d108ad66796b1a35cd4"
+  },
+  {
+    "name": "running under its attempt owner; a dependent waits on it",
+    "cacheIsLive": true,
+    "board": {
+      "status": "active",
+      "tasks": [
+        {
+          "id": "task_1",
+          "status": "running",
+          "attemptOwner": "member_1",
+          "ready": false,
+          "unreviewed": false
+        },
+        {
+          "id": "task_2",
+          "status": "pending",
+          "ready": false,
+          "unreviewed": false
+        }
+      ],
+      "members": [
+        {
+          "id": "member_1",
+          "status": "working"
+        },
+        {
+          "id": "member_2",
+          "status": "idle"
+        }
+      ],
+      "pendingDeliveries": 0,
+      "challengedEvidence": 0,
+      "ceilings": []
+    },
+    "digest": "0ae4a4b73a0acdeb06f66c4737c88433"
+  },
+  {
+    "name": "submitted beside a live independent reviewer",
+    "cacheIsLive": true,
+    "board": {
+      "status": "active",
+      "tasks": [
+        {
+          "id": "task_1",
+          "status": "submitted",
+          "attemptOwner": "member_1",
+          "ready": false,
+          "unreviewed": false
+        },
+        {
+          "id": "task_2",
+          "status": "pending",
+          "ready": false,
+          "unreviewed": false
+        },
+        {
+          "id": "task_3",
+          "status": "pending",
+          "ready": true,
+          "unreviewed": false
+        }
+      ],
+      "members": [
+        {
+          "id": "member_1",
+          "status": "idle"
+        },
+        {
+          "id": "member_2",
+          "status": "idle"
+        }
+      ],
+      "pendingDeliveries": 0,
+      "challengedEvidence": 0,
+      "ceilings": []
+    },
+    "digest": "592329b6ed9a906cf823a50c35d7c3fe"
+  },
+  {
+    "name": "submitted with the only reviewer stopped",
+    "cacheIsLive": true,
+    "board": {
+      "status": "active",
+      "tasks": [
+        {
+          "id": "task_1",
+          "status": "submitted",
+          "attemptOwner": "member_1",
+          "ready": false,
+          "unreviewed": true
+        },
+        {
+          "id": "task_2",
+          "status": "pending",
+          "ready": false,
+          "unreviewed": false
+        },
+        {
+          "id": "task_3",
+          "status": "pending",
+          "ready": false,
+          "unreviewed": false
+        }
+      ],
+      "members": [
+        {
+          "id": "member_1",
+          "status": "idle"
+        },
+        {
+          "id": "member_2",
+          "status": "stopped"
+        }
+      ],
+      "pendingDeliveries": 0,
+      "challengedEvidence": 0,
+      "ceilings": []
+    },
+    "digest": "ab337336576c276a4437cca1109fcf0a"
+  },
+  {
+    "name": "a challenged claim",
+    "cacheIsLive": true,
+    "board": {
+      "status": "active",
+      "tasks": [
+        {
+          "id": "task_1",
+          "status": "submitted",
+          "attemptOwner": "member_1",
+          "ready": false,
+          "unreviewed": true
+        },
+        {
+          "id": "task_2",
+          "status": "pending",
+          "ready": false,
+          "unreviewed": false
+        },
+        {
+          "id": "task_3",
+          "status": "pending",
+          "ready": false,
+          "unreviewed": false
+        }
+      ],
+      "members": [
+        {
+          "id": "member_1",
+          "status": "idle"
+        },
+        {
+          "id": "member_2",
+          "status": "stopped"
+        }
+      ],
+      "pendingDeliveries": 0,
+      "challengedEvidence": 1,
+      "ceilings": []
+    },
+    "digest": "7a7d21cbfe2a9f3a8159fe3338458a22"
+  },
+  {
+    "name": "a task ceiling",
+    "cacheIsLive": true,
+    "board": {
+      "status": "active",
+      "tasks": [
+        {
+          "id": "task_1",
+          "status": "submitted",
+          "attemptOwner": "member_1",
+          "ready": false,
+          "unreviewed": true
+        },
+        {
+          "id": "task_2",
+          "status": "pending",
+          "ready": false,
+          "unreviewed": false
+        },
+        {
+          "id": "task_3",
+          "status": "pending",
+          "ready": false,
+          "unreviewed": false
+        }
+      ],
+      "members": [
+        {
+          "id": "member_1",
+          "status": "idle"
+        },
+        {
+          "id": "member_2",
+          "status": "stopped"
+        }
+      ],
+      "pendingDeliveries": 0,
+      "challengedEvidence": 1,
+      "ceilings": [
+        "task:task_2:maxSteps"
+      ]
+    },
+    "digest": "d17b24ff0f2fc5597c75d0bcfd2740db"
+  },
+  {
+    "name": "an undeliverable worker message",
+    "cacheIsLive": true,
+    "board": {
+      "status": "active",
+      "tasks": [
+        {
+          "id": "task_1",
+          "status": "submitted",
+          "attemptOwner": "member_1",
+          "ready": false,
+          "unreviewed": true
+        },
+        {
+          "id": "task_2",
+          "status": "pending",
+          "ready": false,
+          "unreviewed": false
+        },
+        {
+          "id": "task_3",
+          "status": "pending",
+          "ready": false,
+          "unreviewed": false
+        }
+      ],
+      "members": [
+        {
+          "id": "member_1",
+          "status": "idle"
+        },
+        {
+          "id": "member_2",
+          "status": "stopped"
+        }
+      ],
+      "pendingDeliveries": 1,
+      "challengedEvidence": 1,
+      "ceilings": [
+        "task:task_2:maxSteps"
+      ]
+    },
+    "digest": "60de64f496df4d79732b225ab38b9d9e"
+  },
+  {
+    "name": "a parked assignee with pending work",
+    "cacheIsLive": true,
+    "board": {
+      "status": "active",
+      "tasks": [
+        {
+          "id": "task_1",
+          "status": "submitted",
+          "attemptOwner": "member_1",
+          "ready": false,
+          "unreviewed": true
+        },
+        {
+          "id": "task_2",
+          "status": "pending",
+          "ready": false,
+          "unreviewed": false
+        },
+        {
+          "id": "task_3",
+          "status": "pending",
+          "ready": false,
+          "unreviewed": false
+        },
+        {
+          "id": "task_4",
+          "status": "running",
+          "attemptOwner": "member_1",
+          "ready": false,
+          "unreviewed": false
+        }
+      ],
+      "members": [
+        {
+          "id": "member_1",
+          "status": "waiting"
+        },
+        {
+          "id": "member_2",
+          "status": "stopped"
+        }
+      ],
+      "pendingDeliveries": 1,
+      "challengedEvidence": 1,
+      "ceilings": [
+        "task:task_2:maxSteps"
+      ]
+    },
+    "digest": "2ca618788a5beafa822678717373d387"
+  },
+  {
+    "name": "a budget pause",
+    "cacheIsLive": true,
+    "board": {
+      "status": "active",
+      "tasks": [
+        {
+          "id": "task_1",
+          "status": "submitted",
+          "attemptOwner": "member_1",
+          "ready": false,
+          "unreviewed": true
+        },
+        {
+          "id": "task_2",
+          "status": "pending",
+          "ready": false,
+          "unreviewed": false
+        },
+        {
+          "id": "task_3",
+          "status": "pending",
+          "ready": false,
+          "unreviewed": false
+        },
+        {
+          "id": "task_4",
+          "status": "running",
+          "attemptOwner": "member_1",
+          "ready": false,
+          "unreviewed": false
+        }
+      ],
+      "members": [
+        {
+          "id": "member_1",
+          "status": "waiting"
+        },
+        {
+          "id": "member_2",
+          "status": "stopped"
+        }
+      ],
+      "pendingDeliveries": 1,
+      "challengedEvidence": 1,
+      "ceilings": [
+        "budget:pause_1",
+        "task:task_2:maxSteps"
+      ]
+    },
+    "digest": "912e061c49739735eeb3c50e39cab971"
+  }
+]

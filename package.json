@@ -77,6 +77,7 @@
     "test:harness": "node --expose-internals tests/harness-composition.mjs && node --expose-internals tests/harness-boundary-compaction.mjs",
     "test:faults": "node scripts/faults/run.mjs",
     "test:replay": "node scripts/replay/replay.mjs",
+    "test:oracle": "node scripts/replay/oracle.mjs",
     "test:isolation": "node --test tests/verification-isolation.mjs",
     "test:load": "node scripts/load/run.mjs",
     "test:pack": "node scripts/smoke-pack.mjs",
