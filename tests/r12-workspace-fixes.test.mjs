@@ -48,9 +48,9 @@ test('M2-1: a repeated pass-timeout naming is recorded once, through the ledger'
   const rt = makeRuntimeStub({ store: { get: () => structuredClone(mission), list: table => table === 'deliveries' ? deliveries : [], event: (_m, _t, _a, data) => records.push(data), revision: () => 0,
     put: (table, row) => { assert.equal(table, 'deliveries'); deliveries.push(row) } },
     stallPassTimeoutMs: 1000, fingerprint: () => 'same', commit: (_id, fn) => fn() })
-  // The runtime's own telling, over this store; the publication and the pump are outside this test.
+  // The runtime's own telling, over this store; the publication is outside this test.
   const notices = new Notices(rt, new RefusalRegistry(rt))
-  rt.notices = { tell: notices.tell.bind(notices), expectWedgedRelease() {}, transition() {}, pumpOutbox() {} }
+  rt.notices = { tell: notices.tell.bind(notices), expectWedgedRelease() {}, transition() {} }
   const scheduling = new Scheduling(rt)
   // Two bodies wedge in turn on one naming fact. The first naming's row is the
   // record: the second body is marked named and writes neither row nor event.

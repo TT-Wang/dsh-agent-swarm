@@ -654,9 +654,10 @@ export class Scheduling {
    * S1/S2: the wedge detector. Runs from the tick timer, outside every mission
    * queue and outside the pass it watches. A body still queued or running past
    * the declared bound is named: the durable stall event is committed, the owner
-   * notice is delivered by an unqueued flush, and the mission publishes as
-   * wedged until the body settles. The queue keeps the body as the physical
-   * owner; each await it can be in carries its own bound.
+   * notice is delivered by the tick's queue-external outbox pump, never by the
+   * wedged mission queue, and the mission publishes as wedged until the body
+   * settles. The queue keeps the body as the physical owner; each await it can
+   * be in carries its own bound.
    *
    * R16-D: the naming is bounded even when the mission still has live work. A
    * live lease or an in-flight quiescence may be progress, so the body is not
@@ -693,9 +694,6 @@ export class Scheduling {
       // runs with the wedged branch even if the body settles first.
       pass.escalatedAt = now
       this.rt.notices.expectWedgedRelease(missionId)
-      // The notice path must not share the fate of the pass that could not report
-      // it: the queue-external pump delivers it, never the wedged mission queue.
-      this.rt.notices.pumpOutbox()
     }
   }
 
