@@ -572,7 +572,9 @@ verification found one hole in E7 (E9).
   statement's prefix, one constant beside the other review-path statements, read by `admitAutomaticReview` and by the
   derivation. It is named after the task slot and the independent member its exit needs. The refusal is a cause like
   the others: the board stalls, the W3 stall is told beside the decision, and the host proposes its review once per
-  need; the owner's exits stay. Deleted: `openReviewBlock`'s `?? recordedBlocker(...)` fallback and
+  need; the owner's exits stay. Deleted: `openReviewBlock`'s `?? recordedBlocker(...)` fallback (not dead, as
+  first recorded: with it a cause the owner removed on a stalled board stayed outstanding until the next pass; without
+  it the decision retires at the removal, which the integrator kept as consistent with the D3 rule) and
   `Notices.recordedBlocker`, whose one remaining reader, `notifyReviewBlocked`'s check that records the blocker whenever
   it changes, reads the newest recorded reason itself; and the known-limitations residual. The +1 is the derivation (2
   lines), the constant (1) and the cause in `reviewPathBlocker`'s contract (1), against the fallback and

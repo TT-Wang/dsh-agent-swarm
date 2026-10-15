@@ -7,7 +7,7 @@ import { PolicyError } from './policy-error.ts'
 export { WorkspaceRevokedError } from './authorization.ts'
 import { recordedClaim, type WorkspaceClaim } from './authorization.ts'
 import { WorkspaceAdmission, gitWriteDeniedMessage, TEMP_RENDEZVOUS_WINDOW_MS, type TempMention } from './workspace-admission.ts'
-import { Notices, NOTICE_TEMPLATES, REJECTION_DECISION_TRIGGER, TERMINAL_STATES, ADMISSION_REFUSED, ADMIT_REVIEW, BOARD_RUNNING, WITHDRAW_SOURCE, missionSubject, renderNotice, subjectsOfTasks, taskSubject, unreviewedSources, type NotifyOptions } from './notices.ts'
+import { Notices, NOTICE_TEMPLATES, REJECTION_DECISION_TRIGGER, TERMINAL_STATES, ADMISSION_REFUSED, ADMIT_REVIEW, BOARD_RUNNING, WITHDRAW_SOURCE, missionSubject, newestReviewBlock, renderNotice, subjectsOfTasks, taskSubject, unreviewedSources, type NotifyOptions } from './notices.ts'
 import { RefusalRegistry, emitGuardTerminal, queueWriterBusy, requireStrings, requireText, sameChecks, unsupportedEffort, validatedBudget } from './refusals.ts'
 import { Scheduling, progressed, type SchedulingPass } from './scheduling.ts'
 // R17-G6/G7: the one derivation of mission derived state and its host projection.
@@ -2418,8 +2418,8 @@ export class SwarmRuntime {
     const automatic = tasks.find(review => review.id === `${AUTOMATIC_REVIEW_PREFIX}${need.id}` || (review.reviewOf === source.id && review.status === 'cancelled'
       && review.id.startsWith(AUTOMATIC_REVIEW_PREFIX) && (this.store.latestTaskEvent(mission.id, review.id, 'task/cancelled')?.seq ?? 0) > need.seq))
     if (automatic !== undefined) return `the automatically admitted review ${automatic.id} ${automatic.status === 'cancelled' ? 'was withdrawn' : `is ${automatic.status} and cannot reach a verdict`}: ${ADMIT_REVIEW}, or ${WITHDRAW_SOURCE}`
-    const recorded = this.store.latestTaskEvent(mission.id, source.id, 'task/review-blocked'), refusal = (recorded?.data as { reason?: string } | undefined)?.reason
-    if (recorded !== undefined && recorded.seq > need.seq && refusal?.startsWith(ADMISSION_REFUSED)) return refusal
+    const recorded = newestReviewBlock(this.store, mission.id, source.id)
+    if (recorded !== undefined && recorded.seq > need.seq && recorded.reason?.startsWith(ADMISSION_REFUSED)) return recorded.reason
     return (stalled ?? this.reviewPathStalled(tasks, members)) ? undefined : BOARD_RUNNING
   }
   /** Admit the bounded independent review of one unreviewable submitted deliverable. Its id is keyed on the review need, and `reviewPathBlocker` names one that exists or was refused, so each need is proposed once. */
@@ -2437,8 +2437,11 @@ export class SwarmRuntime {
         ...(source.checkTimeoutMs === undefined ? {} : { checkTimeoutMs: source.checkTimeoutMs }),
       }, reviewId)
     } catch (error) {
-      // Admission can still refuse a field copied from the source. The
-      // submission stands; the owner is told exactly what to admit instead.
+      // Admission can still refuse a field copied from the source: that
+      // authored refusal is this need's cause, and the owner is told exactly
+      // what to admit instead. A busy writer or any other failure is not a
+      // refusal: it leaves the pass, and the next pass proposes again.
+      if (!(error instanceof PolicyError)) throw error
       this.notifyReviewBlocked(mission, source, need, `${ADMISSION_REFUSED}${error instanceof Error ? error.message : String(error)}`)
       return
     }

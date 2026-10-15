@@ -14,6 +14,7 @@ import { blockCauses, stopFaultKey } from './attempts.ts'
 import { isolationOpener } from './workspace-admission.ts'
 import { PolicyError } from './policy-error.ts'
 import type { SwarmRuntime } from './runtime.ts'
+import type { SwarmStore } from './store.ts'
 import { awaited, type SchedulingPass } from './scheduling.ts'
 import type { Actor, Delivery, Escalation, Member, Mission, NoticeClass, Task, WorkerAdapter } from './types.ts'
 
@@ -395,6 +396,11 @@ export const ADMIT_REVIEW = 'admit a review with swarm_propose(kind: "verificati
 export const WITHDRAW_SOURCE = 'withdraw the source with swarm_cancel(taskId, reason)'
 export const BOARD_RUNNING = `it has no live independent review path and cannot reach a verdict while the rest of the board keeps running: ${ADMIT_REVIEW}, or ${WITHDRAW_SOURCE}`
 export const ADMISSION_REFUSED = `automatic review admission failed: ${ADMIT_REVIEW} correcting what its refusal names, or ${WITHDRAW_SOURCE}. The refusal: `
+/** The source's newest recorded review blocker (its `task/review-blocked` row): the reason last recorded, with the row's sequence. */
+export const newestReviewBlock = (store: Pick<SwarmStore, 'latestTaskEvent'>, missionId: string, sourceId: string): { seq: number; reason: string | undefined } | undefined => {
+  const row = store.latestTaskEvent(missionId, sourceId, 'task/review-blocked')
+  return row && { seq: row.seq, reason: (row.data as { reason?: string }).reason }
+}
 
 /** R17-G9: the runtime slice the lineage rules read, so the classifiers and the delivery-time relevance check consume ONE implementation (a test can supply the same shape). */
 type LineageRuntime = Pick<SwarmRuntime, 'config' | 'stallPassTimeoutMs' | 'now' | 'reviewNeed' | 'reviewPathBlocker' | 'unfinishedDependencies' | 'reviewable'>
@@ -1454,7 +1460,7 @@ export class Notices {
     const record = () => this.rt.store.event(mission.id, 'task/review-blocked', 'runtime', { taskId: source.id, kind: source.kind, reason })
     const { content, statement } = renderNotice('review-blocked', { sourceId: row.id, reason })
     if (this.tell(mission.id, content, view.subjectsOf([row]), { dedupKey: reviewBlockedKey(mission.id, row.id, need, reason), trigger: NOTICE_TEMPLATES['review-blocked'].trigger, reason, statement }, record)) return
-    if ((this.rt.store.latestTaskEvent(mission.id, source.id, 'task/review-blocked')?.data as { reason?: string } | undefined)?.reason !== reason) this.rt.commit(mission.id, record)
+    if (newestReviewBlock(this.rt.store, mission.id, source.id)?.reason !== reason) this.rt.commit(mission.id, record)
   }
 
   topicDelivery(missionId: string, from: string, topic: string, content: string): void {

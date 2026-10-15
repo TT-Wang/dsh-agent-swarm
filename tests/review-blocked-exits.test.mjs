@@ -32,6 +32,7 @@ import { assertNamedCalls, ownerTools, toolSchemaIndex } from './refusal-invento
 import { FakeClock, MISSION_ACCEPTANCE, acceptThroughReview, events, makeRuntime, taskOf } from './faults/harness.mjs'
 import { sidebarState } from '../lib/types/client/progress.js'
 import { noticeFamily } from '../lib/notices.js'
+import { WriterBusyError } from '../lib/store.js'
 
 const { definitions } = await toolSchemaIndex()
 
@@ -540,6 +541,87 @@ test('a refusal written in the pass that admitted another source\'s review is ou
   assert.equal(outstanding(f, refusal), true, 'the refusal is outstanding')
   await f.runtime.flushOutbox(f.mission.id)
   assert.notEqual(f.runtime.store.get('deliveries', refusal.id).deliveredAt, undefined, 'and delivered')
+})
+
+/** Counts the host's own review proposals; `fail` may throw instead of the first one. */
+function countProposals(f, fail) {
+  const proposals = [], propose = f.runtime.propose.bind(f.runtime)
+  f.runtime.propose = (actor, missionId, input, admittedId) => {
+    if (admittedId?.startsWith('task_auto_review_')) { proposals.push(admittedId); if (proposals.length === 1) fail?.() }
+    return propose(actor, missionId, input, admittedId)
+  }
+  return proposals
+}
+
+test('a busy writer while the host proposes its review is not a refusal: the pass fails, and the next pass proposes again and admits the review', async t => {
+  const f = await fixture(t)
+  const proposals = countProposals(f, () => {
+    const store = f.runtime.store, transaction = store.transaction.bind(store)
+    store.transaction = () => { store.transaction = transaction; throw new WriterBusyError('SQLite writer conflicted during a swarm transaction: database is locked', 1) }
+  })
+  const source = f.propose()
+  await f.submit(source)
+  for (let pass = 0; pass < 4; pass++) await f.pass()
+  assert.deepEqual([proposals.length, f.reviewsOf(source).map(review => review.id)], [2, [proposals[1]]], 'the second proposal admitted the host review')
+  assert.deepEqual(events(f.runtime, f.mission.id, 'task/review-blocked').filter(event => event.data.taskId === source.id), [], 'no refusal was recorded for the busy writer')
+})
+
+test('a refusal a later cause displaced is the cause again once that cause is removed: the host proposes once more, records the refusal, and the refusal and the W3 stall naming the stuck work stay outstanding', async t => {
+  const f = await fixture(t)
+  const proposals = countProposals(f)
+  const { source, stuck } = await refusedAdmission(f, async () => {
+    const prerequisite = f.propose({ title: 'Prerequisite', kind: 'research', checks: [] })
+    const dead = f.propose({ title: 'Dependent', kind: 'research', checks: [], dependencies: [prerequisite.id] })
+    await f.tool('swarm_cancel', { taskId: prerequisite.id, reason: 'Not needed' })
+    return [dead]
+  })
+  await f.pass()
+  const refusal = blockedNotice(f, source, REFUSED)
+  const admitted = f.runtime.store.list('tasks', f.mission.id).length
+  f.runtime.updateBudget(f.owner, f.mission.id, { ...f.runtime.mission(f.mission.id).budget, maxTasks: admitted }, 'Hold every admission')
+  await f.pass()
+  f.runtime.updateBudget(f.owner, f.mission.id, { ...f.runtime.mission(f.mission.id).budget, maxTasks: admitted + 2 }, 'Room again')
+  for (let pass = 0; pass < 3; pass++) await f.pass()
+  const recorded = events(f.runtime, f.mission.id, 'task/review-blocked').filter(event => event.data.taskId === source.id).map(event => event.data.reason)
+  assert.deepEqual(recorded.map(reason => REFUSED.test(reason) ? 'refusal' : /task budget is exhausted/.test(reason) ? 'budget' : reason), ['refusal', 'budget', 'refusal'], 'the refusal is recorded again once the budget cause is removed')
+  assert.equal(proposals.length, 2, 'the host proposed its review once more, and only once')
+  assert.equal(outstanding(f, refusal), true, 'the refusal decision is outstanding again')
+  const stalls = f.runtime.store.list('deliveries', f.mission.id).filter(delivery => delivery.to === 'owner' && noticeFamily(delivery) === 'board-stall' && outstanding(f, delivery))
+  assert.ok(stalls.some(stall => stuck.every(task => stall.subjects.includes(`${task.id}@${taskOf(f.runtime, task.id).epoch}`))), 'an outstanding W3 stall names the stuck work')
+})
+
+test('a refusal is the cause of its review need only: once the check is repaired and a challenge re-opens the source, the host admits its review for the new need', async t => {
+  const f = await fixture(t)
+  const source = f.propose({ checks: ['npm run verify'] })
+  const claimed = await f.runtime.claim(f.actor(f.author), f.mission.id, source.id)
+  const runId = await f.workers.callbacks.toolRun(f.author.id, { tool: 'bash', arguments: { command: 'true' }, result: { exitCode: 0 }, isError: false })
+  const evidence = f.runtime.publish(f.actor(f.author), f.mission.id, { taskId: source.id, attemptId: claimed.attempt.id, claim: 'The change works', outcome: 'supported', toolRunIds: [runId] })
+  await writeFile(join(f.dir, 'package.json'), JSON.stringify({ scripts: { verify: 'sandbox-exec -f verify.sb node verify.js' } }))
+  await f.runtime.submit(f.actor(f.author), f.mission.id, { taskId: source.id, attemptId: claimed.attempt.id, output: 'candidate' })
+  await f.pass()
+  blockedNotice(f, source, REFUSED)
+  await writeFile(join(f.dir, 'package.json'), JSON.stringify({ scripts: { verify: 'node -e 0' } }))
+  const review = f.propose({ title: 'Review the source', objective: 'Independently review the scoped change', kind: 'verification', reviewOf: source.id, checks: undefined, assigneeId: f.reviewer.id })
+  const taken = await f.runtime.claim(f.actor(f.reviewer), f.mission.id, review.id)
+  await f.runtime.verify(f.actor(f.reviewer), f.mission.id, { taskId: review.id, attemptId: taken.attempt.id, verdict: 'accept', reason: 'Review against acceptance' })
+  assert.equal(taskOf(f.runtime, source.id).status, 'accepted', 'the owner\'s own review accepted the source')
+  f.runtime.challenge(f.owner, f.mission.id, { evidenceId: evidence.id, reason: 'A counterexample overturns the accepted claim', toolRunIds: [] })
+  assert.equal(taskOf(f.runtime, source.id).status, 'submitted', 'the challenge re-opens the source')
+  for (let pass = 0; pass < 3; pass++) await f.pass()
+  assert.equal(f.reviewsOf(source).filter(task => task.id.startsWith('task_auto_review_')).length, 1, 'the re-opened need is admitted a host review: the earlier need\'s refusal does not hold it')
+})
+
+test('a cause the owner removes retires its decision at once: the budget decision is not outstanding after the raise, before the next pass admits the review', async t => {
+  const f = await fixture(t, { budget: { maxTasks: 1 } })
+  const source = f.propose()
+  await f.submit(source)
+  await f.pass(); await f.pass()
+  const decision = blockedNotice(f, source, /task budget is exhausted/)
+  assert.equal(outstanding(f, decision), true, 'the budget decision is outstanding')
+  f.runtime.updateBudget(f.owner, f.mission.id, { ...f.runtime.mission(f.mission.id).budget, maxTasks: 2 }, 'Room for the review')
+  assert.equal(outstanding(f, decision), false, 'the raise retires it before any pass')
+  await f.pass()
+  assert.match(f.reviewsOf(source)[0]?.id ?? 'none', /^task_auto_review_/, 'and the next pass admits the review')
 })
 
 test('a wedged pass keeps the host\'s admission from running: the classifier names a source only once that admission recorded its need', async t => {
