@@ -19,7 +19,8 @@
  * F18 and F19 run unchanged on the oracle clock; F21 has its own clocked
  * variant (scripts/replay/f21-clocked.mjs), because its wedge ends at a real
  * timer; `paths` (scripts/replay/paths-clocked.mjs) reaches what none of them
- * does: stop fences, an isolation violation, the silence bounds, completion.
+ * does: stop fences, an isolation violation, the silence bounds, completion,
+ * and preferred work whose readings show the interpretation's ask order.
  *
  * Usage: node scripts/replay/oracle.mjs [--only replay,F19] [--runs n] [--stress] [--write] [--out dir]
  *   --runs n   run the whole set n times; every run must produce the same logs

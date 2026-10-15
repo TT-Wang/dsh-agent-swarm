@@ -14,6 +14,13 @@
  *     declared bounds are named, each by its own guard, exactly once.
  *  4. Completion. The owner completes a mission whose work is accepted; the
  *     terminal mission and its accepted task stay immutable.
+ *  5. Preference. Two untouched tasks preferred to different members wait
+ *     behind a member that prefers neither, with nothing running. Every
+ *     reading of that board (the dispatch sweep's, the board judgement's) asks
+ *     the adapter whether each preferred member can start, once for the
+ *     dispatchable work and again for the stall, so the order in which the
+ *     interpretation evaluates its sets is in the trace. Once every handle can
+ *     start, each preferred member takes its own task.
  *
  * Durable state is injected only where no runtime path produces it (a marker
  * without an owner or at an older epoch, a missing owner, a shared worktree),
@@ -150,7 +157,28 @@ async function completion() {
   } finally { await f.cleanup() }
 }
 
+async function preference() {
+  const workers = new FakeWorkers()
+  const f = await setup({ workers, budget: { maxWorkers: 4 } })
+  try {
+    const left = await f.runtime.addMember(f.owner, f.mission.id, { name: 'Left', role: 'implementation', maxOutputTokens: 5_000 })
+    const right = await f.runtime.addMember(f.owner, f.mission.id, { name: 'Right', role: 'implementation', maxOutputTokens: 5_000 })
+    await f.runtime.settle(f.mission.id)
+    // Both proposals commit before the pass they kick reads the board, and the
+    // author, first in store order, is preferred by neither.
+    const first = f.propose({ title: 'Preferred to Left', assigneeId: left.id, assignmentMode: 'preferred' })
+    const second = f.propose({ title: 'Preferred to Right', assigneeId: right.id, assignmentMode: 'preferred' })
+    await f.runtime.settle(f.mission.id)
+    assert.deepEqual([first, second].map(task => taskOf(f.runtime, task.id).status), ['pending', 'pending'], 'no busy handle takes either task')
+    for (const member of [f.author, f.reviewer, left, right]) workers.idle.add(member.id)
+    await f.runtime.tick()
+    assert.equal((await running(f, first.id, 'the task preferred to Left is dispatched')).attempt.ownerId, left.id, 'Left takes the task preferred to it')
+    assert.equal((await running(f, second.id, 'the task preferred to Right is dispatched')).attempt.ownerId, right.id, 'Right takes the task preferred to it')
+    return { owners: 2 }
+  } finally { await f.cleanup() }
+}
+
 await runScenario({
-  id: 'paths', title: 'Clocked: stop fences, isolation, silence bounds and completion', invariants: [],
-  body: async () => ({ fences: await stopFences(), isolation: await isolation(), silence: await silence(), completion: await completion() }),
+  id: 'paths', title: 'Clocked: stop fences, isolation, silence bounds, completion and preference', invariants: [],
+  body: async () => ({ fences: await stopFences(), isolation: await isolation(), silence: await silence(), completion: await completion(), preference: await preference() }),
 })
