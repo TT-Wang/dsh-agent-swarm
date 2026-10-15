@@ -20,7 +20,7 @@ async function fixture(t, config = {}) {
     budget: { maxTokens: 100000, maxSteps: 1000, maxWorkers: 4, maxDurationMs: 3600000, maxTasks: 100 },
   })
   // Drive the real outbox at a controlled adapter boundary, without a competing pump.
-  runtime.pumpOutbox = () => {}
+  runtime.notices.pumpOutbox = () => {}
   const owner = { sessionId: 'ack-owner' }
   const mission = runtime.create(owner, { title: 'Outbox acknowledgement', objective: 'Preserve concurrent decisions',
     workspace: directory, scope: ['**'], acceptance: ['preserved'], budget }, { grantRoot: directory, source: 'session' })

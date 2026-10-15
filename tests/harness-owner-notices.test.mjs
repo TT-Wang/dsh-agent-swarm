@@ -61,7 +61,7 @@ async function fixture(t, respond = () => text('Done'), configure, profile = {})
   const handle = await ctx.agents.create({ sessionId: SessionId('owner-session'), meta: { cwd: source }, agentOptions: { provider: 'swarm-test', model: 'scripted' } })
   await ctx.plugin(Swarm, { statePath: path.join(root, 'state.sqlite'), workspacesRoot: path.join(root, 'worktrees'), tickMs: 60000, leaseMs: 60000, maxEvents: 500, maxAttempts: 100, maxMessageChars: 10000, ...profile })
   const rt = ctx.swarm
-  rt.kick = () => {}; rt.pumpOutbox = () => {}
+  rt.kick = () => {}; rt.notices.pumpOutbox = () => {}
   const owner = { sessionId: 'owner-session' }
   // The owner session's own cwd, authorized as the session workspace every production caller records.
   const mission = rt.create(owner, { title: 'Native owner notices', objective: 'Preserve correct owner work', workspace: source, scope: ['**'], acceptance: ['correct'], budget: { ...budget, maxTokens: 100000, maxSteps: 1000, maxWorkers: 4, maxDurationMs: 3600000, maxTasks: 100 } }, { grantRoot: source, source: 'session' })

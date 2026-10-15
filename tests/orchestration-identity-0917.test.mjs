@@ -21,7 +21,7 @@ async function fixture(t, extra = {}) {
     budget: { maxTokens: 100000, maxSteps: 1000, maxWorkers: 4, maxDurationMs: 3600000, maxTasks: 100 } })
   const nativeKick = runtime.kick.bind(runtime)
   runtime.kick = () => {}
-  runtime.pumpOutbox = () => {}
+  runtime.notices.pumpOutbox = () => {}
   runtimes.push(runtime)
   const owner = { sessionId: 'identity-owner' }
   const mission = runtime.create(owner, { title: 'Orchestration identities', objective: 'Complete independently verified work', workspace: root, scope: ['src/'], acceptance: ['done'], budget }, { grantRoot: root, source: 'session' })
@@ -44,7 +44,7 @@ async function fixture(t, extra = {}) {
   const restart = async () => {
     await runtimes.at(-1).dispose()
     const restored = new SwarmRuntime(config, new Workers())
-    restored.kick = () => {}; restored.pumpOutbox = () => {}
+    restored.kick = () => {}; restored.notices.pumpOutbox = () => {}
     runtimes.push(restored)
     await restored.start()
     return restored

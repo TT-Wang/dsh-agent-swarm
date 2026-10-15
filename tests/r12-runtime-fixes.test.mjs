@@ -22,7 +22,7 @@ async function fixture(t) {
 test('a failed tick guard and one failed mission do not suppress other guards or missions', async t => {
   const f = await fixture(t), calls = []
   const second = f.runtime.create(f.owner, { title: 'Other', objective: 'Continue', workspace: f.mission.workspace, scope: ['src/'], acceptance: ['works'], budget: f.budget }, { grantRoot: f.mission.workspace, source: 'session' })
-  f.runtime.pumpOutbox = () => { calls.push('outbox'); throw new Error('injected write contention') }
+  f.runtime.notices.pumpOutbox = () => { calls.push('outbox'); throw new Error('injected write contention') }
   f.runtime.sweepStarts = () => calls.push('starts')
   f.runtime.checkSchedulingPasses = () => calls.push('passes')
   f.runtime.sweepDecisions = () => calls.push('decisions')

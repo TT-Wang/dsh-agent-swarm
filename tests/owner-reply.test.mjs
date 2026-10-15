@@ -198,7 +198,7 @@ test('L2: the turn boundary and the consumption stamp are on the runtime clock, 
   guard.observe(f.owner.sessionId, 'user/message', { createdAt: Date.now() })
   guard.observe(f.owner.sessionId, 'turn/end', { reason: { kind: 'completed' } })
   assert.deepEqual(f.events('owner/reply-missing').map(event => event.data.deliveryId), [ask.id], 'the unanswered question is booked and recorded')
-  f.runtime.pumpOutbox = () => {}
+  f.runtime.notices.pumpOutbox = () => {}
   f.runtime.message(f.asker, f.mission.id, { to: 'owner', kind: 'question', content: 'And the schema version?' })
   const consumed = f.deliveries().filter(row => row.replyExpected && row.id !== ask.id).at(-1)
   guard.observe(f.owner.sessionId, 'user/message', { createdAt: Date.now(), source: { kind: 'swarm', deliveryId: consumed.id } })
@@ -287,7 +287,7 @@ test('L2/L3: a stopped asker does not hide the open receipt the owner still owes
 
 test('owner receipt books actual consumption before transport acknowledgement and survives context messages', async t => {
   const f = await fixture(t)
-  f.runtime.pumpOutbox = () => {}
+  f.runtime.notices.pumpOutbox = () => {}
   f.runtime.message(f.asker, f.mission.id, { to: 'owner', kind: 'question', content: 'Which version?' })
   const question = f.deliveries().find(row => row.replyExpected)
   const guard = new OwnerReplyGuard(fakeContext(), f.runtime, { maxNudges: 1 })
@@ -305,7 +305,7 @@ test('owner receipt books actual consumption before transport acknowledgement an
 
 for (const summarized of [false, true]) test(`answered receipts invalidate queued nudges and terminal escalation${summarized ? ' within a wake summary' : ''}`, async t => {
   const f = await fixture(t)
-  f.runtime.pumpOutbox = () => {}
+  f.runtime.notices.pumpOutbox = () => {}
   const question = await f.ask()
   if (summarized) {
     f.runtime.notices.wakeBudget = 1
@@ -329,7 +329,7 @@ for (const summarized of [false, true]) test(`answered receipts invalidate queue
 
 test('pre-upgrade receipt nudges expire by their existing structured question key', async t => {
   const f = await fixture(t)
-  f.runtime.pumpOutbox = () => {}
+  f.runtime.notices.pumpOutbox = () => {}
   const question = await f.ask()
   f.runtime.commit(f.mission.id, () => f.runtime.notify(f.mission.id, 'legacy nudge', [`mission:${f.mission.id}`], { dedupKey: `owner-reply-missing:${question.id}:1` }))
   const nudge = f.deliveries().find(row => row.notice?.dedupKey === `owner-reply-missing:${question.id}:1`)

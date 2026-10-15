@@ -89,7 +89,7 @@ function refusalFixture() {
       get: (table, id) => table === 'missions' ? { id, status: 'active' } : admissions.get(id), list: () => [],
       recordAdmission: row => admissions.set(row.id, structuredClone(row)),
       event: (missionId, type, actor, data) => events.push({ missionId, type, actor, data }),
-    }, fingerprint: () => 'stable', noticeSubjectsFor: () => [], notify() {}, tell, pumpOutbox() {},
+    }, fingerprint: () => 'stable', noticeSubjectsFor: () => [], notify() {}, tell, notices: { pumpOutbox() {} },
   })
   return { rt, registry: new RefusalRegistry(rt), admissions, events, release: () => { busy = false } }
 }
@@ -219,7 +219,7 @@ function stopFixture(reason, stop) {
     workers: new FakeWorkers({ stop: async memberId => { stopped.push(memberId); await stop(stopped.length) } }),
     task: (_mission, id) => structuredClone(rows.get(id)), mission: () => mission,
     defer: fn => { pending.push(Promise.resolve().then(fn)) }, exclusive: (_id, fn) => fn(), commit: (_id, fn) => fn(),
-    kick() {}, fingerprint: () => 'stable', noticeSubjectsFor: () => [], notify() {}, tell, pumpOutbox() {},
+    kick() {}, fingerprint: () => 'stable', noticeSubjectsFor: () => [], notify() {}, tell, notices: { pumpOutbox() {} },
   })
   return { mission, rows, pending, events, stopped, attempts: new Attempts(rt) }
 }

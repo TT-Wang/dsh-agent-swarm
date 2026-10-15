@@ -389,7 +389,7 @@ export function emitGuardTerminal(rt: SwarmRuntime, missionId: string, chain: Gu
     // of the pass that could not report it: the queue-external pump delivers it.
     if (rt.tell(missionId, terminal.message, [...new Set(subjects)], { dedupKey: key, reason: context.detail, questionId: context.questionId }, () => rt.store.event(missionId, 'mission/stalled', 'runtime', {
       cause: 'guard-terminal', chain, code: terminal.code, taskId: context.taskId ?? null, memberId: context.memberId ?? null, detail: context.detail ?? null, noticeKey: key,
-    }))) rt.pumpOutbox()
+    }))) rt.notices.pumpOutbox()
   } catch (error) {
     // The best-effort contract of a busy writer: an escalation it refused is
     // recorded once the writer is free (`recordWriterBusyRecovery`), never an

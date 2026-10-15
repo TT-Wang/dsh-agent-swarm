@@ -696,7 +696,7 @@ export class Scheduling {
       this.rt.expectWedgedRelease(missionId)
       // The notice path must not share the fate of the pass that could not report
       // it: the queue-external pump delivers it, never the wedged mission queue.
-      this.rt.pumpOutbox()
+      this.rt.notices.pumpOutbox()
     }
   }
 

@@ -46,9 +46,10 @@ test('M2-1: a repeated pass-timeout naming is recorded once, through the ledger'
   // The stub store writes only ledger rows: a naming that wrote the mission row would throw.
   const rt = makeRuntimeStub({ store: { get: () => structuredClone(mission), list: table => table === 'deliveries' ? deliveries : [], event: (_m, _t, _a, data) => records.push(data), revision: () => 0,
     put: (table, row) => { assert.equal(table, 'deliveries'); deliveries.push(row) } },
-    stallPassTimeoutMs: 1000, fingerprint: () => 'same', commit: (_id, fn) => fn(), expectWedgedRelease() {}, pumpOutbox() {}, passSettled() {} })
-  // The runtime's own telling, over this store.
+    stallPassTimeoutMs: 1000, fingerprint: () => 'same', commit: (_id, fn) => fn(), defer() {}, expectWedgedRelease() {}, passSettled() {} })
+  // The runtime's own notices over this store; a requested pump is deferred and never runs.
   const notices = new Notices(rt)
+  rt.notices = notices
   rt.tell = notices.tell.bind(notices)
   const scheduling = new Scheduling(rt)
   // Two bodies wedge in turn on one naming fact. The first naming's row is the

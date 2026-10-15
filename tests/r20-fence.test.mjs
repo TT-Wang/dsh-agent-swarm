@@ -44,7 +44,7 @@ async function fixture(t) {
     budget: { maxTokens: 1000000, maxSteps: 5000, maxWorkers: 6, maxDurationMs: 3600000, maxTasks: 60 },
   })
   runtime.kick = () => {}
-  runtime.pumpOutbox = () => {}
+  runtime.notices.pumpOutbox = () => {}
   const holdStop = () => {
     workers.stop = async memberId => { workers.stopped.push(memberId); await new Promise(resolve => { held.release = resolve }) }
     return () => held.release?.()

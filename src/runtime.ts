@@ -353,7 +353,7 @@ export class SwarmRuntime implements Kernel {
   private refuseProposal(mission: Mission, proposer: string | undefined, title: string, budget: 'task' | 'experiment', admitted: number, limit: number): void { return this.refusals.refuseProposal(mission, proposer, title, budget, admitted, limit) }
 
   /** M1a seam 3/7: owner notices, witnesses and the outbox that delivers them. */
-  private readonly notices = new Notices(this)
+  readonly notices = new Notices(this)
   notify(missionId: string, content: string, subjects: string[], options: NotifyOptions): boolean { return this.notices.notify(missionId, content, subjects, options) }
   tell(missionId: string, content: string, subjects: string[], options: NotifyOptions, then?: () => void): boolean { return this.notices.tell(missionId, content, subjects, options, then) }
   ownerDeliveryRelevant(mission: Mission, delivery: Delivery): boolean { return this.notices.ownerDeliveryRelevant(mission, delivery) }
@@ -410,7 +410,6 @@ export class SwarmRuntime implements Kernel {
   private notifyReviewBlocked(mission: Mission, source: Task, need: ReviewNeed, reason: string): void { return this.notices.notifyReviewBlocked(mission, source, need.id, reason) }
   private topicDelivery(missionId: string, from: string, topic: string, content: string): void { return this.notices.topicDelivery(missionId, from, topic, content) }
   async flushOutbox(missionId: string, pass?: SchedulingPass, only?: string): Promise<void> { return this.notices.flushOutbox(missionId, pass, only) }
-  pumpOutbox(): void { return this.notices.pumpOutbox() }
 
   /** M1a seam 7/7: scheduling predicates, pass bookkeeping and the dispatch sweep. */
   private readonly scheduling = new Scheduling(this)
@@ -656,7 +655,7 @@ export class SwarmRuntime implements Kernel {
     // queue. A durable owner notice is delivered even when the mission's pass
     // is wedged in an adapter call or the lock is otherwise held, because the
     // pump reads only durable rows and never takes `exclusive`.
-    this.tickGuard('outbox', () => this.pumpOutbox())
+    this.tickGuard('outbox', () => this.notices.pumpOutbox())
     this.tickGuard('starts', () => this.sweepStarts())
     this.tickGuard('passes', () => this.checkSchedulingPasses())
     this.tickGuard('decisions', () => this.sweepDecisions())

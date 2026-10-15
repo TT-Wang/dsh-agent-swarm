@@ -68,7 +68,7 @@ class StubWorkers extends FakeWorkers {
   async captureArtifact(member) { return { ...artifact('a'.repeat(40)), workspace: member.workspace } }
 }
 /** The runtime without its own tick and outbox pumps: each test drives both. */
-const quiet = runtime => { runtime.kick = () => {}; runtime.pumpOutbox = () => {}; return runtime }
+const quiet = runtime => { runtime.kick = () => {}; runtime.notices.pumpOutbox = () => {}; return runtime }
 const r18Config = { tickMs: 60000, maxMessageChars: 10000, maxEvents: 1000, maxTasksPerMember: 100, checkTimeoutMs: undefined }
 async function fixture(t, config = {}) {
   // Registered before makeRuntime's cleanup, so a reopened runtime is disposed before the temp dir goes.
