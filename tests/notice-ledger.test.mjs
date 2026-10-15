@@ -12,6 +12,8 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
+import { writeFile } from 'node:fs/promises'
+import { join } from 'node:path'
 import { FakeClock, FakeWorkers, MISSION_ACCEPTANCE, acceptThroughReview, blockThroughReview, eventually, events, setup, taskOf } from './faults/harness.mjs'
 import { ownerTools } from './refusal-inventory.mjs'
 import { emitGuardTerminal } from '../lib/refusals.js'
@@ -453,22 +455,26 @@ test('the board classifier is the one emitter of the board\'s facts: a pass that
   assert.deepEqual([stalls.map(delivery => delivery.subjects), boardStallEvents(f).length], [[[`${dependent.id}@${taskOf(f.runtime, dependent.id).epoch}`]], 1], 'then the board classifier tells the stall, once')
 })
 
-test('an unreviewable submission is named by the review admission\'s decision, and the W3 stall of a board with nothing else to do is told beside it, once: one more wording of the open item R20, with or without a review of it no live member can take, and when the task budget admits no review', async t => {
-  for (const review of [false, true, 'budget']) {
-    // The budget board keeps its independent member but has no task slot left for the host's review.
+test('an unreviewable submission is named by the review admission\'s decision, and the W3 stall of a board with nothing else to do is told beside it, once: one more wording of the open item R20, with or without a review of it no live member can take, when the task budget admits no review, and when the host\'s review is refused', async t => {
+  const blockers = { false: /no live member other than the author/, true: /no live member other than the author/, budget: /the mission task budget is exhausted \(1\/1 admitted tasks\)/,
+    refused: /automatic review admission failed: .* The refusal: \[check_requires_host\] / }
+  for (const review of [false, true, 'budget', 'refused']) {
+    // The budget board keeps its independent member but has no task slot left for the host's review. The refused one keeps
+    // both, and the source's check now resolves to a nested sandbox, so the host's review that copies it is refused.
     const f = await setup({ clock: new FakeClock(), budget: review === 'budget' ? { maxTasks: 1 } : {} })
     t.after(f.cleanup)
-    const task = f.propose()
+    const task = f.propose(review === 'refused' ? { checks: ['npm run verify'] } : {})
+    if (review === 'refused') await writeFile(join(f.dir, 'package.json'), JSON.stringify({ scripts: { verify: 'sandbox-exec -f verify.sb node verify.js' } }))
     const claimed = await f.runtime.claim(f.actor(f.author), f.mission.id, task.id)
     await f.runtime.submit(f.actor(f.author), f.mission.id, { taskId: task.id, attemptId: claimed.attempt.id, output: 'candidate' })
     // The only independent member was to review it; once it is gone, that review is dead too.
     const dead = review === true ? f.propose({ title: 'Review', kind: 'verification', reviewOf: task.id, checks: [], assigneeId: f.reviewer.id }) : task
-    if (review !== 'budget') f.runtime.commit(f.mission.id, () => f.runtime.store.put('members', { ...f.runtime.store.get('members', f.reviewer.id), phase: 'stopped' }))
+    if (typeof review === 'boolean') f.runtime.commit(f.mission.id, () => f.runtime.store.put('members', { ...f.runtime.store.get('members', f.reviewer.id), phase: 'stopped' }))
     await f.runtime.settle(f.mission.id)
     await ticks(f, 150)
     const decisions = ownerRows(f).filter(delivery => delivery.notice.dedupKey.startsWith(`review-blocked:${f.mission.id}:${task.id}:`))
     assert.equal(decisions.length, 1, `review=${review}: the admission named the blocker once`)
-    assert.match(decisions[0].content, review === 'budget' ? /the mission task budget is exhausted \(1\/1 admitted tasks\)/ : /no live member other than the author/)
+    assert.match(decisions[0].content, blockers[review])
     const stalls = ownerRows(f).filter(delivery => noticeFamily(delivery) === 'board-stall')
     assert.deepEqual([stalls.map(delivery => delivery.subjects), boardStallEvents(f).length], [[[subjectOf(f, dead)]], 1], `review=${review}: the W3 stall names the board's stuck work beside it, once, with its one event`)
     assert.deepEqual([relevant(f, decisions[0]), relevant(f, stalls[0])], [true, true], 'and both are outstanding')

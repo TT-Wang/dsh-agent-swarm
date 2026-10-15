@@ -7,7 +7,7 @@ import { PolicyError } from './policy-error.ts'
 export { WorkspaceRevokedError } from './authorization.ts'
 import { recordedClaim, type WorkspaceClaim } from './authorization.ts'
 import { WorkspaceAdmission, gitWriteDeniedMessage, TEMP_RENDEZVOUS_WINDOW_MS, type TempMention } from './workspace-admission.ts'
-import { Notices, NOTICE_TEMPLATES, REJECTION_DECISION_TRIGGER, TERMINAL_STATES, ADMIT_REVIEW, BOARD_RUNNING, WITHDRAW_SOURCE, missionSubject, renderNotice, subjectsOfTasks, taskSubject, unreviewedSources, type NotifyOptions } from './notices.ts'
+import { Notices, NOTICE_TEMPLATES, REJECTION_DECISION_TRIGGER, TERMINAL_STATES, ADMISSION_REFUSED, ADMIT_REVIEW, BOARD_RUNNING, WITHDRAW_SOURCE, missionSubject, renderNotice, subjectsOfTasks, taskSubject, unreviewedSources, type NotifyOptions } from './notices.ts'
 import { RefusalRegistry, emitGuardTerminal, queueWriterBusy, requireStrings, requireText, sameChecks, unsupportedEffort, validatedBudget } from './refusals.ts'
 import { Scheduling, progressed, type SchedulingPass } from './scheduling.ts'
 // R17-G6/G7: the one derivation of mission derived state and its host projection.
@@ -2403,7 +2403,8 @@ export class SwarmRuntime {
    * independent member, so the host's own review that cannot reach a verdict
    * is named after those: the one it admitted for this need (it admits one), or
    * one the owner withdrew, an automatic review (host-minted id) with a durable
-   * `task/cancelled` row newer than the row that opened the need (a verdict, rework or challenge retires a review without cancelling it).
+   * `task/cancelled` row newer than the row that opened the need (a verdict, rework or challenge retires a review without cancelling it),
+   * or the one admission refused for this need: the source's newest recorded blocker is newer than that row and states the refusal (`ADMISSION_REFUSED`).
    * The host's own admission reviews on a board with nothing else to do (`stalled`, as the admission pass judged it).
    */
   reviewPathBlocker(source: Task, need: ReviewNeed, stalled?: boolean): string | undefined {
@@ -2417,9 +2418,11 @@ export class SwarmRuntime {
     const automatic = tasks.find(review => review.id === `${AUTOMATIC_REVIEW_PREFIX}${need.id}` || (review.reviewOf === source.id && review.status === 'cancelled'
       && review.id.startsWith(AUTOMATIC_REVIEW_PREFIX) && (this.store.latestTaskEvent(mission.id, review.id, 'task/cancelled')?.seq ?? 0) > need.seq))
     if (automatic !== undefined) return `the automatically admitted review ${automatic.id} ${automatic.status === 'cancelled' ? 'was withdrawn' : `is ${automatic.status} and cannot reach a verdict`}: ${ADMIT_REVIEW}, or ${WITHDRAW_SOURCE}`
+    const recorded = this.store.latestTaskEvent(mission.id, source.id, 'task/review-blocked'), refusal = (recorded?.data as { reason?: string } | undefined)?.reason
+    if (recorded !== undefined && recorded.seq > need.seq && refusal?.startsWith(ADMISSION_REFUSED)) return refusal
     return (stalled ?? this.reviewPathStalled(tasks, members)) ? undefined : BOARD_RUNNING
   }
-  /** Admit the bounded independent review of one unreviewable submitted deliverable. Its id is keyed on the review need, and `reviewPathBlocker` names one that exists, so each need is admitted once. */
+  /** Admit the bounded independent review of one unreviewable submitted deliverable. Its id is keyed on the review need, and `reviewPathBlocker` names one that exists or was refused, so each need is proposed once. */
   private admitAutomaticReview(mission: Mission, source: Task, need: ReviewNeed): void {
     const reviewId = `${AUTOMATIC_REVIEW_PREFIX}${need.id}`
     try {
@@ -2436,7 +2439,7 @@ export class SwarmRuntime {
     } catch (error) {
       // Admission can still refuse a field copied from the source. The
       // submission stands; the owner is told exactly what to admit instead.
-      this.notifyReviewBlocked(mission, source, need, `automatic review admission failed: ${ADMIT_REVIEW} correcting what its refusal names, or ${WITHDRAW_SOURCE}. The refusal: ${error instanceof Error ? error.message : String(error)}`)
+      this.notifyReviewBlocked(mission, source, need, `${ADMISSION_REFUSED}${error instanceof Error ? error.message : String(error)}`)
       return
     }
     // The review already exists and its task/proposed event is durable; a busy

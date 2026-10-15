@@ -390,10 +390,11 @@ export function taskFromSubject(subject: string, tasks: readonly Task[]): Task |
 /** The task a subject names while it is unfinished at that epoch: the term a subject-judged notice is deliverable and reminded by. */
 const unfinished = (subject: string, tasks: readonly Task[]): Task | undefined => { const task = taskFromSubject(subject, tasks); return task === undefined || TERMINAL_STATES.has(task.status) ? undefined : task }
 
-/** The exits a review-path blocker may name beside its own cause's (admit the review, naming the recovery limit a launched mission's admission requires and every mission accepts; or withdraw the source), and the blocker while the host's own review waits for the board. */
+/** The exits a review-path blocker may name beside its own cause's (admit the review, naming the recovery limit a launched mission's admission requires and every mission accepts; or withdraw the source), the blocker while the host's own review waits for the board, and the statement a refused host review is recorded with, before its refusal. */
 export const ADMIT_REVIEW = 'admit a review with swarm_propose(kind: "verification", reviewOf, acceptance, outputs: [], maxRecoveryAttempts)'
 export const WITHDRAW_SOURCE = 'withdraw the source with swarm_cancel(taskId, reason)'
 export const BOARD_RUNNING = `it has no live independent review path and cannot reach a verdict while the rest of the board keeps running: ${ADMIT_REVIEW}, or ${WITHDRAW_SOURCE}`
+export const ADMISSION_REFUSED = `automatic review admission failed: ${ADMIT_REVIEW} correcting what its refusal names, or ${WITHDRAW_SOURCE}. The refusal: `
 
 /** R17-G9: the runtime slice the lineage rules read, so the classifiers and the delivery-time relevance check consume ONE implementation (a test can supply the same shape). */
 type LineageRuntime = Pick<SwarmRuntime, 'config' | 'stallPassTimeoutMs' | 'now' | 'reviewNeed' | 'reviewPathBlocker' | 'unfinishedDependencies' | 'reviewable'>
@@ -1019,19 +1020,16 @@ export class Notices {
     return task !== undefined && stallRootsFor(this.rt, tasks).some(candidate => candidate.id === task.id) ? [root!] : []
   }
 
-  /** A review-blocked decision is outstanding while its source is one the review admission speaks for (`unreviewedSources`) and its reason is that source's blocker under the same review need: the one derived now, else the last one recorded (a refused admission). */
+  /** A review-blocked decision is outstanding while its source is one the review admission speaks for (`unreviewedSources`) and its reason is the blocker the admission derives for that source under the same review need (`SwarmRuntime.reviewPathBlocker`). */
   private openReviewBlock(missionId: string, delivery: Delivery, tasks: Task[]): string[] {
     return (delivery.subjects ?? []).filter(subject => {
       const task = taskFromSubject(subject, unreviewedSources(this.rt, tasks))
       if (task === undefined) return false
       const need = this.rt.reviewNeed(task)
-      const blocker = this.rt.reviewPathBlocker(task, need) ?? this.recordedBlocker(missionId, task.id)
+      const blocker = this.rt.reviewPathBlocker(task, need)
       return blocker !== undefined && delivery.notice?.dedupKey === reviewBlockedKey(missionId, task.id, need.id, blocker)
     })
   }
-
-  /** The newest review blocker recorded for a source; it follows each derived one, whether or not that one woke the owner. */
-  private recordedBlocker(missionId: string, sourceId: string): string | undefined { return (this.rt.store.latestTaskEvent(missionId, sourceId, 'task/review-blocked')?.data as { reason?: string } | undefined)?.reason }
 
   /**
    * The board's one fact while its condition holds, with the body and the
@@ -1465,7 +1463,7 @@ export class Notices {
     // S5: the durable notice ledger (class, key, sender) gates the wake; its row is
     // written in this call, so neither a restart nor a repeat can re-emit it.
     const woken = hasNotice(this.rt.store.list('deliveries', mission.id), { class: 'decision', dedupKey: key, from: 'runtime' })
-    if (woken && this.recordedBlocker(mission.id, source.id) === reason) return
+    if (woken && (this.rt.store.latestTaskEvent(mission.id, source.id, 'task/review-blocked')?.data as { reason?: string } | undefined)?.reason === reason) return
     this.rt.commit(mission.id, () => {
       this.rt.store.event(mission.id, 'task/review-blocked', 'runtime', { taskId: source.id, kind: source.kind, reason })
       if (woken) return
