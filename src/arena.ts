@@ -6,7 +6,7 @@
  * tests and the UI projection derive the same answer without a second policy
  * engine. The runtime remains the only writer; these helpers never mutate.
  * A notice's identity is the fact it names (`factKey`, src/notices.ts); the
- * board digest `F(S)` is the kernel's `missionFingerprint`, an instrument.
+ * board digest `F(S)` is the runtime's `missionFingerprint`, an instrument.
  */
 import { createHash } from 'node:crypto'
 import { taskGraphIndex } from './task-graph.ts'

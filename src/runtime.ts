@@ -10,13 +10,12 @@ import { WorkspaceAdmission, gitWriteDeniedMessage, TEMP_RENDEZVOUS_WINDOW_MS, t
 import { Notices, NOTICE_TEMPLATES, REJECTION_DECISION_TRIGGER, ADMISSION_REFUSED, ADMIT_REVIEW, BOARD_RUNNING, WITHDRAW_SOURCE, newestReviewBlock, renderNotice, unreviewedSources, type NotifyOptions } from './notices.ts'
 import { RefusalRegistry, requireStrings, requireText, sameChecks, unsupportedEffort, validatedBudget } from './refusals.ts'
 import { Scheduling } from './scheduling.ts'
-import { missionFingerprint, progressed, type Kernel, type MissionFingerprintBoard, type SchedulingPass } from './kernel.ts'
+import { progressed, type Kernel, type SchedulingPass } from './kernel.ts'
 // R17-G6/G7: the one derivation of mission derived state and its host projection.
 import { deriveMemberBoard, deriveMemberStatus, memberPhaseOf, memberDeliveryHealth, type MissionBoardMember } from './projection.ts'
 import type { MissionInterpretation } from './notices.ts'
-export { emptyUsage, addUsage } from './gates.ts'
-export { missionFingerprint, type MissionFingerprintBoard } from './kernel.ts'
-import { RuntimeGates, emptyUsage, addUsage, BOARD_DELTA_POSTS, postView } from './gates.ts'
+export { emptyUsage, addUsage, missionFingerprint, type MissionFingerprintBoard } from './gates.ts'
+import { RuntimeGates, emptyUsage, addUsage, BOARD_DELTA_POSTS, missionFingerprint, postView, type MissionFingerprintBoard } from './gates.ts'
 import { DeclaredChecks, MAX_REPORTED_CHECK_FAILURES, excerpt } from './declared-checks.ts'
 import { verdictRows } from './trace.ts'
 export { TEMP_RENDEZVOUS_WINDOW_MS, sharedTempPaths, tempRendezvousDecision, type TempMention } from './workspace-admission.ts'
@@ -430,8 +429,9 @@ export class SwarmRuntime implements Kernel {
 
   /** M1a seam 5/7: the declared-check execution path. */
   private readonly declaredChecks = new DeclaredChecks(this)
-  /** M1a seam 2/7: owner instruments, usage accounting and the budget gate. */
+  /** M1a seam 2/7: derived fingerprints, usage accounting and the budget gate. */
   private readonly gates = new RuntimeGates(this)
+  fingerprintBoard(missionId: string): MissionFingerprintBoard { return this.gates.fingerprintBoard(missionId) }
   private ownerInstruments(missionId: string, full: boolean): Record<string, unknown> { return this.gates.ownerInstruments(missionId, full) }
   private boardWindow(missionId: string, memberId: string, afterSeq: number): Record<string, unknown> { return this.gates.boardWindow(missionId, memberId, afterSeq) }
   private async usage(memberId: string, tokens: number): Promise<void> { return this.gates.usage(memberId, tokens) }
@@ -796,48 +796,17 @@ export class SwarmRuntime implements Kernel {
   subscribe(listener: (missionId: string) => void): () => void { this.listeners.add(listener); return () => { this.listeners.delete(listener) } }
   /** Current `F(S)`: the board digest the owner instruments and the audit fields of the stall events carry. */
   fingerprint(missionId: string): string {
-    // Cache per store revision: F(S) is pure over durable state, so a tick that
-    // changed nothing cannot change it. Never trust the cache inside an open
+    // Cache per store revision: a read at an unchanged revision returns the
+    // digest first computed at it, even if the adapter's idleness or the clock
+    // has since changed readiness. Never trust the cache inside an open
     // transaction: the revision has not advanced yet while the board is mutating.
-    if (this.commitDepth > 0) return missionFingerprint(this.fingerprintBoard(missionId))
+    if (this.commitDepth > 0) return missionFingerprint(this.gates.fingerprintBoard(missionId))
     const revision = this.store.revision()
     const cached = this.fingerprintCache.get(missionId)
     if (cached !== undefined && cached.revision === revision) return cached.fingerprint
-    const fingerprint = missionFingerprint(this.fingerprintBoard(missionId))
+    const fingerprint = missionFingerprint(this.gates.fingerprintBoard(missionId))
     this.fingerprintCache.set(missionId, { revision, fingerprint })
     return fingerprint
-  }
-  /**
-   * The owner-observable board slice F(S) digests (`missionFingerprint`), built
-   * from durable state only. The readiness/review counts come from the same
-   * predicates the scheduler and the completion check use, so the digest cannot
-   * disagree with the board.
-   */
-  fingerprintBoard(missionId: string): MissionFingerprintBoard {
-    const mission = this.mission(missionId)
-    const tasks = this.store.list('tasks', missionId)
-    const members = this.store.list('members', missionId)
-    const ready = new Set(this.dispatchable(tasks, members).map(task => task.id))
-    const unreviewed = new Set(tasks.filter(task => task.status === 'submitted' && !this.reviewable(task, tasks)).map(task => task.id))
-    return {
-      status: mission.status,
-      tasks: tasks.map(task => ({ id: task.id, status: task.status,
-        ...(task.attempt?.ownerId === undefined ? {} : { attemptOwner: task.attempt.ownerId }),
-        ready: ready.has(task.id), unreviewed: unreviewed.has(task.id) })),
-      members: members.map(member => ({ id: member.id, status: member.status })),
-      // Owner-observable outbox backlog only: a delivery to a live member is the
-      // wake channel and is flushed in the same scheduling pass, and an owner
-      // notice is the ledger's record of a fact told about this board, not
-      // board state, so telling one never moves the digest.
-      pendingDeliveries: this.store.list('deliveries', missionId).filter(delivery => delivery.deliveredAt === undefined
-        && delivery.to !== 'owner'
-        && !members.some(member => member.id === delivery.to && member.status !== 'stopped')).length,
-      challengedEvidence: this.store.list('evidence', missionId).filter(evidence => evidence.status === 'challenged').length,
-      ceilings: [
-        ...(mission.budgetPause === undefined ? [] : [`budget:${mission.budgetPause.id}`]),
-        ...tasks.filter(task => task.ceiling !== undefined).map(task => `task:${task.id}:${task.ceiling!.dimension}`),
-      ],
-    }
   }
 /**
    * R17-G6: the derived member board — the read face the guard model and the
