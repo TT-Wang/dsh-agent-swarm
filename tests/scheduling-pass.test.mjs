@@ -254,6 +254,52 @@ test('S2: every row a tick\'s guards tell is delivered by that tick\'s pump once
   }
 })
 
+test('S2: a row a tick tells while the pump in flight is inside its bound is delivered by that pump, which sweeps again once its sweep ends', async () => {
+  // The interleaving of the test above, half a bound earlier: the held pump is
+  // inside its bound when the tick's pump would start, so that start joins it.
+  // The held pump read the mission's outbox before the silence existed, so it
+  // sweeps again once its sweep ends, and the silence is delivered then, with no
+  // further tick, while the body is still wedged.
+  const clock = new FakeClock()
+  const workers = new WedgeStartWorkers({ clock })
+  const held = hold()
+  const deliver = workers.deliver.bind(workers)
+  workers.deliver = async (member, delivery) => {
+    if (member.id === 'owner' && delivery.content === 'A notice whose delivery hangs') { held.entered.resolve(); await held.release.promise }
+    return await deliver(member, delivery)
+  }
+  const f = await setup({ workers, clock, config: { workerStartTimeoutMs: 3_600_000, stallPassTimeoutMs: 10_000, attemptSilenceBoundMs: 1_000 } })
+  let wedge
+  try {
+    const bound = f.runtime.config.stallPassTimeoutMs
+    const task = f.propose()
+    await f.runtime.claim(f.actor(f.author), f.mission.id, task.id)
+    await f.runtime.settle(f.mission.id)
+    f.runtime.commit(f.mission.id, () => f.runtime.notify(f.mission.id, 'A notice whose delivery hangs', [`mission:${f.mission.id}`], { trigger: 'test/held', reason: 'held' }))
+    const before = new Set(f.runtime.operations)
+    f.runtime.notices.pumpOutbox()
+    const pump = [...f.runtime.operations].find(operation => !before.has(operation))
+    await held.entered.promise
+    clock.advance(bound / 2)
+    wedge = workers.arm()
+    f.runtime.kick(f.mission.id)
+    await wedge.entered.promise
+    await f.runtime.tick()
+    const silence = () => f.runtime.store.list('deliveries', f.mission.id).find(delivery => String(delivery.notice?.dedupKey).startsWith('attempt-silent:'))
+    assert.ok(silence() !== undefined, 'the silence sweep told the owner in this tick')
+    assert.equal(silence().deliveredAt, undefined, 'the tick\'s pump joined the held one, which is still in its first sweep')
+    held.release.resolve()
+    await pump
+    assert.ok(silence().deliveredAt !== undefined, 'the held pump delivered the silence in the sweep after its first, with no further tick')
+    assert.equal(workers.wedgeSettledAt, undefined, 'while the body is still wedged')
+  } finally {
+    wedge?.release.reject(new Error('Worker startup timed out (released by the test)'))
+    held.release.resolve()
+    await f.runtime.settle(f.mission.id)
+    await f.cleanup()
+  }
+})
+
 test('R15-D2: the naming of a wedged body states a blocked task\'s stop only past its declared bound, in the words of the stall root it is', async () => {
   // A body wedges in start. Past the live-work bound, three tasks are parked
   // behind a stop at their own epoch: one awaited 10ms of the 1000ms bound, one

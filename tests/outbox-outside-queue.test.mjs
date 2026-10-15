@@ -155,3 +155,101 @@ test('S2: pump requests made before a pump starts share that pump, and a request
     assert.equal(f.runtime.store.get('deliveries', row.id).deliveryFailure?.reason, 'Recipient member_gone is missing from the durable member roster')
   } finally { await f.cleanup() }
 })
+
+test('S2: a pump past its bound is superseded, ends with its sweep, and leaves the requests it held and every later one to its successor', async () => {
+  // Two owner rows hang in deliver until the test releases them, so each pump
+  // that reaches one stays in flight. The row before them is addressed to a
+  // member missing from the roster: every sweep attempts it without any adapter
+  // call and records one more starvation attempt, so the attempts count sweeps.
+  const clock = new FakeClock()
+  const workers = new FakeWorkers()
+  const holds = new Map(['msg_s2_held_first', 'msg_s2_held_second'].map(id => [id, { entered: Promise.withResolvers(), release: Promise.withResolvers() }]))
+  workers.deliver = async (member, delivery) => {
+    const held = holds.get(delivery.id)
+    if (held !== undefined) { held.entered.resolve(); await held.release.promise }
+    return await FakeWorkers.prototype.deliver.call(workers, member, delivery)
+  }
+  const f = await setup({ workers, clock })
+  const releaseAll = () => { for (const held of holds.values()) held.release.resolve() }
+  try {
+    const bound = f.runtime.config.stallPassTimeoutMs
+    await f.runtime.settle(f.mission.id)
+    const row = (id, to) => ({ id, missionId: f.mission.id, from: 'runtime', to, kind: 'control', content: `S2 fixture ${id}`, createdAt: clock.now() })
+    f.runtime.store.transaction(() => {
+      f.runtime.store.put('deliveries', row('msg_s2_unrostered', 'member_gone'))
+      for (const id of holds.keys()) f.runtime.store.put('deliveries', row(id, 'owner'))
+    })
+    const attempts = () => f.runtime.store.get('missions', f.mission.id).outboxStarved?.attempts
+    const delivered = id => f.runtime.store.get('deliveries', id).deliveredAt !== undefined
+    /** One request; resolves to the operation its deferred start runs as. */
+    const request = () => { const before = new Set(f.runtime.operations); f.runtime.notices.pumpOutbox(); return [...f.runtime.operations].find(operation => !before.has(operation)) }
+    const [first, second] = holds.values()
+    const superseded = request()
+    await first.entered.promise
+    assert.equal(attempts(), 1, 'the first pump swept the unrostered row and holds the first owner row')
+    await request()
+    assert.equal(attempts(), 1, 'a request inside its bound joins it and starts no sweep')
+    clock.advance(bound)
+    const successor = request()
+    await second.entered.promise
+    assert.equal(attempts(), 2, 'a request past its bound starts a successor, which sweeps while the first pump is held')
+    first.release.resolve()
+    await superseded
+    assert.ok(delivered('msg_s2_held_first'), 'the superseded pump finished its sweep')
+    assert.equal(attempts(), 2, 'and ended with it: the request it held is its successor\'s')
+    await request()
+    assert.equal(attempts(), 2, 'a request inside the successor\'s bound joins the successor: the superseded pump\'s end left it the current pump')
+    second.release.resolve()
+    await successor
+    assert.ok(delivered('msg_s2_held_second'), 'the successor finished its sweep')
+    assert.equal(attempts(), 3, 'and swept once more for the request that joined it')
+  } finally { releaseAll(); await f.runtime.settle(f.mission.id); await f.cleanup() }
+})
+
+test('S2: a row told while a pump sweeps is delivered by that pump\'s next sweep, and the bound a request is judged against is that sweep\'s', async () => {
+  // A request that joins a pump asks it for one more sweep, because the sweep in
+  // flight may have read the outbox before the request's rows existed. The
+  // declared bound measures the sweep in flight, not the pump: a pump sweeping
+  // again for a request is not superseded by a request inside that sweep's bound.
+  // The first row is addressed to a member missing from the roster, so the
+  // starvation attempts count sweeps; the owner rows hang until released.
+  const clock = new FakeClock()
+  const workers = new FakeWorkers()
+  const holds = new Map(['msg_s2_held_first', 'msg_s2_held_later'].map(id => [id, { entered: Promise.withResolvers(), release: Promise.withResolvers() }]))
+  workers.deliver = async (member, delivery) => {
+    const held = holds.get(delivery.id)
+    if (held !== undefined) { held.entered.resolve(); await held.release.promise }
+    return await FakeWorkers.prototype.deliver.call(workers, member, delivery)
+  }
+  const f = await setup({ workers, clock })
+  try {
+    const bound = f.runtime.config.stallPassTimeoutMs
+    await f.runtime.settle(f.mission.id)
+    const row = (id, to) => ({ id, missionId: f.mission.id, from: 'runtime', to, kind: 'control', content: `S2 fixture ${id}`, createdAt: clock.now() })
+    const put = (id, to) => f.runtime.store.transaction(() => f.runtime.store.put('deliveries', row(id, to)))
+    put('msg_s2_unrostered', 'member_gone')
+    put('msg_s2_held_first', 'owner')
+    const attempts = () => f.runtime.store.get('missions', f.mission.id).outboxStarved?.attempts
+    const delivered = id => f.runtime.store.get('deliveries', id).deliveredAt !== undefined
+    /** One request; resolves to the operation its deferred start runs as. */
+    const request = () => { const before = new Set(f.runtime.operations); f.runtime.notices.pumpOutbox(); return [...f.runtime.operations].find(operation => !before.has(operation)) }
+    const [first, later] = holds.values()
+    const pump = request()
+    await first.entered.promise
+    clock.advance(bound - 1)
+    put('msg_s2_held_later', 'owner')
+    await request()
+    assert.equal(attempts(), 1, 'the request joined the pump, whose sweep read the outbox before the later row existed')
+    first.release.resolve()
+    await later.entered.promise
+    assert.ok(delivered('msg_s2_held_first'))
+    assert.equal(attempts(), 2, 'the pump swept again for the request that joined it, and holds the later row')
+    clock.advance(2)
+    await request()
+    assert.equal(attempts(), 2, 'one bound after the pump started but inside its second sweep\'s, a request joins it')
+    later.release.resolve()
+    await pump
+    assert.ok(delivered('msg_s2_held_later'), 'the row told while the pump swept was delivered by that pump, with no other request')
+    assert.equal(attempts(), 3, 'which swept once more for the request that joined its second sweep')
+  } finally { for (const held of holds.values()) held.release.resolve(); await f.runtime.settle(f.mission.id); await f.cleanup() }
+})

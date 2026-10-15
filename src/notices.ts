@@ -407,6 +407,8 @@ export function dispatchQuestion(board: Board, dispatchable: Task[]): DispatchQu
 const reviewBlockedKey =(missionId: string, sourceId: string, need: string, reason: string): string => `review-blocked:${missionId}:${sourceId}:${need}:${reason}`
 /** The families of the board's own fact: the W3 stall, or an owner-assembled mission's coverage-complete (R10-14). */
 const BOARD_FAMILIES: readonly string[] = ['board-stall', 'coverage-complete']
+/** An outbox pump in flight (`Notices.pumpOutbox`): when its current sweep started, and whether a request waits for its next sweep. */
+interface Pump { sweepStartedAt: number; requested: boolean }
 
 export class Notices {
   /**
@@ -415,10 +417,10 @@ export class Notices {
    * cannot claim the whole outbox).
    */
   private readonly delivering = new Map<string, number>()
-  /** Start time of the running pump; ages out at the declared bound. */
-  private pumpingSince?: number
   /** Whether a pump start is deferred and has not run yet (`pumpOutbox`). */
-  private pumpRequested = false
+  private pumpStartPending = false
+  /** The current outbox pump: the newest one in flight, until a start supersedes it (`pumpOutbox`). */
+  private pump?: Pump
   /** R17-G4: the per-owner budget window (no collection: keyed by mission id). */
   private readonly wakeWindows: Record<string, { startedAt: number; count: number; summaryId?: string }> = {}
   /** R17-G4: the shared bound and its window; public so a test can tighten them. */
@@ -1439,30 +1441,41 @@ export class Notices {
    * on a later pump) if the adapter call does not settle. One hung `deliver`
    * therefore cannot starve another notice — not even another notice of the same
    * mission — and the abandonment is recorded durably on the mission row.
+   *
+   * A request is answered by a sweep that starts after it, so every row
+   * committed before the request is attempted:
+   *  - a request is a pending start, and every request made before that start
+   *    runs shares it, because the start reads the outbox after all of them;
+   *  - the start is judged when it runs, after the synchronous work that
+   *    requested it (every guard of a tick). While the current pump's sweep is
+   *    inside the declared bound, the start joins it: that sweep may have read
+   *    a mission's outbox before the request's rows existed, so the pump sweeps
+   *    again once it ends;
+   *  - a sweep past the bound never holds a request (the reviewer's D2): the
+   *    start supersedes its pump with a new one. The superseded pump ends with
+   *    its sweep, and every request it was holding is its successor's.
    */
   pumpOutbox(): void {
-    // A request is a pending start: every request made before that start runs
-    // is covered by it, because it reads the outbox after them.
-    if (this.rt.shuttingDown || this.rt.closed || this.pumpRequested) return
-    this.pumpRequested = true
+    if (this.rt.shuttingDown || this.rt.closed || this.pumpStartPending) return
+    this.pumpStartPending = true
     this.rt.defer(async () => {
-      this.pumpRequested = false
-      // Bounded coalescing: a request joins a pump that is inside its declared
-      // bound, but a pump whose deliveries hang past the bound never suppresses
-      // the next one — the flag ages out instead of starving the outbox (the
-      // reviewer's D2). The join is judged when this pump would start, after
-      // the synchronous work that requested it (every guard of a tick), so a
-      // pump that aged out meanwhile suppresses nothing that work committed.
+      this.pumpStartPending = false
       const now = this.rt.now()
-      if (this.pumpingSince !== undefined && now - this.pumpingSince < this.rt.bounds.stallPassTimeoutMs) return
-      this.pumpingSince = now
+      const current = this.pump
+      if (current !== undefined && now - current.sweepStartedAt < this.rt.bounds.stallPassTimeoutMs) { current.requested = true; return }
+      const pump: Pump = { sweepStartedAt: now, requested: true }
+      this.pump = pump
       try {
-        for (const mission of this.rt.store.list('missions')) {
-          if (this.rt.closed || this.rt.shuttingDown) return
-          try { await this.flushOutbox(mission.id) }
-          catch { /* Durable outbox retries; one mission must not stop the pump. */ }
+        while (pump.requested && this.pump === pump) {
+          pump.requested = false
+          pump.sweepStartedAt = this.rt.now()
+          for (const mission of this.rt.store.list('missions')) {
+            if (this.rt.closed || this.rt.shuttingDown) return
+            try { await this.flushOutbox(mission.id) }
+            catch { /* Durable outbox retries; one mission must not stop the pump. */ }
+          }
         }
-      } finally { this.pumpingSince = undefined }
+      } finally { if (this.pump === pump) this.pump = undefined }
     })
   }
 }
