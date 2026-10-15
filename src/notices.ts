@@ -207,6 +207,20 @@ export function factKey(missionId: string, fact: { trigger: string; reason: stri
 }
 
 /**
+ * R17-G3: the fact a notice records, durable on its row, and the identity it
+ * is deduplicated under: an explicit key, else the fact (subject@epoch +
+ * triggering event + recorded reason), so an unrelated board change cannot
+ * re-arm a notice and a new fact cannot be suppressed by an old one. The one
+ * derivation `Notices.tell` writes under and every reader of its row asks.
+ */
+export function noticeIdentity(missionId: string, subjects: string[], options: NotifyOptions): { fact: NoticeFactRecord; identity: { class: NoticeClass; dedupKey: string; from: string } } {
+  const fact: NoticeFactRecord = { subjects: noticeSubjects(subjects, { id: missionId }), trigger: options.trigger ?? options.dedupKey.split(':')[0]!, reason: options.reason ?? '', questionId: options.questionId, deliveryFailureId: options.deliveryFailureId,
+    ...(options.facts === undefined ? {} : { facts: options.facts }), ...(options.aggregatedIdentities === undefined ? {} : { aggregatedIdentities: options.aggregatedIdentities }),
+    ...(options.coveredBy === undefined ? {} : { coveredBy: options.coveredBy }), ...(options.statement === undefined ? {} : { statement: options.statement }) }
+  return { fact, identity: { class: options.noticeClass ?? 'decision', dedupKey: options.dedupKey ?? factKey(missionId, fact), from: options.from ?? 'runtime' } }
+}
+
+/**
  * R17-G4: the one per-owner wake budget. Every notice family shares it: the
  * first `wakeBudget` facts of a window are delivered individually, and every
  * further fact of the same window is carried by one degraded summary delivery
@@ -575,7 +589,7 @@ export class Notices {
    * wake-budget summary constituent); false when the ledger already holds it.
    */
   notify(missionId: string, content: string, subjects: string[], options: NotifyOptions): boolean {
-    const { fact, identity } = this.noticeIdentity(missionId, subjects, options)
+    const { fact, identity } = noticeIdentity(missionId, subjects, options)
     if (hasNotice(this.rt.store.list('deliveries', missionId), identity)) return false
     this.enqueueOwnerNotice(missionId, content, identity, fact)
     return true
@@ -583,22 +597,8 @@ export class Notices {
 
   /** Tell the owner one fact in a transaction of its own: a fact the ledger already holds (its class, key and sender) commits nothing; otherwise one commit writes its row, then `then`, the record that exists only with that row. */
   tell(missionId: string, content: string, subjects: string[], options: NotifyOptions, then?: () => void): boolean {
-    const { fact, identity } = this.noticeIdentity(missionId, subjects, options)
+    const { fact, identity } = noticeIdentity(missionId, subjects, options)
     return !hasNotice(this.rt.store.list('deliveries', missionId), identity) && this.rt.commit(missionId, () => { this.enqueueOwnerNotice(missionId, content, identity, fact); then?.(); return true })
-  }
-
-  /**
-   * R17-G3: the fact a notice records, durable on its row, and the identity it
-   * is deduplicated under: an explicit key, else the fact (subject@epoch +
-   * triggering event + recorded reason), so an unrelated board change cannot
-   * re-arm a notice and a new fact cannot be suppressed by an old one.
-   */
-  private noticeIdentity(missionId: string, subjects: string[], options: NotifyOptions): { fact: NoticeFactRecord; identity: { class: NoticeClass; dedupKey: string; from: string } } {
-    const noticeClass = options.noticeClass ?? 'decision'
-    const fact: NoticeFactRecord = { subjects: noticeSubjects(subjects, { id: missionId }), trigger: options.trigger ?? options.dedupKey.split(':')[0]!, reason: options.reason ?? '', questionId: options.questionId, deliveryFailureId: options.deliveryFailureId,
-      ...(options.facts === undefined ? {} : { facts: options.facts }), ...(options.aggregatedIdentities === undefined ? {} : { aggregatedIdentities: options.aggregatedIdentities }),
-      ...(options.coveredBy === undefined ? {} : { coveredBy: options.coveredBy }), ...(options.statement === undefined ? {} : { statement: options.statement }) }
-    return { fact, identity: { class: noticeClass, dedupKey: options.dedupKey ?? factKey(missionId, fact), from: options.from ?? 'runtime' } }
   }
 
   /**

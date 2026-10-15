@@ -13,7 +13,7 @@ import { assignmentAllows, canBorrowTask, canOwnReview, strandedReview } from '.
 import { liveReviewFor } from './admission.ts'
 import { hasNotice } from './arena.ts'
 import { pendingStopOwner, stopPending } from './attempts.ts'
-import { awaitsReviewAdmission, factKey, subjectsOfTasks, taskSubject } from './notices.ts'
+import { awaitsReviewAdmission, factKey, noticeIdentity, subjectsOfTasks, taskSubject } from './notices.ts'
 import { emitGuardTerminal } from './refusals.ts'
 import { AdmissionRefusedError } from './scheduler.ts'
 // R17-G6/G7: the one derivation of the derived member status.
@@ -372,14 +372,13 @@ export class Scheduling {
   dispatchQuestion(missionId: string, tasks: Task[], members: Member[], dispatchable: Task[]): DispatchQuestion | undefined {
     const deliveries = this.rt.store.list('deliveries', missionId)
     for (const task of dispatchable) {
-      const dedupKey = `dispatch-question:${missionId}:${task.id}@${task.epoch}`
+      const subjects = [taskSubject(task)], dedupKey = `dispatch-question:${missionId}:${task.id}@${task.epoch}`
       // An open attempt is not a dispatch candidate: the close-out path nudges it
-      // (W6) or the lease path recovers it; a task asked about at its epoch is
-      // the owner's, and a second owner wake would be noise.
-      if (task.attempt !== undefined || hasNotice(deliveries, { class: 'decision', dedupKey, from: 'runtime' })) continue
+      // (W6) or the lease path recovers it; a task asked about at its epoch, under
+      // the identity `Notices.tell` writes, is the owner's: a second wake is noise.
+      if (task.attempt !== undefined || hasNotice(deliveries, noticeIdentity(missionId, subjects, { dedupKey }).identity)) continue
       const eligible = members.filter(member => this.eligible(task, member, tasks))
       if (!eligible.length) continue
-      const subjects = [taskSubject(task)]
       if (eligible.some(member => this.startBlocker(member) === undefined)) return { task, subjects, dedupKey,
         message: `Task ${task.id} (${task.title}, epoch ${task.epoch}) has an eligible idle member but was not dispatched this tick. An idle handle alone does not identify the dispatch blocker. Inspect the task and recorded admission/preparation diagnostics with swarm_observe; repair the reported cause or withdraw the task with swarm_cancel.` }
       const pinned = task.assigneeId === undefined ? undefined : eligible.find(member => member.id === task.assigneeId)
