@@ -9,7 +9,7 @@
 import { createHash } from 'node:crypto'
 import { id } from './store.ts'
 import { arenaView as projectArenaView, hasNotice } from './arena.ts'
-import { currentEvidenceIds, subjectsOfTasks, terminal } from './task-graph.ts'
+import { TERMINAL_STATES, currentEvidenceIds, subjectsOfTasks, terminal } from './task-graph.ts'
 import { excerpt } from './declared-checks.ts'
 import { executionElapsed } from './resource-time.ts'
 import { memberPhaseOf } from './projection.ts'
@@ -330,7 +330,7 @@ export class RuntimeGates {
       && (this.rt.workers.currentActivity(member.id) ?? member.activity)?.kind === 'model')
     const tasks = this.rt.store.list('tasks', mission.id)
     const pairedSources = new Set(tasks.filter(task => task.kind === 'verification' && task.status !== 'cancelled').map(task => task.reviewOf))
-    const pendingReviewSlots = tasks.filter(task => task.kind !== 'verification' && !['accepted', 'cancelled'].includes(task.status) && !pairedSources.has(task.id)).length
+    const pendingReviewSlots = tasks.filter(task => task.kind !== 'verification' && !TERMINAL_STATES.has(task.status) && !pairedSources.has(task.id)).length
     const dimensions: Array<{ dimension: string; used: number; limit: number; inFlight: number; reviewSlots?: number; task?: Task }> = [
       { dimension: 'maxTokens', used: mission.usedTokens, limit: mission.budget.maxTokens, inFlight: this.rt.inFlightEstimate(members) },
       { dimension: 'maxSteps', used: mission.usedSteps, limit: mission.budget.maxSteps, inFlight: inFlight.length },
@@ -338,7 +338,7 @@ export class RuntimeGates {
       { dimension: 'maxTasks', used: tasks.length, limit: mission.budget.maxTasks, inFlight: 0, reviewSlots: pendingReviewSlots },
     ]
     for (const task of tasks) {
-      if (['accepted', 'cancelled'].includes(task.status)) continue
+      if (TERMINAL_STATES.has(task.status)) continue
       if (task.maxSteps !== undefined) dimensions.push({ dimension: 'maxSteps', used: task.usedSteps ?? 0, limit: task.maxSteps,
         inFlight: inFlight.some(member => member.id === task.attempt?.ownerId) ? 1 : 0, task })
       // A claim a rework archived is history of a rejected round, so it counts toward no round's findings.

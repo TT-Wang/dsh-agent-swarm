@@ -8,7 +8,7 @@
  * member loop used to be.
  */
 import { id } from './store.ts'
-import { pendingStopOwner, selectAcceptedDelivery, stopPending, subjectsOfTasks, taskSubject, terminal } from './task-graph.ts'
+import { TERMINAL_STATES, pendingStopOwner, selectAcceptedDelivery, stopPending, subjectsOfTasks, taskSubject, terminal } from './task-graph.ts'
 import { assignmentAllows, canBorrowTask, canOwnReview, strandedReview } from './assignment.ts'
 import { liveReviewFor } from './admission.ts'
 import { hasNotice } from './arena.ts'
@@ -278,7 +278,7 @@ export class Scheduling {
   dispatchQuestion(missionId: string, tasks: Task[], members: Member[], dispatchable: Task[]): DispatchQuestion | undefined {
     const deliveries = this.rt.store.list('deliveries', missionId)
     for (const task of dispatchable) {
-      const subjects = [taskSubject(task)], dedupKey = `dispatch-question:${missionId}:${task.id}@${task.epoch}`
+      const subjects = [taskSubject(task)], dedupKey = `dispatch-question:${missionId}:${subjects[0]}`
       // An open attempt is not a dispatch candidate: the close-out path nudges it
       // (W6) or the lease path recovers it; a task asked about at its epoch, under
       // the identity `Notices.tell` writes, is the owner's: a second wake is noise.
@@ -377,7 +377,7 @@ export class Scheduling {
         const stuck = task.dependencies.some(dep => { const effective = this.rt.effectiveDependency(mission.id, dep, tasks); return effective.status === 'cancelled' || dead.has(effective.id) })
           || (task.reviewOf !== undefined && (() => {
             const source = this.rt.task(mission.id, task.reviewOf)
-            return source.status === 'cancelled' || source.status === 'accepted' || dead.has(source.id)
+            return TERMINAL_STATES.has(source.status) || dead.has(source.id)
               || !live.some(member => assignmentAllows(task, member.id, tasks) && canOwnReview(source, member.id))
           })())
           || !live.some(member => assignmentAllows(task, member.id, tasks))
@@ -579,7 +579,7 @@ export class Scheduling {
     // Guard pair: scheduling-pass stall x stall-root classifier — both can fire for
     // one board, and each keeps its own subject and dedup key; the mission root is
     // the fallback only when the board has no non-terminal task left.
-    const unreached = tasks.filter(task => task.status !== 'accepted' && task.status !== 'cancelled')
+    const unreached = tasks.filter(task => !TERMINAL_STATES.has(task.status))
     // R16-D: the live work that held a naming to its second bound is unfinished
     // (`liveWorkHolders`: running, or blocked on its stop), so it is among these
     // subjects: the owner sees which subjects made the wait unavoidable, and

@@ -367,18 +367,16 @@ export class SwarmRuntime {
    * independent of a healthy sibling (R15-A4).
    */
   noticeSubjectsFor(missionId: string, scope: { taskId?: string; memberId?: string } = {}): string[] {
-    const mission = this.store.get('missions', missionId)
-    const root = mission === undefined ? `mission:${missionId}` : missionSubject(mission)
     const tasks = this.store.list('tasks', missionId)
     if (scope.taskId !== undefined) {
       const task = tasks.find(candidate => candidate.id === scope.taskId)
       if (task !== undefined) return [taskSubject(task)]
     }
     if (scope.memberId !== undefined) {
-      const owned = tasks.filter(task => (task.attempt?.ownerId === scope.memberId || task.assigneeId === scope.memberId) && task.status !== 'accepted' && task.status !== 'cancelled')
-      if (owned.length) return subjectsOfTasks(owned, mission ?? { id: missionId })
+      const owned = tasks.filter(task => (task.attempt?.ownerId === scope.memberId || task.assigneeId === scope.memberId) && !TERMINAL_STATES.has(task.status))
+      if (owned.length) return subjectsOfTasks(owned, { id: missionId })
     }
-    return [root]
+    return [missionSubject({ id: missionId })]
   }
   /**
    * R15-A4: the dispatcher's per-(task, assignee) question, forwarded so the
@@ -914,7 +912,7 @@ export class SwarmRuntime {
     const unfinished: Task[] = []
     for (const dependency of task.dependencies) {
       const effective = graph.effective(dependency)
-      if (effective === undefined || effective.status === 'accepted' || effective.status === 'cancelled') continue
+      if (effective === undefined || TERMINAL_STATES.has(effective.status)) continue
       if (seen.has(effective.id)) continue
       seen.add(effective.id)
       unfinished.push(effective)
@@ -961,7 +959,7 @@ export class SwarmRuntime {
     }
     const remainingOf = (chain: string[]): number => chain.filter(id => {
       const task = byId.get(id)
-      return task !== undefined && task.status !== 'accepted' && task.status !== 'cancelled'
+      return task !== undefined && !TERMINAL_STATES.has(task.status)
     }).length
     let chain: string[] = []
     for (const task of tasks) {
@@ -1259,7 +1257,7 @@ export class SwarmRuntime {
       if (!input.reviewOf) throw new PolicyError('verification_review_source_required', 'validation_error', 'Verification requires reviewOf')
       const source = this.task(missionId, input.reviewOf)
       if (source.kind === 'verification') throw new PolicyError('verification_review_source_invalid', 'tool_error', 'Verification cannot review another verification task')
-      if (source.status === 'cancelled' || source.status === 'accepted') throw new PolicyError('review_source_not_submitted', 'tool_error', `reviewOf ${source.id}: that task is already ${source.status}; a review can only start on submitted work`)
+      if (TERMINAL_STATES.has(source.status)) throw new PolicyError('review_source_not_submitted', 'tool_error', `reviewOf ${source.id}: that task is already ${source.status}; a review can only start on submitted work`)
       if (input.assigneeId !== undefined && !canOwnReview(source, input.assigneeId)) throw new PolicyError('review_assignee_not_independent', 'validation_error', `assigneeId ${input.assigneeId} authored ${source.id}; an independent review must be assigned to a member who never owned it, or left unassigned`)
     } else if (input.reviewOf) throw new PolicyError('review_source_not_verification', 'tool_error', 'Only verification tasks may set reviewOf')
     // Round 9-C: a repair may keep the original acceptance while changing the
@@ -3345,7 +3343,7 @@ export class SwarmRuntime {
   completionError(mission: Mission): string | undefined {
     const tasks = this.store.list('tasks', mission.id)
     if (!tasks.length) return 'Mission still has unfinished or blocked required work'
-    const unfinished = tasks.filter(task => !['accepted', 'cancelled'].includes(task.status) && !completionExempt(task, tasks))
+    const unfinished = tasks.filter(task => !TERMINAL_STATES.has(task.status) && !completionExempt(task, tasks))
     if (unfinished.length) return `Mission still has unfinished or blocked required work: ${unfinished.map(task => `${task.id} (${task.status})`).join(', ')}`
     // Only accepted deliverable work covers a mission criterion, by the ids its
     // replacement lineage cites; code deliverables need an artifact.
@@ -3413,11 +3411,11 @@ export class SwarmRuntime {
     const task = this.task(missionId, taskId)
     // Retry preservation after an explicit repair without reopening terminal work.
     if (action === 'resume' && Object.keys(changes).length === 0 && stopPending(task)
-      && (terminal(mission) || ['accepted', 'cancelled'].includes(task.status))) {
+      && (terminal(mission) || TERMINAL_STATES.has(task.status))) {
       this.attempts.resumeStoppedAttempt(missionId, task, { force: true })
       return task
     }
-    if (['accepted', 'cancelled'].includes(task.status)) throw new PolicyError('task_immutable', 'conflict_error', 'Accepted and cancelled tasks are immutable')
+    if (TERMINAL_STATES.has(task.status)) throw new PolicyError('task_immutable', 'conflict_error', 'Accepted and cancelled tasks are immutable')
     // A replacement carries this task's obligation while any row of its
     // replacement chain is not cancelled, even behind a withdrawn repair.
     const carrier = taskGraphIndex(this.store.list('tasks', missionId)).liveReplacement(task.id)
@@ -4319,8 +4317,8 @@ function tempRendezvousSubjects(rt: SwarmRuntime, missionId: string, rendezvous:
   for (const taskId of [rendezvous.first.taskId, rendezvous.second.taskId]) {
     if (typeof taskId !== 'string' || subjects.includes(taskId)) continue
     const task = rt.store.get('tasks', taskId)
-    const subject = task === undefined ? `mission:${missionId}` : `${task.id}@${task.epoch}`
+    const subject = task === undefined ? missionSubject({ id: missionId }) : taskSubject(task)
     if (!subjects.includes(subject)) subjects.push(subject)
   }
-  return subjects.length ? subjects : [`mission:${missionId}`]
+  return subjects.length ? subjects : [missionSubject({ id: missionId })]
 }

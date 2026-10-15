@@ -8,7 +8,7 @@
  * type-only, so no runtime import cycle exists.
  */
 import { id } from './store.ts'
-import { blockCauses, stopPending, taskSubject, terminal, type BlockCause } from './task-graph.ts'
+import { TERMINAL_STATES, blockCauses, stopPending, taskSubject, terminal, type BlockCause } from './task-graph.ts'
 import { emitGuardTerminal } from './refusals.ts'
 import { stopFaultKey } from './notices.ts'
 import { memberPhaseOf } from './projection.ts'
@@ -178,7 +178,7 @@ export class Attempts {
           const { blocked: exhausted, recoveryLimit: recoveryExhausted } = stopOutcome(causes, reason)
           const released = ownerIds.map(memberId => this.rt.store.get('members', memberId)).filter((member): member is Member => member !== undefined)
           if (reason === 'worker-closeout' && state.memberId !== undefined && (released.length === 0 || released[0]!.status === 'stopped')) delete fresh.assigneeId
-          if (fresh.status !== 'cancelled' && fresh.status !== 'accepted') fresh.status = exhausted ? 'blocked' : 'pending'
+          if (!TERMINAL_STATES.has(fresh.status)) fresh.status = exhausted ? 'blocked' : 'pending'
           delete fresh.resumeAfterStop
           this.rt.commit(missionId, () => {
             for (const member of released) if (memberPhaseOf(member) !== 'stopped') {

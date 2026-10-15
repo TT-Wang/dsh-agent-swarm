@@ -1,6 +1,6 @@
 import { EVENT_PANEL_LABELS, type EventKind } from '../events.ts'
 import type { Evidence, Member, Snapshot, Task, WorkerActivity } from '../types.ts'
-import { completionExempt } from '../task-graph.ts'
+import { TERMINAL_STATES, completionExempt, missionSubject, taskSubject } from '../task-graph.ts'
 import type { LiveWorkRow } from './live-work.ts'
 
 export type ConnectionState = 'connecting' | 'connected' | 'reconnecting' | 'paused'
@@ -51,7 +51,7 @@ export function currentProgress(snapshot: Snapshot, connection: ConnectionState 
   const firstRunning = running.values().next().value as Task | undefined
   if (firstRunning) return { label: 'Task in progress', task: firstRunning, note: 'Waiting for the next observed activity.', stale }
   if (snapshot.tasks.some(task => task.status === 'submitted')) return { label: 'Waiting for acceptance', note: 'Submitted work is waiting for independent review.', stale }
-  if (snapshot.tasks.length > 0 && snapshot.tasks.every(task => ['accepted', 'cancelled'].includes(task.status) || completionExempt(task, snapshot.tasks))) return { label: 'Preparing the final result', stale }
+  if (snapshot.tasks.length > 0 && snapshot.tasks.every(task => TERMINAL_STATES.has(task.status) || completionExempt(task, snapshot.tasks))) return { label: 'Preparing the final result', stale }
   return { label: 'Waiting for worker activity', note: mission.reason ?? 'No current worker activity has been observed.', stale }
 }
 
@@ -287,8 +287,6 @@ function lastEvent(snapshot: Snapshot, taskId: string, types: ReadonlySet<string
   return undefined
 }
 
-function taskSubject(task: Task): string { return `${task.id}@${task.epoch}` }
-
 function recoveryAge(since: number | undefined, now: number): number | undefined {
   return since === undefined || !Number.isFinite(since) ? undefined : Math.max(0, now - since)
 }
@@ -312,7 +310,7 @@ export function sidebarState(snapshot: Snapshot, connection: ConnectionState = '
   if (mission.status === 'staged') {
     return { ...base, phase: 'waiting-for-owner', label: 'Waiting for you',
       note: 'The plan is staged and has not been launched.',
-      decision: { subject: `mission:${mission.id}`, content: mission.reason ?? 'Launch the staged plan or edit it.', queuedAt: mission.updatedAt, consumption: 'unknown' },
+      decision: { subject: missionSubject(mission), content: mission.reason ?? 'Launch the staged plan or edit it.', queuedAt: mission.updatedAt, consumption: 'unknown' },
       evidence: 'mission.status=staged' }
   }
   // One pass over the durable task rows (F-34: the board render must not rescan
@@ -388,7 +386,7 @@ export function sidebarState(snapshot: Snapshot, connection: ConnectionState = '
   }
   if (!tasks.length) {
     return { ...base, phase: 'waiting-for-owner', label: 'Waiting for you', note: 'No work has been admitted yet.',
-      decision: { subject: `mission:${mission.id}`, content: 'Admit work with swarm_propose or inspect the plan.', queuedAt: mission.updatedAt, consumption: 'unknown' },
+      decision: { subject: missionSubject(mission), content: 'Admit work with swarm_propose or inspect the plan.', queuedAt: mission.updatedAt, consumption: 'unknown' },
       evidence: 'no tasks admitted' }
   }
   return { ...base, phase: 'finished', label: 'No task can make further progress', note: mission.reason,

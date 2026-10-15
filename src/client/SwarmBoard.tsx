@@ -1,5 +1,6 @@
 import { createContext, useContext, useMemo, useState, type ReactNode } from 'react'
 import { criterionId, type Snapshot, type Task, type Evidence, type Member, type UsageBuckets } from '../types.ts'
+import { TERMINAL_STATES } from '../task-graph.ts'
 import { LANES, activityGroups, boardIndex, cancellationNotes, compactNumber, durableVerdicts, evidenceCounts, eventSummary, remainingPercent, retiredReviewsBySource, shortId, type BoardIndex, type BoardLane, type CancellationKind, type CancellationNote, type DurableVerdict, type RetiredReview } from './projection.ts'
 import { leaseExpired, useVisibleClock } from './clock.ts'
 import { DependencyGraph } from './DependencyGraph.tsx'
@@ -104,7 +105,7 @@ function TaskCard({ task, index, memberById, lane, reason, cancellation, onCance
       {task.reviewOf && <p className="sw-refs">{t('Reviews')} {shortId(task.reviewOf)}{task.reviewedCommit ? ` ${t('at')} ${shortId(task.reviewedCommit)}` : ''}</p>}
       {task.output && <p className="sw-small" style={{ marginTop: 8 }}>{task.output}</p>}
     </details>}
-    {onCancel && !['accepted', 'cancelled'].includes(task.status) && <div className="sw-row" style={{ marginTop: 8 }}>
+    {onCancel && !TERMINAL_STATES.has(task.status) && <div className="sw-row" style={{ marginTop: 8 }}>
       {arming ? <>
         <button className="sw-link" data-action="confirm-cancel-task" onClick={() => { setArming(false); onCancel(task) }}>{t('Confirm cancel')}</button>
         <button className="sw-link" data-action="dismiss-cancel-task" onClick={() => setArming(false)}>{t('Cancel')}</button>
