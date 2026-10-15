@@ -18,7 +18,6 @@ import type { SwarmStore } from './store.ts'
 import { PolicyError } from './policy-error.ts'
 import { executionClock } from './resource-time.ts'
 import { assignmentAllows, authorIdsOf, canBorrowTask, canOwnReview, strandedReview } from './assignment.ts'
-import { liveReviewFor } from './admission.ts'
 import { memberPhaseOf } from './projection.ts'
 import { recoveryExit } from './declared-checks.ts'
 import { TERMINAL_STATES, blockCauses, completionExempt, missionSubject, pendingStopOwner, quiescencePending, selectAcceptedDelivery, stopPending, subjectsOfTasks, taskGraphIndex, taskSubject, terminal, uncoveredCriteria, type TaskGraphIndex } from './task-graph.ts'
@@ -273,6 +272,21 @@ export function unschedulable(board: Board): Task[] {
     }
   }
   return tasks.filter(task => dead.has(task.id))
+}
+
+/**
+ * The one live-review rule: the review of `source` that can still reach a
+ * verdict. Its status is pending or running, or it is parked behind a stop at
+ * its own epoch (`quiescencePending`), so it re-pends once the stop settles;
+ * and at least one live member may own it: independently (`canOwnReview`) and
+ * by assignment (`assignmentAllows`). A review nobody live may own is no path.
+ * The dispatcher's stall, the owner notices, the arena digest and the
+ * runtime's own review admission all answer from this, through `reviewable`.
+ */
+export function liveReviewFor(reviews: readonly Task[], source: Task, liveMemberIds: ReadonlySet<string>): Task | undefined {
+  return reviews.find(review => review.kind === 'verification' && review.reviewOf === source.id
+    && (review.status === 'pending' || review.status === 'running' || quiescencePending(review))
+    && [...liveMemberIds].some(memberId => canOwnReview(source, memberId) && assignmentAllows(review, memberId, reviews)))
 }
 
 /**

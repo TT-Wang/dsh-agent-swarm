@@ -1,10 +1,11 @@
 /** F2 unit coverage for the shared review-path predicate and its diagnostic. */
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { formatDiagnostic, liveReviewFor, missingReviewDiagnostic } from '../lib/admission.js'
+import { formatDiagnostic, missingReviewDiagnostic } from '../lib/admission.js'
+import { liveReviewFor } from '../lib/board.js'
 import { NOTICE_TEMPLATES } from '../lib/notices.js'
 
-const pending = extra => ({ id: 'review-1', kind: 'verification', status: 'pending', reviewOf: 'source-1', ...extra })
+const pending = extra => ({ id: 'review-1', kind: 'verification', status: 'pending', epoch: 0, reviewOf: 'source-1', ...extra })
 /** A source authored by `assigneeId`; independence is decided by `canOwnReview` over its whole author set. */
 const source = (assigneeId, extra = {}) => ({ id: 'source-1', assigneeId, ...extra })
 
