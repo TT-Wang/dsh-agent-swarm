@@ -20,6 +20,8 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { setup, eventually, taskOf } from './faults/harness.mjs'
+import { isolationIssues } from '../lib/task-graph.js'
+import { scopesOverlap } from '../lib/scheduler.js'
 
 const SCOPES = ['src/', 'docs/', 'scripts/faults/', 'tests/', '**', 'src/runtime.ts']
 /** Deterministic generator so a failing seed is reproducible. */
@@ -130,4 +132,15 @@ test('S7: a shared worktree is refused durably, never dispatched into, and its d
     assert.match(second.content, /has no provisioned isolated worktree/, 'the new decision names the new violation')
     assert.deepEqual([relevant(second), relevant(refused.notice)], [true, false], 'and only the violation the invariant lists is outstanding')
   } finally { await f.cleanup() }
+})
+
+test('S7: two running tasks in one worktree add an overlap violation exactly when their declared scopes overlap', () => {
+  const members = [{ id: 'member_a', name: 'A', status: 'working', workspace: '/isolated/a' }]
+  const running = (id, scope) => ({ id, status: 'running', scope, attempt: { ownerId: 'member_a' } })
+  const messages = (left, right) => isolationIssues(members, [running('task_one', left), running('task_two', right)], scopesOverlap).map(issue => issue.message)
+  const shared = 'concurrently running tasks task_one, task_two share worktree /isolated/a'
+  const overlap = 'concurrently running tasks task_one and task_two declare overlapping scope in worktree /isolated/a'
+  assert.deepEqual(messages(['src/'], ['src/runtime.ts']), [shared, overlap], 'a directory selector overlaps a file under it')
+  assert.deepEqual(messages(['docs/', 'tests/'], ['**']), [shared, overlap], '`**` overlaps every scope')
+  assert.deepEqual(messages(['src/'], ['docs/', 'tests/']), [shared], 'disjoint scopes share the worktree but declare no overlap')
 })

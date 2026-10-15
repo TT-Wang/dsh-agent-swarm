@@ -1,5 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
+import { createHash } from 'node:crypto'
 import { join } from 'node:path'
 import { OwnerReplyGuard } from '../lib/owner-reply.js'
 import { RoleScoper } from '../lib/roles.js'
@@ -311,4 +312,46 @@ test('R12: a stop whose recorded owner has no member row is refused, and the own
   // The named exit works: the task is withdrawn and its repair is admitted.
   runtime.cancel(owner, mission.id, { taskId: task.id, reason: 'The recorded stop owner is gone' })
   assert.deepEqual(runtime.propose(owner, mission.id, { ...work, replaces: [task.id] }).replaces, [task.id])
+})
+
+test('R12: an unresolved legacy stop owner reserves every member, and a marker at an older epoch reserves none', () => {
+  const blocked = (epoch, marker) => ({ id: 'task', status: 'blocked', epoch, resumeAfterStop: { reason: 'handoff', at: 1, ...marker } })
+  assert.equal(pendingStopOwner([blocked(2, { epoch: 2 })], 'member_any'), true, 'a stop whose owner an older build never recorded reserves every member')
+  assert.equal(pendingStopOwner([blocked(2, { epoch: 2, memberId: 'member_old' })], 'member_old'), true, 'a recorded owner waits for its own stop')
+  assert.equal(pendingStopOwner([blocked(2, { epoch: 2, memberId: 'member_old' })], 'member_any'), false, 'and reserves no other member')
+  assert.equal(pendingStopOwner([blocked(3, { epoch: 2 })], 'member_any'), false, 'a marker at an older epoch is no pending stop, even without an owner')
+  assert.equal(pendingStopOwner([blocked(3, { epoch: 2, memberId: 'member_old' })], 'member_old'), false)
+})
+
+test('R12: each distinct stop failure at one epoch is its own decision, keyed by task, epoch, owner and the failure digest', async t => {
+  class Workers extends FakeWorkers { fault; async stop(id) { this.stopped.push(id); if (this.fault !== undefined) throw this.fault } }
+  const workers = new Workers()
+  const clock = new FakeClock(1_700_000_000_000)
+  const { dir, runtime, budget } = await makeRuntime(t, { workers, clock })
+  await runtime.start()
+  const owner = { sessionId: 'owner' }
+  const mission = runtime.create(owner, { title: 'Stop faults', objective: 'Tell each stop failure once', workspace: dir, scope: ['src/'], acceptance: ['works'], budget }, { grantRoot: dir, source: 'session' })
+  const stream = runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Main' })
+  const member = await runtime.addMember(owner, mission.id, { name: 'Builder', role: 'implementation' })
+  await runtime.settle(mission.id)
+  workers.fault = new Error('EBUSY: the handle is busy (first)')
+  const task = runtime.propose(owner, mission.id, { outputs: [], workstreamId: stream.id, title: 'Work', objective: 'Do the work', kind: 'implementation', scope: ['src/'], acceptance: ['works'], checks: ['test -d .'] })
+  const row = runtime.store.get('tasks', task.id)
+  row.status = 'blocked'; row.epoch++
+  row.resumeAfterStop = { epoch: row.epoch, memberId: member.id, reason: 'handoff', at: runtime.now() }
+  runtime.store.transaction(() => runtime.store.put('tasks', row))
+  const keyOf = message => `guard-terminal:attempt_lease:attempt_terminal:stop:${task.id}:${row.epoch}:${member.id}:${createHash('sha256').update(message).digest('hex')}`
+  const told = () => runtime.store.list('deliveries', mission.id).filter(delivery => delivery.to === 'owner' && /\[attempt_terminal\]/.test(delivery.content)).map(delivery => delivery.notice.dedupKey)
+  const retry = async ms => { clock.advance(ms); await runtime.tick(); await runtime.settle(mission.id) }
+  await retry(0)
+  assert.deepEqual(told(), [keyOf('EBUSY: the handle is busy (first)')], 'the failed stop is told under its full key')
+  await retry(1_000)
+  assert.ok(workers.stopped.length >= 2, 'the stop was retried')
+  assert.deepEqual(told(), [keyOf('EBUSY: the handle is busy (first)')], 'the same failure again is the same decision')
+  workers.fault = new Error('EBUSY: the handle is busy (second)')
+  await retry(2_000)
+  assert.deepEqual(told(), [keyOf('EBUSY: the handle is busy (first)'), keyOf('EBUSY: the handle is busy (second)')], 'a different failure at the same epoch is a new decision')
+  workers.fault = undefined
+  await retry(4_000)
+  assert.equal(runtime.store.get('tasks', task.id).resumeAfterStop, undefined, 'the confirmed stop clears the fence')
 })
