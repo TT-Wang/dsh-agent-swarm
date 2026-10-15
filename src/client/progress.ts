@@ -316,12 +316,14 @@ export function sidebarState(snapshot: Snapshot, connection: ConnectionState = '
   // One pass over the durable task rows (F-34: the board render must not rescan
   // per task or per event), keeping the first row of each class in board order.
   const tasks = snapshot.tasks
+  // The unreviewed reading is reached only on a board with no blocked task (a
+  // blocked one is a recovery or an owner decision first), so a parked review
+  // never stands here: a pending or running review is the live one.
   const reviewed: Record<string, true> = {}
   for (const task of tasks) {
-    if (task.kind === 'verification' && task.reviewOf !== undefined
-      && (task.status === 'pending' || task.status === 'running' || (task.status === 'blocked' && stopPending(task)))) reviewed[task.reviewOf] = true
+    if (task.kind === 'verification' && task.reviewOf !== undefined && (task.status === 'pending' || task.status === 'running')) reviewed[task.reviewOf] = true
   }
-  let stopping: Task | undefined
+  let stopping: (Task & { resumeAfterStop: NonNullable<Task['resumeAfterStop']> }) | undefined
   let blocked: Task | undefined
   let unreviewed: Task | undefined
   let recovering: Task | undefined
@@ -342,7 +344,7 @@ export function sidebarState(snapshot: Snapshot, connection: ConnectionState = '
   }
   // A durable stop transition is the runtime's own recovery step, with its age.
   if (stopping !== undefined) {
-    const stop = stopping.resumeAfterStop!
+    const stop = stopping.resumeAfterStop
     const since = stop.at
     const start = since ?? lastEvent(snapshot, stopping.id, recoveryEventTypes)?.createdAt
     return { ...base, phase: 'recovering',
