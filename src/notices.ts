@@ -1250,16 +1250,6 @@ export class Notices {
       const question = this.rt.dispatchQuestion(missionId, tasks, members, dispatchable)
       if (question !== undefined) this.tell(missionId, question.message, view.subjectsOf([question.task]), { dedupKey: question.dedupKey })
     }
-    // Row 3 (documented scope): a board whose *every* non-terminal task is
-    // running under a live lease is exempt outright. Running work plus a pending
-    // or blocked task falls through to the classifiers below, which owe a witness
-    // only for what no live path advances: a dependent whose lineage is dead
-    // (T1av2 evidence_978a4694) is named. Ready work queued behind its selected
-    // member's live lease is not (the 69211b9 wait rule in `waitsLegitimately`):
-    // that lease bounds the wait exactly as in row 3, and its end (close-out, or
-    // the row-4 expiry recovery) is the next chance to run the queued task.
-    const nonTerminal = view.nonTerminal
-    if (nonTerminal.length && nonTerminal.every(task => task.status === 'running' && task.attempt !== undefined && task.attempt.leaseUntil >= this.rt.now())) return
     // The board's own fact, of which this is the one emitter: coverage-complete
     // whenever completion is allowed (an automatic mission completes on its
     // pass instead), the W3 stall once the board is stalled (`boardFact`).
@@ -1267,14 +1257,16 @@ export class Notices {
     // No live work: stuck work is the W3 stall's alone (a stall candidate until the board is stalled).
     if (this.rt.reviewPathStalled(tasks, members)) return
     // R14-F2(c): the unnamed fallback is replaced. While every unfinished task is
-    // legitimately waiting, the runtime stays silent; otherwise it escalates
-    // UNCONDITIONALLY and names every task its classifier did not recognise, so
-    // no state can be silent and unnamed at the same time. A stall root and a
-    // dispatchable task have their own board namer (the root's notice, the
-    // dispatch question); every other task no live path advances is named here,
-    // whatever owner decision also names it.
+    // legitimately waiting (row 3: a running attempt waits on its lease's path),
+    // the runtime stays silent; otherwise it escalates UNCONDITIONALLY and names
+    // every task its classifier did not recognise, so no state can be silent and
+    // unnamed at the same time. A stall root and a dispatchable task have their
+    // own board namer (the root's notice, the dispatch question). While no member
+    // is startable (T3), no question is asked, and the dispatchable task is still
+    // left to it, asked once a member can start; every other task no live path
+    // advances is named here, whatever owner decision also names it.
     const roots = new Set(view.stallRoots.map(task => task.id))
-    const unrecognised = nonTerminal.filter(task => !roots.has(task.id) && !dispatchable.includes(task) && !this.waitsLegitimately(task, tasks))
+    const unrecognised = view.nonTerminal.filter(task => !roots.has(task.id) && !dispatchable.includes(task) && !this.waitsLegitimately(task, tasks))
     if (!unrecognised.length) return
     // R17-G3: the fact is the named subjects and the recorded reason (the
     // classifier's verdict), never the board digest.
