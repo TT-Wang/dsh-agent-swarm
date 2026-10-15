@@ -26,7 +26,7 @@
 import { guardTerminal } from '../lib/refusals.js'
 import { taskCeilingExhaustion } from '../lib/admission.js'
 import { authorIdsOf } from '../lib/assignment.js'
-import { dependencySatisfied, effectiveDependency, reviewable } from '../lib/board.js'
+import { reviewable } from '../lib/board.js'
 import { taskGraphIndex } from '../lib/task-graph.js'
 
 /**
@@ -59,8 +59,8 @@ export function guardBoard(runtime, missionId, mission) {
         id: task.id, status: task.status,
         ...(task.attempt === undefined ? {} : { attempt: { leaseLive: task.attempt.leaseUntil >= now } }),
         ...(exhaustion === undefined ? {} : { ceilingExhausted: true }),
-        dependenciesSatisfied: task.dependencies.every(dependency => dependencySatisfied(board, dependency)),
-        dependenciesDead: task.dependencies.some(dependency => effectiveDependency(board, dependency).status === 'cancelled'),
+        dependenciesSatisfied: task.dependencies.every(dependency => board.graph.dependencyMetOf(dependency)),
+        dependenciesDead: task.dependencies.some(dependency => board.graph.effectiveOf(dependency).status === 'cancelled'),
         ...(task.reviewOf === undefined ? {} : { reviewOf: task.reviewOf }),
         // S4r-D4: `reviewSourceLive` is the SAME predicate the scheduler uses. A
         // review task is live exactly while its source is submitted (`capable`);

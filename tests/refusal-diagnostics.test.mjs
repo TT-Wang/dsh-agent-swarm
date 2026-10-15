@@ -264,7 +264,7 @@ test('refusals outside this branch are inventoried through the same helper and r
   // M1a split the control path into modules: every file that carries refusal
   // sites of the two serialized sources is inventoried here, so the report stays
   // the full set rather than the subset that happened to stay in one file.
-  const deferredSources = ['src/runtime.ts', 'src/workspaces.ts', 'src/authorization.ts', 'src/plans.ts', 'src/planner.ts', 'src/store.ts', 'src/web-api.ts', 'src/attempts.ts', 'src/notices.ts', 'src/refusals.ts', 'src/gates.ts', 'src/workspace-admission.ts', 'src/scheduling.ts', 'src/board.ts']
+  const deferredSources = ['src/runtime.ts', 'src/workspaces.ts', 'src/authorization.ts', 'src/plans.ts', 'src/planner.ts', 'src/store.ts', 'src/web-api.ts', 'src/attempts.ts', 'src/notices.ts', 'src/refusals.ts', 'src/gates.ts', 'src/workspace-admission.ts', 'src/scheduling.ts', 'src/board.ts', 'src/task-graph.ts']
   let total = 0
   let uncoded = 0
   for (const file of deferredSources) {

@@ -7,7 +7,7 @@
  */
 import { id } from './store.ts'
 import { TERMINAL_STATES, pendingStopOwner, quiescencePending, selectAcceptedDelivery, stopPending, subjectsOfTasks, taskSubject, terminal } from './task-graph.ts'
-import { effectiveDependencies, eligible, noticeSubjectsFor, ready, startBlocker, unschedulable } from './board.ts'
+import { eligible, noticeSubjectsFor, ready, startBlocker, unschedulable } from './board.ts'
 import { factKey } from './notices.ts'
 import { AdmissionRefusedError } from './scheduler.ts'
 import { awaited, formatSpan, progressed, type SchedulingPass } from './kernel.ts'
@@ -153,7 +153,7 @@ export class Scheduling {
             // (`SwarmRuntime.onRecoveryFallback`), which stamps the body that
             // marked the member it prepares before it commits the report.
             if (pass !== undefined) pass.preparing = member.id
-            try { await awaited(pass, this.rt.workers.prepareTask(member, { ...task, epoch: task.epoch + 1 }, effectiveDependencies(this.rt.boardOf(missionId), task), task.reviewOf ? this.rt.task(missionId, task.reviewOf) : undefined), this.rt.now) }
+            try { await awaited(pass, this.rt.workers.prepareTask(member, { ...task, epoch: task.epoch + 1 }, this.rt.boardOf(missionId).graph.effectiveDependencies(task), task.reviewOf ? this.rt.task(missionId, task.reviewOf) : undefined), this.rt.now) }
             finally { if (pass !== undefined) delete pass.preparing }
             if (this.rt.shuttingDown || this.rt.mission(missionId).status !== 'active') return false
             const fresh = this.rt.task(missionId, task.id)

@@ -14,7 +14,7 @@ import { PolicyError } from './policy-error.ts'
 import type { SwarmRuntime } from './runtime.ts'
 import { WriterBusyError, id } from './store.ts'
 import { awaited, type SchedulingPass } from './kernel.ts'
-import { awaitsReviewAdmission, completionError, dispatchable, eligible, newestReviewBlock, noticeSubjectsFor, reviewable, reviewNeed, reviewPathBlocker, reviewPathStalled, stalled, startBlocker, unfinishedDependencies, unreviewedSources, unschedulable, type Board } from './board.ts'
+import { awaitsReviewAdmission, completionError, dispatchable, eligible, newestReviewBlock, noticeSubjectsFor, reviewable, reviewNeed, reviewPathBlocker, reviewPathStalled, stalled, startBlocker, unreviewedSources, unschedulable, type Board } from './board.ts'
 import type { Actor, Delivery, Escalation, Member, Mission, NoticeClass, Task, WorkerAdapter } from './types.ts'
 
 /**
@@ -446,7 +446,7 @@ export function waitsLegitimately(board: Board, task: Task): boolean {
     // the same row as a root, and this classifier refusing it here keeps the two
     // in agreement instead of leaving the state both silent and unnamed.
     if (stop !== undefined) return stop.at !== undefined && board.clock() - stop.at <= board.bounds.stallPassTimeoutMs
-    return unfinishedDependencies(board, task).length > 0
+    return board.graph.unfinishedDependencies(task).length > 0
   }
   if (task.status === 'pending') {
     // Reviews wait on their exact source; no worker stop can repair a missing
@@ -457,7 +457,7 @@ export function waitsLegitimately(board: Board, task: Task): boolean {
       const source = tasks.find(candidate => candidate.id === task.reviewOf)
       return source !== undefined && !TERMINAL_STATES.has(source.status) && reviewable(board, source)
     }
-    if (unfinishedDependencies(board, task).length > 0) return true
+    if (board.graph.unfinishedDependencies(task).length > 0) return true
     if (!task.dependencies.every(dependency => board.graph.dependencyMet(dependency))) return false
     // A preparation failure the host will not retry is a block cause the owner
     // repairs (`blockCauses` owns that distinction). One carrying `retryAt` is the

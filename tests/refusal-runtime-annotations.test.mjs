@@ -46,7 +46,7 @@ const CODED_CLASS_REFUSALS = {
   'src/workspaces.ts': ['dependency_directory_unavailable', 'dependency_copy_escape'],
 }
 /** Enumerate the whole split control path; named diagnostic contracts below are stable across added lifecycle guards. */
-const INVENTORY_SOURCES = [...Object.keys(ANNOTATED), 'src/attempts.ts', 'src/notices.ts', 'src/refusals.ts', 'src/gates.ts', 'src/declared-checks.ts', 'src/workspace-admission.ts', 'src/scheduling.ts', 'src/board.ts']
+const INVENTORY_SOURCES = [...Object.keys(ANNOTATED), 'src/attempts.ts', 'src/notices.ts', 'src/refusals.ts', 'src/gates.ts', 'src/declared-checks.ts', 'src/workspace-admission.ts', 'src/scheduling.ts', 'src/board.ts', 'src/task-graph.ts']
 const ALLOWLIST = []
 
 test('S3: every refusal code this branch added is present exactly once and compliant', async () => {

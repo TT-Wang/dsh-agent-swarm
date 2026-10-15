@@ -3,9 +3,10 @@
  *
  * A board is one mission's rows read at one instant (`readBoard`): the mission
  * with its execution clock applied, its tasks, its members and the task graph
- * over them. The scheduling, review-admission and task-graph decisions below
- * are functions of it, so a reader builds the board where it decides and every
- * predicate it asks sees those rows; none re-reads a row. Three inputs are not
+ * over them (`graph`, whose lineage queries a decision asks of it). The
+ * scheduling and review-admission decisions below are functions of it, so a
+ * reader builds the board where it decides and every predicate it asks sees
+ * those rows; none re-reads a row. Three inputs are not
  * rows and are never snapshotted: the clock (`clock`, read where a decision
  * needs the time), the adapter (`view`, asked where a decision needs its
  * answer) and the durable log (`records`: task events, tool runs, the
@@ -146,54 +147,6 @@ export function readBoard(store: Pick<SwarmStore, 'get' | 'list' | 'latestTaskEv
   return { missionId, mission, tasks, members: store.list('members', missionId), graph: taskGraphIndex(tasks), clock, bounds, view, records: store }
 }
 
-/** A task of this board, refused like `SwarmRuntime.task` when the id names no task of the mission. */
-function taskOf(board: Pick<Board, 'graph'>, taskId: string): Task {
-  const task = board.graph.byId.get(taskId)
-  if (task === undefined) throw new PolicyError('task_not_in_mission', 'validation_error', 'Task is not in this mission')
-  return task
-}
-
-/* ----------------------------------------------------------------------- *
- * The task-graph queries: dependency lineage as the dispatcher resolves it.
- * ----------------------------------------------------------------------- */
-
-/**
- * Follow repair lineage from a referenced dependency to the task that now
- * carries its obligations. A blocked or cancelled task replaced by a live
- * repair resolves to that repair, recursively; the original identity in a
- * dependent's `dependencies` therefore keeps working after replacement.
- */
-export function lineage(board: Pick<Board, 'graph'>, dependencyId: string): Task[] {
-  const chain = board.graph.lineage(dependencyId)
-  if (!chain.length) throw new PolicyError('task_not_in_mission', 'validation_error', 'Task is not in this mission')
-  return chain
-}
-export function effectiveDependency(board: Pick<Board, 'graph'>, dependencyId: string): Task { return lineage(board, dependencyId).at(-1)! }
-export function dependencySatisfied(board: Pick<Board, 'graph'>, dependencyId: string): boolean { return effectiveDependency(board, dependencyId).status === 'accepted' }
-/** Effective prerequisites for workspace preparation; one accepted repair covering several originals is merged once. */
-export function effectiveDependencies(board: Pick<Board, 'graph'>, task: Task): Task[] {
-  const seen = new Set<string>()
-  return task.dependencies.map(dependency => effectiveDependency(board, dependency)).filter(dependency => !seen.has(dependency.id) && seen.add(dependency.id))
-}
-/**
- * R16-A: the EFFECTIVE unfinished prerequisites of one task, deduplicated in
- * reference order. This is the one seam the waking classifier reads, so a notice
- * and the scheduler resolve a replaced dependency through the same lineage.
- */
-export function unfinishedDependencies(board: Pick<Board, 'graph'>, task: Task): Task[] {
-  const seen = new Set<string>()
-  const unfinished: Task[] = []
-  for (const dependency of task.dependencies) {
-    const effective = board.graph.effective(dependency)
-    if (effective === undefined || TERMINAL_STATES.has(effective.status) || seen.has(effective.id)) continue
-    seen.add(effective.id)
-    unfinished.push(effective)
-  }
-  return unfinished
-}
-/** Every identity a dependency reference stands for, including the current effective repair. */
-export function dependencyIdentities(board: Pick<Board, 'graph'>, dependencyId: string): Set<string> { return new Set(lineage(board, dependencyId).map(task => task.id)) }
-
 /* ----------------------------------------------------------------------- *
  * The scheduling predicates: readiness, capability, the dispatchable work,
  * the unschedulable work and the stall.
@@ -265,13 +218,13 @@ export function capable(board: Board, task: Task, member: Member): boolean {
 }
 
 function capabilityBlocker(board: Board, task: Task, member: Member): string | undefined {
-  const waiting = task.dependencies.find(dependency => !dependencySatisfied(board, dependency))
+  const waiting = task.dependencies.find(dependency => !board.graph.dependencyMetOf(dependency))
   if (waiting !== undefined) {
-    const effective = effectiveDependency(board, waiting)
+    const effective = board.graph.effectiveOf(waiting)
     return `dependency ${waiting}${effective.id === waiting ? '' : ` (effective replacement ${effective.id})`} is ${effective.status}, not accepted; inspect it or amend the dependency plan`
   }
   if (task.reviewOf) {
-    const source = taskOf(board, task.reviewOf)
+    const source = board.graph.taskOf(task.reviewOf)
     if (source.status !== 'submitted') return `review source ${source.id} is ${source.status}; review begins only after its artifact is submitted`
     if (!canOwnReview(source, member.id)) return `member ${member.id} authored review source ${source.id}; assign an independent reviewer`
   }
@@ -299,9 +252,9 @@ export function unschedulable(board: Board): Task[] {
     changed = false
     for (const task of tasks) {
       if (dead.has(task.id) || task.status !== 'pending') continue
-      const stuck = task.dependencies.some(dependency => { const effective = effectiveDependency(board, dependency); return effective.status === 'cancelled' || dead.has(effective.id) })
+      const stuck = task.dependencies.some(dependency => { const effective = board.graph.effectiveOf(dependency); return effective.status === 'cancelled' || dead.has(effective.id) })
         || (task.reviewOf !== undefined && (() => {
-          const source = taskOf(board, task.reviewOf)
+          const source = board.graph.taskOf(task.reviewOf)
           return TERMINAL_STATES.has(source.status) || dead.has(source.id)
             || !live.some(member => assignmentAllows(task, member.id, tasks) && canOwnReview(source, member.id))
         })())

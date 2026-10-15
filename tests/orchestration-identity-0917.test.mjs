@@ -6,7 +6,6 @@ import { join } from 'node:path'
 import { canBorrowTask } from '../lib/assignment.js'
 import { taskGraphIndex } from '../lib/task-graph.js'
 import { FakeWorkers, SwarmRuntime, eventually, makeRuntime } from './faults/harness.mjs'
-import { dependencySatisfied, effectiveDependency } from '../lib/board.js'
 import { openAsks } from '../lib/arena.js'
 
 class Workers extends FakeWorkers {
@@ -73,8 +72,8 @@ test('C04: an ancestor fork cannot displace an accepted repair or change a runni
   const tasksBefore = f.runtime.store.list('tasks', f.mission.id).length
   assert.throws(() => f.propose('Competing ancestor repair', { replaces: [original.id] }), error => /already replaced/.test(error.message) && error.message.includes(current.id))
   assert.equal(f.runtime.store.list('tasks', f.mission.id).length, tasksBefore)
-  assert.equal(effectiveDependency(f.runtime.boardOf(f.mission.id), original.id).id, current.id)
-  assert.equal(dependencySatisfied(f.runtime.boardOf(f.mission.id), original.id), true)
+  assert.equal(f.runtime.boardOf(f.mission.id).graph.effectiveOf(original.id).id, current.id)
+  assert.equal(f.runtime.boardOf(f.mission.id).graph.dependencyMetOf(original.id), true)
   assert.equal(f.runtime.task(f.mission.id, integration.id).attempt.id, running.attempt.id)
   assert.equal(f.workers.callbacks.guard(f.integrator.id, 'write_file'), undefined)
 })
@@ -83,7 +82,7 @@ test('C04: a pending descendant also prevents an ancestor from admitting a compe
   const f = await fixture(t)
   const { original, current } = await replacementChain(f)
   assert.throws(() => f.propose('Competing repair', { replaces: [original.id] }), error => /already replaced/.test(error.message) && error.message.includes(current.id))
-  assert.equal(effectiveDependency(f.runtime.boardOf(f.mission.id), original.id).id, current.id)
+  assert.equal(f.runtime.boardOf(f.mission.id).graph.effectiveOf(original.id).id, current.id)
 })
 
 test('C04: legacy forks keep an accepted descendant visible and refuse ambiguous accepted branches', () => {
@@ -186,7 +185,7 @@ test('dependency amendments report full replacement and cancellation names the s
   assert.deepEqual(withdrawn.strandedDependents, [integration.id])
   assert.equal(f.runtime.task(f.mission.id, integration.id).status, 'pending')
   const repair = f.propose('Corrected input', { replaces: [second.id] })
-  assert.equal(effectiveDependency(f.runtime.boardOf(f.mission.id), second.id).id, repair.id)
+  assert.equal(f.runtime.boardOf(f.mission.id).graph.effectiveOf(second.id).id, repair.id)
   assert.deepEqual(f.runtime.task(f.mission.id, integration.id).dependencies, [second.id], 'replacement reuses the dependent instead of duplicating delivery work')
 })
 

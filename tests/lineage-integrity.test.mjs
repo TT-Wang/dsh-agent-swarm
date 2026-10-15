@@ -3,7 +3,6 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { join } from 'node:path'
 import { FakeWorkers, makeRuntime } from './faults/harness.mjs'
-import { effectiveDependencies } from '../lib/board.js'
 
 async function fixture(t) {
   // Only the external execution adapter is replaced; admission, lineage and store stay real.
@@ -92,7 +91,7 @@ test('replacement admission rejects a cycle before persisting the task or check-
   assert.deepEqual(f.runtime.store.list('tasks', f.mission.id), before, 'rejected admission changes no durable task')
   assert.deepEqual(f.runtime.store.events(f.mission.id, 500), events, 'rejected admission publishes neither a proposal nor a check change')
   const repair = f.propose({ title: 'Acyclic repair', replaces: [original.id] })
-  assert.deepEqual(effectiveDependencies(f.runtime.boardOf(f.mission.id), dependent).map(task => task.id), [repair.id])
+  assert.deepEqual(f.runtime.boardOf(f.mission.id).graph.effectiveDependencies(dependent).map(task => task.id), [repair.id])
   const claimed = await f.runtime.claim(f.actor(f.author), f.mission.id, repair.id)
   assert.equal(claimed.status, 'running', 'the corrected repair remains executable')
 })
@@ -108,7 +107,7 @@ test('replacement admission follows transitive repairs and dependencies before c
   assert.throws(() => f.propose({ title: 'Cyclic second repair', replaces: [firstRepair.id], dependencies: [second.id] }),
     /\[task_graph_cycle\]/)
   const repair = f.propose({ title: 'Corrected second repair', replaces: [firstRepair.id] })
-  assert.deepEqual(effectiveDependencies(f.runtime.boardOf(f.mission.id), first).map(task => task.id), [repair.id])
+  assert.deepEqual(f.runtime.boardOf(f.mission.id).graph.effectiveDependencies(first).map(task => task.id), [repair.id])
   assert.equal(f.current(original).status, 'cancelled')
   assert.equal(f.current(firstRepair).status, 'cancelled')
 })
@@ -137,7 +136,7 @@ test('a combined repair preserves obsolete dependency and review edges without r
   const repair = f.propose({ title: 'Combined repair', replaces: [original.id, withdrawn.id] })
   assert.deepEqual([original, rejectedReview, withdrawn, obsoleteReview].map(task => f.current(task)), historical,
     'blocked sources, completed verdicts and cancelled reviews remain unchanged')
-  assert.deepEqual(effectiveDependencies(f.runtime.boardOf(f.mission.id), dependent).map(task => task.id), [repair.id])
+  assert.deepEqual(f.runtime.boardOf(f.mission.id).graph.effectiveDependencies(dependent).map(task => task.id), [repair.id])
   const claimed = await f.runtime.claim(f.actor(f.author), f.mission.id, repair.id)
   assert.equal(claimed.status, 'running', 'obsolete waits do not prevent a valid combined repair')
 })

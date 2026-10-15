@@ -1,4 +1,5 @@
 /** Pure functions of task and mission rows, shared by the runtime seams and the read-only projections. */
+import { PolicyError } from './policy-error.ts'
 import { criterionId, type EvidenceStatus, type Mission, type Task } from './types.ts'
 
 const oldest = (tasks: readonly Task[]): Task | undefined => [...tasks].sort((a, b) => a.createdAt - b.createdAt || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))[0]
@@ -77,6 +78,13 @@ export function taskGraphIndex(tasks: readonly Task[]) {
     return targets
   }
   const chains = new Map<string, Task[]>()
+  /**
+   * Follow repair lineage from a referenced dependency to the task that now
+   * carries its obligations. A blocked or cancelled task replaced by a live
+   * repair resolves to that repair, recursively; the original identity in a
+   * dependent's `dependencies` therefore keeps working after replacement. An id
+   * outside the index has no chain.
+   */
   const lineage = (id: string): Task[] => {
     const cached = chains.get(id)
     if (cached) return cached
@@ -122,6 +130,41 @@ export function taskGraphIndex(tasks: readonly Task[]) {
     return result
   }
   const dependencyMet = (id: string): boolean => effective(id)?.status === 'accepted'
+  /**
+   * The runtime's reads of an id it holds as one of this mission's tasks: the
+   * row, `lineage`, `effective` and `dependencyMet`, with one difference, an id
+   * that names no task of the mission is refused rather than read as no task.
+   * A projection, a classifier and a review source read the plain forms.
+   */
+  const taskOf = (id: string): Task => {
+    const task = byId.get(id)
+    if (task === undefined) throw new PolicyError('task_not_in_mission', 'validation_error', 'Task is not in this mission')
+    return task
+  }
+  const lineageOf = (id: string): Task[] => lineage(taskOf(id).id)
+  const effectiveOf = (id: string): Task => lineageOf(id).at(-1)!
+  const dependencyMetOf = (id: string): boolean => dependencyMet(taskOf(id).id)
+  /** Effective prerequisites for workspace preparation; one accepted repair covering several originals is merged once. */
+  const effectiveDependencies = (task: Pick<Task, 'dependencies'>): Task[] => {
+    const seen = new Set<string>()
+    return task.dependencies.map(dependency => effectiveOf(dependency)).filter(dependency => !seen.has(dependency.id) && seen.add(dependency.id))
+  }
+  /**
+   * R16-A: the EFFECTIVE unfinished prerequisites of one task, deduplicated in
+   * reference order. This is the one seam the waking classifier reads, so a notice
+   * and the scheduler resolve a replaced dependency through the same lineage.
+   */
+  const unfinishedDependencies = (task: Pick<Task, 'dependencies'>): Task[] => {
+    const seen = new Set<string>()
+    const unfinished: Task[] = []
+    for (const dependency of task.dependencies) {
+      const endpoint = effective(dependency)
+      if (endpoint === undefined || TERMINAL_STATES.has(endpoint.status) || seen.has(endpoint.id)) continue
+      seen.add(endpoint.id)
+      unfinished.push(endpoint)
+    }
+    return unfinished
+  }
   // Reviews always name the exact submitted source; replacement lineage is only for ordinary dependencies.
   const reviewSource = (task: Pick<Task, 'reviewOf'>): Task | undefined => task.reviewOf === undefined ? undefined : byId.get(task.reviewOf)
   /** The mission criteria `id` answers for: its covers and those of every task it replaces. */
@@ -163,7 +206,8 @@ export function taskGraphIndex(tasks: readonly Task[]) {
       return identities(id).has(sourceId) || covers(endpoint, sourceId, seen)
     })
   }
-  return { byId, lineage, effective, identities, dependencyMet, reviewSource, covers, replacementDescendants, liveReplacement, replacedLineage, criteriaOf, checklist }
+  return { byId, lineage, effective, identities, dependencyMet, taskOf, lineageOf, effectiveOf, dependencyMetOf, effectiveDependencies, unfinishedDependencies,
+    reviewSource, covers, replacementDescendants, liveReplacement, replacedLineage, criteriaOf, checklist }
 }
 
 /** Each mission criterion whose id `covered` lacks, as the id and its quoted text (`c2 "text"`), in mission order. */

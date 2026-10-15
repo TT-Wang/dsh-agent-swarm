@@ -29,7 +29,7 @@ import { HarnessWorkers, strandedInboxDecision } from '../lib/harness-workers.js
 import { sidebarState } from '../lib/types/client/progress.js'
 import { tempDirectory } from './temp-root.mjs'
 import { guardBoard } from './guard-model.mjs'
-import { dependencySatisfied, effectiveDependency, noticeSubjectsFor, reviewNeed, reviewable } from '../lib/board.js'
+import { noticeSubjectsFor, reviewNeed, reviewable } from '../lib/board.js'
 import { taskGraphIndex } from '../lib/task-graph.js'
 import { dispatchQuestion } from '../lib/notices.js'
 import { wakePrecision } from './instruments.mjs'
@@ -544,7 +544,7 @@ const TERMINAL_STATES = new Set(['accepted', 'cancelled'])
  * weakened classifier did not).
  */
 function referenceCarried(board, task) {
-  const tail = effectiveDependency(board, task.id)
+  const tail = board.graph.effectiveOf(task.id)
   return tail.id !== task.id && !TERMINAL_STATES.has(tail.status)
 }
 
@@ -574,13 +574,13 @@ function referenceWaiting(board, task) {
     return source !== undefined && !TERMINAL_STATES.has(source.status) && reviewable(board, source)
   }
   if (task.status === 'pending' && task.resumeAfterStop?.epoch === task.epoch
-    && task.dependencies.every(id => tasks.some(candidate => candidate.id === id) && effectiveDependency(board, id).status === 'accepted')) {
+    && task.dependencies.every(id => tasks.some(candidate => candidate.id === id) && board.graph.effectiveOf(id).status === 'accepted')) {
     const stop = task.resumeAfterStop
     return stop.at !== undefined && Date.now() - stop.at <= board.bounds.stallPassTimeoutMs
   }
   return task.dependencies.some(id => {
     if (!tasks.some(candidate => candidate.id === id)) return false
-    return !TERMINAL_STATES.has(effectiveDependency(board, id).status)
+    return !TERMINAL_STATES.has(board.graph.effectiveOf(id).status)
   })
 }
 
@@ -768,7 +768,7 @@ test("R16-A2: a cancelled predecessor with a live repair leaves its dependent wa
   const fallthroughs = () => f.notices().filter(delivery => typeof delivery.notice?.dedupKey === 'string' && delivery.notice.dedupKey.startsWith('fallthrough:'))
   await sleep(300)
   assert.deepEqual(fallthroughs(), [], `the dependent waits on the running repair instead of being named: ${JSON.stringify(fallthroughs().map(delivery => delivery.content.slice(0, 80)))}`)
-  assert.equal(dependencySatisfied(f.runtime.boardOf(f.mission.id), original.id), false, 'the dispatcher still cannot start the dependent: its effective dependency is running, not accepted')
+  assert.equal(f.runtime.boardOf(f.mission.id).graph.dependencyMetOf(original.id), false, 'the dispatcher still cannot start the dependent: its effective dependency is running, not accepted')
   const live = f.runtime.store.get('tasks', dependent.id)
   assert.equal(f.runtime.notices.waitsLegitimately(f.runtime.boardOf(f.mission.id), live), true, 'the dependent is waiting on the live repair, not dead')
   // Pair: closing the repair's whole lineage makes the same dependent a named
@@ -851,7 +851,7 @@ test('R16-A1r2 pair: a two-hop repair chain through a cancelled repair keeps the
     && Array.isArray(delivery.subjects) && delivery.subjects.some(subject => subject.startsWith(`${original.id}@`)))
   await sleep(300)
   const board = f.runtime.boardOf(f.mission.id)
-  const tail = effectiveDependency(board, original.id)
+  const tail = board.graph.effectiveOf(original.id)
   assert.equal(tail.id, secondRepair.id, 'the runtime seam resolves the original through the cancelled first repair to the second')
   assert.equal(tail.status, 'running', 'the seam tail is the running second repair')
   assert.equal(f.runtime.notices.waitsLegitimately(board, f.runtime.store.get('tasks', original.id)), true, 'the original waits on the running second repair')
@@ -982,7 +982,7 @@ test('R16-A6 pair: the lineage rule reaches an ordinary dependent but not a revi
   const dependent = put('task_r16a6_dependent', 'pending', { dependencies: [source.id] })
   const review = put('task_r16a6_review', 'pending', { kind: 'verification', reviewOf: source.id, dependencies: [] })
   const board = f.runtime.boardOf(f.mission.id)
-  assert.equal(dependencySatisfied(board, source.id), false, 'the effective dependency is running, not accepted')
+  assert.equal(board.graph.dependencyMetOf(source.id), false, 'the effective dependency is running, not accepted')
   assert.equal(f.runtime.notices.waitsLegitimately(board, dependent), true, 'an ordinary dependent waits on the live repair')
   assert.equal(f.runtime.notices.waitsLegitimately(board, review), false, 'the review follows its source IDENTITY, which is terminal: a review of a cancelled task has no path even when the obligation is repaired')
   assert.equal(f.runtime.notices.stallRoots(board).some(root => root.id === review.id), false, 'a verdict record is never a stall root')
