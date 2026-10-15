@@ -46,6 +46,7 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { silenceReport } from './instruments.mjs'
 import { FakeWorkers, eventually, makeRuntime } from './faults/harness.mjs'
+import { noticeFamily } from '../lib/notices.js'
 
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
 
@@ -197,7 +198,7 @@ test('R16-D3 pair: a control-path kick neither supersedes nor duplicates a wedge
   const wedged = {
     id: f.passKey, operationId: 'operation_wedged_probe', missionId: f.mission.id,
     startedAt: Date.now() - 5000, revisionBefore: f.runtime.store.revision(),
-    fingerprintBefore: f.runtime.fingerprint(f.mission.id), noProgressPasses: 0,
+    fingerprintBefore: f.runtime.fingerprint(f.mission.id),
   }
   f.runtime.scheduling.passes.set(f.mission.id, wedged)
   t.after(() => f.runtime.scheduling.closePass(f.mission.id, wedged))
@@ -234,6 +235,8 @@ test('R16-D4: an attempt with no durable progress past its bound escalates with 
     'a freshly claimed attempt is inside its bound')
   const escalation = await eventually(() => f.escalations('attempt-silent:')[0], 'the silence must escalate inside the declared bound plus one tick', 3000)
   assert.equal(escalation.notice.class, 'stall', 'the escalation is a liveness notice')
+  assert.equal(noticeFamily(escalation), 'stall', 'its family is its class, never the W3 board stall (`board-stall`)')
+  assert.equal(f.runtime.ownerDeliveryRelevant(f.runtime.mission(f.mission.id), escalation), true, 'it stays relevant while the attempt runs')
   assert.equal(escalation.notice.dedupKey, `attempt-silent:${attemptId}:${claimedAt}`, 'the dedup key is the attempt and the instant its silence began')
   assert.deepEqual(escalation.subjects, [`${task.id}@${claimed.epoch}`], 'the subject is the attempt task at its epoch')
   assert.match(escalation.content, new RegExp(`Builder \\(${builder.id}\\)`), 'the member is named')

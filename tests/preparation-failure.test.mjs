@@ -156,7 +156,9 @@ test('a flapping preparation keeps its retry count across start-failure re-pends
   assert.match(blocked.output, /workspace busy 5[\s\S]*swarm_control\(action: "resume"/)
   const blockEvents = f.events('task/blocked').filter(event => event.data.taskId === proposed.id)
   assert.equal(blockEvents.length, 1)
-  const notified = f.runtime.store.list('deliveries', f.mission.id).filter(row => row.to === 'owner' && row.content === blocked.output)
+  // Its own row, or recorded in full in the wake-budget summary that carries it: each re-pend's start failure and
+  // dispatch question (two wordings, the open item R20) spend slots of the window.
+  const notified = f.runtime.store.list('deliveries', f.mission.id).filter(row => row.to === 'owner' && (row.notice?.facts ?? [row.content]).some(text => text.endsWith(blocked.output)))
   assert.equal(notified.length, 1, 'the owner is notified of the block with its resume path')
   const calls = f.workers.calls
   await new Promise(resolve => setTimeout(resolve, 100))

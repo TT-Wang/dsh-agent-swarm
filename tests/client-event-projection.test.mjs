@@ -101,6 +101,16 @@ test('a real restart with the human root removed projects the revocation with it
   t.after(async () => { await restarted.dispose() })
   await restarted.start(after)
   await eventually(() => restarted.store.list('tasks', mission.id).find(task => task.status === 'blocked'), 'the running mission was not fenced', 15000)
+  // The fence opens three owner facts after the revocation, each told with its
+  // mission/stalled event: the workspace terminal, which names the work it blocked,
+  // and the board's own namings of that stuck work, its stall root and the W3 stall
+  // (three wordings of one condition, the open item R20).
+  const blocked = restarted.store.list('tasks', mission.id).find(task => task.status === 'blocked')
+  const subject = `${blocked.id}@${blocked.epoch}`
+  const naming = prefix => restarted.store.list('deliveries', mission.id).filter(delivery => delivery.to === 'owner' && delivery.notice?.dedupKey.startsWith(prefix)).map(delivery => delivery.subjects)
+  await eventually(() => naming('stall-root:').length && naming('board-stall:').length, 'the fenced board was not judged', 15000)
+  assert.deepEqual(naming('guard-terminal:workspace:'), [[subject]], 'the revocation\'s request names the work the fence blocked')
+  assert.deepEqual([naming('stall-root:'), naming('board-stall:')], [[[subject]], [[subject]]], 'and the board names that stuck work too')
   const snapshot = restarted.snapshot(owner, mission.id)
   const revoked = recentProgress(snapshot, 20).find(event => event.label === 'Mission workspace authorization revoked')
   assert.ok(revoked, 'the compact panel labels the revocation')
@@ -110,7 +120,13 @@ test('a real restart with the human root removed projects the revocation with it
   const summary = eventSummary(event.data)
   assert.match(summary, /grantRoot: /)
   assert.match(summary, /blockedTasks: /)
-  assert.match(renderChinese(LiveWorkOverview, { snapshot }), /任务工作目录授权已撤销/)
+  // The overview shows the three newest events, so it shows those facts, the stall
+  // root's with the revocation's reason; the revocation itself is read in the
+  // panel's progress (above) and the Activity view, under its zh label.
+  const overview = renderChinese(LiveWorkOverview, { snapshot })
+  assert.deepEqual(overview.match(/任务已停滞|任务工作目录授权已撤销/g), ['任务已停滞', '任务已停滞', '任务已停滞'], 'the overview shows the facts the revocation opened')
+  assert.match(overview, /workspace_not_authorized/, 'the stall root names the revocation\'s reason')
+  assert.equal(zh[revoked.label], '任务工作目录授权已撤销', 'the revocation is labelled through the real zh table')
 })
 
 test('the sanctioned board stays model-tool-only in the client and the declared gap is documented', async t => {

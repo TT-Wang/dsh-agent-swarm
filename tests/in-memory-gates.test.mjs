@@ -131,7 +131,7 @@ const CENSUS = [
   ["src/delivery.ts",2,"Map","const sourceIdentities = new Map<string, string>()","outside","","outside the runtime decision path: the delivery engine module (applyDelivery); the runtime serializes applies per workspace through exclusive(\"delivery:<workspace>\"), so the runtime path does not depend on this process-global mutex (enumerated, no label claimed)"],
   ["src/delivery.ts",3,"Set","const FALLBACK_TEMP_CODES = new Set(['EPERM', 'EACCES', 'ENOENT', 'ENOTDIR'])","constant","","module-level immutable lookup table, never mutated after construction: the errno allowlist the R15-F5 temp-root fallback decides on, data rather than a gate"],
   ["src/gates.ts",1,"Map","readonly fingerprintCache = new Map<string, { revision: number; fingerprint: string }>()","gate","cache-only","keyed by the global store revision; the digest is pure over durable state and is bypassed inside a transaction"],
-  ["src/gates.ts",3,"Set","const ready = new Set(tasks.filter(task => task.status === 'pending' && runnable.some(member => this.rt.ready(task, member, tasks))).map(task => task.id))","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
+  ["src/gates.ts",3,"Set","const ready = new Set(tasks.filter(task => task.status === 'pending' && runnable.some(member => this.rt.eligible(task, member, tasks))).map(task => task.id))","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
   ["src/gates.ts",4,"Set","const unreviewed = new Set(tasks.filter(task => task.status === 'submitted' && !this.rt.reviewable(task, tasks)).map(task => task.id))","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
   ["src/git-snapshot.ts",1,"Set","const trackedSet = new Set(tracked)","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
   ["src/git-snapshot.ts",2,"Set","const headPaths = new Set(headEntries.map(entry => entry.slice(entry.indexOf('\\t') + 1)))","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
@@ -154,7 +154,7 @@ const CENSUS = [
   ["src/notices.ts",4,"Set","const roots = new Set(stallRootsFor(rt, tasks).map(task => taskSubject(task)))","local","","function-local: created and discarded inside the one synchronous call of the R17-G9 refusal predicate, which re-reads the durable task rows on every call, so it cannot gate a later call"],
   ["src/notices.ts",8,"Map","private readonly delivering = new Map<string, number>()","gate","cache-only","per-attempt claim; the durable deliveredAt row is the real gate and adapter acceptance is idempotent"],
   ["src/notices.ts",9,"Set","private readonly pendingTransitions = new Set<string>()","gate","derivable","R17-G5: the missions whose committed transition still owes a publication. The durable commit is the gate; losing the pending set skips at most one publication, which the next commit (or the absence net) re-derives, and the probe below clears it and observes the fact still published by a later transition"],
-  ["src/notices.ts",10,"Set","private readonly wedgedReleases = new Set<string>()","gate","derivable","R17-G5: missions whose pass was just released as wedged, so the next publication runs the wedged branch. The release is durable (the pass row plus the mission/stalled event); losing the marker degrades the next publication to the ordinary off-pass branch, which the probe below exercises"],
+  ["src/notices.ts",10,"Set","private readonly wedgedReleases = new Set<string>()","gate","derivable","R17-G5: missions whose pass was just named wedged, so the publication that naming queues runs the wedged branch. The naming is durable (the scheduling-pass row the owner holds, written with its mission/stalled event); losing the marker degrades that publication to the ordinary off-pass branch, which the probe below exercises"],
   ["src/notices.ts",11,"Set","const roots = new Set(view.stallRoots.map(task => task.id))","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
   ["src/notices.ts",12,"Map","const found = new Map<string, Task>()","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
   // L2 owner-reply guard: a plugin-side observer of host session events, not a
@@ -210,13 +210,12 @@ const CENSUS = [
   ["src/runtime.ts",39,"Set","const leftover = options.cancelUnschedulable ? new Set(this.unschedulable(mission, tasks, this.store.list('members', mission.id)).map(task => task.id)) : new Set<string>()","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
   ["src/runtime.ts",40,"Set","const dead = new Set(tasks.filter(task => task.status === 'cancelled' || leftover.has(task.id)).map(task => task.id))","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
   ["src/scheduling.ts",1,"Map","readonly passes = new Map<string, SchedulingPass>()","gate","in-flight","the scheduling body queued or running on a mission's serial queue, removed only when that body settles; every await in the body is bounded and the tick watchdog names a body past its bound, and losing the record can only queue a second body that the mission queue refuses while the first is in flight (probe below)"],
-  ["src/scheduling.ts",2,"Map","private readonly noProgress = new Map<string, number>()","gate","cache-only","consecutive no-progress passes carried to the next pass; losing it restarts the declared window, and the escalation's dedup key is durable on the mission row (probe below)"],
-  ["src/scheduling.ts",3,"Set","const dead = new Set(tasks.filter(task => task.status === 'blocked' && !this.quiescencePending(task)).map(task => task.id))","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
-  ["src/scheduling.ts",4,"Set","const covers = (task: Task, sourceId: string, seen = new Set<string>()): boolean => {","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
-  // R16-D: the inline dedup of `escalateSchedulingStall`, built from the
-  // durable rows inside one synchronous, read-only call and discarded with it;
+  ["src/scheduling.ts",2,"Set","const dead = new Set(tasks.filter(task => task.status === 'blocked' && !this.quiescencePending(task)).map(task => task.id))","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
+  ["src/scheduling.ts",3,"Set","const covers = (task: Task, sourceId: string, seen = new Set<string>()): boolean => {","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
+  // R16-D: the inline dedup of `escalateWedge`, built from the
+  // durable rows inside one synchronous call and discarded with it;
   // it is not retained, not read by a later call and cannot gate one.
-  ["src/scheduling.ts",5,"Set","const subjects = [...new Set([...subjectsOfTasks(unreached, mission), ...holders.map(holder => holder.subject)])]","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
+  ["src/scheduling.ts",4,"Set","const subjects = [...new Set([...subjectsOfTasks(unreached, mission), ...holders.map(holder => holder.subject)])]","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
   ["src/store.ts",1,"Set","private readonly listeners = new Set<() => void>()","gate","cache-only","observer fan-out for committed changes; the durable revision and change cursor carry the state"],
   ["src/store.ts",2,"Set","this.transactionScopes = new Set()","transient","","created and destroyed inside one store transaction; the revision-bump decision it feeds is re-derived on every call"],
   ["src/store.ts",3,"Set","let liveOwners = new Set<string>()","local","","R17-G7 function-local: the live-attempt owner ids for the member rows being hydrated, created and discarded inside one synchronous read, so it cannot gate a later call"],
@@ -426,7 +425,7 @@ const GATE_TESTS = {
       // durable state (the pass row, the budget stop claim, the outbox), so a
       // lost drain cannot make a durable transition wrong. The queued owner
       // notice below is the durable record a later pump delivers from.
-      await f.runtime.commit(f.mission.id, () => f.runtime.notify(f.mission.id, 'S5c drain probe', [`mission:${f.mission.id}`], { from: 'runtime', noticeClass: 'decision', dedupe: false }))
+      await f.runtime.commit(f.mission.id, () => f.runtime.notify(f.mission.id, 'S5c drain probe', [`mission:${f.mission.id}`], { trigger: 'test/probe', reason: 'S5c drain probe' }))
       const queued = f.runtime.store.list('deliveries', f.mission.id).filter(delivery => delivery.to === 'owner' && delivery.deliveredAt === undefined)
       assert.ok(queued.length >= 1, 'the deferred notice is durable in the outbox, so a later pump re-derives it')
     } finally { await f.cleanup() }
@@ -584,7 +583,7 @@ const GATE_TESTS = {
     const f = await setup({ config: { tickMs: 10, stallPassTimeoutMs: 100 } })
     try {
       const first = f.propose({ title: 'Notice' })
-      await f.runtime.commit(f.mission.id, () => f.runtime.notify(f.mission.id, 'S5 outbox probe', [`mission:${f.mission.id}`], { from: 'runtime', noticeClass: 'decision', dedupe: false }))
+      await f.runtime.commit(f.mission.id, () => f.runtime.notify(f.mission.id, 'S5 outbox probe', [`mission:${f.mission.id}`], { trigger: 'test/probe', reason: 'S5 outbox probe' }))
       const queued = f.runtime.store.list('deliveries', f.mission.id).filter(delivery => delivery.to === 'owner')
       assert.ok(queued.length >= 1)
       // Gate the adapter delivery, so the per-attempt claim is observable and
@@ -635,29 +634,6 @@ const GATE_TESTS = {
         'once the in-flight body settles, a later pass dispatches the work')
       assert.equal(running.attempt.ownerId, f.author.id)
     } finally { gate.resolve(); await f.cleanup() }
-  },
-  'src/scheduling.ts:2': async t => {
-    // Cache-only: the carried no-progress count. Its loss restarts the declared
-    // window; the escalation still fires, once per unchanged board.
-    const f = await setup({ config: { tickMs: 3_600_000, stallPasses: 3 } })
-    try {
-      const scheduling = f.runtime.scheduling
-      await eventually(() => scheduling.passes.size === 0 ? true : undefined, 'the passes setup kicked must settle')
-      scheduling.boardCannotProgress = () => true
-      const stalls = () => events(f.runtime, f.mission.id, 'mission/stalled').filter(item => item.data.cause === 'scheduling-pass' && item.data.wedged === false)
-      const unchangedPass = () => { const pass = scheduling.openPass(f.mission.id); scheduling.closePass(f.mission.id, pass) }
-      unchangedPass(); unchangedPass()
-      assert.equal(scheduling.noProgress.get(f.mission.id), 2, 'two unchanged passes are counted')
-      assert.ok(scheduling.noProgress.size > 0, 'the loss must be exercised on a non-empty collection')
-      scheduling.noProgress.clear()   // the loss
-      unchangedPass(); unchangedPass()
-      assert.equal(stalls().length, 0, 'the lost count restarts the window instead of escalating early')
-      unchangedPass()
-      assert.equal(stalls().length, 1, 'the declared window of unchanged passes still escalates')
-      scheduling.noProgress.clear()
-      unchangedPass(); unchangedPass(); unchangedPass()
-      assert.equal(stalls().length, 1, 'and the durable dedup key on the mission row keeps one escalation per unchanged board')
-    } finally { await f.cleanup() }
   },
   'src/store.ts:1': async t => {
     const f = await setup()

@@ -32,11 +32,15 @@ await runScenario({
         'the worker is re-woken with a durable control delivery')
       assert.match(nudgeDelivery.content, /swarm_submit/)
       assert.match(nudgeDelivery.content, new RegExp(claimed.attempt.id))
-      // Injection 2: the worker still does not act; the bound is reached.
+      // Injection 2: the worker still does not act; the bound is reached. The body
+      // the last signal kicked settles first: a kick made while it is open is
+      // coalesced into it, and this scenario's hour-long tick would never retry.
+      await f.runtime.settle(f.mission.id)
       f.workers.callbacks.idle(f.author.id)
       await eventually(() => events(f.runtime, f.mission.id, 'task/closeout-nudged').length === 2, 'the second close-out nudge')
       assert.equal(taskOf(f.runtime, task.id).closeout.nudges, 2, 'nudges are bounded by maxIdleCloseouts')
       // Injection 3: the bound is exhausted, so the workspace is checkpointed.
+      await f.runtime.settle(f.mission.id)
       f.workers.callbacks.idle(f.author.id)
       const abandoned = await eventually(() => events(f.runtime, f.mission.id, 'task/closeout-abandoned')[0], 'the exhausted close-out checkpoints the workspace')
       assert.equal(f.workers.captured.length, 1, 'the workspace is checkpointed exactly once')

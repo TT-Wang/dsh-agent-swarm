@@ -26,7 +26,6 @@ import assert from 'node:assert/strict'
 import { rm } from 'node:fs/promises'
 import { join } from 'node:path'
 import { HarnessWorkers, strandedInboxDecision } from '../lib/harness-workers.js'
-import { reviewGraceMs } from '../lib/notices.js'
 import { sidebarState } from '../lib/types/client/progress.js'
 import { tempDirectory } from './temp-root.mjs'
 import { guardBoard } from './guard-model.mjs'
@@ -557,9 +556,8 @@ function referenceWaiting(runtime, missionId, task, tasks) {
   if (referenceCarried(runtime, missionId, task, tasks)) return true
   if (task.status === 'running') return task.attempt !== undefined && task.attempt.leaseUntil >= Date.now()
   if (task.status === 'submitted') {
-    if (runtime.reviewable(task, tasks)) return true
-    const { age } = runtime.reviewNeed(task)
-    return age === undefined || age < reviewGraceMs(runtime.config)
+    const need = runtime.reviewNeed(task)
+    return runtime.reviewable(task, tasks) || !need.ripe || (task.artifact !== undefined && !need.recorded)
   }
   if (task.status === 'blocked' && task.resumeAfterStop?.epoch === task.epoch) {
     const stop = task.resumeAfterStop
@@ -617,10 +615,7 @@ test('R16-A1: the waiting classifier is enumerated over every constructed board 
     // The pre-fix rule: raw ids, no lineage, no replacement coverage.
     if (TERMINAL_STATES.has(task.status)) return false
     if (task.status === 'running') return task.attempt !== undefined && task.attempt.leaseUntil >= Date.now()
-    if (task.status === 'submitted') {
-      const { age } = f.runtime.reviewNeed(task)
-      return age === undefined || age < reviewGraceMs(f.runtime.config)
-    }
+    if (task.status === 'submitted') return !f.runtime.reviewNeed(task).ripe
     if (task.status === 'blocked' && task.resumeAfterStop?.epoch === task.epoch) {
       const stop = task.resumeAfterStop
       return stop.at !== undefined && Date.now() - stop.at <= f.runtime.stallPassTimeoutMs

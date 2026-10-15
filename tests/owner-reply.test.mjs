@@ -309,7 +309,7 @@ for (const summarized of [false, true]) test(`answered receipts invalidate queue
   const question = await f.ask()
   if (summarized) {
     f.runtime.notices.wakeBudget = 1
-    f.runtime.commit(f.mission.id, () => f.runtime.notify(f.mission.id, 'first fact', [`mission:${f.mission.id}`]))
+    f.runtime.commit(f.mission.id, () => f.runtime.notify(f.mission.id, 'first fact', [`mission:${f.mission.id}`], { trigger: 'test/fact' }))
   }
   const guard = new OwnerReplyGuard(fakeContext(), f.runtime, { maxNudges: 1 })
   t.after(() => guard.dispose())

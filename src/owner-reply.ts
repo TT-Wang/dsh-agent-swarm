@@ -172,7 +172,7 @@ export class OwnerReplyGuard {
       // row together so restart cannot spend a nudge without retaining it.
       this.rt.notify(booking.missionId, ownerReplyNudge(booking.missionId, delivery, booking, spent + 1, this.options.maxNudges),
         this.rt.noticeSubjectsFor(booking.missionId, { ...(booking.taskId === undefined ? {} : { taskId: booking.taskId }), memberId: booking.from }),
-        { dedupe: true, dedupKey: `owner-reply-missing:${deliveryId}:${spent + 1}`, questionId: deliveryId })
+        { dedupKey: `owner-reply-missing:${deliveryId}:${spent + 1}`, questionId: deliveryId })
     })
   }
 }

@@ -30,7 +30,7 @@ import { join } from 'node:path'
 import { ObserveDetailRefusedError } from '../lib/runtime.js'
 import { registerTools, SWARM_TOOLS, MEMBER_TOOLS, hiddenToolsFor } from '../lib/tools.js'
 import { TRACE_STEPS } from '../lib/trace.js'
-import { arenaLedgerDigest, hasNotice, noticeFingerprint, noticeLedger, pendingReadiness } from '../lib/arena.js'
+import { hasNotice, noticeLedger } from '../lib/arena.js'
 import { FakeWorkers, budget as sharedBudget, eventually, makeRuntime } from './faults/harness.mjs'
 
 const DEFAULT_BUDGET = { ...sharedBudget, maxTokens: 100000, maxSteps: 100, maxWorkers: 2, maxTasks: 6, maxExperiments: 1 }
@@ -92,7 +92,7 @@ test('proposal capacity is the aggregate mission budget and never shrinks when t
     assert.equal(admitted.result.proposedBy, f.alice.id)
   }
   await assert.rejects(propose.execute(proposal(f, { title: 'Over aggregate' }), alice), /task budget exhausted/)
-  const notice = notices(f).filter(delivery => delivery.notice.class === 'budget').at(-1)
+  const notice = notices(f).filter(delivery => delivery.notice.dedupKey.startsWith('guard-terminal:task_ceiling:')).at(-1)
   assert.match(notice.content, /6\/6/)
   const count = notices(f).length
   await assert.rejects(propose.execute(proposal(f, { title: 'Still over aggregate' }), alice), /task budget exhausted/)
@@ -110,11 +110,11 @@ test('R11-17: the experiment ceiling refuses a worker proposal with an owner not
   const f = await fixture(t, { budget: { maxTasks: 6, maxWorkers: 2, maxExperiments: 0 } })
   const tools = definitions(f.runtime)
   await assert.rejects(tools.get('swarm_propose').execute(proposal(f, { title: 'Experiment', experiment: true }), execution(f.alice.sessionId)), /experiment budget exhausted/)
-  const notice = notices(f).find(delivery => delivery.notice.class === 'budget')
+  // The limit's one request, whoever proposed; the proposer is on the refusal's own event.
+  const notice = notices(f).find(delivery => delivery.notice.dedupKey === 'guard-terminal:task_ceiling:task_ceiling_terminal:experiment-budget:0')
   assert.ok(notice)
-  assert.match(notice.content, new RegExp(f.alice.id))
-  assert.match(notice.content, /experiment budget exhausted \(0\/0/)
-  assert.match(notice.content, /limit 0/)
+  assert.match(notice.content, /experiment budget exhausted \(0\/0 experiments admitted\)/)
+  assert.deepEqual(f.runtime.store.events(f.mission.id, 100).filter(event => event.type === 'task/proposal-refused').map(event => [event.data.memberId, event.data.limit]), [[f.alice.id, 0]])
 })
 
 test('the notice ledger records sent, queued and claimed with the state fingerprint and is read-only', async t => {
@@ -133,17 +133,17 @@ test('the notice ledger records sent, queued and claimed with the state fingerpr
 
   // Synchronous read: the notice is recorded and queued, not yet delivered.
   const queuedView = f.runtime.noticeLedger(f.owner, f.mission.id)
-  const queued = queuedView.ledger.find(entry => entry.class === 'budget')
+  const admission = entry => entry.dedupKey.startsWith('guard-terminal:task_ceiling:')
+  const queued = queuedView.ledger.find(admission)
   assert.ok(queued, 'the ledger exposes the notice')
   assert.equal(queued.state, 'queued')
   assert.equal(queued.deliveredAt, undefined)
   assert.equal(queued.consumedAt, undefined, 'transport is never relabelled as consumption')
   assert.ok(Number.isSafeInteger(queued.sentAt) && Number.isSafeInteger(queued.queuedAt))
   assert.equal(queued.sentAt, queued.queuedAt, 'sent and queued are recorded at enqueue')
-  // R17-G3: the identity is the fact — family, subject@epoch and the recorded
-  // reason — not a digest of the whole board, so an unrelated change cannot
-  // re-arm this notice.
-  assert.match(queued.dedupKey, /^budget:mission_[0-9a-f-]+:mission:mission_[0-9a-f-]+:(?:none|[0-9a-f]{16})$/, `the dedup key is the fact key: ${queued.dedupKey}`)
+  // R17-G3: the identity is the fact — the admission limit the refusal met — not a
+  // digest of the whole board, so an unrelated change cannot re-arm this notice.
+  assert.equal(queued.dedupKey, `guard-terminal:task_ceiling:task_ceiling_terminal:task-budget:${f.mission.budget.maxTasks}`, 'the dedup key is the limit the refusal met')
   assert.equal(queued.deliveryId, queued.id)
   // Read-only: two reads of the same state are identical and mutate nothing.
   const revision = f.runtime.store.revision()
@@ -154,7 +154,7 @@ test('the notice ledger records sent, queued and claimed with the state fingerpr
 
   // The outbox drains on the scheduler pass: the transport fact is `delivered`.
   const deliveredEntry = await eventually(() => {
-    const entry = f.runtime.noticeLedger(f.owner, f.mission.id).ledger.find(row => row.class === 'budget')
+    const entry = f.runtime.noticeLedger(f.owner, f.mission.id).ledger.find(admission)
     return entry?.state === 'claimed' ? entry : undefined
   }, 'the owner notice was never delivered', 5000)
   assert.ok(deliveredEntry.deliveredAt >= deliveredEntry.sentAt)
@@ -200,7 +200,7 @@ test('swarm_escalate is a typed durable owner escalation that grants no authorit
   assert.equal(escalation.fromMemberId, f.alice.id, 'the sender is host-derived')
   assert.equal(escalation.taskId, source.id, 'the running attempt is bound automatically')
   assert.equal(escalation.attemptId, claimed.attempt.id)
-  assert.match(escalation.dedupKey, /^[a-f0-9]{64}$/)
+  assert.equal(escalation.dedupKey, `escalation:${escalation.id}`, 'an escalation\'s identity is its own id, never a digest of the board')
   assert.ok(escalation.deliveryId)
 
   const delivery = f.runtime.store.list('deliveries', f.mission.id).find(item => item.id === escalation.deliveryId)
@@ -243,40 +243,12 @@ test('swarm_escalate is a typed durable owner escalation that grants no authorit
   assert.equal(authorityRecords(f).includes('hostile'), false, 'a refused escalation records no content')
 })
 
-test('the arena ledger digest is stable and order-independent; the notice channel is excluded from the dedup key', () => {
-  const member = (id, status) => ({ id, missionId: 'm', name: id, role: 'r', sessionId: `s-${id}`, workspace: '/w', status, subscriptions: [] })
-  const task = (id, status, owner) => ({
-    id, missionId: 'm', workstreamId: 'w', title: id, objective: id, kind: 'research', dependencies: [], scope: ['src/'],
-    acceptance: ['a'], checks: [], status, priority: 50, experiment: false, epoch: 0, evidenceIds: [], createdAt: 1,
-    ...(owner === undefined ? {} : { attempt: { id: `a-${id}`, epoch: 0, ownerId: owner, leaseUntil: 1 } }),
-  })
-  const base = {
-    mission: { status: 'active', updatedAt: 1 },
-    tasks: [task('task_a', 'pending'), task('task_b', 'running', 'member_a')],
-    members: [member('member_a', 'working'), member('member_b', 'idle')],
-    evidence: [],
-    deliveries: [],
-  }
-  assert.equal(arenaLedgerDigest(base), arenaLedgerDigest({ ...base, tasks: [...base.tasks].reverse(), members: [...base.members].reverse() }), 'input order is irrelevant')
-  assert.equal(arenaLedgerDigest(base), arenaLedgerDigest({ ...base, mission: { status: 'active', updatedAt: 999 }, tasks: base.tasks.map(item => ({ ...item, createdAt: 999 })) }), 'wall-clock fields are excluded')
-  assert.notEqual(arenaLedgerDigest(base), arenaLedgerDigest({ ...base, tasks: [task('task_a', 'running', 'member_b'), base.tasks[1]] }), 'a status change changes the digest')
-  assert.notEqual(arenaLedgerDigest(base), arenaLedgerDigest({ ...base, tasks: [base.tasks[0], base.tasks[1], task('task_c', 'pending')] }), 'a new task changes the digest')
-  assert.notEqual(arenaLedgerDigest(base), arenaLedgerDigest({ ...base, members: [member('member_a', 'idle'), base.members[1]] }), 'a member status change changes the digest')
-
+test('a covered fact is neither a queued entry nor the last notice, and still deduplicates', () => {
   const notice = { id: 'd1', missionId: 'm', from: 'runtime', to: 'owner', kind: 'control', content: 'x', createdAt: 1, notice: { dedupKey: 'k', class: 'decision', sentAt: 1, queuedAt: 1 } }
-  assert.notEqual(arenaLedgerDigest({ ...base, deliveries: [notice] }), arenaLedgerDigest(base), 'the ledger digest counts pending deliveries')
-  assert.equal(noticeFingerprint({ ...base, deliveries: [notice] }), noticeFingerprint(base), 'the notice channel is not board state')
   // A covered fact (recorded against the delivery that carried it) is never sent.
   const covered = { ...notice, id: 'd3', createdAt: 2, notice: { ...notice.notice, dedupKey: 'k3', sentAt: 2, queuedAt: 2, coveredBy: notice.id } }
-  assert.equal(arenaLedgerDigest({ ...base, deliveries: [covered] }), arenaLedgerDigest(base), 'a covered fact is no pending delivery')
   assert.deepEqual(noticeLedger([{ ...notice, deliveredAt: 1 }, covered]).map(entry => [entry.id, entry.state]), [['d1', 'claimed']], 'a covered fact is neither a queued entry nor the last notice')
   assert.equal(hasNotice([covered], { class: 'decision', dedupKey: 'k3', from: 'runtime' }), true, 'a covered fact still deduplicates')
-  const assignment = { id: 'd2', missionId: 'm', from: 'runtime', to: 'member_a', kind: 'assignment', content: 'x', createdAt: 1 }
-  assert.notEqual(noticeFingerprint({ ...base, deliveries: [assignment] }), noticeFingerprint(base), 'member-bound deliveries still count')
-
-  assert.deepEqual(pendingReadiness(base.tasks, base.members), { ready: 1, notReady: 0 })
-  assert.deepEqual(pendingReadiness([task('task_a', 'pending')], [member('member_a', 'stopped')]), { ready: 0, notReady: 1 })
-  assert.deepEqual(pendingReadiness([{ ...task('task_a', 'pending'), dependencies: ['task_b'] }], base.members), { ready: 0, notReady: 1 })
 })
 
 test('swarm_escalate joins the single registry, the closed trace vocabulary and the member surface', async t => {

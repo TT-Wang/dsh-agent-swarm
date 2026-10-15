@@ -6,7 +6,7 @@ import path from 'node:path'
 import { Context } from '@deepseek-ai/cordis'
 import AgentRegistry, { installModelSelection } from '@deepseek-ai/dsh-agent'
 import AgentLoop from '@deepseek-ai/dsh-agent-loop'
-import LlmRuntime, { ToolCallId, LlmAdapter, MessageId, ReasoningEffortId, freezeMessage } from '@deepseek-ai/dsh-llm'
+import LlmRuntime, { ToolCallId, LlmAdapter, LlmError, MessageId, ReasoningEffortId, freezeMessage } from '@deepseek-ai/dsh-llm'
 import { ownerModelSelection } from '../lib/model-selection.js'
 import { persistedSessionHeader } from '../lib/session-metadata.js'
 import SessionStore, { Session, SessionId } from '@deepseek-ai/dsh-session'
@@ -231,7 +231,7 @@ test('a worker the host tore down first stops without reading its retired inbox,
     'the journal restores the accepted input the host teardown cleared')
 })
 
-test('an agent-loop reload ends the worker resident, so the next start opens a live agent with the input it accepted', async t => {
+test('a start of a running worker adopts its session and opens nothing; an agent-loop reload ends the resident, so the next start opens a live agent with the input it accepted', async t => {
   const f = await fixture(t, undefined, {
     beforeChunks: (_action, options, count) => count === 1 ? new Promise((_resolve, reject) => {
       options.signal.addEventListener('abort', () => reject(options.signal.reason), { once: true })
@@ -239,12 +239,15 @@ test('an agent-loop reload ends the worker resident, so the next start opens a l
   })
   await f.adapter.deliver(f.member, message(f.member))
   await eventually(() => f.requests.length === 1, 'the assignment turn never reached the provider', 10000)
+  const running = f.ctx.agents.get(SessionId(f.member.sessionId))
+  assert.equal(await f.adapter.start(f.spec), true, 'a start during the running turn adopts the resident')
+  assert.equal(f.ctx.agents.get(SessionId(f.member.sessionId)), running, 'on the same native agent')
   await f.adapter.deliver(f.member, { ...message(f.member, 'finding-one'), kind: 'finding', content: 'A finding for the next step.' })
   await f.agentLoop.dispose()
   assert.equal(f.adapter.isIdle(f.member.id), false, 'a worker whose agent the host retired is not startable')
   await f.ctx.plugin(AgentLoop, { agents: [] })
   // No adapter stop in between: the runtime's next dispatch pass only starts the member again.
-  await f.adapter.start(f.spec)
+  assert.equal(await f.adapter.start(f.spec), false, 'this start opened the session')
   const agent = f.ctx.agents.get(SessionId(f.member.sessionId))
   assert.notEqual(agent, undefined, 'the start opened a live agent')
   assert.deepEqual(agent.inbox.nextStep.map(item => item.id), ['swarm:finding-one'], 'the journal restores the accepted input the reload cleared')
@@ -459,6 +462,20 @@ test('step admission denial spends no model request and reports a real agent err
   assert.equal(f.requests.length, 0)
   assert.match(JSON.stringify(f.observations.failures), /Mission budget exhausted/)
   assert.equal(f.adapter.isIdle(f.member.id), true)
+})
+
+test('a provider error the adapter classifies as an outage is reported as that outage alone, never also as the member\'s failure', async t => {
+  // Each report differs by its request id, as a provider's retries do.
+  const f = await fixture(t, (_options, count) => { throw new LlmError(`Rate limit reached for requests. Request id: req_${count}`, 'RATE_LIMIT', { status: 429 }) })
+  const outages = []
+  f.callbacks.providerOutage = (id, outage) => { outages.push({ id, outage }) }
+  for (const id of ['delivery-one', 'delivery-two']) {
+    await f.adapter.deliver(f.member, message(f.member, id))
+    await f.ctx.agents.get(SessionId(f.member.sessionId)).whenIdle()
+  }
+  assert.equal(f.requests.length, 2, 'each delivery reached the provider')
+  assert.deepEqual(outages.map(({ id, outage }) => [id, outage.class, outage.status]), [['worker-test', 'rate-limit', 429], ['worker-test', 'rate-limit', 429]])
+  assert.deepEqual(f.observations.failures, [], 'the outage is not reported a second time as a member failure')
 })
 
 for (const wakeDuringRejection of [false, true]) {
