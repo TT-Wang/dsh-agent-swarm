@@ -1306,7 +1306,7 @@ export class Notices {
     // except by a wedged pass, which never reached its own question (R15-D1).
     // The dedup key is the task at its epoch, so every judgement re-asks it
     // without repeating the wake.
-    if (dispatchable.length && (options.wedged === true || members.some(member => member.status === 'waiting' || (member.status === 'idle' && this.rt.workers.isIdle(member.id))))) {
+    if (dispatchable.length && (options.wedged === true || members.some(member => member.status === 'waiting' || (member.status === 'idle' && view.view.startable(member.id))))) {
       const question = dispatchQuestion(view, dispatchable)
       if (question !== undefined) this.tell(missionId, question.message, view.subjectsOf([question.task]), { dedupKey: question.dedupKey })
     }
