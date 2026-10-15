@@ -109,7 +109,7 @@ const PAYLOAD_CENSUS = [
   ['mission/stalled', 'revisionBefore', 'keep', 'engine', 'src/scheduling.ts'],
   ['mission/stalled', 'revisionAtStall', 'keep', 'engine', 'src/scheduling.ts'],
   ['mission/stalled', 'missionFingerprint', 'keep', 'engine', 'src/scheduling.ts'],
-  ['mission/stalled', 'noticeKey', 'keep', 'engine', 'src/refusals.ts'],
+  ['mission/stalled', 'noticeKey', 'keep', 'engine', 'src/notices.ts'],
   ['mission/stalled', 'chain', 'keep', 'engine', 'src/scheduling.ts'],
   ['mission/stalled', 'code', 'keep', 'engine', 'src/scheduling.ts'],
   ['mission/stalled', 'taskId', 'keep', 'engine', 'src/scheduling.ts'],

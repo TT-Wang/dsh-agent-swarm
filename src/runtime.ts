@@ -8,7 +8,7 @@ export { WorkspaceRevokedError } from './authorization.ts'
 import { recordedClaim, type WorkspaceClaim } from './authorization.ts'
 import { WorkspaceAdmission, gitWriteDeniedMessage, TEMP_RENDEZVOUS_WINDOW_MS, type TempMention } from './workspace-admission.ts'
 import { Notices, NOTICE_TEMPLATES, REJECTION_DECISION_TRIGGER, ADMISSION_REFUSED, ADMIT_REVIEW, BOARD_RUNNING, WITHDRAW_SOURCE, newestReviewBlock, renderNotice, unreviewedSources, type NotifyOptions } from './notices.ts'
-import { RefusalRegistry, emitGuardTerminal, queueWriterBusy, requireStrings, requireText, sameChecks, unsupportedEffort, validatedBudget } from './refusals.ts'
+import { RefusalRegistry, requireStrings, requireText, sameChecks, unsupportedEffort, validatedBudget } from './refusals.ts'
 import { Scheduling } from './scheduling.ts'
 import { progressed, type Kernel, type SchedulingPass } from './kernel.ts'
 // R17-G6/G7: the one derivation of mission derived state and its host projection.
@@ -344,16 +344,11 @@ export class SwarmRuntime implements Kernel {
   isolationViolations(missionId: string): string[] { return this.workspaceAdmission.isolationViolations(missionId) }
 
   readonly attempts = new Attempts(this)
-  /** M1a seam 4/7: the durable refusal registry and its writer-busy recovery. */
-  private readonly refusals = new RefusalRegistry(this)
-  private admissionDecision(mission: Mission, member: Member, task: Task): { candidate: AdmissionCandidate; decision: AdmissionDecision } { return this.refusals.admissionDecision(mission, member, task) }
-  private admissionRecord(candidate: AdmissionCandidate, decision: AdmissionDecision, latencyMs: number): AdmissionRecord { return this.refusals.admissionRecord(candidate, decision, latencyMs) }
-  private recordRefusal(candidate: AdmissionCandidate, decision: AdmissionDecision, latencyMs: number): void { return this.refusals.recordRefusal(candidate, decision, latencyMs) }
-  upsertBudgetRefusals(mission: Mission, reason: string): void { return this.refusals.upsertBudgetRefusals(mission, reason) }
-  private refuseProposal(mission: Mission, proposer: string | undefined, title: string, budget: 'task' | 'experiment', admitted: number, limit: number): void { return this.refusals.refuseProposal(mission, proposer, title, budget, admitted, limit) }
+  /** M1a seam 4/7: the durable refusal registry and its writer-busy recovery, on the kernel alone. */
+  readonly refusals = new RefusalRegistry(this)
 
-  /** M1a seam 3/7: owner notices, witnesses and the outbox that delivers them. */
-  readonly notices = new Notices(this)
+  /** M1a seam 3/7: owner notices, witnesses, guard terminals and the outbox that delivers them; a guard terminal a busy writer refused is queued on the one registry. */
+  readonly notices = new Notices(this, this.refusals)
   notify(missionId: string, content: string, subjects: string[], options: NotifyOptions): boolean { return this.notices.notify(missionId, content, subjects, options) }
   tell(missionId: string, content: string, subjects: string[], options: NotifyOptions, then?: () => void): boolean { return this.notices.tell(missionId, content, subjects, options, then) }
   ownerDeliveryRelevant(mission: Mission, delivery: Delivery): boolean { return this.notices.ownerDeliveryRelevant(mission, delivery) }
@@ -751,7 +746,7 @@ export class SwarmRuntime implements Kernel {
       return await fn()
     } catch (error) {
       if (error instanceof Error && error.message.startsWith('[mission_operation_pending]')) {
-        emitGuardTerminal(this, missionId, 'workspace', { localKey: `mission-operation-pending:${operation.id}`, detail: error.message })
+        this.notices.emitGuardTerminal(missionId, 'workspace', { localKey: `mission-operation-pending:${operation.id}`, detail: error.message })
       }
       throw error
     } finally {
@@ -1249,14 +1244,25 @@ export class SwarmRuntime implements Kernel {
     const stream = this.store.get('workstreams', input.workstreamId)
     if (!stream || stream.missionId !== missionId) throw new PolicyError('workstream_unknown', 'validation_error', 'Unknown workstream')
     const tasks = this.store.list('tasks', missionId)
+    // A proposal at a mission admission limit is refused whoever proposed it, and
+    // the owner, the only actor who can raise the limit, is asked once: the
+    // task-ceiling chain's terminal keyed by the limit it met, so a refusal under
+    // a limit the owner holds never wakes it again and a raised limit that
+    // refuses is a new request. A worker's refusal is also recorded and thrown,
+    // so its tool result carries it; the owner's own is thrown below.
+    const refuse = (budget: 'task' | 'experiment', admitted: number, limit: number): void => {
+      const reason = `mission ${budget} budget exhausted (${admitted}/${limit} ${budget}s admitted)`
+      this.notices.emitGuardTerminal(mission.id, 'task_ceiling', { detail: reason, localKey: `${budget}-budget:${limit}` })
+      if (owner) return
+      this.commit(mission.id, () => this.store.event(mission.id, 'task/proposal-refused', key, { memberId: key, title: input.title, reason, limit }))
+      throw new Error(`Worker ${key} cannot propose ${JSON.stringify(input.title)}: ${reason} (limit ${limit}). The owner can raise the mission ceiling with swarm_budget or admit the work with swarm_propose.`)
+    }
     if (tasks.length >= mission.budget.maxTasks) {
-      // The owner is the only actor who can raise the ceiling: a refusal at the
-      // limit is the owner's one decision request, whoever proposed.
-      this.refuseProposal(mission, owner ? undefined : key, input.title, 'task', tasks.length, mission.budget.maxTasks)
+      refuse('task', tasks.length, mission.budget.maxTasks)
       throw new PolicyError('mission_task_budget_exhausted', 'budget_error', '[mission_task_budget_exhausted] Mission task budget exhausted: raise maxTasks with swarm_budget(budget, reason), then propose the task again')
     }
     if (input.experiment && tasks.filter(t => t.experiment).length >= mission.budget.maxExperiments) {
-      this.refuseProposal(mission, owner ? undefined : key, input.title, 'experiment', tasks.filter(t => t.experiment).length, mission.budget.maxExperiments)
+      refuse('experiment', tasks.filter(t => t.experiment).length, mission.budget.maxExperiments)
       throw new PolicyError('mission_experiment_budget_exhausted', 'budget_error', 'Mission experiment budget exhausted')
     }
     const dependencies = [...new Set(normalizeReviewDependencies(input.kind, input.reviewOf, input.dependencies))]
@@ -1410,16 +1416,16 @@ export class SwarmRuntime implements Kernel {
   }
 
   /** Check before any workspace mutation, and again immediately before assignment. */
-  assertAdmission(task: Task, member: Member): { candidate: ReturnType<SwarmRuntime['admissionDecision']>['candidate']; decision: ReturnType<SwarmRuntime['admissionDecision']>['decision']; latencyMs: number } {
+  assertAdmission(task: Task, member: Member): { candidate: AdmissionCandidate; decision: AdmissionDecision; latencyMs: number } {
     if (pendingStopOwner(this.store.list('tasks', task.missionId), member.id)) throw new Error('Worker is waiting for its previous attempt to stop')
     member = this.store.get('members', member.id) ?? member
     const mission = this.mission(task.missionId)
     this.refusals.recordWriterBusyRecovery(mission)
     const started = performance.now()
-    const { candidate, decision } = this.admissionDecision(mission, member, task)
+    const { candidate, decision } = this.refusals.admissionDecision(mission, member, task)
     const latencyMs = Math.max(0, Math.round((performance.now() - started) * 1000) / 1000)
     if (!decision.admitted) {
-      this.recordRefusal(candidate, decision, latencyMs)
+      this.refusals.recordRefusal(candidate, decision, latencyMs)
       throw new AdmissionRefusedError(decision)
     }
     return { candidate, decision, latencyMs }
@@ -1442,7 +1448,7 @@ export class SwarmRuntime implements Kernel {
     // no recovery credit (a worker start failure), and only an owner resume
     // clears it. While it carries `retryAt`, `blockCauses` does not read it as
     // a block cause.
-    const admitted = this.admissionRecord(candidate, decision, latencyMs)
+    const admitted = this.refusals.admissionRecord(candidate, decision, latencyMs)
     try {
       return this.commit(task.missionId, () => {
         this.store.put('tasks', task); this.store.put('members', member)
@@ -1455,7 +1461,7 @@ export class SwarmRuntime implements Kernel {
       // A classified writer conflict is an admission refusal, not a task failure:
       // nothing was committed, the task stays pending, and the next tick retries.
       if (error instanceof WriterBusyError) {
-        queueWriterBusy(this, { at: this.now(), attempts: error.attempts, candidate, detail: error.message })
+        this.refusals.queueWriterBusy({ at: this.now(), attempts: error.attempts, candidate, detail: error.message })
         throw new AdmissionRefusedError({ reason: 'writer_busy', admitted: false, detail: `writer_busy after ${error.attempts} attempt(s): ${error.message}` })
       }
       throw error
@@ -3764,7 +3770,7 @@ export class SwarmRuntime implements Kernel {
     })
     // S4b: the durable event carried the code, the owner notice did not. The
     // shared coded terminal names the task, the dimension and the exits.
-    emitGuardTerminal(this, mission.id, 'task_ceiling', { taskId: task.id, ...(ownerId === undefined ? {} : { memberId: ownerId }), localKey: `ceiling:${taskSubject(task)}:${ceiling.dimension}`,
+    this.notices.emitGuardTerminal(mission.id, 'task_ceiling', { taskId: task.id, ...(ownerId === undefined ? {} : { memberId: ownerId }), localKey: `ceiling:${taskSubject(task)}:${ceiling.dimension}`,
       detail: `${task.title} (${task.id}) exhausted its own ${ceiling.dimension} ceiling (${ceiling.used}/${ceiling.limit}) and blocked` })
     this.attempts.resumeStoppedAttempt(mission.id, task)
     this.kick(mission.id)

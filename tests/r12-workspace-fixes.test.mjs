@@ -13,6 +13,7 @@ const sourceMode = process.env.SWARM_TEST_SOURCE === '1'
 const moduleOf = name => import(new URL(`../${sourceMode ? 'src' : 'lib'}/${name}.${sourceMode ? 'ts' : 'js'}`, import.meta.url))
 const { Scheduling } = await moduleOf('scheduling')
 const { Notices } = await moduleOf('notices')
+const { RefusalRegistry } = await moduleOf('refusals')
 const { Workspaces, runProcess } = await moduleOf('workspaces')
 const { WorkspaceAdmission, isolationIssues } = await moduleOf('workspace-admission')
 const { SwarmStore } = await moduleOf('store')
@@ -48,7 +49,7 @@ test('M2-1: a repeated pass-timeout naming is recorded once, through the ledger'
     put: (table, row) => { assert.equal(table, 'deliveries'); deliveries.push(row) } },
     stallPassTimeoutMs: 1000, fingerprint: () => 'same', commit: (_id, fn) => fn(), defer() {}, expectWedgedRelease() {}, passSettled() {} })
   // The runtime's own notices over this store; a requested pump is deferred and never runs.
-  const notices = new Notices(rt)
+  const notices = new Notices(rt, new RefusalRegistry(rt))
   rt.notices = notices
   rt.tell = notices.tell.bind(notices)
   const scheduling = new Scheduling(rt)
@@ -272,7 +273,7 @@ test('M2-10: inline # remains word data, while actual shell comments remain igno
 
 test('M2-11: isolation uses explicit member IDs including task workspace conflicts', () => {
   const members = [{ id: 'bad', name: 'victim', workspace: '', status: 'idle' }, { id: 'victim', name: 'Safe', workspace: '/safe', status: 'idle' }]
-  const admission = new WorkspaceAdmission(makeRuntimeStub({ store: { list: table => table === 'members' ? members : [], get: () => undefined }, noticeSubjectsFor: () => [] }))
+  const admission = new WorkspaceAdmission(makeRuntimeStub({ store: { list: table => table === 'members' ? members : [], get: () => undefined }, noticeSubjectsFor: () => [], notices: { emitGuardTerminal() {} } }))
   assert.equal(admission.isolationAllows('m', members[1]), true)
   assert.equal(admission.isolationAllows('m', members[0]), false)
   const tasks = ['a', 'b'].map(id => ({ id, status: 'running', scope: ['**'], attempt: { ownerId: 'victim' } }))

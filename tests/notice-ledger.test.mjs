@@ -16,7 +16,6 @@ import { writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { FakeClock, FakeWorkers, MISSION_ACCEPTANCE, acceptThroughReview, blockThroughReview, eventually, events, setup, taskOf } from './faults/harness.mjs'
 import { ownerTools } from './refusal-inventory.mjs'
-import { emitGuardTerminal } from '../lib/refusals.js'
 import { BOARD_RUNNING, NOTICE_TEMPLATES, factKey, noticeFamily, noticeTemplateKey } from '../lib/notices.js'
 
 const ownerRows = f => f.runtime.store.list('deliveries', f.mission.id).filter(delivery => delivery.to === 'owner' && delivery.notice !== undefined)
@@ -1726,7 +1725,7 @@ test('the fall-through names stuck work at its epoch, once, beside an open reque
       // Work only the reviewer may take, dead once the reviewer is gone, with a request raised for it.
       const stuck = f.propose({ title: 'Reviewer-only work', kind: 'research', checks: [], assigneeId: f.reviewer.id })
       f.runtime.commit(f.mission.id, () => f.runtime.store.put('members', { ...f.runtime.store.get('members', f.reviewer.id), phase: 'stopped' }))
-      emitGuardTerminal(f.runtime, f.mission.id, 'attempt_lease', { taskId: stuck.id, localKey: 'closeout-abandoned:attempt_abandoned', detail: 'idle close-out abandoned attempt attempt_abandoned and re-pended the task' })
+      f.runtime.notices.emitGuardTerminal(f.mission.id, 'attempt_lease', { taskId: stuck.id, localKey: 'closeout-abandoned:attempt_abandoned', detail: 'idle close-out abandoned attempt attempt_abandoned and re-pended the task' })
       await quiet(f)
       // The board digest moves: work queued behind the author's live lease.
       f.propose({ title: 'Queued work', kind: 'research', checks: [] })

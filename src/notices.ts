@@ -8,11 +8,11 @@ import { createHash } from 'node:crypto'
 import { covered, hasNotice, noticeLedger as projectNoticeLedger } from './arena.ts'
 import { hostContextOf, memberPhaseOf } from './projection.ts'
 import { formatDiagnostic, missingReviewDiagnostic } from './admission.ts'
-import { guardTerminalKey, requireText } from './refusals.ts'
-import { TERMINAL_STATES, blockCauses, missionSubject, stopPending, subjectsOfTasks, taskGraphIndex, taskSubject } from './task-graph.ts'
+import { guardTerminal, guardTerminalKey, requireText, type GuardChainId, type GuardTerminal, type GuardTerminalContext, type RefusalRegistry } from './refusals.ts'
+import { TERMINAL_STATES, blockCauses, missionSubject, stopPending, subjectsOfTasks, taskGraphIndex, taskSubject, terminal } from './task-graph.ts'
 import { PolicyError } from './policy-error.ts'
 import type { SwarmRuntime } from './runtime.ts'
-import { id, type SwarmStore } from './store.ts'
+import { WriterBusyError, id, type SwarmStore } from './store.ts'
 import { awaited, type SchedulingPass } from './kernel.ts'
 import type { Actor, Delivery, Escalation, Member, Mission, NoticeClass, Task, WorkerAdapter } from './types.ts'
 
@@ -557,7 +557,8 @@ export class Notices {
    */
   private readonly wedgedReleases = new Set<string>()
 
-  constructor(private readonly rt: SwarmRuntime) {}
+  /** `refusals` holds the writes a busy writer refused: a guard terminal it could not tell is queued there (`emitGuardTerminal`). */
+  constructor(private readonly rt: SwarmRuntime, private readonly refusals: RefusalRegistry) {}
 
   /**
    * Owner notices wake the primary agent and replay its whole context, so only
@@ -587,6 +588,49 @@ export class Notices {
   tell(missionId: string, content: string, subjects: string[], options: NotifyOptions, then?: () => void): boolean {
     const { fact, identity } = noticeIdentity(missionId, subjects, options)
     return !hasNotice(this.rt.store.list('deliveries', missionId), identity) && this.rt.commit(missionId, () => { this.enqueueOwnerNotice(missionId, content, identity, fact); then?.(); return true })
+  }
+
+  /**
+   * End a guard chain: tell the owner its terminal decision request
+   * (`guardTerminal`) with the stall event that names its row. A caller names
+   * the chain and passes the scope it already has with the fact that opened it
+   * (`GuardTerminalContext.localKey`, or the unanswered question).
+   *
+   * The terminal is always built, and its request is told unless the same
+   * request is already on the deliveries ledger. Nothing else suppresses it: a
+   * failure of the chain under another opener is another request whatever the
+   * board looks like, and a busy writer is recorded (`RefusalRegistry.queueWriterBusy`),
+   * never silent. It names its caller's subjects, else the task it was asked
+   * about, else the member's unfinished work, else the mission root
+   * (`noticeSubjectsFor`).
+   */
+  emitGuardTerminal(missionId: string, chain: GuardChainId, context: GuardTerminalContext): GuardTerminal | undefined {
+    const mission = this.rt.store.get('missions', missionId)
+    // S4r-D5: only a terminal mission (completed/stopped) ends the chain's duty to
+    // speak. A mission that left `active` without reaching a terminal status —
+    // most importantly `blocked` after a budget stop, which is when the owner needs
+    // the executable exit most — still emits the terminal.
+    if (mission === undefined || terminal(mission)) return undefined
+    const request = guardTerminal(chain, context)
+    const key = guardTerminalKey(chain, context)
+    const subjects = context.subjects ?? this.rt.noticeSubjectsFor(missionId, { taskId: context.taskId, memberId: context.memberId })
+    try {
+      // The board-stall event type is reused with `cause: 'guard-terminal'`, so the
+      // durable log names the chain and the code without inventing an unregistered
+      // event type (the vocabulary is a separate owner surface). It exists only
+      // with the row its `noticeKey` names. The notice path must not share the fate
+      // of the pass that could not report it: the queue-external pump delivers it.
+      if (this.tell(missionId, request.message, [...new Set(subjects)], { dedupKey: key, reason: context.detail, questionId: context.questionId }, () => this.rt.store.event(missionId, 'mission/stalled', 'runtime', {
+        cause: 'guard-terminal', chain, code: request.code, taskId: context.taskId ?? null, memberId: context.memberId ?? null, detail: context.detail ?? null, noticeKey: key,
+      }))) this.pumpOutbox()
+    } catch (error) {
+      // The best-effort contract of a busy writer: an escalation it refused is
+      // recorded once the writer is free (`RefusalRegistry.recordWriterBusyRecovery`),
+      // never an unhandled rejection, and the chain re-derives its state on the next pass.
+      if (!(error instanceof WriterBusyError)) throw error
+      this.refusals.queueWriterBusy({ at: this.rt.now(), attempts: error.attempts, missionId, chain, context, detail: error.message })
+    }
+    return request
   }
 
   /**

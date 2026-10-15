@@ -13,7 +13,6 @@ import { TERMINAL_STATES, currentEvidenceIds, subjectsOfTasks, terminal } from '
 import { excerpt } from './declared-checks.ts'
 import { executionElapsed } from './resource-time.ts'
 import { memberPhaseOf } from './projection.ts'
-import { emitGuardTerminal } from './refusals.ts'
 import { noticeFamily, noticeIdentity } from './notices.ts'
 import type { SwarmRuntime } from './runtime.ts'
 import type { Delivery, Member, Mission, Post, Task, UsageBuckets, UsageSnapshotSource } from './types.ts'
@@ -387,7 +386,7 @@ export class RuntimeGates {
         this.rt.store.putTask(task)
       }
       for (const member of this.rt.store.list('members', mission.id)) { delete member.activity; this.rt.store.put('members', member) }
-      this.rt.upsertBudgetRefusals(mission, mission.reason!)
+      this.rt.refusals.upsertBudgetRefusals(mission, mission.reason!)
       this.rt.store.event(mission.id, 'mission/budget-exhausted', 'runtime', { tokens: mission.usedTokens, steps: mission.usedSteps, dimensions })
     })
     // S4b: the budget chain's terminal. The mission is durably blocked and the
@@ -398,7 +397,7 @@ export class RuntimeGates {
     // Co-firing guards: the budget guard fires with the attempt/lease chain (the
     // preserved attempts) and with the dispatch sweep (nothing new is admitted
     // while the pause holds).
-    emitGuardTerminal(this.rt, mission.id, 'budget', { detail: mission.reason!, localKey: `budget-pause:${mission.budgetPause.id}` })
+    this.rt.notices.emitGuardTerminal(mission.id, 'budget', { detail: mission.reason!, localKey: `budget-pause:${mission.budgetPause.id}` })
     this.beginBudgetStop(mission.id, mission.budgetPause.id)
   }
 

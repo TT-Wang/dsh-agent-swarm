@@ -13,7 +13,7 @@ import { scopeKeysOverlap } from './scheduler.ts'
 import { claimFor, isContained, reauthorizeWorkspace, WorkspaceRevokedError, WORKSPACE_AUTHORIZATION_CODE, type WorkspaceClaim } from './authorization.ts'
 import { hasNotice } from './arena.ts'
 import { isolationOpener, noticeIdentity } from './notices.ts'
-import { emitGuardTerminal, guardTerminalKey } from './refusals.ts'
+import { guardTerminalKey } from './refusals.ts'
 import type { SwarmRuntime } from './runtime.ts'
 import { progressed, type SchedulingPass } from './kernel.ts'
 import { absoluteCheckPaths, shellSegments } from './admission.ts'
@@ -437,7 +437,7 @@ export class WorkspaceAdmission {
     // S4b: the fence reaches the shared coded workspace terminal. A revocation
     // is a local fault, not a board state, so the decision is keyed by it and
     // the owner is woken once per revocation however the board moves afterwards.
-    emitGuardTerminal(this.rt, missionId, 'workspace', { detail: reason, localKey: revocation, subjects: subjectsOfTasks(blocked, mission) })
+    this.rt.notices.emitGuardTerminal(missionId, 'workspace', { detail: reason, localKey: revocation, subjects: subjectsOfTasks(blocked, mission) })
   }
 
   /**
@@ -509,7 +509,7 @@ export class WorkspaceAdmission {
   isolationAllows(missionId: string, member: Member): boolean {
     const violation = this.isolationIssues(missionId).find(entry => entry.memberIds.includes(member.id))
     if (violation === undefined) return true
-    emitGuardTerminal(this.rt, missionId, 'workspace', { subjects: violation.memberIds.flatMap(id => this.rt.noticeSubjectsFor(missionId, { memberId: id })), localKey: isolationOpener(violation.message),
+    this.rt.notices.emitGuardTerminal(missionId, 'workspace', { subjects: violation.memberIds.flatMap(id => this.rt.noticeSubjectsFor(missionId, { memberId: id })), localKey: isolationOpener(violation.message),
       detail: `the isolation invariant refuses dispatch: ${violation.message}` })
     return false
   }

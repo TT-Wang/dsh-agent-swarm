@@ -1,7 +1,6 @@
 import type { Context } from '@deepseek-ai/cordis'
 import type { SwarmRuntime } from './runtime.ts'
 import type { Delivery, Mission } from './types.ts'
-import { emitGuardTerminal } from './refusals.ts'
 import { terminal } from './task-graph.ts'
 
 /** One question booked at turn start, with everything the nudge must name. */
@@ -153,7 +152,7 @@ export class OwnerReplyGuard {
     if (spent >= this.options.maxNudges) {
       // Idempotent by its own dedup key: the terminal is emitted once and later
       // turns re-derive the same decision without a second notice.
-      emitGuardTerminal(this.rt, booking.missionId, 'owner_reply', {
+      this.rt.notices.emitGuardTerminal(booking.missionId, 'owner_reply', {
         detail: `question ${deliveryId} from ${booking.from} still has no answer after ${spent} nudge(s)`,
         memberId: booking.from,
         questionId: deliveryId,

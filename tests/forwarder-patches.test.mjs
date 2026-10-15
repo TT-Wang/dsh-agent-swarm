@@ -22,9 +22,14 @@ const PROJECT = fileURLToPath(new URL('../', import.meta.url))
 /** Deleted runtime forwarder -> the runtime field of the seam that owns the method, or null when nothing does. */
 const DELETED_FORWARDERS = {
   pumpOutbox: 'notices',
+  admissionDecision: 'refusals',
+  admissionRecord: 'refusals',
+  recordRefusal: 'refusals',
+  upsertBudgetRefusals: 'refusals',
   upsertAdmission: 'refusals',
   recordWriterBusyRecovery: 'refusals',
   sweepSilentAttempts: 'scheduling',
+  refuseProposal: null,
   dependencyUnfinished: null,
 }
 

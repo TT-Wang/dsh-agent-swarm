@@ -309,7 +309,7 @@ const RECOVERY_COLLECTIONS = {
     reason: 'Task.resumeAfterStop carries the fenced epoch and old owner; this map only coalesces attempts and delays retries.' },
   'src/runtime.ts:workerStarts': { kind: 'Map', label: 'lifecycle', proof: 'tests/r12-native-start-fixes.test.mjs',
     behavior: 'cancelled unpublished setup fences', reason: 'One cancellable native-start operation per member; durable member/mission checks fence late settlement, and adapter disposal owns handles.' },
-  'src/refusals.ts:writerRecoveries': { kind: 'WeakMap', label: 'pending-audit', proof: 'tests/r12-protocol-fixes.test.mjs',
+  'src/refusals.ts:writerRecoveries': { kind: 'Map', label: 'pending-audit', proof: 'tests/r12-protocol-fixes.test.mjs',
     behavior: 'writer recovery retains distinct refusals',
     reason: 'Coalesced admission/guard persistence failures; never grants or blocks task authority. Until SQLite accepts a write this audit buffer is process-local.' },
 }

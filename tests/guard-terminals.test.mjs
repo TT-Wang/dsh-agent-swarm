@@ -48,7 +48,7 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { setTimeout as sleep } from 'node:timers/promises'
 import { guardActions, guardBoard, guardDispatchActions, guardMissionTerminal, guardProgressActions, guardTerminalChain, terminalEscalation } from './guard-model.mjs'
-import { emitGuardTerminal, guardTerminal } from '../lib/refusals.js'
+import { guardTerminal } from '../lib/refusals.js'
 import { dependencyAssumptions, reconcileTaskAdmission } from '../lib/admission.js'
 import { assessText, ownerTools, sessionTools, toolSchemaIndex } from './refusal-inventory.mjs'
 import { setup, eventually, events, FakeClock, budget } from './faults/harness.mjs'
@@ -439,7 +439,7 @@ test('R14 hand-off mechanism: emitGuardTerminal lets any call site opt in mechan
   try {
     const task = f.propose({ title: 'Held work' })
     const context = { taskId: task.id, memberId: f.author.id, detail: 'the workspace guard refused the close-out (Member has uncommitted commits)', localKey: `closeout-refused:${task.id}@${task.epoch}` }
-    const terminal = emitGuardTerminal(f.runtime, f.mission.id, 'attempt_lease', context)
+    const terminal = f.runtime.notices.emitGuardTerminal(f.mission.id, 'attempt_lease', context)
     assert.ok(terminal, 'the call site always gets a terminal back')
     assert.equal(terminal.chain, 'attempt_lease')
     assert.equal(terminal.code, 'attempt_terminal')
@@ -455,7 +455,7 @@ test('R14 hand-off mechanism: emitGuardTerminal lets any call site opt in mechan
     // The same call under the same opener is the same decision request: the
     // repeat is suppressed because the request is durable, not because the
     // caller chose to stay silent.
-    assert.ok(emitGuardTerminal(f.runtime, f.mission.id, 'attempt_lease', context))
+    assert.ok(f.runtime.notices.emitGuardTerminal(f.mission.id, 'attempt_lease', context))
     await sleep(60)
     assert.equal(events(f.runtime, f.mission.id, 'mission/stalled')
       .filter(item => item.data.cause === 'guard-terminal' && item.data.chain === 'attempt_lease').length, 1,
@@ -563,7 +563,7 @@ test('S4r-D5: a budget-blocked mission still escalates, and the terminal emissio
       'the budget block delivers the coded owner decision request', 8_000)
     assert.deepEqual(lintRefusal(notice.content), [])
     // The emission is still unconditional and idempotent for the same state.
-    const terminal = emitGuardTerminal(f.runtime, f.mission.id, 'budget', { detail: 'budget-blocked probe', localKey: 'budget-blocked-probe' })
+    const terminal = f.runtime.notices.emitGuardTerminal(f.mission.id, 'budget', { detail: 'budget-blocked probe', localKey: 'budget-blocked-probe' })
     assert.ok(terminal, 'the terminal emission is unconditional for a blocked mission')
     assert.equal(terminal.code, 'budget_terminal')
   } finally { await f.cleanup() }

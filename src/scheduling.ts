@@ -13,7 +13,6 @@ import { assignmentAllows, canBorrowTask, canOwnReview, strandedReview } from '.
 import { liveReviewFor } from './admission.ts'
 import { hasNotice } from './arena.ts'
 import { awaitsReviewAdmission, factKey, noticeIdentity } from './notices.ts'
-import { emitGuardTerminal } from './refusals.ts'
 import { AdmissionRefusedError } from './scheduler.ts'
 import { awaited, formatSpan, progressed, type SchedulingPass } from './kernel.ts'
 // R17-G6/G7: the one derivation of the derived member status.
@@ -224,7 +223,7 @@ export class Scheduling {
             // its request names: the same throw over that work on a later pass is the
             // request the owner already holds; other work or another failure is another.
             const detail = String(error), subjects = this.rt.noticeSubjectsFor(missionId, { memberId: member.id })
-            emitGuardTerminal(this.rt, missionId, 'attempt_lease', { memberId: member.id, detail, subjects, localKey: factKey(missionId, { trigger: `dispatch-failed:${member.id}`, reason: detail, subjects }) })
+            this.rt.notices.emitGuardTerminal(missionId, 'attempt_lease', { memberId: member.id, detail, subjects, localKey: factKey(missionId, { trigger: `dispatch-failed:${member.id}`, reason: detail, subjects }) })
             continue
           }
         }

@@ -3,7 +3,7 @@
  *
  * The kernel obligation is structural: every guard chain ends in an escalation
  * that has no conditions of its own, so a dead end is impossible. In production
- * that terminal element is `emitGuardTerminal` (src/refusals.ts), which every
+ * that terminal element is `Notices.emitGuardTerminal` (src/notices.ts), which every
  * chain calls directly with `guardTerminal`'s coded request. This module is the
  * vocabulary the property test and the dead-end census use to CHECK that claim
  * over a generated board space: `guardDispatchActions` and `guardProgressActions`

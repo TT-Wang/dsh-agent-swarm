@@ -4,7 +4,8 @@ import { createHash } from 'node:crypto'
 import { join } from 'node:path'
 import { OwnerReplyGuard } from '../lib/owner-reply.js'
 import { RoleScoper } from '../lib/roles.js'
-import { RefusalRegistry, emitGuardTerminal, guardTerminalKey } from '../lib/refusals.js'
+import { RefusalRegistry, guardTerminalKey } from '../lib/refusals.js'
+import { Notices } from '../lib/notices.js'
 import { WriterBusyError } from '../lib/store.js'
 import { Attempts } from '../lib/attempts.js'
 import { pendingStopOwner } from '../lib/task-graph.js'
@@ -80,18 +81,20 @@ test('R12: owner can settle a receipt in paused, blocked and terminal missions w
   }
 })
 
+/** A refusal registry on a kernel stub whose writer is busy until released, and the notices that queue a guard terminal on that one registry. */
 function refusalFixture() {
   let busy = true
   const admissions = new Map(), events = []
-  const rt = makeRuntimeStub({
+  const kernel = makeRuntimeStub({
     commit: (_id, fn) => { if (busy) throw new WriterBusyError('busy', 2); return fn() },
     store: {
       get: (table, id) => table === 'missions' ? { id, status: 'active' } : admissions.get(id), list: () => [],
       recordAdmission: row => admissions.set(row.id, structuredClone(row)),
       event: (missionId, type, actor, data) => events.push({ missionId, type, actor, data }),
-    }, fingerprint: () => 'stable', noticeSubjectsFor: () => [], notify() {}, tell, notices: { pumpOutbox() {} },
+    }, noticeSubjectsFor: missionId => [`mission:${missionId}`],
   })
-  return { rt, registry: new RefusalRegistry(rt), admissions, events, release: () => { busy = false } }
+  const registry = new RefusalRegistry(kernel)
+  return { registry, notices: new Notices(kernel, registry), admissions, events, release: () => { busy = false } }
 }
 
 test('R12: writer recovery retains distinct refusals and flushes them only under their own mission', () => {
@@ -113,7 +116,7 @@ test('R12: writer recovery retains distinct refusals and flushes them only under
 
 test('R12: failed guard writes preserve their origin without manufacturing an admission', () => {
   const f = refusalFixture()
-  emitGuardTerminal(f.rt, 'mission', 'attempt_lease', { taskId: 'task', memberId: 'member', detail: 'lease stop failed', localKey: 'stop:task' })
+  f.notices.emitGuardTerminal('mission', 'attempt_lease', { taskId: 'task', memberId: 'member', detail: 'lease stop failed', localKey: 'stop:task' })
   f.release()
   f.registry.recordWriterBusyRecovery()
   assert.equal(f.admissions.size, 0)
@@ -135,7 +138,7 @@ test('a busy writer records each guard request it could not write: distinct open
     ['task_ceiling', { detail: 'mission experiment budget exhausted', localKey: 'experiment-budget:0' }],
     ['attempt_lease', { taskId: 'task', memberId: 'member', detail: 'idle close-out abandoned attempt_1', localKey: 'closeout-abandoned:attempt_1' }],
   ]
-  for (const [chain, context] of failures) emitGuardTerminal(f.rt, 'mission', chain, context)
+  for (const [chain, context] of failures) f.notices.emitGuardTerminal('mission', chain, context)
   f.release()
   f.registry.recordWriterBusyRecovery()
   assert.deepEqual(f.events.map(event => [event.data.cause, event.data.chain, event.data.taskId, event.data.count]), [
@@ -153,13 +156,14 @@ test('a guard request a busy writer could not write is named by its cause and ch
   t.after(f.cleanup)
   const context = { detail: 'mission task budget exhausted (1/1 tasks admitted)', localKey: 'task-budget:1' }
   f.runtime.commit = () => { throw new WriterBusyError('database is locked', 3) }
-  emitGuardTerminal(f.runtime, f.mission.id, 'task_ceiling', context)
+  f.runtime.notices.emitGuardTerminal(f.mission.id, 'task_ceiling', context)
   delete f.runtime.commit
+  assert.equal(f.runtime.notices.refusals, f.runtime.refusals, 'one registry per runtime: the notices queue the refused request on the registry the tick drains')
   f.clock.advance(f.runtime.config.tickMs)
   await f.runtime.tick()
   const stalls = () => f.runtime.store.events(f.mission.id, 500).filter(event => event.type === 'mission/stalled').map(event => event.data)
   assert.deepEqual(stalls().map(data => [data.cause, data.chain]), [['guard-terminal-write-failed', 'task_ceiling']], 'the writer\'s refusal is recorded')
-  emitGuardTerminal(f.runtime, f.mission.id, 'task_ceiling', context)
+  f.runtime.notices.emitGuardTerminal(f.mission.id, 'task_ceiling', context)
   const requests = f.runtime.store.list('deliveries', f.mission.id).filter(delivery => delivery.notice?.dedupKey.startsWith('guard-terminal:task_ceiling:'))
   assert.equal(requests.length, 1, 'the request is written once the writer is free')
   assert.deepEqual(stalls().filter(data => data.noticeKey === requests[0].notice.dedupKey).map(data => data.cause), ['guard-terminal'], 'one stall event names that row: the one written with it, never the record of the write that failed')
@@ -219,7 +223,7 @@ function stopFixture(reason, stop) {
     workers: new FakeWorkers({ stop: async memberId => { stopped.push(memberId); await stop(stopped.length) } }),
     task: (_mission, id) => structuredClone(rows.get(id)), mission: () => mission,
     defer: fn => { pending.push(Promise.resolve().then(fn)) }, exclusive: (_id, fn) => fn(), commit: (_id, fn) => fn(),
-    kick() {}, fingerprint: () => 'stable', noticeSubjectsFor: () => [], notify() {}, tell, notices: { pumpOutbox() {} },
+    kick() {}, fingerprint: () => 'stable', notify() {}, tell, notices: { emitGuardTerminal() {} },
   })
   return { mission, rows, pending, events, stopped, attempts: new Attempts(rt) }
 }
