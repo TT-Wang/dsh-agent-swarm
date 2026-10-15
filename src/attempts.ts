@@ -410,7 +410,7 @@ export class Attempts {
     // silence x lease expiry x the board-level stall — the subject is this task's
     // identity, so a healthy sibling's notices never consume the clock of this
     // one (they carry different subjects and different dedup keys).
-    this.rt.tell(mission.id, message, [taskSubject(task)], { noticeClass: 'stall', dedupKey: `operation-silent:${silent.attemptId}:${silent.activityId}:${silent.silentSince}` })
+    this.rt.notices.tell(mission.id, message, [taskSubject(task)], { noticeClass: 'stall', dedupKey: `operation-silent:${silent.attemptId}:${silent.activityId}:${silent.silentSince}` })
   }
   /**
    * Renew only a still-owned native operation, bounded by the owner's actual
@@ -576,7 +576,7 @@ export class Attempts {
           // silent board. Record it durably and wake the owner once per attempt.
           const ownerMember = this.rt.store.get('members', oldOwner)
           const parked = ownerMember?.status === 'waiting'
-          if (parked) this.rt.notifyParkedHolder(mission, task)
+          if (parked) this.rt.notices.notifyParkedHolder(mission, task)
           // F1: an in-flight operation that has recorded nothing past its
           // declared bound is named to the owner once, and stops renewing the
           // lease so the existing expiry path can free the attempt.

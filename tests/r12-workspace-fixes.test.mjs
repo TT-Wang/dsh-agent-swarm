@@ -47,11 +47,10 @@ test('M2-1: a repeated pass-timeout naming is recorded once, through the ledger'
   // The stub store writes only ledger rows: a naming that wrote the mission row would throw.
   const rt = makeRuntimeStub({ store: { get: () => structuredClone(mission), list: table => table === 'deliveries' ? deliveries : [], event: (_m, _t, _a, data) => records.push(data), revision: () => 0,
     put: (table, row) => { assert.equal(table, 'deliveries'); deliveries.push(row) } },
-    stallPassTimeoutMs: 1000, fingerprint: () => 'same', commit: (_id, fn) => fn(), defer() {}, expectWedgedRelease() {}, passSettled() {} })
-  // The runtime's own notices over this store; a requested pump is deferred and never runs.
+    stallPassTimeoutMs: 1000, fingerprint: () => 'same', commit: (_id, fn) => fn() })
+  // The runtime's own telling, over this store; the publication and the pump are outside this test.
   const notices = new Notices(rt, new RefusalRegistry(rt))
-  rt.notices = notices
-  rt.tell = notices.tell.bind(notices)
+  rt.notices = { tell: notices.tell.bind(notices), expectWedgedRelease() {}, transition() {}, pumpOutbox() {} }
   const scheduling = new Scheduling(rt)
   // Two bodies wedge in turn on one naming fact. The first naming's row is the
   // record: the second body is marked named and writes neither row nor event.
@@ -113,7 +112,7 @@ test('stop recovery owns its member until quiescence, including before native st
   const stopping = { id: 'old-task', status: 'blocked', epoch: 3, resumeAfterStop: { epoch: 3, memberId: member.id } }
   const ready = { id: 'new-task', title: 'New task', epoch: 0, status: 'pending', dependencies: [], acceptance: [], scope: ['**'], objective: 'New work' }
   let starts = 0
-  const rt = makeRuntimeStub({ store: { list: () => [stopping, ready] }, interpretation: () => ({ members: [member], tasks: [stopping, ready] }), mission: () => ({ status: 'active' }), startWorker: async () => { starts++ }, workers: new FakeWorkers({ autoIdle: true }) })
+  const rt = makeRuntimeStub({ store: { list: () => [stopping, ready] }, notices: { interpretation: () => ({ members: [member], tasks: [stopping, ready] }) }, mission: () => ({ status: 'active' }), startWorker: async () => { starts++ }, workers: new FakeWorkers({ autoIdle: true }) })
   const scheduling = new Scheduling(rt); scheduling.ready = () => true
   assert.equal(await scheduling.dispatch({ status: 'active' }, 'm'), true)
   assert.equal(starts, 0)

@@ -12,8 +12,8 @@ import { pendingStopOwner } from '../lib/task-graph.js'
 import { wakePrecision } from './instruments.mjs'
 import { FakeClock, FakeWorkers, MISSION_ACCEPTANCE, makeRuntime, makeRuntimeStub, setup } from './faults/harness.mjs'
 
-/** A stub runtime's `tell`: the fact's own transaction, then the record that exists only with it (the ledger is not modelled). */
-function tell(missionId, _content, _subjects, _options, then) { return this.commit(missionId, () => { then?.(); return true }) }
+/** A stub `Notices.tell`: the record that exists only with the fact, in the stubs' pass-through transaction (the ledger is not modelled). */
+function tell(_missionId, _content, _subjects, _options, then) { then?.(); return true }
 
 function guardFixture() {
   const mission = { id: 'm', ownerSessionId: 'owner', status: 'active' }
@@ -21,7 +21,7 @@ function guardFixture() {
   const rt = makeRuntimeStub({
     store: { list: () => [mission], get: table => table === 'missions' ? mission : question, put() {}, event() {} },
     openAsks: () => [question],
-    commit: (_id, fn) => fn(), notify() {}, noticeSubjectsFor: () => [],
+    commit: (_id, fn) => fn(), notices: { notify() {} }, noticeSubjectsFor: () => [],
   })
   return { mission, question, rt, guard: new OwnerReplyGuard({ on: () => () => {} }, rt, { maxNudges: 2 }) }
 }
@@ -223,7 +223,7 @@ function stopFixture(reason, stop) {
     workers: new FakeWorkers({ stop: async memberId => { stopped.push(memberId); await stop(stopped.length) } }),
     task: (_mission, id) => structuredClone(rows.get(id)), mission: () => mission,
     defer: fn => { pending.push(Promise.resolve().then(fn)) }, exclusive: (_id, fn) => fn(), commit: (_id, fn) => fn(),
-    kick() {}, fingerprint: () => 'stable', notify() {}, tell, notices: { emitGuardTerminal() {} },
+    kick() {}, fingerprint: () => 'stable', notices: { emitGuardTerminal() {}, notify() {}, tell },
   })
   return { mission, rows, pending, events, stopped, attempts: new Attempts(rt) }
 }

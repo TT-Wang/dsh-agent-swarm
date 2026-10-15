@@ -348,10 +348,14 @@ export class SwarmRuntime implements Kernel {
   /** M1a seam 4/7: the durable refusal registry and its writer-busy recovery, on the kernel alone. */
   readonly refusals = new RefusalRegistry(this)
 
-  /** M1a seam 3/7: owner notices, witnesses, guard terminals and the outbox that delivers them; a guard terminal a busy writer refused is queued on the one registry. */
+  /**
+   * M1a seam 3/7: owner notices, witnesses, guard terminals and the outbox that
+   * delivers them; a guard terminal a busy writer refused is queued on the one
+   * registry. A seam reaches it one way, as `rt.notices`; the forwarders below
+   * are the runtime's own surface (its body, index.ts, roles.ts, the tests).
+   */
   readonly notices = new Notices(this, this.refusals)
   notify(missionId: string, content: string, subjects: string[], options: NotifyOptions): boolean { return this.notices.notify(missionId, content, subjects, options) }
-  tell(missionId: string, content: string, subjects: string[], options: NotifyOptions, then?: () => void): boolean { return this.notices.tell(missionId, content, subjects, options, then) }
   ownerDeliveryRelevant(mission: Mission, delivery: Delivery): boolean { return this.notices.ownerDeliveryRelevant(mission, delivery) }
   ownerDeliveryContent(mission: Mission, delivery: Delivery): string { return this.notices.ownerDeliveryContent(mission, delivery) }
   /**
@@ -395,13 +399,8 @@ export class SwarmRuntime implements Kernel {
    * so the dispatcher and every generator read the same derived view.
    */
   interpretation(missionId: string): MissionInterpretation { return this.notices.interpretation(missionId) }
-  /** R17-G5: the named wedged pass owed its dispatch question; publish with the wedged branch. */
-  expectWedgedRelease(missionId: string): void { this.notices.expectWedgedRelease(missionId) }
   /** R17-G5: the scheduling pass state at a committed transition (for publication; see `Scheduling.passState`). */
   passState(missionId: string): { passLive: boolean; wedged: boolean } { return this.scheduling.passState(missionId) }
-  /** R17-G5: a settled pass is a transition; it publishes what its live window left unpublished. */
-  passSettled(missionId: string): void { this.notices.transition(missionId) }
-  notifyParkedHolder(mission: Mission, task: Task): void { return this.notices.notifyParkedHolder(mission, task) }
   private warnIntegrationGap(mission: Mission, admitted: Task): void { return this.notices.warnIntegrationGap(mission, admitted) }
   private notifyReviewBlocked(mission: Mission, source: Task, need: ReviewNeed, reason: string): void { return this.notices.notifyReviewBlocked(mission, source, need.id, reason) }
   private topicDelivery(missionId: string, from: string, topic: string, content: string): void { return this.notices.topicDelivery(missionId, from, topic, content) }

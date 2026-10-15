@@ -275,7 +275,7 @@ export class RuntimeGates {
       const keys = warnings.map(warning => warning.key)
       const dedupKey = warnings.length === 1 ? keys[0]! : `budget-review:${mission.id}:batch:${createHash('sha256').update(keys.join('\n')).digest('hex').slice(0, 20)}`
       const instructions = 'Review remaining work and use swarm_budget with reason: budget for the mission, or taskId and taskBudget for a task. Exhaustion preserves work; an extension never overrides a user pause or fixed deadline.'
-      this.rt.notify(mission.id, `Resource review (${warnings.length} threshold${warnings.length === 1 ? '' : 's'}):\n${warnings.map(warning => `- ${warning.content}`).join('\n')}\n${instructions}`,
+      this.rt.notices.notify(mission.id, `Resource review (${warnings.length} threshold${warnings.length === 1 ? '' : 's'}):\n${warnings.map(warning => `- ${warning.content}`).join('\n')}\n${instructions}`,
         [...new Set(warnings.flatMap(warning => warning.subjects))], { noticeClass: 'budget', dedupKey, trigger: 'mission/budget-warning', reason: keys.join('\n'),
           facts: [...warnings.map(warning => warning.content), instructions],
           aggregatedIdentities: warnings.map(warning => ({ ...noticeIdentity(mission.id, warning.subjects, { noticeClass: 'budget', dedupKey: warning.key }).identity, contentDigest: createHash('sha256').update(warning.content).digest('hex') })) })
@@ -349,7 +349,7 @@ export class RuntimeGates {
         this.rt.store.event(missionId, 'mission/budget-quiesced', 'runtime', { pauseId })
       })
       this.rt.kick(missionId)
-      await this.rt.flushOutbox(missionId)
+      await this.rt.notices.flushOutbox(missionId)
     })
   }
 

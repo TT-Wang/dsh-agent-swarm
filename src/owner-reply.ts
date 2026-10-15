@@ -170,7 +170,7 @@ export class OwnerReplyGuard {
       this.rt.store.put('deliveries', delivery)
       // Each recovery turn needs its own wake. Persist its ordinal and outbox
       // row together so restart cannot spend a nudge without retaining it.
-      this.rt.notify(booking.missionId, ownerReplyNudge(booking.missionId, delivery, booking, spent + 1, this.options.maxNudges),
+      this.rt.notices.notify(booking.missionId, ownerReplyNudge(booking.missionId, delivery, booking, spent + 1, this.options.maxNudges),
         this.rt.noticeSubjectsFor(booking.missionId, { ...(booking.taskId === undefined ? {} : { taskId: booking.taskId }), memberId: booking.from }),
         { dedupKey: `owner-reply-missing:${deliveryId}:${spent + 1}`, questionId: deliveryId })
     })

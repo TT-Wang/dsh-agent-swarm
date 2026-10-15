@@ -96,7 +96,7 @@ export class Scheduling {
         // member rows), so no notice can describe a board the dispatcher would
         // act on differently. The view is rebuilt after each await, so it is
         // never staler than the per-step store reads it replaces.
-        const members = this.rt.interpretation(missionId).members
+        const members = this.rt.notices.interpretation(missionId).members
         const from = pass?.sweepFrom === undefined ? -1 : members.findIndex(member => member.id === pass.sweepFrom)
         const rotation = from > 0 ? [...members.slice(from), ...members.slice(0, from)] : members
         const end = pass?.chainFrom === undefined ? -1 : rotation.findIndex((member, index) => index > 0 && member.id === pass.chainFrom)
@@ -142,7 +142,7 @@ export class Scheduling {
           // described to the owner with a cause the sweep did not test. The
           // parked-member hatch keeps priority: a parked member is dispatchable.
           if (this.startBlocker(member) !== undefined) continue
-          const view = this.rt.interpretation(missionId)
+          const view = this.rt.notices.interpretation(missionId)
           if (pendingStopOwner(view.tasks, member.id)) continue
           const open = view.tasks.find(t => t.status === 'running' && t.attempt?.ownerId === member.id)
           if (open !== undefined) {
@@ -214,7 +214,7 @@ export class Scheduling {
               this.rt.store.event(missionId, 'task/preparation-failed', 'runtime', { taskId: fresh.id, epoch: fresh.epoch, reason, ...fresh.preparationFailure, status: fresh.status })
               if (retry) return
               this.rt.store.event(missionId, 'task/blocked', 'runtime', { taskId: fresh.id, reason: fresh.output })
-              this.rt.notify(missionId, fresh.output!, this.rt.interpretation(missionId).subjectsOf([fresh]), { trigger: 'task/preparation-failed', reason })
+              this.rt.notices.notify(missionId, fresh.output!, this.rt.notices.interpretation(missionId).subjectsOf([fresh]), { trigger: 'task/preparation-failed', reason })
             })
           }
           } catch (error) {
@@ -606,7 +606,7 @@ export class Scheduling {
           : `${task.id} is blocked and its stop has been awaited for ${Math.max(0, now - stop.at)}ms, past its declared bound`
       })
     const stopText = stopFacts.length ? ` Stop state: ${stopFacts.join('; ')}.` : ''
-    this.rt.tell(missionId, `Scheduling pass ${pass.id} (run ${pass.operationId}) for mission ${missionId} did not return within ${bound}ms and produced no durable state change (fingerprint ${fingerprint.slice(0, 12)}). This pass keeps the mission's scheduling until the call it awaits returns at its own bound; the next pass then resumes from lease recovery. Unschedulable: ${unschedulable.join(', ') || 'none'}.${heldText} Work the pass never reached: ${unreachedText}.${stopText} Decide: inspect the named tasks, admit a repair with swarm_propose, or withdraw the blocking work with swarm_cancel.`, subjects,
+    this.rt.notices.tell(missionId, `Scheduling pass ${pass.id} (run ${pass.operationId}) for mission ${missionId} did not return within ${bound}ms and produced no durable state change (fingerprint ${fingerprint.slice(0, 12)}). This pass keeps the mission's scheduling until the call it awaits returns at its own bound; the next pass then resumes from lease recovery. Unschedulable: ${unschedulable.join(', ') || 'none'}.${heldText} Work the pass never reached: ${unreachedText}.${stopText} Decide: inspect the named tasks, admit a repair with swarm_propose, or withdraw the blocking work with swarm_cancel.`, subjects,
       { dedupKey: noticeKey, reason }, () => {
       // Reuse the registered board-stall event rather than inventing a new type:
       // `cause: 'scheduling-pass'` and `wedged` make the pass-level escalation
@@ -647,7 +647,7 @@ export class Scheduling {
    */
   closePass(missionId: string, pass: SchedulingPass): void {
     if (this.passes.get(missionId) === pass) this.passes.delete(missionId)
-    if (!this.rt.closed) this.rt.passSettled(missionId)
+    if (!this.rt.closed) this.rt.notices.transition(missionId)
   }
 
   /**
@@ -692,7 +692,7 @@ export class Scheduling {
       // board its live window left unpublished, so a publication is queued that
       // runs with the wedged branch even if the body settles first.
       pass.escalatedAt = now
-      this.rt.expectWedgedRelease(missionId)
+      this.rt.notices.expectWedgedRelease(missionId)
       // The notice path must not share the fate of the pass that could not report
       // it: the queue-external pump delivers it, never the wedged mission queue.
       this.rt.notices.pumpOutbox()
@@ -812,7 +812,7 @@ export class Scheduling {
       ? ` The mission's scheduling pass ${pass.operationId} is wedged past its ${this.rt.stallPassTimeoutMs}ms bound, so the in-pass recovery sweep cannot run either.`
       : ''
     const message = `${name} has held task ${task.id} "${task.title}" at epoch ${task.epoch} (attempt ${silent.attemptId}) for ${formatSpan(silent.silentMs)} (${silent.silentMs}ms) with no durable report past its declared bound of ${formatSpan(silent.boundMs)} (${silent.boundMs}ms): no durable event, no task state transition and no recorded tool run names this attempt since ${since}; no operation is in flight and the idle close-out is not handling it.${passState} Nothing was stopped or re-pended by this notice: the attempt may still be working. Owner actions: inspect it with swarm_observe (taskId ${task.id}), send it input or finish it with swarm_handoff, raise attemptSilenceBoundMs if this silence is healthy, or withdraw the work with swarm_cancel. [witness: attempt-silent, subject ${silent.subject}, attempt ${silent.attemptId}, member ${silent.ownerId}, lastDurableAt ${silent.lastDurableAt}, silentMs ${silent.silentMs}, boundMs ${silent.boundMs}]`
-    return this.rt.tell(mission.id, message, [taskSubject(task)], { noticeClass: 'stall', dedupKey: `${ATTEMPT_SILENCE_PREFIX}${silent.attemptId}:${silent.lastDurableAt}` })
+    return this.rt.notices.tell(mission.id, message, [taskSubject(task)], { noticeClass: 'stall', dedupKey: `${ATTEMPT_SILENCE_PREFIX}${silent.attemptId}:${silent.lastDurableAt}` })
   }
 
   /**
