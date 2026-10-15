@@ -503,6 +503,17 @@ function replacementCoverage(board: Pick<Board, 'tasks' | 'graph'>): Set<string>
 }
 
 /**
+ * R14-F2v D2 / R15-A3: a pending stop is inside its declared bound. Its marker
+ * records when the stop began, and no more than `stallPassTimeoutMs` has passed
+ * since. A marker with no recorded start (a pre-upgrade durable row) is
+ * unbounded: the bound cannot be shown to hold, so it is never inside it.
+ * Waiting on a stop inside its bound is progress; any other stop is a root.
+ */
+function stopInBound(board: Pick<Board, 'clock' | 'bounds'>, marker: Pick<NonNullable<Task['resumeAfterStop']>, 'at'>): boolean {
+  return marker.at !== undefined && board.clock() - marker.at <= board.bounds.stallPassTimeoutMs
+}
+
+/**
  * R14-F2(b): the stall roots of one board, in board order. Purely a function of
  * durable rows, so the pass, the timer-driven notice path, the delivery-time
  * relevance check and a test all classify the same board identically.
@@ -514,14 +525,7 @@ export function stallRoots(board: Pick<Board, 'tasks' | 'graph' | 'clock' | 'bou
     if (task.status !== 'blocked' || replaced.has(task.id)) return false
     // A verdict record is not a repairable root: its source carries the repair.
     if (task.reviewOf !== undefined) return false
-    const stop = stopPending(task) ? task.resumeAfterStop : undefined
-    if (stop === undefined) return true
-    const at = stop.at
-    // R14-F2v D2: a stop inside the declared bound is progress, not a root, but an
-    // absent timestamp is UNBOUNDED — the bound cannot be shown to hold, so the
-    // state escalates as a root rather than becoming silence (a pre-upgrade
-    // durable row reaches exactly this state).
-    return at === undefined || board.clock() - at > board.bounds.stallPassTimeoutMs
+    return !stopPending(task) || !stopInBound(board, task.resumeAfterStop)
   })
 }
 
@@ -594,12 +598,7 @@ export function waitsLegitimately(board: Board, task: Task): boolean {
     // record again (a W3 reminder, a fall-through) repeats the root's decision.
     if (task.reviewOf !== undefined && (covered.has(task.reviewOf)
       || stallRoots(board).some(root => root.id === task.reviewOf))) return true
-    const stop = stopPending(task) ? task.resumeAfterStop : undefined
-    // R15-A3: an absent `at` is UNBOUNDED, so it is not legitimate waiting. The
-    // "cannot judge" case must never be the silent one: `stallRoots` classifies
-    // the same row as a root, and this classifier refusing it here keeps the two
-    // in agreement instead of leaving the state both silent and unnamed.
-    if (stop !== undefined) return stop.at !== undefined && board.clock() - stop.at <= board.bounds.stallPassTimeoutMs
+    if (stopPending(task)) return stopInBound(board, task.resumeAfterStop)
     return board.graph.unfinishedDependencies(task).length > 0
   }
   if (task.status === 'pending') {
@@ -626,11 +625,10 @@ export function waitsLegitimately(board: Board, task: Task): boolean {
     // The same marker that fences dispatch is a live wait only while every
     // matching stop is inside its bound. An unknown owner reserves all members.
     const memberId = task.assigneeId ?? task.plannedAssigneeId
-    const stops = tasks.filter(candidate => stopPending(candidate)
+    const stops = tasks.flatMap(candidate => stopPending(candidate)
       && (candidate.id === task.id || candidate.resumeAfterStop.memberId === undefined
-        || (memberId !== undefined && candidate.resumeAfterStop.memberId === memberId)))
-    if (stops.length > 0) return stops.every(candidate => candidate.resumeAfterStop!.at !== undefined
-      && board.clock() - candidate.resumeAfterStop!.at! <= board.bounds.stallPassTimeoutMs)
+        || (memberId !== undefined && candidate.resumeAfterStop.memberId === memberId)) ? [candidate.resumeAfterStop] : [])
+    if (stops.length > 0) return stops.every(marker => stopInBound(board, marker))
     // Once the stop settles, another live attempt may take the selected member
     // first. Its bounded lease provides the next chance to run this ready work.
     return memberId !== undefined && tasks.some(candidate => candidate.status === 'running'
