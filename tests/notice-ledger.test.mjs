@@ -430,7 +430,7 @@ test('coverage-complete is told whenever completion is allowed, whatever the sta
   await ticks(f, 1)
   await eventually(() => !f.runtime.passState(f.mission.id).passLive, 'the tick\'s pass ends')
   const view = f.runtime.interpretation(f.mission.id)
-  assert.deepEqual([completionError(view.board), view.stalled, taskOf(f.runtime, experiment.id).status], [undefined, false, 'blocked'], 'completion is allowed on a board the stall predicate calls live')
+  assert.deepEqual([completionError(view), view.stalled, taskOf(f.runtime, experiment.id).status], [undefined, false, 'blocked'], 'completion is allowed on a board the stall predicate calls live')
   assert.equal(ownerRows(f).filter(delivery => noticeFamily(delivery) === 'coverage-complete').length, 1, 'coverage-complete is told')
 })
 
@@ -605,7 +605,7 @@ test('D1: an unreviewable source, its review pending for a stopped reviewer and 
   await f.runtime.settle(f.mission.id)
   await ticks(f, 2)
   const view = f.runtime.interpretation(f.mission.id)
-  const reason = completionError(view.board)
+  const reason = completionError(view)
   const subjects = [subjectOf(f, dead)]
   assert.deepEqual(view.unschedulable.map(task => task.id), [dead.id], 'the dispatcher counts the dead dependent alone')
   const [stall, ...others] = outstanding()

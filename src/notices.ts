@@ -309,19 +309,11 @@ export function noticeTemplateKey(delivery: Pick<Delivery, 'notice'>): keyof typ
   return prefix in NOTICE_TEMPLATES ? prefix as keyof typeof NOTICE_TEMPLATES : undefined
 }
 
-/** R17-G1: the shared interpretation one mission's notice generators consume. */
-export interface MissionInterpretation {
-  missionId: string
-  /** The board every field below is read from; its mission, tasks and members are the next three. */
-  board: Board
-  mission: Mission
-  tasks: Task[]
-  members: Member[]
+/** R17-G1: the shared interpretation one mission's notice generators consume: one board, and what the dispatcher's predicates answer over it. */
+export interface MissionInterpretation extends Board {
   nonTerminal: Task[]
   stallRoots: Task[]
   replaced: Set<string>
-  /** The dispatcher's eligibility (`eligible`), over this board. */
-  eligible: (task: Task, member: Member) => boolean
   /** The dispatchable work (`dispatchable`), the dispatcher's question. */
   dispatchable: Task[]
   /** The review admission's sources (`unreviewedSources`). */
@@ -879,20 +871,19 @@ export class Notices {
   /**
    * R17-G1: the ONE shared interpretation of a mission's durable state. Every
    * owner-facing generator reads this view instead of re-reading raw rows and
-   * re-deriving its own answer, and the dispatcher's own predicates
-   * (`eligible`, `unfinishedDependencies`, `reviewable`) are what it exposes, so a
-   * notice can never describe a board the dispatcher would act on differently.
-   * Read-only: it writes nothing and holds no cache.
+   * re-deriving its own answer: it is a board, so the dispatcher's own
+   * predicates (`eligible`, `reviewable`, `completionError`) are asked of it
+   * directly, and a notice can never describe a board the dispatcher would act
+   * on differently. Read-only: it writes nothing and holds no cache.
    */
   interpretation(missionId: string): MissionInterpretation {
     const board = this.rt.boardOf(missionId)
     const { mission, tasks, members } = board
     return {
-      missionId, board, mission, tasks, members,
+      ...board,
       nonTerminal: tasks.filter(task => !TERMINAL_STATES.has(task.status)),
       stallRoots: this.stallRoots(board),
       replaced: replacementCoverage(tasks),
-      eligible: (task, member) => eligible(board, task, member),
       // The dispatcher's own question and its own predicates, computed once here
       // so a notice can never describe a board the dispatcher would act on
       // differently (`eligible`, `reviewable`, `unschedulable`, `stalled`).
@@ -993,8 +984,8 @@ export class Notices {
     // A stall-root decision is outstanding exactly while its root still is one;
     // the dependents it lists (a rejecting review) never keep it open.
     const family = noticeFamily(delivery)
-    if (family === 'stall-root') return this.openStallRoot(view.board, delivery)
-    if (family === 'review-blocked') return this.openReviewBlock(view.board, delivery)
+    if (family === 'stall-root') return this.openStallRoot(view, delivery)
+    if (family === 'review-blocked') return this.openReviewBlock(view, delivery)
     if (BOARD_FAMILIES.includes(family) && !this.boardFactOpen(view, delivery)) return []
     // Coverage-complete names its terminal deliverable: the completion it asks for is what stays outstanding.
     if (family === 'coverage-complete') return delivery.subjects ?? []
@@ -1005,7 +996,7 @@ export class Notices {
           || (view.tasks.length > 0 && view.nonTerminal.length === 0)
       }
       const task = unfinished(subject, view.tasks)
-      return task !== undefined && !this.waitsLegitimately(view.board, task)
+      return task !== undefined && !this.waitsLegitimately(view, task)
     })
   }
 
@@ -1112,7 +1103,7 @@ export class Notices {
   private boardFact(view: MissionInterpretation): { key: string; subjects: string[]; reason: string; content: string; statement: NoticeStatement } | undefined {
     const fact = (body: { content: string; statement: NoticeStatement }, subjects: string[], reason: string) =>
       ({ ...body, subjects, reason, key: factKey(view.missionId, { trigger: NOTICE_TEMPLATES[body.statement.family].trigger, reason, subjects, statement: body.statement }) })
-    const refusal = completionError(view.board)
+    const refusal = completionError(view)
     if (refusal === undefined) return this.rt.store.list('starts', view.missionId).length > 0 ? undefined
       : fact(renderNotice('coverage-complete', { missionTitle: view.mission.title }), view.subjectsOf(view.tasks.filter(task => TERMINAL_STATES.has(task.status))), 'every acceptance criterion is independently covered')
     if (!view.stalled) return undefined
@@ -1290,8 +1281,8 @@ export class Notices {
     // rule, only what it does not reach: while a wedged pass keeps it from
     // running, a need it recorded (`ReviewNeed.recorded`).
     if (options.wedged === true) for (const task of view.unreviewed) {
-      const need = reviewNeed(view.board, task)
-      const blocker = need.recorded ? reviewPathBlocker(view.board, task, need) : undefined
+      const need = reviewNeed(view, task)
+      const blocker = need.recorded ? reviewPathBlocker(view, task, need) : undefined
       if (blocker !== undefined) this.notifyReviewBlocked(view.mission, task, need.id, blocker)
     }
     this.judgeBoard(view, options)
@@ -1305,7 +1296,7 @@ export class Notices {
     const members = view.members
     // R17-G1: the dispatcher's own `dispatchable` set, from the shared view.
     const dispatchable = options.wedged === true
-      ? tasks.filter(task => task.status === 'pending' && members.some(member => view.eligible(task, member)))
+      ? tasks.filter(task => task.status === 'pending' && members.some(member => eligible(view, task, member)))
       : view.dispatchable
     // The dispatchable work is the dispatcher's own question's to name (R15-A4),
     // one emitter among the board's: it names the member whose handle holds the
@@ -1316,7 +1307,7 @@ export class Notices {
     // The dedup key is the task at its epoch, so every judgement re-asks it
     // without repeating the wake.
     if (dispatchable.length && (options.wedged === true || members.some(member => member.status === 'waiting' || (member.status === 'idle' && this.rt.workers.isIdle(member.id))))) {
-      const question = dispatchQuestion(view.board, dispatchable)
+      const question = dispatchQuestion(view, dispatchable)
       if (question !== undefined) this.tell(missionId, question.message, view.subjectsOf([question.task]), { dedupKey: question.dedupKey })
     }
     // The board's own fact, of which this is the one emitter: coverage-complete
@@ -1324,7 +1315,7 @@ export class Notices {
     // pass instead), the W3 stall once the board is stalled (`boardFact`).
     this.notifyBoard(view)
     // No live work: stuck work is the W3 stall's alone (a stall candidate until the board is stalled).
-    if (reviewPathStalled(view.board)) return
+    if (reviewPathStalled(view)) return
     // R14-F2(c): the unnamed fallback is replaced. While every unfinished task is
     // legitimately waiting (row 3: a running attempt waits on its lease's path),
     // the runtime stays silent; otherwise it escalates UNCONDITIONALLY and names
@@ -1335,7 +1326,7 @@ export class Notices {
     // left to it, asked once a member can start; every other task no live path
     // advances is named here, whatever owner decision also names it.
     const roots = new Set(view.stallRoots.map(task => task.id))
-    const unrecognised = view.nonTerminal.filter(task => !roots.has(task.id) && !dispatchable.includes(task) && !this.waitsLegitimately(view.board, task))
+    const unrecognised = view.nonTerminal.filter(task => !roots.has(task.id) && !dispatchable.includes(task) && !this.waitsLegitimately(view, task))
     if (!unrecognised.length) return
     // R17-G3: the fact is the named subjects and the recorded reason (the
     // classifier's verdict), never the board digest.

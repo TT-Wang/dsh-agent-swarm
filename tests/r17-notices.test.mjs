@@ -310,7 +310,7 @@ test('R17-G2b: the W3 stall body replays from the unschedulable rows alone', asy
   const stall = () => {
     const view = f.runtime.interpretation(f.mission.id)
     f.runtime.notices.notifyBoard(view)
-    return { view, reason: completionError(view.board), notice: f.ownerNotices().filter(delivery => delivery.notice.dedupKey.startsWith('board-stall:')).at(-1) }
+    return { view, reason: completionError(view), notice: f.ownerNotices().filter(delivery => delivery.notice.dedupKey.startsWith('board-stall:')).at(-1) }
   }
   // First nothing is unschedulable: two pending rows wait on each other, so the
   // body names every non-terminal row; then a blocked row and its dependent

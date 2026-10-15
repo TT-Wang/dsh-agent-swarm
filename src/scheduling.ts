@@ -7,7 +7,7 @@
  */
 import { id } from './store.ts'
 import { TERMINAL_STATES, pendingStopOwner, quiescencePending, selectAcceptedDelivery, stopPending, subjectsOfTasks, taskSubject, terminal } from './task-graph.ts'
-import { effectiveDependencies, noticeSubjectsFor, ready, startBlocker, unschedulable } from './board.ts'
+import { effectiveDependencies, eligible, noticeSubjectsFor, ready, startBlocker, unschedulable } from './board.ts'
 import { factKey } from './notices.ts'
 import { AdmissionRefusedError } from './scheduler.ts'
 import { awaited, formatSpan, progressed, type SchedulingPass } from './kernel.ts'
@@ -137,13 +137,12 @@ export class Scheduling {
             if (!parkedMember && (durableIdle || cachedIdle)) await this.rt.closeOutIdleAttempt(mission, member, open, pass)
             continue
           }
-          const all = view.tasks
-          const eligible = all.filter(t => view.eligible(t, member)).sort((a, b) => b.priority - a.priority || a.createdAt - b.createdAt)
+          const choices = view.tasks.filter(t => eligible(view, t, member)).sort((a, b) => b.priority - a.priority || a.createdAt - b.createdAt)
           // R12-F9 (a task whose text assumes prior work no content-carrying edge
           // provides) is refused where a dependency set is written: plan
           // validation, propose() and the owner's `changes.dependencies`
           // amendment. Dispatch takes the first ready task as admitted.
-          const task = eligible[0]
+          const task = choices[0]
           if (!task) continue
           try {
             // Revocation fencing: a mission whose human authorization was withdrawn
