@@ -149,7 +149,8 @@ test('a board that stalls while a pass runs is judged by the board classifier al
   await ticks(f, 1)
   const [decision] = ownerRows(f).filter(delivery => delivery.notice.dedupKey.startsWith(`review-blocked:${f.mission.id}:${task.id}:`))
   assert.match(decision?.content ?? 'none', /no live member other than the author/, 'the admission names the stalled board\'s one subject')
-  assert.equal(stallRow(f), undefined, 'and nothing restates it')
+  assert.deepEqual(ownerRows(f).filter(delivery => noticeFamily(delivery) === 'board-stall').map(delivery => delivery.subjects), [[`${task.id}@${taskOf(f.runtime, task.id).epoch}`]],
+    'and the W3 stall of that board is told beside it, once: one more wording of the open item R20 (docs/known-limitations.md)')
 })
 
 test('the board classifier tells what a live pass left unpublished: the pass end publishes the board, and a wedged judgement tells its board facts, with no tick', async t => {
@@ -318,7 +319,8 @@ test('D3: a submission whose review need ripened, beside a dependent that waits 
     await f.runtime.submit(f.actor(f.author), f.mission.id, { taskId: source.id, attemptId: claimed.attempt.id, output: 'candidate' })
     await f.runtime.settle(f.mission.id)
     f.clock.advance(grace(f))
-    assert.equal(f.runtime.interpretation(f.mission.id).stalled, true, `deliverable ${index}: the board is stalled before the next pass`)
+    const need = f.runtime.reviewNeed(taskOf(f.runtime, source.id))
+    assert.deepEqual([need.ripe, need.recorded, f.runtime.interpretation(f.mission.id).stalled], [true, false, false], `deliverable ${index}: before the next pass the need is ripe, the admission has yet to process it, and the board is not stalled by it`)
     return { source, dependent }
   }
   const admitted = (f, source) => f.runtime.store.list('tasks', f.mission.id).find(task => task.reviewOf === source.id)
@@ -409,7 +411,7 @@ test('the board classifier is the one emitter of the board\'s facts: a pass that
   assert.deepEqual([stalls.map(delivery => delivery.subjects), boardStallEvents(f).length], [[[`${dependent.id}@${taskOf(f.runtime, dependent.id).epoch}`]], 1], 'then the board classifier tells the stall, once')
 })
 
-test('an unreviewable submission is the review admission\'s decision alone: the board classifier adds no W3 stall, even for a review of it no live member can take', async t => {
+test('an unreviewable submission is named by the review admission\'s decision, and the W3 stall of a board with nothing else to do is told beside it, once: one more wording of the open item R20, with or without a review of it no live member can take', async t => {
   for (const review of [false, true]) {
     const f = await setup({ clock: new FakeClock() })
     t.after(f.cleanup)
@@ -417,15 +419,16 @@ test('an unreviewable submission is the review admission\'s decision alone: the 
     const claimed = await f.runtime.claim(f.actor(f.author), f.mission.id, task.id)
     await f.runtime.submit(f.actor(f.author), f.mission.id, { taskId: task.id, attemptId: claimed.attempt.id, output: 'candidate' })
     // The only independent member was to review it; once it is gone, that review is dead too.
-    if (review) f.propose({ title: 'Review', kind: 'verification', reviewOf: task.id, checks: [], assigneeId: f.reviewer.id })
+    const dead = review ? f.propose({ title: 'Review', kind: 'verification', reviewOf: task.id, checks: [], assigneeId: f.reviewer.id }) : task
     f.runtime.commit(f.mission.id, () => f.runtime.store.put('members', { ...f.runtime.store.get('members', f.reviewer.id), phase: 'stopped' }))
     await f.runtime.settle(f.mission.id)
     await ticks(f, 150)
     const decisions = ownerRows(f).filter(delivery => delivery.notice.dedupKey.startsWith(`review-blocked:${f.mission.id}:${task.id}:`))
     assert.equal(decisions.length, 1, `review=${review}: the admission named the blocker once`)
     assert.match(decisions[0].content, /no live member other than the author/)
-    assert.equal(stallRow(f), undefined, `review=${review}: no W3 stall restates it`)
-    assert.deepEqual(boardStallEvents(f), [])
+    const stalls = ownerRows(f).filter(delivery => noticeFamily(delivery) === 'board-stall')
+    assert.deepEqual([stalls.map(delivery => delivery.subjects), boardStallEvents(f).length], [[[subjectOf(f, dead)]], 1], `review=${review}: the W3 stall names the board's stuck work beside it, once, with its one event`)
+    assert.deepEqual([relevant(f, decisions[0]), relevant(f, stalls[0])], [true, true], 'and both are outstanding')
   }
 })
 
@@ -473,60 +476,38 @@ test('a board whose only unfinished work is a submission and its dead host revie
   await ticks(f, 150)
   assert.equal(f.runtime.interpretation(f.mission.id).stalled, true, 'the board is stalled on the submission and its dead review')
   const told = ownerRows(f).filter(delivery => !before.includes(delivery.id))
-  assert.deepEqual(told.map(delivery => noticeFamily(delivery)), ['review-blocked'], 'the owner is told once, by the admission')
-  assert.deepEqual(told[0].subjects, [`${source.id}@${taskOf(f.runtime, source.id).epoch}`])
-  assert.match(told[0].content, new RegExp(`the automatically admitted review ${review.id} is blocked and cannot reach a verdict: admit a review with swarm_propose\\(.*\\), or withdraw the source with swarm_cancel\\(taskId, reason\\)$`))
-  assert.equal(relevant(f, told[0]), true, 'and the decision is outstanding')
-  assert.deepEqual(boardStallEvents(f), [], 'no W3 stall restates it')
+  assert.deepEqual(told.map(delivery => noticeFamily(delivery)).sort(), ['board-stall', 'review-blocked'], 'the owner is told by the admission, and by the W3 stall of that board beside it: one more wording of the open item R20')
+  const [decision] = told.filter(delivery => noticeFamily(delivery) === 'review-blocked')
+  assert.deepEqual(decision.subjects, [`${source.id}@${taskOf(f.runtime, source.id).epoch}`])
+  assert.match(decision.content, new RegExp(`the automatically admitted review ${review.id} is blocked and cannot reach a verdict: admit a review with swarm_propose\\(.*\\), or withdraw the source with swarm_cancel\\(taskId, reason\\)$`))
+  assert.equal(relevant(f, decision), true, 'and the decision is outstanding')
+  assert.deepEqual([told.find(delivery => noticeFamily(delivery) === 'board-stall').subjects, boardStallEvents(f).length], [[subjectOf(f, review)], 1], 'the W3 stall names the dead review, once')
 })
 
-test('while a submission the review admission speaks for is unreviewable, its decision speaks for the board: other stuck work is named once no such submission remains, by the W3 stall on a board with no live work and by the fall-through behind live work', async t => {
-  const namings = (f, task) => ownerRows(f).filter(delivery => (delivery.subjects ?? []).includes(`${task.id}@${taskOf(f.runtime, task.id).epoch}`))
-  const sourceDecisions = (f, source) => ownerRows(f).filter(delivery => delivery.notice.dedupKey.startsWith(`review-blocked:${f.mission.id}:${source.id}:`))
-  const withdraw = async (f, task) => { f.runtime.cancel(f.owner, f.mission.id, { taskId: task.id, reason: 'Not needed' }); await f.runtime.settle(f.mission.id); await ticks(f, 2) }
-
-  // A stalled board: work a withdrawn prerequisite left dead, beside the author's submission no live member can review.
-  const stalled = await setup({ clock: new FakeClock() })
-  t.after(stalled.cleanup)
-  stalled.runtime.commit(stalled.mission.id, () => stalled.runtime.store.put('members', { ...stalled.runtime.store.get('members', stalled.reviewer.id), phase: 'stopped' }))
-  const withdrawn = stalled.propose({ title: 'Prerequisite', kind: 'research', checks: [] })
-  const dead = stalled.propose({ title: 'Dependent', kind: 'research', checks: [], dependencies: [withdrawn.id] })
-  const unreviewable = stalled.propose()
-  const claimedSource = await stalled.runtime.claim(stalled.actor(stalled.author), stalled.mission.id, unreviewable.id)
-  await stalled.runtime.submit(stalled.actor(stalled.author), stalled.mission.id, { taskId: unreviewable.id, attemptId: claimedSource.attempt.id, output: 'candidate' })
-  stalled.runtime.cancel(stalled.owner, stalled.mission.id, { taskId: withdrawn.id, reason: 'Not needed' })
-  await stalled.runtime.settle(stalled.mission.id)
-  await ticks(stalled, 150)
-  assert.equal(sourceDecisions(stalled, unreviewable).length, 1, 'the admission named the source')
-  const stallsOf = (f, task) => namings(f, task).filter(delivery => noticeFamily(delivery) === 'board-stall')
-  assert.deepEqual([stallsOf(stalled, dead), boardStallEvents(stalled)], [[], []], 'its decision speaks for the board: no W3 stall names the dead work')
-  await withdraw(stalled, unreviewable)
-  assert.equal(stallsOf(stalled, dead).length, 1, 'once no unreviewable submission remains, the W3 stall names the dead work')
-
-  // Beside unrelated running work the board is not stalled: the fall-through names
-  // the work only the reviewer could take, dead once the reviewer is gone.
-  const running = await setup({ clock: new FakeClock() })
-  t.after(running.cleanup)
-  const dependent = running.propose({ title: 'Reviewer-only work', kind: 'research', checks: [], assigneeId: running.reviewer.id })
-  const source = running.propose()
-  const claimed = await running.runtime.claim(running.actor(running.author), running.mission.id, source.id)
-  await running.runtime.submit(running.actor(running.author), running.mission.id, { taskId: source.id, attemptId: claimed.attempt.id, output: 'candidate' })
-  const unrelated = running.propose({ title: 'Unrelated work', kind: 'research', checks: [] })
-  await running.runtime.claim(running.actor(running.author), running.mission.id, unrelated.id)
-  running.runtime.commit(running.mission.id, () => running.runtime.store.put('members', { ...running.runtime.store.get('members', running.reviewer.id), phase: 'stopped' }))
-  await running.runtime.settle(running.mission.id)
-  await ticks(running, 150)
-  assert.equal(sourceDecisions(running, source).length, 1, 'the admission named the source beside the running work')
-  assert.deepEqual(namings(running, dependent), [], 'its decision speaks for the board: no fall-through names the dead work')
-  assert.deepEqual(ownerRows(running).filter(delivery => noticeFamily(delivery) !== 'review-blocked' && (delivery.subjects ?? []).some(subject => subject.startsWith(`${source.id}@`))).map(delivery => delivery.content), [], 'and no other naming restates the source')
-  await withdraw(running, source)
-  const [fallthrough, ...more] = namings(running, dependent)
-  assert.deepEqual([noticeFamily(fallthrough), more], ['fallthrough', []], 'once no unreviewable submission remains, the fall-through names the dead work')
-  assert.deepEqual(fallthrough.subjects, [`${dependent.id}@${taskOf(running.runtime, dependent.id).epoch}`])
-  assert.equal(relevant(running, fallthrough), true, 'the naming is outstanding')
+test('a dependent a cancellation strands beside an unreviewable submission is named while that submission stays unreviewable: by the W3 stall on a board with no live work and by the fall-through beside running work, each beside the admission\'s decision (the D1 probe)', async t => {
+  for (const running of [false, true]) {
+    const f = await setup({ clock: new FakeClock(), budget: LONG })
+    t.after(f.cleanup)
+    // The withdrawn prerequisite leaves its dependent dead; an unrelated deliverable is submitted and its only independent member stopped.
+    const prerequisite = f.propose({ title: 'Prerequisite', kind: 'research', checks: [] })
+    const dead = f.propose({ title: 'Dependent', kind: 'research', checks: [], dependencies: [prerequisite.id] })
+    const source = f.propose()
+    const claimed = await f.runtime.claim(f.actor(f.author), f.mission.id, source.id)
+    await f.runtime.submit(f.actor(f.author), f.mission.id, { taskId: source.id, attemptId: claimed.attempt.id, output: 'candidate' })
+    if (running) await f.runtime.claim(f.actor(f.author), f.mission.id, f.propose({ title: 'Unrelated work', kind: 'research', checks: [] }).id)
+    f.runtime.commit(f.mission.id, () => f.runtime.store.put('members', { ...f.runtime.store.get('members', f.reviewer.id), phase: 'stopped' }))
+    f.runtime.cancel(f.owner, f.mission.id, { taskId: prerequisite.id, reason: 'Not needed' })
+    await f.runtime.settle(f.mission.id)
+    await ticks(f, 150)
+    const [decision, ...more] = ownerRows(f).filter(delivery => delivery.notice.dedupKey.startsWith(`review-blocked:${f.mission.id}:${source.id}:`))
+    assert.deepEqual([more, taskOf(f.runtime, source.id).status, relevant(f, decision)], [[], 'submitted', true], `running=${running}: the source is still unreviewable and its admission's decision is outstanding`)
+    const namings = ownerRows(f).filter(delivery => (delivery.subjects ?? []).includes(subjectOf(f, dead)) && delivery.notice.trigger !== 'owner-decision-unresolved')
+    assert.deepEqual([...new Set(namings.map(delivery => noticeFamily(delivery)))], [running ? 'fallthrough' : 'board-stall'], `running=${running}: the board's own naming names the stranded dependent at its epoch`)
+    assert.equal(namings.some(delivery => relevant(f, delivery)), true, `running=${running}: and that naming is outstanding`)
+  }
 })
 
-test('D1: an unreviewable source, its review pending for a stopped reviewer and a dead dependent: withdrawing only the review never tells the dead work twice at one epoch, and the W3 stall that follows the source states one unfiltered set', async t => {
+test('D1: an unreviewable source, its review pending for a stopped reviewer and a dead dependent: the W3 stall names the dead work while the source is unreviewable, each withdrawal that moves its identity tells it again (R20) with only the newest outstanding, and the one that follows the source states one unfiltered set', async t => {
   const f = await setup({ clock: new FakeClock() })
   t.after(f.cleanup)
   const source = f.propose()
@@ -541,27 +522,31 @@ test('D1: an unreviewable source, its review pending for a stopped reviewer and 
   await f.runtime.settle(f.mission.id)
   await ticks(f, 150)
   const stalls = () => ownerRows(f).filter(delivery => delivery.content.startsWith('Mission stalled'))
-  const subjectsTold = () => stalls().flatMap(delivery => delivery.subjects)
-  // The owner withdraws only the review: the source is still unreviewable.
+  const outstanding = () => stalls().filter(delivery => relevant(f, delivery))
+  assert.equal(ownerRows(f).filter(delivery => delivery.notice.dedupKey.startsWith(`review-blocked:${f.mission.id}:${source.id}:`)).length, 1, 'the admission named the source')
+  const first = [subjectOf(f, review), subjectOf(f, dead)]
+  assert.deepEqual(stalls().map(delivery => delivery.subjects), [first], 'while the source is unreviewable the W3 stall names the dead work beside its decision')
+  // The owner withdraws only the review: the source is still unreviewable, and the W3 stall's identity moves.
   f.runtime.cancel(f.owner, f.mission.id, { taskId: review.id, reason: 'Not this review' })
   await f.runtime.settle(f.mission.id)
   await ticks(f, 150)
-  assert.equal(new Set(subjectsTold()).size, subjectsTold().length, `no subject at one epoch is named by two stalls: ${JSON.stringify(subjectsTold())}`)
-  assert.deepEqual(stalls(), [], 'while the source is unreviewable its decision speaks for the board')
+  assert.deepEqual(stalls().map(delivery => delivery.subjects), [first, [subjectOf(f, dead)]], 'the moved identity is told again: a second W3 after a withdrawn review, one wording of the open item R20')
+  assert.deepEqual(outstanding(), stalls().slice(-1), 'only the newest is outstanding')
   // The owner withdraws the source too: the W3 stall names what remains, as one set.
   f.runtime.cancel(f.owner, f.mission.id, { taskId: source.id, reason: 'Not needed' })
   await f.runtime.settle(f.mission.id)
   await ticks(f, 2)
   const view = f.runtime.interpretation(f.mission.id)
   const reason = f.runtime.completionError(view.mission)
-  const subjects = [`${dead.id}@${taskOf(f.runtime, dead.id).epoch}`]
+  const subjects = [subjectOf(f, dead)]
   assert.deepEqual(view.unschedulable.map(task => task.id), [dead.id], 'the dispatcher counts the dead dependent alone')
-  const [stall, ...others] = stalls()
-  assert.deepEqual(others, [], 'one stall')
+  const [stall, ...others] = outstanding()
+  assert.deepEqual([others, stall.id], [[], stalls().at(-1).id], 'one outstanding stall, the newest')
   assert.equal(stall.content, NOTICE_TEMPLATES['board-stall'].build({ reason, unschedulable: view.unschedulable, subjects }), 'its whole body is the template of that one set')
   assert.equal(stall.notice.dedupKey, factKey(f.mission.id, { trigger: 'mission/stalled', reason, subjects, statement: { family: 'board-stall' } }), 'and so is its key')
   assert.deepEqual(stall.notice.statement, { family: 'board-stall', counts: { unschedulable: 1 } })
-  assert.deepEqual(boardStallEvents(f).map(event => [event.data.noticeKey, event.data.unschedulable]), [[stall.notice.dedupKey, [dead.id]]], 'and its event records that set')
+  assert.deepEqual(boardStallEvents(f).map(event => event.data.noticeKey), stalls().map(delivery => delivery.notice.dedupKey), 'each W3 row has its one event')
+  assert.deepEqual(boardStallEvents(f).at(-1).data.unschedulable, [dead.id], 'and the last records that set')
 })
 
 /**
@@ -588,15 +573,11 @@ const graceBoard = async (t, { legacy = false, running = false } = {}) => {
   return { f, dead, source, naming, families: task => naming(task).map(delivery => noticeFamily(delivery)) }
 }
 
-test('a board with no live work is the stall\'s to name: inside a review grace it is a stall candidate the fall-through leaves alone, past it the admission speaks for it, and its dead work is named by one decision once the source is withdrawn', async t => {
+test('a board with no live work is the stall\'s to name: inside a review grace it is a stall candidate the fall-through leaves alone, and once the admission names the source\'s blocker the W3 stall names the dead work beside that decision and is reminded as one obligation', async t => {
   const { f, dead, source, naming, families } = await graceBoard(t)
   assert.deepEqual([families(dead), families(source)], [[], []], 'nothing is told inside the grace')
   await ticks(f, 150)
-  assert.deepEqual([families(dead), families(source)], [[], ['review-blocked']], 'past the grace the source is named by its admission, which speaks for the board')
-  f.runtime.cancel(f.owner, f.mission.id, { taskId: source.id, reason: 'Not needed' })
-  await f.runtime.settle(f.mission.id)
-  await ticks(f, 2)
-  assert.deepEqual(families(dead), ['board-stall'], 'once it is withdrawn the dead work is named once')
+  assert.deepEqual([families(dead), families(source)], [['board-stall'], ['review-blocked']], 'past the grace the admission names the source and the W3 stall names the dead work beside it')
   await f.runtime.flushOutbox(f.mission.id)
   for (let interval = 0; interval < 4; interval += 1) { f.clock.advance(f.runtime.notices.obligationFollowupMs); f.runtime.notices.absenceNet(f.mission.id); await f.runtime.flushOutbox(f.mission.id) }
   assert.deepEqual(naming(dead).filter(delivery => relevant(f, delivery)).map(delivery => noticeFamily(delivery)), ['board-stall'], 'one outstanding decision names it')

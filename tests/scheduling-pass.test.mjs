@@ -1105,19 +1105,19 @@ test('manualTick runs no timer while tickMs stays the tick unit: settle() return
     assert.equal(checks, 1, 'one tick runs the watchdog once')
     assert.equal(scheduling.passes.has(f.mission.id), false, 'and returns once the body it kicked has settled')
     // The review grace is one tick unit, at least 1 s, of clock time from the
-    // durable submission, so a submission is not a stall inside it.
+    // durable submission, so a submission's review need ripens only past it.
     const claimed = taskOf(f.runtime, task.id)
     await f.runtime.submit(f.actor(f.author), f.mission.id, { taskId: task.id, attemptId: claimed.attempt.id, output: 'candidate' })
-    const unreviewed = () => f.runtime.scheduling.unreviewedStall([taskOf(f.runtime, task.id)])
-    assert.equal(unreviewed(), false, 'a submission is not a stall at its own instant')
+    const ripe = () => f.runtime.reviewNeed(taskOf(f.runtime, task.id)).ripe
+    assert.equal(ripe(), false, 'a submission\'s review need is not ripe at its own instant')
     clock.advance(Math.max(tickMs, 1_000) - 1)
-    assert.equal(unreviewed(), false, 'nor one clock millisecond inside the grace')
+    assert.equal(ripe(), false, 'nor one clock millisecond inside the grace')
     clock.advance(1)
-    assert.equal(unreviewed(), true, 'it is one once the grace has elapsed on the clock')
+    assert.equal(ripe(), true, 'it ripens once the grace has elapsed on the clock')
   } finally { await f.cleanup() }
 })
 
-test('an unreviewed submission is a stall exactly when it stops waiting legitimately: both read the one review grace, fast tick or slow', async () => {
+test('an unreviewed submission is a stall exactly when it stops waiting legitimately: both read the review admission\'s one rule, its grace and then its record of the need, fast tick or slow', async () => {
   for (const tickMs of [10, 60_000]) {
     const clock = new FakeClock()
     const f = await setup({ clock, config: { tickMs } })
@@ -1126,17 +1126,23 @@ test('an unreviewed submission is a stall exactly when it stops waiting legitima
       const task = f.propose()
       await f.runtime.settle(f.mission.id)
       const claimed = taskOf(f.runtime, task.id)
+      // The only independent member is gone, so the admission names a blocker instead of admitting a review.
+      f.runtime.commit(f.mission.id, () => f.runtime.store.put('members', { ...f.runtime.store.get('members', f.reviewer.id), phase: 'stopped' }))
       await f.runtime.submit(f.actor(f.author), f.mission.id, { taskId: task.id, attemptId: claimed.attempt.id, output: 'candidate' })
       const classified = () => {
         const tasks = f.runtime.store.list('tasks', f.mission.id)
         const row = tasks.find(candidate => candidate.id === task.id)
-        return { stall: f.runtime.scheduling.unreviewedStall([row]), waits: waitsLegitimately(f.runtime, row, tasks) }
+        return { stall: f.runtime.stalled(tasks, f.runtime.store.list('members', f.mission.id)), waits: waitsLegitimately(f.runtime, row, tasks) }
       }
       // One scheduler period, at least 1 s.
       clock.advance(Math.max(tickMs, 1_000) - 1)
       assert.deepEqual(classified(), { stall: false, waits: true }, `tickMs ${tickMs}: inside the grace the submission still waits`)
       clock.advance(1)
-      assert.deepEqual(classified(), { stall: true, waits: false }, `tickMs ${tickMs}: past it the submission is a stall`)
+      assert.deepEqual(classified(), { stall: false, waits: true }, `tickMs ${tickMs}: past it the need awaits the admission, which has not yet processed it`)
+      await f.runtime.tick()
+      await f.runtime.settle(f.mission.id)
+      assert.equal(f.runtime.reviewNeed(taskOf(f.runtime, task.id)).recorded, true, `tickMs ${tickMs}: the next pass's admission recorded the need`)
+      assert.deepEqual(classified(), { stall: true, waits: false }, `tickMs ${tickMs}: once it has, the submission is a stall`)
     } finally { await f.cleanup() }
   }
 })

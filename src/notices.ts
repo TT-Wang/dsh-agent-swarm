@@ -392,7 +392,7 @@ interface LineageRuntime {
   readonly stallPassTimeoutMs: number
   /** The runtime clock (`SwarmRuntime.now`). */
   readonly now: () => number
-  reviewNeed(source: Task): { ripe: boolean }
+  reviewNeed(source: Task): { ripe: boolean; recorded: boolean }
   unfinishedDependencies(missionId: string, task: Task, tasks?: Task[]): Task[]
   reviewable(task: Task, tasks: Task[]): boolean
 }
@@ -457,12 +457,10 @@ export function waitsLegitimately(rt: LineageRuntime, task: Task, tasks: Task[])
   // owns its expiry (fence, re-pend, re-route). Only a running row with no
   // attempt at all is unrecognised.
   if (task.status === 'running') return task.attempt !== undefined
-  if (task.status === 'submitted') {
-    // Submission remains in this state for the entire independent review. Use
-    // the dispatcher's live-review rule, including an admitted/parked review,
-    // rather than mistaking the end of the admission grace for a stalled task.
-    return rt.reviewable(task, tasks) || !rt.reviewNeed(task).ripe
-  }
+  // Submission remains in this state for the entire independent review: the
+  // dispatcher's live-review rule (an admitted or parked review included), or
+  // a need the review admission has yet to process (`awaitsReviewAdmission`).
+  if (task.status === 'submitted') return rt.reviewable(task, tasks) || awaitsReviewAdmission(rt, task)
   if (task.status === 'blocked') {
     // A blocked verdict record is not outstanding on its own while its source
     // speaks for it: a live replacement carries the repair, or the source is a
@@ -520,6 +518,8 @@ const id = (prefix: string) => `${prefix}_${randomUUID()}`
 
 /** The review admission's sources, the one set its admission, its decisions and the interpretation read: submitted artifacts no live review can accept (before the grace is applied). A submission an older build left without an artifact is ordinary stuck work. */
 export const unreviewedSources = (rt: Pick<LineageRuntime, 'reviewable'>, tasks: Task[]): Task[] => tasks.filter(task => task.status === 'submitted' && task.artifact !== undefined && !rt.reviewable(task, tasks))
+/** Whether the host can still advance an unreviewable submission, the one rule the stall predicate and the waiting classifier read: inside its review grace (`ReviewNeed.ripe`), and for a source the review admission speaks for until that admission has processed its current need (`ReviewNeed.recorded`), admitting its review or naming its blocker. */
+export const awaitsReviewAdmission = (rt: Pick<LineageRuntime, 'reviewNeed'>, task: Task): boolean => { const need = rt.reviewNeed(task); return !need.ripe || (task.artifact !== undefined && !need.recorded) }
 /** A review-blocked decision's identity: one per blocker reason of one review need (`SwarmRuntime.reviewNeed`) of a source. */
 const reviewBlockedKey =(missionId: string, sourceId: string, need: string, reason: string): string => `review-blocked:${missionId}:${sourceId}:${need}:${reason}`
 /** The families of the board's own fact: the W3 stall, or an owner-assembled mission's coverage-complete (R10-14). */
@@ -1051,9 +1051,7 @@ export class Notices {
    * identity it is told under. Completion refused: a stalled board's W3
    * stall, keyed by the completion diagnostic and its stuck work (the
    * unschedulable tasks, else every unfinished one), one set that its subjects,
-   * body, count and event state; not told while a submission the review
-   * admission speaks for is unreviewable, whose own record or decision then
-   * speaks for the board. Completion allowed: coverage-complete of an
+   * body, count and event state. Completion allowed: coverage-complete of an
    * owner-assembled mission (no start request), keyed by its terminal work.
    */
   private boardFact(view: MissionInterpretation): { key: string; subjects: string[]; reason: string; content: string; statement: NoticeStatement } | undefined {
@@ -1062,7 +1060,7 @@ export class Notices {
     const refusal = this.rt.completionError(view.mission)
     if (refusal === undefined) return this.rt.store.list('starts', view.missionId).length > 0 ? undefined
       : fact(renderNotice('coverage-complete', { missionTitle: view.mission.title }), view.subjectsOf(view.tasks.filter(task => TERMINAL_STATES.has(task.status))), 'every acceptance criterion is independently covered')
-    if (!view.stalled || view.unreviewed.length > 0) return undefined
+    if (!view.stalled) return undefined
     const subjects = view.subjectsOf(view.unschedulable.length ? view.unschedulable : view.nonTerminal)
     return fact(renderNotice('board-stall', { reason: refusal, unschedulable: view.unschedulable, subjects }), subjects, refusal)
   }
@@ -1296,12 +1294,10 @@ export class Notices {
     if (nonTerminal.length && nonTerminal.every(task => task.status === 'running' && task.attempt !== undefined && task.attempt.leaseUntil >= this.rt.now())) return
     // The board's own fact, of which this is the one emitter: coverage-complete
     // whenever completion is allowed (an automatic mission completes on its
-    // pass instead), the W3 stall once a stalled board's review needs are past
-    // their grace (`boardFact`).
+    // pass instead), the W3 stall once the board is stalled (`boardFact`).
     this.notifyBoard(view)
-    // An unreviewable submission the review admission speaks for: its record or decision speaks for the board.
     // No live work: stuck work is the W3 stall's alone (a stall candidate until the board is stalled).
-    if (view.unreviewed.length || this.rt.reviewPathStalled(tasks, members)) return
+    if (this.rt.reviewPathStalled(tasks, members)) return
     // R14-F2(c): the unnamed fallback is replaced. While every unfinished task is
     // legitimately waiting, the runtime stays silent; otherwise it escalates
     // UNCONDITIONALLY and names every task its classifier did not recognise, so

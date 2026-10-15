@@ -12,7 +12,7 @@ import { selectAcceptedDelivery } from './task-graph.ts'
 import { assignmentAllows, canBorrowTask, canOwnReview, strandedReview } from './assignment.ts'
 import { liveReviewFor } from './admission.ts'
 import { pendingStopOwner, stopPending } from './attempts.ts'
-import { factKey, subjectsOfTasks, taskSubject } from './notices.ts'
+import { awaitsReviewAdmission, factKey, subjectsOfTasks, taskSubject } from './notices.ts'
 import { emitGuardTerminal } from './refusals.ts'
 import { AdmissionRefusedError } from './scheduler.ts'
 import { isolationIssues } from './workspace-admission.ts'
@@ -501,25 +501,14 @@ export class Scheduling {
   }
 
   /**
-   * A submission with no live review is a stall candidate, not a stall, until
-   * its review need is past the one review grace (`ReviewNeed.ripe`), the grace
-   * the review admission and the waiting classifier read. S5: the grace is
-   * read from the durable row that opened each unreviewed task's review need
-   * (its submission, or a challenge that re-opened it), not from an in-memory
-   * timer — a restart (or a lost cache) can no longer restart the window, and
-   * the answer is identical for the same durable board.
-   */
-  unreviewedStall(unreviewed: Task[]): boolean {
-    return unreviewed.every(task => this.rt.reviewNeed(task).ripe)
-  }
-
-  /**
-   * Nothing is running, reviewably submitted or dispatchable: workers would stay
-   * idle forever. An empty board is a mission the owner has not planned yet.
+   * Nothing is running, reviewably submitted or dispatchable, and no submission
+   * with no live review awaits the review admission (`awaitsReviewAdmission`,
+   * read from the durable rows of its review need): workers would stay idle
+   * forever. An empty board is a mission the owner has not planned yet.
    */
   stalled(tasks: Task[], members: Member[]): boolean {
     return tasks.length > 0 && this.reviewPathStalled(tasks, members)
-      && this.unreviewedStall(tasks.filter(task => task.status === 'submitted' && !this.reviewable(task, tasks, members)))
+      && !tasks.some(task => task.status === 'submitted' && !this.reviewable(task, tasks, members) && awaitsReviewAdmission(this.rt, task))
   }
 
   /**

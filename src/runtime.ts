@@ -104,12 +104,12 @@ const AUTO_REVIEW_RECOVERY_ATTEMPTS = 2
 const AUTOMATIC_REVIEW_PREFIX = 'task_auto_review_'
 /**
  * F2: one review need of a submitted source (`SwarmRuntime.reviewNeed`).
- * `ripe` is the one review grace every reader asks: the need is older than one
- * scheduler period, at least 1 s (the author may propose its own review in the
- * turn it submitted; the floor keeps a fast tick from turning a same-turn
- * proposal into a race), or has no dated row to show it is not. `recorded` is
- * the admission's own record: a `task/review-missing` row newer than the row
- * that opened the need.
+ * `ripe` is the one review grace: the need is older than one scheduler period,
+ * at least 1 s (the author may propose its own review in the turn it
+ * submitted; the floor keeps a fast tick from turning a same-turn proposal
+ * into a race), or has no dated row to show it is not. `recorded` is the
+ * admission's own record: a `task/review-missing` row newer than the row that
+ * opened the need. The board's classifiers read both (`awaitsReviewAdmission`).
  */
 interface ReviewNeed { id: string; seq: number; ripe: boolean; recorded: boolean }
 /**

@@ -76,13 +76,12 @@ test('M2-2: submission grace survives newer unrelated events without aging a new
   } finally { Date.now = clock }
   store.transaction(() => { for (let index = 0; index < 5; index++) store.event('mission', 'message/sent', 'runtime', { index }) })
   const rt = makeRuntimeStub({ store, config: { tickMs: 100, maxEvents: 1 } })
-  // The runtime's own review-need derivation, over this store.
-  rt.reviewNeed = SwarmRuntime.prototype.reviewNeed.bind(rt)
-  const scheduling = new Scheduling(rt)
+  // The runtime's own review-need derivation, over this store: its grace is the one every reader of a need asks.
+  const reviewNeed = SwarmRuntime.prototype.reviewNeed.bind(rt)
   const submitted = id => ({ id, missionId: 'mission', epoch: 0, evidenceIds: [] })
-  assert.equal(scheduling.unreviewedStall([submitted('old')]), true)
+  assert.equal(reviewNeed(submitted('old')).ripe, true)
   store.transaction(() => store.event('mission', 'task/submitted', 'runtime', { taskId: 'new' }))
-  assert.equal(scheduling.unreviewedStall([submitted('new')]), false)
+  assert.equal(reviewNeed(submitted('new')).ripe, false)
 })
 
 test('M2-3: the dispatch question leaves a task whose every startable member the isolation invariant refuses to the workspace terminal, without inventing budget refusals', () => {

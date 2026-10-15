@@ -556,7 +556,8 @@ function referenceWaiting(runtime, missionId, task, tasks) {
   if (referenceCarried(runtime, missionId, task, tasks)) return true
   if (task.status === 'running') return task.attempt !== undefined && task.attempt.leaseUntil >= Date.now()
   if (task.status === 'submitted') {
-    return runtime.reviewable(task, tasks) || !runtime.reviewNeed(task).ripe
+    const need = runtime.reviewNeed(task)
+    return runtime.reviewable(task, tasks) || !need.ripe || (task.artifact !== undefined && !need.recorded)
   }
   if (task.status === 'blocked' && task.resumeAfterStop?.epoch === task.epoch) {
     const stop = task.resumeAfterStop
