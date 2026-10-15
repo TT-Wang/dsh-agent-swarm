@@ -8,6 +8,7 @@
  */
 import { admissionRowId, decideAdmission, defaultLimitRules, scopeKeysOverlap, type AdmissionCandidate, type AdmissionDecision, type AdmissionRecord, type AdmissionUsage, type LimitRule } from './scheduler.ts'
 import { WriterBusyError } from './store.ts'
+import { terminal as missionTerminal } from './task-graph.ts'
 import { PolicyError } from './policy-error.ts'
 import type { SwarmRuntime } from './runtime.ts'
 import type { Budget, Member, Mission, Task } from './types.ts'
@@ -376,7 +377,7 @@ export function emitGuardTerminal(rt: SwarmRuntime, missionId: string, chain: Gu
   // speak. A mission that left `active` without reaching a terminal status —
   // most importantly `blocked` after a budget stop, which is when the owner needs
   // the executable exit most — still emits the terminal.
-  if (mission === undefined || rt.isMissionTerminal(mission)) return undefined
+  if (mission === undefined || missionTerminal(mission)) return undefined
   const terminal = guardTerminal(chain, context)
   const key = guardTerminalKey(chain, context)
   const subjects = context.subjects ?? rt.noticeSubjectsFor(missionId, { taskId: context.taskId, memberId: context.memberId })

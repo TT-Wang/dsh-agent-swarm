@@ -8,7 +8,7 @@
  * type-only, so no runtime import cycle exists.
  */
 import { createHash, randomUUID } from 'node:crypto'
-import { taskSubject } from './notices.ts'
+import { blockCauses, stopPending, taskSubject, terminal, type BlockCause } from './task-graph.ts'
 import { emitGuardTerminal } from './refusals.ts'
 import { memberPhaseOf } from './projection.ts'
 import { PolicyError } from './policy-error.ts'
@@ -24,83 +24,15 @@ import { awaited, type SchedulingPass } from './scheduling.ts'
  */
 const terminalDetail = (text: string): string => text.replace(/\[[a-z][a-z0-9_]{2,63}\]\s*/g, '').trim()
 import type { SwarmRuntime } from './runtime.ts'
-import type { Actor, Artifact, EvidenceStatus, Member, Mission, Task, WorkerActivity } from './types.ts'
+import type { Actor, Artifact, Member, Mission, Task, WorkerActivity } from './types.ts'
 
 const id = (prefix: string) => `${prefix}_${randomUUID()}`
 
 /** Why a fenced task still owes a stop, as the durable marker records it. */
 type StopReason = NonNullable<Task['resumeAfterStop']>['reason']
 
-/**
- * A fence this task still owes: a stop marker recorded at the task's OWN epoch.
- * A marker at an older epoch belongs to a fence a later epoch already replaced,
- * so it obliges nothing. This one comparison was written out at roughly twenty
- * call sites across the runtime, the attempt accounting, the scheduling pass and
- * the notices; naming it is what lets a reader see that they all ask the same
- * question rather than four similar ones.
- */
-export function stopPending(task: Pick<Task, 'epoch' | 'resumeAfterStop'>): boolean {
-  return task.resumeAfterStop?.epoch === task.epoch
-}
-
 /** The local key of a stop fault's decision request: one per task, stop epoch, member and failure text. */
 export const stopFaultKey = (taskId: string, marker: { epoch: number; memberId?: string }, message: string): string => `stop:${taskId}:${marker.epoch}:${marker.memberId ?? 'unresolved'}:${createHash('sha256').update(message).digest('hex')}`
-
-/** A fenced handle must finish stopping before that member can own new work. */
-export function pendingStopOwner(tasks: readonly Task[], memberId: string): boolean {
-  return tasks.some(task => {
-    if (!stopPending(task)) return false
-    const marker = task.resumeAfterStop!
-    if (marker.memberId !== undefined) return marker.memberId === memberId
-    // An unresolved legacy owner is a conservative stop of every mission
-    // handle; reserve every member until the complete scan confirms quiescence.
-    return true
-  })
-}
-
-/**
- * Why a task is, or on its next confirmed stop would be, blocked. A `blocked`
- * status has several causes that can hold together and clear independently (a
- * restart retires an obsolete finding ceiling while a preparation failure still
- * needs repair), so the set is derived from the task's own fields whenever a
- * reader asks, never stored as one discriminant.
- */
-export type BlockCause = 'task-ceiling' | 'preparation-failed' | 'review-deferred' | 'needs-replacement' | 'refuted' | 'recovery-exhausted'
-
-/**
- * The claims of the task's current attempt generation. A rework archives the
- * claims its rejection refuted in `rejections`: they stay refuted, but they no
- * longer block the task and no later submission or verdict touches them.
- */
-export function currentEvidenceIds(task: Pick<Task, 'evidenceIds' | 'rejections'>): string[] {
-  const archived = new Set(task.rejections?.flatMap(rejection => rejection.evidenceIds))
-  return (task.evidenceIds ?? []).filter(evidenceId => !archived.has(evidenceId))
-}
-
-/**
- * The block causes holding for `task` now. `evidenceStatusOf` reads an evidence
- * row's current status; `defaultMaxRecoveryAttempts` is the limit of a task
- * without its own `maxRecoveryAttempts` (the runtime's `maxTasksPerMember`). A
- * preparation failure still inside its backoff retry is not a cause: that task
- * is pending and the host retries it.
- */
-export function blockCauses(
-  task: Pick<Task, 'status' | 'ceiling' | 'preparationFailure' | 'verificationRecovery' | 'artifact' | 'evidenceIds' | 'recoveryCount' | 'maxRecoveryAttempts' | 'rejections'>,
-  evidenceStatusOf: (evidenceId: string) => EvidenceStatus | undefined,
-  defaultMaxRecoveryAttempts: number,
-): Set<BlockCause> {
-  const causes = new Set<BlockCause>()
-  if (task.ceiling !== undefined) causes.add('task-ceiling')
-  if (task.preparationFailure !== undefined && task.preparationFailure.retryAt === undefined) causes.add('preparation-failed')
-  if (task.verificationRecovery !== undefined) causes.add('review-deferred')
-  // A rejected source, or submitted work invalidated after submission: its
-  // artifact is immutable. Only an owner rework (a rejected non-experiment,
-  // whose artifact then moves into history) or a replacement repairs it.
-  if (task.status === 'blocked' && task.artifact !== undefined) causes.add('needs-replacement')
-  if (currentEvidenceIds(task).some(evidenceId => evidenceStatusOf(evidenceId) === 'refuted')) causes.add('refuted')
-  if ((task.recoveryCount ?? 0) >= (task.maxRecoveryAttempts ?? defaultMaxRecoveryAttempts)) causes.add('recovery-exhausted')
-  return causes
-}
 
 /** Stops the host or the owner caused: the task's automatic recovery limit does not decide where they land. */
 const recoveryLimitExempt = (reason: StopReason): boolean => reason === 'resource' || reason === 'handoff' || reason === 'invalidated'
@@ -268,7 +200,7 @@ export class Attempts {
               // the barrier is in flight, which is the whole window the park used
               // to cover. A terminal mission still ends the membership here,
               // because that is the barrier's own decision, not a released flag.
-              if (this.rt.isMissionTerminal(mission)) member.phase = 'stopped'
+              if (terminal(mission)) member.phase = 'stopped'
               this.rt.store.put('members', member)
             }
             this.rt.store.put('tasks', fresh)

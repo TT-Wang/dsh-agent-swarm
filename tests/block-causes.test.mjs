@@ -1,5 +1,5 @@
 /**
- * One owner for why a task is blocked. `blockCauses` (src/attempts.ts) derives
+ * One owner for why a task is blocked. `blockCauses` (src/task-graph.ts) derives
  * the set of causes holding for a task from its own fields; causes coexist and
  * clear independently, so no single stored discriminant can answer the
  * question. The stop barrier decides through `stopOutcome`, the restart path,
@@ -13,7 +13,8 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { join } from 'node:path'
-import { blockCauses, stopOutcome } from '../lib/attempts.js'
+import { blockCauses } from '../lib/task-graph.js'
+import { stopOutcome } from '../lib/attempts.js'
 import { guardBoard } from './guard-model.mjs'
 import { FakeWorkers, makeRuntime } from './faults/harness.mjs'
 

@@ -9,8 +9,8 @@ import { covered, hasNotice, noticeLedger as projectNoticeLedger } from './arena
 import { hostContextOf, memberPhaseOf } from './projection.ts'
 import { formatDiagnostic, missingReviewDiagnostic } from './admission.ts'
 import { guardTerminalKey, requireText } from './refusals.ts'
-import { taskGraphIndex } from './task-graph.ts'
-import { blockCauses, stopFaultKey } from './attempts.ts'
+import { TERMINAL_STATES, blockCauses, missionSubject, stopPending, subjectsOfTasks, taskGraphIndex, taskSubject } from './task-graph.ts'
+import { stopFaultKey } from './attempts.ts'
 import { isolationOpener } from './workspace-admission.ts'
 import { PolicyError } from './policy-error.ts'
 import type { SwarmRuntime } from './runtime.ts'
@@ -18,24 +18,6 @@ import type { SwarmStore } from './store.ts'
 import { awaited, type SchedulingPass } from './scheduling.ts'
 import type { Actor, Delivery, Escalation, Member, Mission, NoticeClass, Task, WorkerAdapter } from './types.ts'
 
-/** R14-F2(a): the durable identity of one task at one epoch, as notices carry it. */
-export function taskSubject(task: Pick<Task, 'id' | 'epoch'>): string { return `${task.id}@${task.epoch}` }
-/**
- * R15-A1: the mission-scoped subject for a decision that names no single task (a
- * wedged scheduling pass, a failed member with no assigned work, an escalation).
- * It is the exact lineage root of such a decision, never a placeholder, so an
- * owner-facing notice always has something to be attributed to.
- */
-export function missionSubject(mission: Pick<Mission, 'id'>): string { return `mission:${mission.id}` }
-/**
- * R15-A1: the subjects of a set of tasks, with the mission root as the honest
- * fallback when the set is empty. Deduplicated and order-preserving.
- */
-export function subjectsOfTasks(tasks: readonly Pick<Task, 'id' | 'epoch'>[], mission: Pick<Mission, 'id'>): string[] {
-  const subjects: string[] = []
-  for (const task of tasks) { const subject = taskSubject(task); if (!subjects.includes(subject)) subjects.push(subject) }
-  return subjects.length ? subjects : [missionSubject(mission)]
-}
 /**
  * R15-A1: a notice without a subject is unattributable, so it is refused rather
  * than written as an anonymous durable row. This is the runtime end of the
@@ -350,8 +332,6 @@ export interface MissionInterpretation {
   lastTransitionAt: number
   subjectsOf: (tasks: readonly Pick<Task, 'id' | 'epoch'>[]) => string[]
 }
-/** The states that leave a task no future. */
-export const TERMINAL_STATES: ReadonlySet<string> = new Set(['accepted', 'cancelled'])
 
 /**
  * R16-A: the durable families of owner decisions. A family is read from the
@@ -434,7 +414,7 @@ function stallRootsFor(rt: Pick<LineageRuntime, 'stallPassTimeoutMs' | 'now'>, t
     if (task.status !== 'blocked' || replaced.has(task.id)) return false
     // A verdict record is not a repairable root: its source carries the repair.
     if (task.reviewOf !== undefined) return false
-    const stop = task.resumeAfterStop?.epoch === task.epoch ? task.resumeAfterStop : undefined
+    const stop = stopPending(task) ? task.resumeAfterStop : undefined
     if (stop === undefined) return true
     const at = stop.at
     // R14-F2v D2: a stop inside the declared bound is progress, not a root, but an
@@ -476,7 +456,7 @@ export function waitsLegitimately(rt: LineageRuntime, task: Task, tasks: Task[])
     // record again (a W3 reminder, a fall-through) repeats the root's decision.
     if (task.reviewOf !== undefined && (replacementCoverage(tasks).has(task.reviewOf)
       || stallRootsFor(rt, tasks).some(root => root.id === task.reviewOf))) return true
-    const stop = task.resumeAfterStop?.epoch === task.epoch ? task.resumeAfterStop : undefined
+    const stop = stopPending(task) ? task.resumeAfterStop : undefined
     // R15-A3: an absent `at` is UNBOUNDED, so it is not legitimate waiting. The
     // "cannot judge" case must never be the silent one: `stallRootsFor` classifies
     // the same row as a root, and this classifier refusing it here keeps the two
@@ -509,9 +489,9 @@ export function waitsLegitimately(rt: LineageRuntime, task: Task, tasks: Task[])
     // The same marker that fences dispatch is a live wait only while every
     // matching stop is inside its bound. An unknown owner reserves all members.
     const memberId = task.assigneeId ?? task.plannedAssigneeId
-    const stops = tasks.filter(candidate => candidate.resumeAfterStop?.epoch === candidate.epoch
-      && (candidate.id === task.id || candidate.resumeAfterStop.memberId === undefined
-        || (memberId !== undefined && candidate.resumeAfterStop.memberId === memberId)))
+    const stops = tasks.filter(candidate => stopPending(candidate)
+      && (candidate.id === task.id || candidate.resumeAfterStop!.memberId === undefined
+        || (memberId !== undefined && candidate.resumeAfterStop!.memberId === memberId)))
     if (stops.length > 0) return stops.every(candidate => candidate.resumeAfterStop!.at !== undefined
       && rt.now() - candidate.resumeAfterStop!.at! <= rt.stallPassTimeoutMs)
     // Once the stop settles, another live attempt may take the selected member
@@ -1297,7 +1277,7 @@ export class Notices {
       const subject = taskSubject(root)
       const key = `stall-root:${mission.id}:${subject}`
       const dependents = this.dependentsOf(root, tasks)
-      const stop = root.resumeAfterStop?.epoch === root.epoch ? root.resumeAfterStop : undefined
+      const stop = stopPending(root) ? root.resumeAfterStop : undefined
       const cause = stop !== undefined
         ? (stop.at === undefined
           ? `its stop carries no recorded start, so the declared bound (${this.rt.stallPassTimeoutMs}ms) cannot be shown to hold`

@@ -8,12 +8,11 @@
  * member loop used to be.
  */
 import { randomUUID } from 'node:crypto'
-import { selectAcceptedDelivery } from './task-graph.ts'
+import { pendingStopOwner, selectAcceptedDelivery, stopPending, subjectsOfTasks, taskSubject, terminal } from './task-graph.ts'
 import { assignmentAllows, canBorrowTask, canOwnReview, strandedReview } from './assignment.ts'
 import { liveReviewFor } from './admission.ts'
 import { hasNotice } from './arena.ts'
-import { pendingStopOwner, stopPending } from './attempts.ts'
-import { awaitsReviewAdmission, factKey, noticeIdentity, subjectsOfTasks, taskSubject } from './notices.ts'
+import { awaitsReviewAdmission, factKey, noticeIdentity } from './notices.ts'
 import { emitGuardTerminal } from './refusals.ts'
 import { AdmissionRefusedError } from './scheduler.ts'
 // R17-G6/G7: the one derivation of the derived member status.
@@ -887,7 +886,7 @@ export class Scheduling {
   sweepSilentAttempts(missionId: string): number {
     if (this.rt.closed || this.rt.shuttingDown) return 0
     const mission = this.rt.store.get('missions', missionId)
-    if (mission === undefined || mission.status !== 'active' || this.rt.isMissionTerminal(mission)) return 0
+    if (mission === undefined || mission.status !== 'active' || terminal(mission)) return 0
     // A deliberate budget pause is host policy, not a stalled worker: the pause
     // owns the board until the owner resumes it.
     if (mission.budgetPause !== undefined) return 0

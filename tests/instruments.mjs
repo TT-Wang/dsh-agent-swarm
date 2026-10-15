@@ -5,7 +5,8 @@
  * production classifiers it measures (they stay in src/ because the live
  * notice paths use them) and writes nothing.
  */
-import { NO_LIVE_PATH_FAMILIES, TERMINAL_STATES, noticeFamily, taskFromSubject, taskSubject } from '../lib/notices.js'
+import { NO_LIVE_PATH_FAMILIES, noticeFamily, taskFromSubject } from '../lib/notices.js'
+import { TERMINAL_STATES, taskSubject } from '../lib/task-graph.js'
 import { ATTEMPT_FENCING_EVENTS } from '../lib/types.js'
 
 

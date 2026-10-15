@@ -1,5 +1,5 @@
-/** Pure task identity selectors shared by runtime and read-only projections. */
-import { criterionId, type Task } from './types.ts'
+/** Pure functions of task, mission and member rows, shared by the runtime seams and the read-only projections. */
+import { criterionId, type EvidenceStatus, type Member, type Mission, type Task } from './types.ts'
 
 const oldest = (tasks: readonly Task[]): Task | undefined => [...tasks].sort((a, b) => a.createdAt - b.createdAt || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))[0]
 
@@ -199,4 +199,131 @@ export function completionExempt(task: Pick<Task, 'status' | 'experiment' | 'rev
   if (task.experiment) return true
   const source = task.reviewOf === undefined ? undefined : tasks.find(candidate => candidate.id === task.reviewOf)
   return source !== undefined && completionExempt(source, tasks)
+}
+
+/** The states that leave a task no future. */
+export const TERMINAL_STATES: ReadonlySet<string> = new Set(['accepted', 'cancelled'])
+
+/** The mission is terminal: no further scheduling or fencing applies. */
+export const terminal = (mission: Pick<Mission, 'status'>): boolean => mission.status === 'stopped' || mission.status === 'completed'
+
+/** R14-F2(a): the durable identity of one task at one epoch, as notices carry it. */
+export function taskSubject(task: Pick<Task, 'id' | 'epoch'>): string { return `${task.id}@${task.epoch}` }
+/**
+ * R15-A1: the mission-scoped subject for a decision that names no single task (a
+ * wedged scheduling pass, a failed member with no assigned work, an escalation).
+ * It is the exact lineage root of such a decision, never a placeholder, so an
+ * owner-facing notice always has something to be attributed to.
+ */
+export function missionSubject(mission: Pick<Mission, 'id'>): string { return `mission:${mission.id}` }
+/**
+ * R15-A1: the subjects of a set of tasks, with the mission root as the honest
+ * fallback when the set is empty. Deduplicated and order-preserving.
+ */
+export function subjectsOfTasks(tasks: readonly Pick<Task, 'id' | 'epoch'>[], mission: Pick<Mission, 'id'>): string[] {
+  const subjects: string[] = []
+  for (const task of tasks) { const subject = taskSubject(task); if (!subjects.includes(subject)) subjects.push(subject) }
+  return subjects.length ? subjects : [missionSubject(mission)]
+}
+
+/**
+ * A fence this task still owes: a stop marker recorded at the task's OWN epoch.
+ * A marker at an older epoch belongs to a fence a later epoch already replaced,
+ * so it obliges nothing. This one comparison was written out at roughly twenty
+ * call sites across the runtime, the attempt accounting, the scheduling pass and
+ * the notices; naming it is what lets a reader see that they all ask the same
+ * question rather than four similar ones.
+ */
+export function stopPending(task: Pick<Task, 'epoch' | 'resumeAfterStop'>): boolean {
+  return task.resumeAfterStop?.epoch === task.epoch
+}
+
+/** A fenced handle must finish stopping before that member can own new work. */
+export function pendingStopOwner(tasks: readonly Task[], memberId: string): boolean {
+  return tasks.some(task => {
+    if (!stopPending(task)) return false
+    const marker = task.resumeAfterStop!
+    if (marker.memberId !== undefined) return marker.memberId === memberId
+    // An unresolved legacy owner is a conservative stop of every mission
+    // handle; reserve every member until the complete scan confirms quiescence.
+    return true
+  })
+}
+
+/**
+ * Why a task is, or on its next confirmed stop would be, blocked. A `blocked`
+ * status has several causes that can hold together and clear independently (a
+ * restart retires an obsolete finding ceiling while a preparation failure still
+ * needs repair), so the set is derived from the task's own fields whenever a
+ * reader asks, never stored as one discriminant.
+ */
+export type BlockCause = 'task-ceiling' | 'preparation-failed' | 'review-deferred' | 'needs-replacement' | 'refuted' | 'recovery-exhausted'
+
+/**
+ * The claims of the task's current attempt generation. A rework archives the
+ * claims its rejection refuted in `rejections`: they stay refuted, but they no
+ * longer block the task and no later submission or verdict touches them.
+ */
+export function currentEvidenceIds(task: Pick<Task, 'evidenceIds' | 'rejections'>): string[] {
+  const archived = new Set(task.rejections?.flatMap(rejection => rejection.evidenceIds))
+  return (task.evidenceIds ?? []).filter(evidenceId => !archived.has(evidenceId))
+}
+
+/**
+ * The block causes holding for `task` now. `evidenceStatusOf` reads an evidence
+ * row's current status; `defaultMaxRecoveryAttempts` is the limit of a task
+ * without its own `maxRecoveryAttempts` (the runtime's `maxTasksPerMember`). A
+ * preparation failure still inside its backoff retry is not a cause: that task
+ * is pending and the host retries it.
+ */
+export function blockCauses(
+  task: Pick<Task, 'status' | 'ceiling' | 'preparationFailure' | 'verificationRecovery' | 'artifact' | 'evidenceIds' | 'recoveryCount' | 'maxRecoveryAttempts' | 'rejections'>,
+  evidenceStatusOf: (evidenceId: string) => EvidenceStatus | undefined,
+  defaultMaxRecoveryAttempts: number,
+): Set<BlockCause> {
+  const causes = new Set<BlockCause>()
+  if (task.ceiling !== undefined) causes.add('task-ceiling')
+  if (task.preparationFailure !== undefined && task.preparationFailure.retryAt === undefined) causes.add('preparation-failed')
+  if (task.verificationRecovery !== undefined) causes.add('review-deferred')
+  // A rejected source, or submitted work invalidated after submission: its
+  // artifact is immutable. Only an owner rework (a rejected non-experiment,
+  // whose artifact then moves into history) or a replacement repairs it.
+  if (task.status === 'blocked' && task.artifact !== undefined) causes.add('needs-replacement')
+  if (currentEvidenceIds(task).some(evidenceId => evidenceStatusOf(evidenceId) === 'refuted')) causes.add('refuted')
+  if ((task.recoveryCount ?? 0) >= (task.maxRecoveryAttempts ?? defaultMaxRecoveryAttempts)) causes.add('recovery-exhausted')
+  return causes
+}
+
+interface IsolationIssue { memberIds: string[]; message: string }
+
+/** Identity-bearing evidence shared by admission and its read-only explanation. */
+export function isolationIssues(allMembers: readonly Member[], tasks: readonly Task[], overlaps: (left: string[], right: string[]) => boolean): IsolationIssue[] {
+    const violations: IsolationIssue[] = []
+    const members = allMembers.filter(member => member.status !== 'stopped')
+    const byWorkspace = new Map<string, Member[]>()
+    for (const member of members) {
+      if (!member.workspace) { violations.push({ memberIds: [member.id], message: `member ${member.id} (${member.name}) has no provisioned isolated worktree` }); continue }
+      byWorkspace.set(member.workspace, [...(byWorkspace.get(member.workspace) ?? []), member])
+    }
+    for (const [workspace, group] of byWorkspace) {
+      if (group.length > 1) violations.push({ memberIds: group.map(member => member.id), message: `live workers ${group.map(member => member.id).join(', ')} share one provisioned worktree (${workspace}); live workers must never exceed provisioned worktrees` })
+    }
+    const running = tasks.filter(task => task.status === 'running' && task.attempt !== undefined)
+    const byTaskWorkspace = new Map<string, Task[]>()
+    for (const task of running) {
+      const owner = allMembers.find(member => member.id === task.attempt!.ownerId)
+      if (owner === undefined || owner.status === 'stopped') { violations.push({ memberIds: [task.attempt!.ownerId], message: `running task ${task.id} has no live owner (${task.attempt!.ownerId})` }); continue }
+      byTaskWorkspace.set(owner.workspace, [...(byTaskWorkspace.get(owner.workspace) ?? []), task])
+    }
+    for (const [workspace, group] of byTaskWorkspace) {
+      if (group.length > 1) violations.push({ memberIds: group.map(task => task.attempt!.ownerId), message: `concurrently running tasks ${group.map(task => task.id).join(', ')} share worktree ${workspace}` })
+      for (let left = 0; left < group.length; left++) {
+        for (let right = left + 1; right < group.length; right++) {
+          if (overlaps(group[left]!.scope, group[right]!.scope)) {
+            violations.push({ memberIds: [group[left]!.attempt!.ownerId, group[right]!.attempt!.ownerId], message: `concurrently running tasks ${group[left]!.id} and ${group[right]!.id} declare overlapping scope in worktree ${workspace}` })
+          }
+        }
+      }
+    }
+    return violations
 }

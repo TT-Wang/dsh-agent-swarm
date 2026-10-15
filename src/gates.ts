@@ -8,12 +8,12 @@
  */
 import { randomUUID, createHash } from 'node:crypto'
 import { arenaView as projectArenaView, hasNotice } from './arena.ts'
-import { currentEvidenceIds } from './attempts.ts'
+import { currentEvidenceIds, subjectsOfTasks, terminal } from './task-graph.ts'
 import { excerpt } from './declared-checks.ts'
 import { executionElapsed } from './resource-time.ts'
 import { memberPhaseOf } from './projection.ts'
 import { emitGuardTerminal } from './refusals.ts'
-import { noticeFamily, noticeIdentity, subjectsOfTasks } from './notices.ts'
+import { noticeFamily, noticeIdentity } from './notices.ts'
 import type { SwarmRuntime } from './runtime.ts'
 import type { Delivery, Member, Mission, Post, Task, UsageBuckets, UsageSnapshotSource } from './types.ts'
 
@@ -294,7 +294,7 @@ export class RuntimeGates {
    */
   recordOwnerUsage(sessionId: string, usage: UsageBuckets): void {
     if (this.rt.closed || this.rt.shuttingDown || !validUsage(usage) || this.rt.isWorkerSession(sessionId)) return
-    const mission = this.rt.store.list('missions').filter(item => item.ownerSessionId === sessionId && !this.rt.isMissionTerminal(item)).sort((a, b) => b.createdAt - a.createdAt)[0]
+    const mission = this.rt.store.list('missions').filter(item => item.ownerSessionId === sessionId && !terminal(item)).sort((a, b) => b.createdAt - a.createdAt)[0]
     if (mission) {
       mission.ownerUsage = addUsage(mission.ownerUsage, usage); mission.updatedAt = this.rt.now()
       this.rt.commit(mission.id, () => this.rt.store.put('missions', mission))
@@ -387,7 +387,7 @@ export class RuntimeGates {
   }
 
   blockBudget(mission: Mission): void {
-    if (this.rt.isMissionTerminal(mission) || mission.status === 'blocked') return
+    if (terminal(mission) || mission.status === 'blocked') return
     const dimensions = this.exhaustedDimensions(mission)
     mission.status = 'blocked'
     mission.reason = dimensions.length ? `Aggregate mission budget exhausted: ${dimensions.join(', ')}` : 'Aggregate mission budget exhausted'

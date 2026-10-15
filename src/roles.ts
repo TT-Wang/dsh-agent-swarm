@@ -4,6 +4,7 @@ import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { SessionEvent } from '@deepseek-ai/dsh-session'
 import { ENTRY_PROMPT, HISTORICAL_OWNER_PROMPT, hiddenToolsFor, OWNER_PROMPT, type SwarmRole } from './tools.ts'
 import type { SwarmRuntime } from './runtime.ts'
+import { terminal } from './task-graph.ts'
 
 interface Applied { role: SwarmRole; dispose: () => void }
 /** Presentation history only: a completed turn does not settle task or notice obligations. */
@@ -44,7 +45,7 @@ export class RoleScoper {
     const missions = this.runtime.list(sessionId)
     if (starts.length === 0 && missions.length === 0) return 'entry'
     if (starts.some(start => ['planning', 'launching', 'running'].includes(start.status))
-      || missions.some(mission => !this.runtime.isMissionTerminal(mission))) return 'owner'
+      || missions.some(mission => !terminal(mission))) return 'owner'
     const handling = this.handling.get(sessionId)
     const handled = handling?.handled
     if (starts.some(start => start.status === 'failed' && (start.recoveryNoticePending

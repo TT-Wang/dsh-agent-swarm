@@ -2,6 +2,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import type { SwarmRuntime } from './runtime.ts'
 import type { Delivery, Mission } from './types.ts'
 import { emitGuardTerminal } from './refusals.ts'
+import { terminal } from './task-graph.ts'
 
 /** One question booked at turn start, with everything the nudge must name. */
 interface Booking {
@@ -83,7 +84,7 @@ export class OwnerReplyGuard {
 
   /** Owner missions that are still live for this session. */
   private ownerMissions(sessionId: string): Mission[] {
-    return this.rt.store.list('missions').filter(mission => mission.ownerSessionId === sessionId && !this.rt.isMissionTerminal(mission) && mission.status !== 'paused')
+    return this.rt.store.list('missions').filter(mission => mission.ownerSessionId === sessionId && !terminal(mission) && mission.status !== 'paused')
   }
 
   /**
@@ -144,7 +145,7 @@ export class OwnerReplyGuard {
    */
   private missing(deliveryId: string, delivery: Delivery, booking: Booking): void {
     const mission = this.rt.store.get('missions', booking.missionId)
-    if (mission === undefined || this.rt.isMissionTerminal(mission) || mission.status === 'paused') return
+    if (mission === undefined || terminal(mission) || mission.status === 'paused') return
     const spent = delivery.replyNudges ?? 0
     // The durable miss record is bounded with the nudges: after the bound the
     // guard terminal is the outcome, so a later turn cannot keep writing rows

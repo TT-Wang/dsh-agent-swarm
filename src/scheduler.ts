@@ -152,6 +152,10 @@ export function scopeKeysOverlap(a: string, b: string): boolean {
   if (a === b) return true
   return (a.endsWith('/') && b.startsWith(a)) || (b.endsWith('/') && a.startsWith(b))
 }
+/** Two declared scopes overlap when either is `**`, equal, or one contains the other. */
+export function scopesOverlap(left: readonly string[], right: readonly string[]): boolean {
+  return left.some(a => right.some(b => scopeKeysOverlap(a, b)))
+}
 
 /** The key a candidate is counted and matched under at each level. */
 function candidateKeys(candidate: AdmissionCandidate): Record<LimitLevel, string> {

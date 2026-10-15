@@ -5,7 +5,8 @@ import { OwnerReplyGuard } from '../lib/owner-reply.js'
 import { RoleScoper } from '../lib/roles.js'
 import { RefusalRegistry, emitGuardTerminal, guardTerminalKey } from '../lib/refusals.js'
 import { WriterBusyError } from '../lib/store.js'
-import { Attempts, pendingStopOwner } from '../lib/attempts.js'
+import { Attempts } from '../lib/attempts.js'
+import { pendingStopOwner } from '../lib/task-graph.js'
 import { wakePrecision } from './instruments.mjs'
 import { FakeClock, FakeWorkers, MISSION_ACCEPTANCE, makeRuntime, makeRuntimeStub, setup } from './faults/harness.mjs'
 
@@ -17,7 +18,7 @@ function guardFixture() {
   const question = { id: 'q', missionId: 'm', from: 'worker', to: 'owner', content: 'Choose an API', replyExpected: true, deliveredAt: 1 }
   const rt = makeRuntimeStub({
     store: { list: () => [mission], get: table => table === 'missions' ? mission : question, put() {}, event() {} },
-    isMissionTerminal: value => ['completed', 'stopped'].includes(value.status), openAsks: () => [question],
+    openAsks: () => [question],
     commit: (_id, fn) => fn(), notify() {}, noticeSubjectsFor: () => [],
   })
   return { mission, question, rt, guard: new OwnerReplyGuard({ on: () => () => {} }, rt, { maxNudges: 2 }) }
@@ -42,7 +43,7 @@ test('R12: muted stopped questions do not retain the full owner role; completed 
   const scoper = Object.assign(Object.create(RoleScoper.prototype), {
     runtime: {
       isWorkerSession: () => false, starts: () => [], list: () => [mission],
-      isMissionTerminal: () => true, openAsks: () => [{ id: 'question' }], store: { list: () => [] },
+      openAsks: () => [{ id: 'question' }], store: { list: () => [] },
     }, handling: new Map(), applied: new Map(),
   })
   const owner = { id: 'owner', status: 'idle', session: { header: {} } }
@@ -87,7 +88,7 @@ function refusalFixture() {
       get: (table, id) => table === 'missions' ? { id, status: 'active' } : admissions.get(id), list: () => [],
       recordAdmission: row => admissions.set(row.id, structuredClone(row)),
       event: (missionId, type, actor, data) => events.push({ missionId, type, actor, data }),
-    }, fingerprint: () => 'stable', isMissionTerminal: () => false, noticeSubjectsFor: () => [], notify() {}, tell, pumpOutbox() {},
+    }, fingerprint: () => 'stable', noticeSubjectsFor: () => [], notify() {}, tell, pumpOutbox() {},
   })
   return { rt, registry: new RefusalRegistry(rt), admissions, events, release: () => { busy = false } }
 }
@@ -216,7 +217,6 @@ function stopFixture(reason, stop) {
     },
     workers: new FakeWorkers({ stop: async memberId => { stopped.push(memberId); await stop(stopped.length) } }),
     task: (_mission, id) => structuredClone(rows.get(id)), mission: () => mission,
-    isMissionTerminal: value => ['stopped', 'completed'].includes(value.status),
     defer: fn => { pending.push(Promise.resolve().then(fn)) }, exclusive: (_id, fn) => fn(), commit: (_id, fn) => fn(),
     kick() {}, fingerprint: () => 'stable', noticeSubjectsFor: () => [], notify() {}, tell, pumpOutbox() {},
   })
