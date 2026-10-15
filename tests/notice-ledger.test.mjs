@@ -1572,14 +1572,17 @@ test('the isolation request is outstanding exactly while the invariant lists its
       `${exit}, without the repair, leaves the violation listed: the one request stays outstanding`)
     assert.deepEqual((await remind(f, request)).map(delivery => delivery.subjects), [request.subjects], 'and the owner is reminded of it')
   }
-  // The board changes under the listed violation: a third member joins, in its own worktree, and the task is still the reviewer's.
+  // Work given later to a member the violation lists: the request names the work it saw when first told, and the dispatch
+  // question names each undispatched task beside it, once (beside the request for the first: one wording of the open item R20).
   const changed = await board()
-  const digest = changed.f.runtime.fingerprint(changed.f.mission.id)
-  await changed.f.runtime.addMember(changed.f.owner, changed.f.mission.id, { name: 'Third', role: 'implementation', maxOutputTokens: 5_000 })
+  const later = changed.f.propose({ title: 'Later work', assigneeId: changed.f.author.id, kind: 'research', checks: [] })
   await quiet(changed.f)
-  assert.notEqual(changed.f.runtime.fingerprint(changed.f.mission.id), digest, 'the board digest moved')
-  assert.deepEqual([taskOf(changed.f.runtime, changed.task.id).status, changed.f.runtime.isolationViolations(changed.f.mission.id).length, ownerRows(changed.f).filter(delivery => noticeFamily(delivery) === 'dispatch-question')], ['pending', 1, []],
-    'the dispatch question adds no second wording on the new board: the invariant refuses every startable member the task could go to, and the request is the one emitter of that cause')
+  await ticks(changed.f, 3)
+  assert.deepEqual([taskOf(changed.f.runtime, later.id).status, changed.f.runtime.isolationViolations(changed.f.mission.id).length, terminalRows(changed.f, 'workspace').map(delivery => [subjectOf(changed.f, changed.task), subjectOf(changed.f, later)].map(subject => delivery.subjects.includes(subject)))],
+    ['pending', 1, [[true, false]]], 'the violation still refuses both members, and its one request names the work it saw when first told')
+  const questions = ownerRows(changed.f).filter(delivery => noticeFamily(delivery) === 'dispatch-question')
+  assert.deepEqual(questions.map(delivery => [delivery.subjects, relevant(changed.f, delivery)]), [[[subjectOf(changed.f, changed.task)], true], [[subjectOf(changed.f, later)], true]],
+    'the dispatch question names the reviewer\'s task and the later work, each once, and both are outstanding')
   // "Repair the condition, then ... resume": the repair is what ends the request.
   const { f, task, request, repair, tool } = await board()
   assert.match(request.content, /Repair the condition, then use `swarm_control`/)
@@ -1589,6 +1592,27 @@ test('the isolation request is outstanding exactly while the invariant lists its
   await tool('swarm_control', { taskId: task.id, action: 'resume', reason: 'Repaired' })
   await quiet(f)
   assert.equal(taskOf(f.runtime, task.id).status, 'running', 'the resumed task is dispatched')
+})
+
+test('work admitted after the isolation request, unassigned or given to a member it lists, is named by the dispatch question beside that request (the isolation probe)', async t => {
+  for (const assigned of [false, true]) {
+    const f = await setup({ clock: new FakeClock(), workers: new FakeWorkers({ autoIdle: true }), budget: LONG })
+    t.after(f.cleanup)
+    // The reviewer is moved into the author's worktree, and work is given to the reviewer: the isolation request is raised.
+    f.runtime.store.transaction(() => f.runtime.store.put('members', { ...f.runtime.store.get('members', f.reviewer.id), workspace: f.runtime.store.get('members', f.author.id).workspace }))
+    const first = f.propose({ title: 'Reviewer work', assigneeId: f.reviewer.id, kind: 'research', checks: [] })
+    await quiet(f)
+    const [request, ...others] = terminalRows(f, 'workspace')
+    assert.deepEqual([request.subjects.includes(subjectOf(f, first)), others], [true, []], `assigned=${assigned}: the request names the work it saw when first told`)
+    // Later work only the two members the violation lists could run.
+    const later = f.propose({ title: 'Later work', ...(assigned ? { assigneeId: f.author.id } : {}), kind: 'research', checks: [] })
+    await quiet(f)
+    await ticks(f, 5)
+    assert.equal(taskOf(f.runtime, later.id).status, 'pending', `assigned=${assigned}: the later work is not dispatched`)
+    const namings = ownerRows(f).filter(delivery => (delivery.subjects ?? []).includes(subjectOf(f, later)) && delivery.notice.trigger !== 'owner-decision-unresolved')
+    assert.deepEqual(namings.map(delivery => noticeFamily(delivery)), ['dispatch-question'], `assigned=${assigned}: the dispatch question names it, once`)
+    assert.deepEqual([relevant(f, namings[0]), relevant(f, request), terminalRows(f, 'workspace').length, request.subjects.includes(subjectOf(f, later))], [true, true, 1, false], `assigned=${assigned}: outstanding, beside the one open request, which does not name it`)
+  }
 })
 
 test('P1d: no stuck task is without a notice: a member\'s blocked task is named by its stall root beside the open request raised for that member, on each board where B1\'s deferral to that request went silent: a real handoff whose old owner never stops, beside the new assignee\'s failing dispatch; a dead end beside a failing dispatch; a dead end beside an isolation request', async t => {

@@ -410,14 +410,15 @@ test('S1: a wedge that passes its bound while the owner has the mission paused i
   } finally { await f.cleanup() }
 })
 
-test('S1/R17-G5: a named body\'s own commits never publish with the wedged branch, so no dispatch question is asked about work the sweep then dispatches', async () => {
+test('S1/R17-G5: a named body\'s own commits never publish with the wedged branch: once it sweeps again no judgement runs wedged, so each dispatch question about the work it then dispatches is asked while it sat in the wedged await', async () => {
   // The body is named while it waits in the Author's long preparation. When
   // that await settles it keeps sweeping: it claims task A, then prepares and
   // claims task B. Before, the claim of A published with the wedged branch
   // (the body was still named and past its bound), which asked "has an eligible
   // idle member but was not dispatched this tick" about B about 30ms before
   // the same sweep claimed B. A commit the body makes itself proves it is not
-  // sitting in the wedged await.
+  // sitting in the wedged await. While it does sit there, each judgement asks
+  // about the next task the wedged sweep has not reached, once (A, then B).
   //
   // Each preparation takes its time of the runtime's clock, which it moves
   // while the timer's tick runs (clockWait), so the watchdog names the body in
@@ -439,17 +440,22 @@ test('S1/R17-G5: a named body\'s own commits never publish with the wedged branc
     const builder = await f.runtime.addMember(f.owner, f.mission.id, { name: 'Builder', role: 'implementation', maxOutputTokens: 5_000 })
     for (const member of [f.author, f.reviewer, builder]) workers.names.set(member.id, member.name)
     await f.runtime.settle(f.mission.id)
+    // The clock time of every judgement that runs with the wedged branch.
+    const wedgedAt = []
+    const judge = f.runtime.notices.ensureWitness.bind(f.runtime.notices)
+    f.runtime.notices.ensureWitness = (missionId, options = {}) => { if (options.wedged === true) wedgedAt.push(f.clock.now()); return judge(missionId, options) }
     const a = f.propose({ title: 'Task A', assigneeId: f.author.id })
     const b = f.propose({ title: 'Task B', assigneeId: builder.id })
     await ticksUntil(f, () => taskOf(f.runtime, a.id).status === 'running' && taskOf(f.runtime, b.id).status === 'running', 'both tasks dispatch', 400)
     await ticks(f, 15)
     const wedge = wedgeEvents(f)[0]
     assert.ok(wedge !== undefined, 'the body was named while it waited in the long preparation')
-    const claimedB = events(f.runtime, f.mission.id, 'task/claimed').find(item => item.data.taskId === b.id)
+    const [claimedA, claimedB] = [a, b].map(task => events(f.runtime, f.mission.id, 'task/claimed').find(item => item.data.taskId === task.id))
     assert.ok(claimedB.createdAt > wedge.createdAt, 'task B was dispatched after the naming')
+    assert.deepEqual([wedgedAt.length > 0, wedgedAt.filter(at => at >= claimedA.createdAt)], [true, []], 'the naming was judged wedged; once the body sweeps again (its claim of A), no judgement runs with the wedged branch')
     const questions = f.runtime.store.list('deliveries', f.mission.id).filter(item => item.to === 'owner' && item.notice?.dedupKey?.startsWith('dispatch-question:'))
-    assert.deepEqual(questions.filter(item => item.notice.dedupKey.includes(b.id)).map(item => item.content), [],
-      'no dispatch question is asked about task B, which the sweep dispatched without any blocker')
+    assert.deepEqual(questions.filter(item => item.createdAt >= claimedA.createdAt).map(item => item.content), [],
+      'so no dispatch question is asked about work the sweep then dispatches once it sweeps again')
   } finally { await f.cleanup() }
 })
 

@@ -11,11 +11,11 @@ import { randomUUID } from 'node:crypto'
 import { selectAcceptedDelivery } from './task-graph.ts'
 import { assignmentAllows, canBorrowTask, canOwnReview, strandedReview } from './assignment.ts'
 import { liveReviewFor } from './admission.ts'
+import { hasNotice } from './arena.ts'
 import { pendingStopOwner, stopPending } from './attempts.ts'
 import { awaitsReviewAdmission, factKey, subjectsOfTasks, taskSubject } from './notices.ts'
 import { emitGuardTerminal } from './refusals.ts'
 import { AdmissionRefusedError } from './scheduler.ts'
-import { isolationIssues } from './workspace-admission.ts'
 // R17-G6/G7: the one derivation of the derived member status.
 import { memberPhaseOf } from './projection.ts'
 import { PolicyError } from './policy-error.ts'
@@ -352,18 +352,16 @@ export class Scheduling {
   }
 
   /**
-   * R15-A4: the dispatcher's own question, asked per (task, assignee) after a
-   * pass that dispatched nothing, so the owner notice names the real cause and
-   * the member whose handle holds the task instead of claiming an admission
-   * refusal that was never recorded.
+   * R15-A4: the dispatcher's own question, asked about the first dispatchable
+   * task that did not dispatch and is not yet asked about at its epoch on the
+   * ledger, so successive passes ask about each such task once, and the owner
+   * notice names the real cause and the member whose handle holds the task
+   * instead of claiming an admission refusal that was never recorded.
    *
-   * Returns undefined — no owner decision — when:
-   * - every dispatchable task carries an open attempt (the close-out path is
-   *   already nudging it; W6 owns that state);
-   * - no eligible member exists at all (nothing is ready for a member; the board
-   *   is someone else's witness, not this notice's); or
-   * - every startable eligible member is refused by the isolation invariant:
-   *   the workspace terminal is that cause's one emitter (`isolationAllows`).
+   * Returns undefined — no owner decision — when no such task remains: every
+   * other one carries an open attempt (the close-out path is already nudging
+   * it; W6 owns that state) or has no eligible member at all (nothing is ready
+   * for a member; the board is someone else's witness, not this notice's).
    *
    * Otherwise the notice names a handle holder or an unexplained dispatch gap.
    * An idle handle alone proves no budget refusal.
@@ -372,21 +370,18 @@ export class Scheduling {
    *   is pinned, else the first eligible member whose handle is busy;
    */
   dispatchQuestion(missionId: string, tasks: Task[], members: Member[], dispatchable: Task[]): DispatchQuestion | undefined {
+    const deliveries = this.rt.store.list('deliveries', missionId)
     for (const task of dispatchable) {
+      const dedupKey = `dispatch-question:${missionId}:${task.id}@${task.epoch}`
       // An open attempt is not a dispatch candidate: the close-out path nudges it
-      // (W6) or the lease path recovers it, and a second owner wake would be noise.
-      if (task.attempt !== undefined) continue
+      // (W6) or the lease path recovers it; a task asked about at its epoch is
+      // the owner's, and a second owner wake would be noise.
+      if (task.attempt !== undefined || hasNotice(deliveries, { class: 'decision', dedupKey, from: 'runtime' })) continue
       const eligible = members.filter(member => this.eligible(task, member, tasks))
       if (!eligible.length) continue
       const subjects = [taskSubject(task)]
-      const dedupKey = `dispatch-question:${missionId}:${task.id}@${task.epoch}`
-      const startable = eligible.filter(member => this.startBlocker(member) === undefined)
-      if (startable.length) {
-        const issues = isolationIssues(members, tasks, (left, right) => this.rt.scopesOverlap(left, right))
-        if (startable.every(member => issues.some(issue => issue.memberIds.includes(member.id)))) continue
-        return { task, subjects, dedupKey,
-          message: `Task ${task.id} (${task.title}, epoch ${task.epoch}) has an eligible idle member but was not dispatched this tick. An idle handle alone does not identify the dispatch blocker. Inspect the task and recorded admission/preparation diagnostics with swarm_observe; repair the reported cause or withdraw the task with swarm_cancel.` }
-      }
+      if (eligible.some(member => this.startBlocker(member) === undefined)) return { task, subjects, dedupKey,
+        message: `Task ${task.id} (${task.title}, epoch ${task.epoch}) has an eligible idle member but was not dispatched this tick. An idle handle alone does not identify the dispatch blocker. Inspect the task and recorded admission/preparation diagnostics with swarm_observe; repair the reported cause or withdraw the task with swarm_cancel.` }
       const pinned = task.assigneeId === undefined ? undefined : eligible.find(member => member.id === task.assigneeId)
       const holder = pinned ?? eligible[0]!
       return { task, holder, subjects, dedupKey,

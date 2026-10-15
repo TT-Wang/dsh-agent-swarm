@@ -84,18 +84,26 @@ test('M2-2: submission grace survives newer unrelated events without aging a new
   assert.equal(reviewNeed(submitted('new')).ripe, false)
 })
 
-test('M2-3: the dispatch question leaves a task whose every startable member the isolation invariant refuses to the workspace terminal, without inventing budget refusals', () => {
-  // The question is a predicate of the board and the handles: this runtime has no store to read.
-  const rt = makeRuntimeStub({ workers: new FakeWorkers({ autoIdle: true }), scopesOverlap: () => true })
+test('M2-3: the dispatch question is asked on its own condition, beside the isolation invariant\'s refusal, about each undispatched task not yet asked about at its epoch, without inventing budget refusals', () => {
+  // The question is a predicate of the board, the handles and the ledger's own rows.
+  const deliveries = []
+  const rt = makeRuntimeStub({ workers: new FakeWorkers({ autoIdle: true }), store: { list: table => table === 'deliveries' ? deliveries : [] } })
   const scheduling = new Scheduling(rt); scheduling.ready = () => true
+  const asked = dedupKey => deliveries.push({ to: 'owner', from: 'runtime', notice: { class: 'decision', dedupKey } })
   const member = { id: 'one', name: 'One', phase: 'ready', status: 'idle', workspace: '/one' }
   const independent = { id: 't', title: 'Work', epoch: 0, objective: 'Write a new file from the baseline.', acceptance: [], dependencies: [], scope: ['**'] }
-  // The isolation invariant refuses the only startable member: the workspace terminal is that cause's one emitter.
-  assert.equal(scheduling.dispatchQuestion('m', [independent], [{ ...member, workspace: '' }], [independent]), undefined)
-  const unknown = scheduling.dispatchQuestion('m', [independent], [member], [independent])
-  assert.match(unknown.message, /idle handle alone does not identify the dispatch blocker/)
-  // A second startable member the invariant does not refuse leaves the gap unexplained: the question is asked.
-  assert.match(scheduling.dispatchQuestion('m', [independent], [{ ...member, workspace: '' }, { ...member, id: 'two', name: 'Two', workspace: '/two' }], [independent]).message, /idle handle alone does not identify the dispatch blocker/)
+  const later = { ...independent, id: 'later', title: 'Later work' }
+  // The isolation invariant refuses the only startable member (it has no provisioned worktree): its request is not this question's answer.
+  const refused = [{ ...member, workspace: '' }]
+  const question = scheduling.dispatchQuestion('m', [independent, later], refused, [independent, later])
+  assert.deepEqual([question.task.id, question.dedupKey], ['t', 'dispatch-question:m:t@0'])
+  assert.match(question.message, /idle handle alone does not identify the dispatch blocker/)
+  // Once the ledger holds it, the next pass asks about the later work, then about nothing; a new epoch is asked about again.
+  asked(question.dedupKey)
+  assert.equal(scheduling.dispatchQuestion('m', [independent, later], refused, [independent, later]).dedupKey, 'dispatch-question:m:later@0')
+  asked('dispatch-question:m:later@0')
+  assert.equal(scheduling.dispatchQuestion('m', [independent, later], refused, [independent, later]), undefined)
+  assert.equal(scheduling.dispatchQuestion('m', [{ ...independent, epoch: 1 }], refused, [{ ...independent, epoch: 1 }]).dedupKey, 'dispatch-question:m:t@1')
 })
 
 test('stop recovery owns its member until quiescence, including before native startup', async () => {
