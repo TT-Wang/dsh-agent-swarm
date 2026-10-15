@@ -1,4 +1,46 @@
-/** The scheduling pass record and its stamps, below every seam: a seam that awaits for a pass body stamps it without importing the sweep. */
+/**
+ * The kernel every seam stands on, and the scheduling pass record with its
+ * stamps: a seam reads the store, the clock and the bounds, commits and queues
+ * through `Kernel`, and stamps a pass body it awaits for without importing the
+ * sweep.
+ */
+import type { SwarmStore } from './store.ts'
+import type { Mission, RuntimeConfig, Task, WorkerAdapter } from './types.ts'
+
+/**
+ * The infrastructure `SwarmRuntime` implements and hands each seam as itself:
+ * the store and the transaction funnel over it, the runtime clock, the adapter,
+ * the mission queue, the lifecycle flags and the declared bounds. A bound is a
+ * getter over the live config, never a snapshot, because a config can change
+ * after construction. `fingerprint` is F(S), the board digest the owner
+ * instruments and the stall events carry, cached per store revision and never
+ * trusted inside an open transaction (`commitDepth`), so the cache has one owner
+ * below every seam that reads it.
+ */
+export interface Kernel {
+  readonly store: SwarmStore
+  readonly config: RuntimeConfig
+  readonly workers: WorkerAdapter
+  readonly now: () => number
+  readonly closed: boolean
+  readonly shuttingDown: boolean
+  /** Open runtime transactions. */
+  readonly commitDepth: number
+  /** This process's identity in durable claims: a claim another instance wrote never gates this one. */
+  readonly instanceId: string
+  readonly stallPassTimeoutMs: number
+  readonly stallPassLiveGraceMs: number
+  readonly stallPassReleaseBoundMs: number
+  readonly attemptSilenceBoundMs: number
+  commit<T>(missionId: string, fn: () => T): T
+  defer(fn: () => Promise<void>): void
+  exclusive<T>(missionId: string, fn: () => Promise<T>): Promise<T>
+  kick(missionId: string, after?: SchedulingPass): void
+  mission(missionId: string): Mission
+  task(missionId: string, taskId: string): Task
+  isWorkerSession(sessionId: string): boolean
+  fingerprint(missionId: string): string
+}
 
 /**
  * The scheduling body that is queued or running for one mission. `openPass`

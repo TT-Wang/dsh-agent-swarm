@@ -1006,7 +1006,7 @@ test('S5: clearing every in-memory scheduling cache leaves the durable outcome u
     f.runtime.queues.clear()
     f.runtime.attempts.idleSignals.clear()
     f.runtime.startFailures.clear()
-    f.runtime.gates.fingerprintCache.clear()
+    f.runtime.fingerprintCache.clear()
     const task = f.propose()
     const running = await ticksUntil(f, () => taskOf(f.runtime, task.id).status === 'running' ? taskOf(f.runtime, task.id) : undefined,
       'dispatch must not depend on any in-memory gate', 400)

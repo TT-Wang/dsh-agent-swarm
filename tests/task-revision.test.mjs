@@ -24,7 +24,7 @@
  *    loss cannot make two writers both win, because the CAS is in the store;
  *  - the writer-busy classification (`WriterBusyError` / `withWriterRetry`): a
  *    stale refusal is NOT contention and must not be retried as one;
- *  - the revision-keyed fingerprint cache (`RuntimeGates.fingerprintCache`):
+ *  - the revision-keyed fingerprint cache (`SwarmRuntime.fingerprintCache`):
  *    the refusal record advances the store revision, so the cached digest can
  *    never be the stale board's.
  */
@@ -195,7 +195,7 @@ test('S5 pair: the revision-keyed fingerprint cache can never serve the stale bo
   const after = f.runtime.fingerprint(f.mission.id)
   assert.equal(after, missionFingerprint(f.runtime.fingerprintBoard(f.mission.id)),
     'the refusal record advanced the store revision, so the cache recomputed instead of gating on the stale digest')
-  f.runtime.gates.fingerprintCache.clear()
+  f.runtime.fingerprintCache.clear()
   assert.equal(f.runtime.fingerprint(f.mission.id), after, 'losing the cache changes no digest (cache-only)')
 })
 

@@ -130,7 +130,6 @@ const CENSUS = [
   ["src/delivery.ts",1,"Set","const activeSources = new Set<string>()","outside","","outside the runtime decision path: the delivery engine module (applyDelivery); the runtime serializes applies per workspace through exclusive(\"delivery:<workspace>\"), so the runtime path does not depend on this process-global mutex (enumerated, no label claimed)"],
   ["src/delivery.ts",2,"Map","const sourceIdentities = new Map<string, string>()","outside","","outside the runtime decision path: the delivery engine module (applyDelivery); the runtime serializes applies per workspace through exclusive(\"delivery:<workspace>\"), so the runtime path does not depend on this process-global mutex (enumerated, no label claimed)"],
   ["src/delivery.ts",3,"Set","const FALLBACK_TEMP_CODES = new Set(['EPERM', 'EACCES', 'ENOENT', 'ENOTDIR'])","constant","","module-level immutable lookup table, never mutated after construction: the errno allowlist the R15-F5 temp-root fallback decides on, data rather than a gate"],
-  ["src/gates.ts",1,"Map","readonly fingerprintCache = new Map<string, { revision: number; fingerprint: string }>()","gate","cache-only","keyed by the global store revision; the digest is pure over durable state and is bypassed inside a transaction"],
   ["src/gates.ts",3,"Set","const ready = new Set(tasks.filter(task => task.status === 'pending' && runnable.some(member => this.rt.eligible(task, member, tasks))).map(task => task.id))","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
   ["src/gates.ts",4,"Set","const unreviewed = new Set(tasks.filter(task => task.status === 'submitted' && !this.rt.reviewable(task, tasks)).map(task => task.id))","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
   ["src/git-snapshot.ts",1,"Set","const trackedSet = new Set(tracked)","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
@@ -207,6 +206,7 @@ const CENSUS = [
   ["src/runtime.ts",38,"Set","const memberMissions = new Set(this.store.list('members').filter(m => m.sessionId === actor.sessionId && memberPhaseOf(m) !== 'stopped').map(m => m.missionId))","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
   ["src/runtime.ts",39,"Set","const leftover = options.cancelUnschedulable ? new Set(this.unschedulable(mission, tasks, this.store.list('members', mission.id)).map(task => task.id)) : new Set<string>()","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
   ["src/runtime.ts",40,"Set","const dead = new Set(tasks.filter(task => task.status === 'cancelled' || leftover.has(task.id)).map(task => task.id))","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
+  ["src/runtime.ts",41,"Map","readonly fingerprintCache = new Map<string, { revision: number; fingerprint: string }>()","gate","cache-only","keyed by the global store revision; the digest is pure over durable state and is bypassed inside a transaction"],
   ["src/scheduling.ts",1,"Map","readonly passes = new Map<string, SchedulingPass>()","gate","in-flight","the scheduling body queued or running on a mission's serial queue, removed only when that body settles; every await in the body is bounded and the tick watchdog names a body past its bound, and losing the record can only queue a second body that the mission queue refuses while the first is in flight (probe below)"],
   ["src/scheduling.ts",2,"Set","const dead = new Set(tasks.filter(task => task.status === 'blocked' && !this.quiescencePending(task)).map(task => task.id))","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
   ["src/scheduling.ts",3,"Set","const covers = (task: Task, sourceId: string, seen = new Set<string>()): boolean => {","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
@@ -507,12 +507,12 @@ const GATE_TESTS = {
       assert.ok(cursor.eventSeq <= durableEvents.at(-1).seq, 'a cursor can never exceed the durable log, so presence cannot hide an event')
     } finally { await f.cleanup() }
   },
-  'src/gates.ts:1': async t => {
+  'src/runtime.ts:41': async t => {
     const f = await setup()
     try {
       const before = f.runtime.fingerprint(f.mission.id)
-      assert.ok(f.runtime.gates.fingerprintCache.size > 0, 'the loss must be exercised on a non-empty collection')
-      f.runtime.gates.fingerprintCache.clear()   // the loss
+      assert.ok(f.runtime.fingerprintCache.size > 0, 'the loss must be exercised on a non-empty collection')
+      f.runtime.fingerprintCache.clear()   // the loss
       assert.equal(f.runtime.fingerprint(f.mission.id), before, 'the digest is recomputed from durable state and is identical')
       let inside
       const task = f.propose({ title: 'Board change' })

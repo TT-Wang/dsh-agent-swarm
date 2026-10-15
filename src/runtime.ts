@@ -10,12 +10,12 @@ import { WorkspaceAdmission, gitWriteDeniedMessage, TEMP_RENDEZVOUS_WINDOW_MS, t
 import { Notices, NOTICE_TEMPLATES, REJECTION_DECISION_TRIGGER, ADMISSION_REFUSED, ADMIT_REVIEW, BOARD_RUNNING, WITHDRAW_SOURCE, newestReviewBlock, renderNotice, unreviewedSources, type NotifyOptions } from './notices.ts'
 import { RefusalRegistry, emitGuardTerminal, queueWriterBusy, requireStrings, requireText, sameChecks, unsupportedEffort, validatedBudget } from './refusals.ts'
 import { Scheduling } from './scheduling.ts'
-import { progressed, type SchedulingPass } from './kernel.ts'
+import { progressed, type Kernel, type SchedulingPass } from './kernel.ts'
 // R17-G6/G7: the one derivation of mission derived state and its host projection.
 import { deriveMemberBoard, deriveMemberStatus, memberPhaseOf, memberDeliveryHealth, type MissionBoardMember } from './projection.ts'
 import type { MissionInterpretation } from './notices.ts'
 export { emptyUsage, addUsage, missionFingerprint, type MissionFingerprintBoard } from './gates.ts'
-import { RuntimeGates, emptyUsage, addUsage, BOARD_DELTA_POSTS, postView, type MissionFingerprintBoard } from './gates.ts'
+import { RuntimeGates, emptyUsage, addUsage, BOARD_DELTA_POSTS, missionFingerprint, postView, type MissionFingerprintBoard } from './gates.ts'
 import { DeclaredChecks, MAX_REPORTED_CHECK_FAILURES, excerpt } from './declared-checks.ts'
 import { verdictRows } from './trace.ts'
 export { TEMP_RENDEZVOUS_WINDOW_MS, sharedTempPaths, tempRendezvousDecision, type TempMention } from './workspace-admission.ts'
@@ -258,8 +258,8 @@ function ownerQuestionContent(missionId: string, deliveryId: string, from: strin
     `Or close it deliberately: swarm_message({ missionId: "${missionId}", to: "${from}", kind: "question", content: "<why not>", replyTo: "${deliveryId}", dismiss: true })`,
   ].join('\n')
 }
-/** A single runtime owns scheduling, admission, state transitions and a durable outbox. */
-export class SwarmRuntime {
+/** A single runtime owns scheduling, admission, state transitions and a durable outbox; it is the kernel every seam stands on. */
+export class SwarmRuntime implements Kernel {
   /**
    * S5 inventory of every in-memory `Set`/`Map` reachable from the scheduling
    * path, with its classification (a full version lives in
@@ -275,7 +275,7 @@ export class SwarmRuntime {
    *  cache-only (loss changes no durable outcome; each is covered by a test that
    *  clears it and asserts the durable result is unchanged):
    *   - `startFailures`, `operations`, `startControllers`, `listeners`,
-   *     `observeCursors`, `ownerObserveCursors`.
+   *     `observeCursors`, `ownerObserveCursors`, `fingerprintCache`.
    *  physical ownership: `queues` retains in-flight operations until they settle.
    *  It is not a disposable cache while adapter I/O can still affect a checkout.
    *  The scheduling pass guard (`Scheduling.passes`) is the same kind of state:
@@ -323,6 +323,14 @@ export class SwarmRuntime {
   shuttingDown = false
   /** Open runtime transactions; a cached F(S) is not trusted inside one. */
   commitDepth = 0
+  /** F(S) per mission at the store revision it was computed at (`fingerprint`). */
+  readonly fingerprintCache = new Map<string, { revision: number; fingerprint: string }>()
+  /**
+   * Identity of this runtime process in durable claims (the budget stop claim
+   * in src/gates.ts, a workspace revocation's key). A claim written by a
+   * different instance is a crashed process's leftover and never gates this one.
+   */
+  readonly instanceId = id('runtime')
 
   /** M1a seam 6/7: workspace and admission surface. */
   private readonly workspaceAdmission = new WorkspaceAdmission(this)
@@ -430,7 +438,6 @@ export class SwarmRuntime {
   private readonly declaredChecks = new DeclaredChecks(this)
   /** M1a seam 2/7: derived fingerprints, usage accounting and the budget gate. */
   private readonly gates = new RuntimeGates(this)
-  fingerprint(missionId: string): string { return this.gates.fingerprint(missionId) }
   fingerprintBoard(missionId: string): MissionFingerprintBoard { return this.gates.fingerprintBoard(missionId) }
   private ownerInstruments(missionId: string, full: boolean): Record<string, unknown> { return this.gates.ownerInstruments(missionId, full) }
   private boardWindow(missionId: string, memberId: string, afterSeq: number): Record<string, unknown> { return this.gates.boardWindow(missionId, memberId, afterSeq) }
@@ -441,8 +448,6 @@ export class SwarmRuntime {
   private blockBudget(mission: Mission): void { return this.gates.blockBudget(mission) }
   private beginBudgetStop(missionId: string, pauseId: string): void { return this.gates.beginBudgetStop(missionId, pauseId) }
   private resumeBudgetTasks(mission: Mission): void { return this.gates.resumeBudgetTasks(mission) }
-
-  get instanceId(): string { return this.scheduling.instanceId }
 
   constructor(readonly config: RuntimeConfig, readonly workers: WorkerAdapter, storeOptions: StoreOptions = {}) {
     this.now = typeof config.now === 'function' ? config.now : () => Date.now()
@@ -794,6 +799,19 @@ export class SwarmRuntime {
   }
   /** Subscribe to committed state changes. */
   subscribe(listener: (missionId: string) => void): () => void { this.listeners.add(listener); return () => { this.listeners.delete(listener) } }
+  /** Current `F(S)`: the board digest the owner instruments and the audit fields of the stall events carry. */
+  fingerprint(missionId: string): string {
+    // Cache per store revision: F(S) is pure over durable state, so a tick that
+    // changed nothing cannot change it. Never trust the cache inside an open
+    // transaction: the revision has not advanced yet while the board is mutating.
+    if (this.commitDepth > 0) return missionFingerprint(this.gates.fingerprintBoard(missionId))
+    const revision = this.store.revision()
+    const cached = this.fingerprintCache.get(missionId)
+    if (cached !== undefined && cached.revision === revision) return cached.fingerprint
+    const fingerprint = missionFingerprint(this.gates.fingerprintBoard(missionId))
+    this.fingerprintCache.set(missionId, { revision, fingerprint })
+    return fingerprint
+  }
 /**
    * R17-G6: the derived member board — the read face the guard model and the
    * owner/UI views consume, and the ONLY one: the single derivation

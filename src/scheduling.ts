@@ -65,12 +65,6 @@ export class Scheduling {
    * `startedAt` to name a body past its bound.
    */
   readonly passes = new Map<string, SchedulingPass>()
-  /**
-   * Identity of this runtime process in durable claims (the budget stop claim
-   * in src/gates.ts). A claim written by a different instance is a crashed
-   * process's leftover and never gates this runtime.
-   */
-  readonly instanceId = id('runtime')
 
   constructor(private readonly rt: SwarmRuntime) {}
 

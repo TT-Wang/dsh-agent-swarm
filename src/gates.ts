@@ -1,7 +1,7 @@
 /**
- * Gates and caches: the mission fingerprint and its revision-keyed cache, the
- * owner/board instruments, and the usage accounting that gates a budget stop.
- * M1a seam 2/7.
+ * Gates: the board slice the mission fingerprint digests (its revision-keyed
+ * cache is the kernel's, `Kernel.fingerprint`), the owner/board instruments,
+ * and the usage accounting that gates a budget stop. M1a seam 2/7.
  *
  * Behaviour-identical to the code moved from src/runtime.ts; the runtime keeps
  * thin forwarding methods and re-exports the symbols its public surface had.
@@ -124,27 +124,12 @@ export function postView(post: Post, now: number, full = false): Record<string, 
 const BOARD_BODY_EXCERPT = 600
 
 export class RuntimeGates {
-  /** F(S) cache keyed by the store revision: the digest is pure over durable state. */
-  readonly fingerprintCache = new Map<string, { revision: number; fingerprint: string }>()
-
   constructor(private readonly rt: SwarmRuntime) {}
 
-  /** Current `F(S)`: the board digest the owner instruments and the audit fields of the stall events carry. */
-  fingerprint(missionId: string): string {
-    // Cache per store revision: F(S) is pure over durable state, so a tick that
-    // changed nothing cannot change it. Never trust the cache inside an open
-    // transaction: the revision has not advanced yet while the board is mutating.
-    if (this.rt.commitDepth > 0) return missionFingerprint(this.fingerprintBoard(missionId))
-    const revision = this.rt.store.revision()
-    const cached = this.fingerprintCache.get(missionId)
-    if (cached !== undefined && cached.revision === revision) return cached.fingerprint
-    const fingerprint = missionFingerprint(this.fingerprintBoard(missionId))
-    this.fingerprintCache.set(missionId, { revision, fingerprint })
-    return fingerprint
-  }
-
   /**
-   * The owner-observable fingerprint board built from durable state only. The
+   * The owner-observable board slice F(S) digests (`missionFingerprint`; the
+   * kernel caches the digest per store revision, `Kernel.fingerprint`), built
+   * from durable state only. The
    * readiness/review counts come from the same predicates the scheduler and the
    * completion check use, so the digest cannot disagree with the board.
    */
@@ -189,7 +174,7 @@ export class RuntimeGates {
     const counts = { sent: view.notices.length, queued: view.notices.filter(entry => entry.state === 'queued').length, claimed: view.notices.filter(entry => entry.state === 'claimed').length }
     return {
       // T3d: the owner-visible fingerprint is the board digest F(S); no notice is keyed by it.
-      fingerprint: this.fingerprint(missionId),
+      fingerprint: this.rt.fingerprint(missionId),
       pendingDispatchable: this.fingerprintBoard(missionId).tasks.filter(task => task.ready).length,
       ...(view.lastNotice === undefined ? {} : { lastWitness: { ...view.lastNotice, family: noticeFamily(records.deliveries.find(delivery => delivery.id === view.notices[0]!.deliveryId)!) } }),
       notices: counts,
