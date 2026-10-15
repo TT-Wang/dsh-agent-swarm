@@ -142,5 +142,7 @@ test('S7: two running tasks in one worktree add an overlap violation exactly whe
   const overlap = 'concurrently running tasks task_one and task_two declare overlapping scope in worktree /isolated/a'
   assert.deepEqual(messages(['src/'], ['src/runtime.ts']), [shared, overlap], 'a directory selector overlaps a file under it')
   assert.deepEqual(messages(['docs/', 'tests/'], ['**']), [shared, overlap], '`**` overlaps every scope')
+  assert.deepEqual(messages(['docs/', 'src/'], ['src/runtime.ts']), [shared, overlap], 'one overlapping selector on the left is enough')
+  assert.deepEqual(messages(['src/runtime.ts'], ['docs/', 'src/']), [shared, overlap], 'one overlapping selector on the right is enough')
   assert.deepEqual(messages(['src/'], ['docs/', 'tests/']), [shared], 'disjoint scopes share the worktree but declare no overlap')
 })
