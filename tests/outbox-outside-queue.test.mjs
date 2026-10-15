@@ -11,7 +11,7 @@
  */
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { FakeWorkers, setup, eventually, events, budget } from './faults/harness.mjs'
+import { FakeWorkers, FakeClock, setup, eventually, events, budget } from './faults/harness.mjs'
 
 /** The only replaced boundary: one `start` call never resolves once armed. */
 class WedgeStartWorkers extends FakeWorkers {
@@ -130,5 +130,28 @@ test('S2: one never-settling adapter deliver cannot starve a notice for another 
     // The hung delivery is retried rather than lost: the attempt count grows.
     await eventually(() => (f.runtime.store.get('missions', f.mission.id).outboxStarved?.attempts ?? 0) >= 2,
       'the starved delivery is retried by a later pump', 4_000)
+  } finally { await f.cleanup() }
+})
+
+test('S2: pump requests made before a pump starts share that pump, and a request after it starts is a pump of its own', async () => {
+  // A request is a pending start, and every request made before that start runs
+  // is covered by it: the start reads the outbox after all of them. A tick's
+  // outbox guard and a guard terminal the same tick tells are two such requests.
+  // The row's recipient is not on the roster, so a pump attempts it without any
+  // adapter call and records one more starvation attempt each time it does.
+  const clock = new FakeClock()
+  const f = await setup({ clock })
+  try {
+    await f.runtime.settle(f.mission.id)
+    const row = { id: 'msg_s2_unrostered', missionId: f.mission.id, from: 'runtime', to: 'member_gone', kind: 'control', content: 'A message to a member missing from the roster', createdAt: clock.now() }
+    f.runtime.store.transaction(() => f.runtime.store.put('deliveries', row))
+    const attempts = () => f.runtime.store.get('missions', f.mission.id).outboxStarved?.attempts
+    for (let request = 0; request < 5; request += 1) f.runtime.notices.pumpOutbox()
+    await f.runtime.settle(f.mission.id)
+    assert.equal(attempts(), 1, 'five requests in one synchronous span start one pump, which attempts the row once')
+    f.runtime.notices.pumpOutbox()
+    await f.runtime.settle(f.mission.id)
+    assert.equal(attempts(), 2, 'a request made after that pump started is a pump of its own')
+    assert.equal(f.runtime.store.get('deliveries', row.id).deliveryFailure?.reason, 'Recipient member_gone is missing from the durable member roster')
   } finally { await f.cleanup() }
 })

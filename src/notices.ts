@@ -417,6 +417,8 @@ export class Notices {
   private readonly delivering = new Map<string, number>()
   /** Start time of the running pump; ages out at the declared bound. */
   private pumpingSince?: number
+  /** Whether a pump start is deferred and has not run yet (`pumpOutbox`). */
+  private pumpRequested = false
   /** R17-G4: the per-owner budget window (no collection: keyed by mission id). */
   private readonly wakeWindows: Record<string, { startedAt: number; count: number; summaryId?: string }> = {}
   /** R17-G4: the shared bound and its window; public so a test can tighten them. */
@@ -1439,8 +1441,12 @@ export class Notices {
    * mission — and the abandonment is recorded durably on the mission row.
    */
   pumpOutbox(): void {
-    if (this.rt.shuttingDown || this.rt.closed) return
+    // A request is a pending start: every request made before that start runs
+    // is covered by it, because it reads the outbox after them.
+    if (this.rt.shuttingDown || this.rt.closed || this.pumpRequested) return
+    this.pumpRequested = true
     this.rt.defer(async () => {
+      this.pumpRequested = false
       // Bounded coalescing: a request joins a pump that is inside its declared
       // bound, but a pump whose deliveries hang past the bound never suppresses
       // the next one — the flag ages out instead of starving the outbox (the
