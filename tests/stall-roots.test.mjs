@@ -457,7 +457,7 @@ test('a rejected root whose decision was summarized is its own fact, and is name
   assert.equal(rt.store.get('tasks', repair.id).status, 'running', 'the repair ran past two reminder intervals')
   const withdrawnAt = Date.now()
   rt.cancel(f.owner, f.mission.id, { taskId: repair.id, reason: 'withdraw the repair' })
-  assert.ok(rt.notices.stallRoots(rt.store.list('tasks', f.mission.id)).some(task => task.id === source.id), 'the root is a stall root again')
+  assert.ok(rt.notices.stallRoots(rt.boardOf(f.mission.id)).some(task => task.id === source.id), 'the root is a stall root again')
   const naming = await eventually(() => facts().find(fact => fact.createdAt >= withdrawnAt && fact.subjects.includes(rootSubject)), 'a fact names the root after the withdrawal', 8000)
   assert.ok(naming.dedupKey.startsWith('obligation-followup:'), `a reminder names the root: ${naming.dedupKey}`)
 })

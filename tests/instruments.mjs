@@ -36,7 +36,7 @@ export function wakePrecision(runtime, missionId) {
   // A covered fact (`coveredBy`) is never sent: the delivery covering it is the wake.
   const deliveries = runtime.store.list('deliveries', missionId).filter(delivery => delivery.to === 'owner' && delivery.notice?.coveredBy === undefined
     && (delivery.notice?.class === 'decision' || delivery.notice?.class === 'escalation' || delivery.kind === 'escalation'))
-  const roots = new Set(notices.stallRoots(tasks).map(task => taskSubject(task)))
+  const roots = new Set(notices.stallRoots(board).map(task => taskSubject(task)))
   const byFamily = {}
   const falseByFamily = {}
   const falseSubjects = []

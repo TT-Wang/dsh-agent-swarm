@@ -890,7 +890,7 @@ export class Notices {
     return {
       missionId, board, mission, tasks, members,
       nonTerminal: tasks.filter(task => !TERMINAL_STATES.has(task.status)),
-      stallRoots: stallRootsFor(board),
+      stallRoots: this.stallRoots(board),
       replaced: replacementCoverage(tasks),
       eligible: (task, member) => eligible(board, task, member),
       // The dispatcher's own question and its own predicates, computed once here
@@ -1414,8 +1414,8 @@ export class Notices {
    * of durable rows, so the pass, the timer-driven notice path and a test all
    * classify the same board identically.
    */
-  stallRoots(tasks: Task[]): Task[] {
-    return stallRootsFor({ tasks, clock: this.rt.now, bounds: this.rt.bounds })
+  stallRoots(board: Board): Task[] {
+    return stallRootsFor(board)
   }
 
   /**
