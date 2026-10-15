@@ -29,7 +29,8 @@ test('a failed tick guard and one failed mission do not suppress other guards or
   f.runtime.warnBudget = mission => { calls.push(mission.id); if (mission.id === f.mission.id) throw new Error('injected mission failure') }
   f.runtime.startTicker()
   await delay(25)
-  assert.ok(calls.includes('starts') && calls.includes('passes') && calls.includes('decisions'))
+  // The tick reaches its pump through the member patched above, so the injected failure is the first thing it does.
+  assert.deepEqual(calls.slice(0, 4), ['outbox', 'starts', 'passes', 'decisions'], 'the outbox guard failed first and the later guards still ran')
   assert.ok(calls.includes(second.id), 'one mission failure must not skip the next mission')
 })
 

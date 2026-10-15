@@ -305,7 +305,10 @@ test('owner receipt books actual consumption before transport acknowledgement an
 
 for (const summarized of [false, true]) test(`answered receipts invalidate queued nudges and terminal escalation${summarized ? ' within a wake summary' : ''}`, async t => {
   const f = await fixture(t)
-  f.runtime.notices.pumpOutbox = () => {}
+  // The terminal escalation asks the queue-external pump to deliver it; the pump
+  // is held here, so only the flush below, after the answer, reaches transport.
+  let pumps = 0
+  f.runtime.notices.pumpOutbox = () => { pumps += 1 }
   const question = await f.ask()
   if (summarized) {
     f.runtime.notices.wakeBudget = 1
@@ -317,6 +320,8 @@ for (const summarized of [false, true]) test(`answered receipts invalidate queue
     guard.observe(f.owner.sessionId, 'user/message', { createdAt: Date.now() + 1000 })
     guard.observe(f.owner.sessionId, 'turn/end', { reason: { kind: 'completed' } })
   }
+  const terminals = f.events('mission/stalled').filter(event => event.data.cause === 'guard-terminal' && event.data.chain === 'owner_reply')
+  assert.deepEqual([terminals.length, pumps], [1, 1], 'the one terminal escalation asked the held pump to deliver it')
   const reminders = f.deliveries().filter(row => row.notice?.questionId === question.id || row.notice?.aggregatedFacts?.some(fact => fact.questionId === question.id))
   assert.ok(reminders.length)
   assert.ok(reminders.every(row => f.runtime.ownerDeliveryRelevant(f.runtime.mission(f.mission.id), row)))
