@@ -89,10 +89,11 @@ test('M2-3: the dispatch question is asked on its own condition, beside the isol
   // The question is a predicate of the board, the handles and the ledger's own rows.
   const deliveries = []
   const rt = makeRuntimeStub({ workers: new FakeWorkers({ autoIdle: true }), store: { list: table => table === 'deliveries' ? deliveries : [] } })
-  const scheduling = new Scheduling(rt); scheduling.ready = () => true
+  const scheduling = new Scheduling(rt)
   const asked = dedupKey => deliveries.push({ to: 'owner', from: 'runtime', notice: { class: 'decision', dedupKey } })
   const member = { id: 'one', name: 'One', phase: 'ready', status: 'idle', workspace: '/one' }
-  const independent = { id: 't', title: 'Work', epoch: 0, objective: 'Write a new file from the baseline.', acceptance: [], dependencies: [], scope: ['**'] }
+  // Pending, unassigned and free of prerequisites: ready for the member by the dispatcher's own predicate.
+  const independent = { id: 't', missionId: 'm', title: 'Work', status: 'pending', epoch: 0, objective: 'Write a new file from the baseline.', acceptance: [], dependencies: [], scope: ['**'] }
   const later = { ...independent, id: 'later', title: 'Later work' }
   // The isolation invariant refuses the only startable member (it has no provisioned worktree): its request is not this question's answer.
   const refused = [{ ...member, workspace: '' }]
@@ -110,10 +111,10 @@ test('M2-3: the dispatch question is asked on its own condition, beside the isol
 test('stop recovery owns its member until quiescence, including before native startup', async () => {
   const member = { id: 'old-owner', name: 'Old owner', phase: 'active', status: 'idle', workspace: '/owned' }
   const stopping = { id: 'old-task', status: 'blocked', epoch: 3, resumeAfterStop: { epoch: 3, memberId: member.id } }
-  const ready = { id: 'new-task', title: 'New task', epoch: 0, status: 'pending', dependencies: [], acceptance: [], scope: ['**'], objective: 'New work' }
+  const ready = { id: 'new-task', missionId: 'm', title: 'New task', epoch: 0, status: 'pending', dependencies: [], acceptance: [], scope: ['**'], objective: 'New work' }
   let starts = 0
   const rt = makeRuntimeStub({ store: { list: () => [stopping, ready] }, notices: { interpretation: () => ({ members: [member], tasks: [stopping, ready] }) }, mission: () => ({ status: 'active' }), startWorker: async () => { starts++ }, workers: new FakeWorkers({ autoIdle: true }) })
-  const scheduling = new Scheduling(rt); scheduling.ready = () => true
+  const scheduling = new Scheduling(rt)
   assert.equal(await scheduling.dispatch({ status: 'active' }, 'm'), true)
   assert.equal(starts, 0)
   assert.equal(scheduling.dispatchQuestion('m', [stopping, ready], [member], [ready]), undefined)
