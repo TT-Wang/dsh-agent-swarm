@@ -481,6 +481,25 @@ test('an unreviewable submission is named by the review admission\'s decision, a
   }
 })
 
+test('beside running work, an unreviewable source past its grace is stuck work: the fall-through names it, outstanding, beside the admission\'s BOARD_RUNNING decision, whose blocker is the running board', async t => {
+  // The other half of the pin above: beside live work the admission's own rule names the running board, never a stall it imagines.
+  const f = await setup({ clock: new FakeClock() })
+  t.after(f.cleanup)
+  const running = f.propose({ title: 'Running work', kind: 'research', checks: [], assigneeId: f.reviewer.id })
+  await f.runtime.claim(f.actor(f.reviewer), f.mission.id, running.id)
+  const source = f.propose()
+  const claimed = await f.runtime.claim(f.actor(f.author), f.mission.id, source.id)
+  await f.runtime.submit(f.actor(f.author), f.mission.id, { taskId: source.id, attemptId: claimed.attempt.id, output: 'candidate' })
+  await f.runtime.settle(f.mission.id)
+  await ticks(f, 150)
+  assert.deepEqual([taskOf(f.runtime, running.id).status, f.runtime.reviewNeed(taskOf(f.runtime, source.id)).ripe], ['running', true], 'the other work still runs under its lease, and the source is past its grace')
+  const naming = ownerRows(f).filter(delivery => (delivery.subjects ?? []).includes(subjectOf(f, source)) && delivery.notice.trigger !== 'owner-decision-unresolved')
+  assert.deepEqual(naming.map(delivery => noticeFamily(delivery)).sort(), ['fallthrough', 'review-blocked'], 'the source is named by the fall-through beside the admission\'s decision')
+  const [decision, fallthrough] = ['review-blocked', 'fallthrough'].map(family => naming.find(delivery => noticeFamily(delivery) === family))
+  assert.equal(decision.notice.reason, BOARD_RUNNING, 'whose blocker is the running board')
+  assert.deepEqual([fallthrough.subjects, relevant(f, fallthrough), relevant(f, decision)], [[subjectOf(f, source)], true, true], 'the fall-through names the source alone, and both are outstanding')
+})
+
 test('a board whose only unfinished work is a submission and its dead host review is the admission\'s to name: it is told once, by that decision, even when no guard terminal was', async t => {
   // A worker stop the test holds open, so the owner can pause the mission while the review's last lease expiry is settling.
   let held
