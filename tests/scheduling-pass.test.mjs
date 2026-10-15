@@ -1123,8 +1123,8 @@ test('manualTick runs no timer while tickMs stays the tick unit: settle() return
   } finally { await f.cleanup() }
 })
 
-test('an unreviewed submission is a stall exactly when it stops waiting legitimately: both read the review admission\'s one rule, its grace and then its record of the need, fast tick or slow', async () => {
-  for (const tickMs of [10, 60_000]) {
+test('an unreviewed submission is a stall exactly when it stops waiting legitimately: both read the review admission\'s one rule, its grace and then its blocker, never its record, fast tick or slow', async () => {
+  for (const tickMs of [10, 60_000]) for (const blocked of [true, false]) {
     const clock = new FakeClock()
     const f = await setup({ clock, config: { tickMs } })
     try {
@@ -1132,23 +1132,25 @@ test('an unreviewed submission is a stall exactly when it stops waiting legitima
       const task = f.propose()
       await f.runtime.settle(f.mission.id)
       const claimed = taskOf(f.runtime, task.id)
-      // The only independent member is gone, so the admission names a blocker instead of admitting a review.
-      f.runtime.commit(f.mission.id, () => f.runtime.store.put('members', { ...f.runtime.store.get('members', f.reviewer.id), phase: 'stopped' }))
+      // Without the only independent member the admission names a blocker; with it, the admission admits a review.
+      if (blocked) f.runtime.commit(f.mission.id, () => f.runtime.store.put('members', { ...f.runtime.store.get('members', f.reviewer.id), phase: 'stopped' }))
       await f.runtime.submit(f.actor(f.author), f.mission.id, { taskId: task.id, attemptId: claimed.attempt.id, output: 'candidate' })
       const classified = () => {
         const tasks = f.runtime.store.list('tasks', f.mission.id)
         const row = tasks.find(candidate => candidate.id === task.id)
         return { stall: f.runtime.stalled(tasks, f.runtime.store.list('members', f.mission.id)), waits: waitsLegitimately(f.runtime, row, tasks) }
       }
+      const past = blocked ? { stall: true, waits: false } : { stall: false, waits: true }
       // One scheduler period, at least 1 s.
       clock.advance(Math.max(tickMs, 1_000) - 1)
-      assert.deepEqual(classified(), { stall: false, waits: true }, `tickMs ${tickMs}: inside the grace the submission still waits`)
+      assert.deepEqual(classified(), { stall: false, waits: true }, `tickMs ${tickMs}, blocked ${blocked}: inside the grace the submission still waits`)
       clock.advance(1)
-      assert.deepEqual(classified(), { stall: false, waits: true }, `tickMs ${tickMs}: past it the need awaits the admission, which has not yet processed it`)
+      assert.deepEqual(classified(), past, `tickMs ${tickMs}, blocked ${blocked}: past it, a source the admission names a blocker for is a stall, and one it would admit a review for waits for the admission, before the admission has run`)
       await f.runtime.tick()
       await f.runtime.settle(f.mission.id)
-      assert.equal(f.runtime.reviewNeed(taskOf(f.runtime, task.id)).recorded, true, `tickMs ${tickMs}: the next pass's admission recorded the need`)
-      assert.deepEqual(classified(), { stall: true, waits: false }, `tickMs ${tickMs}: once it has, the submission is a stall`)
+      assert.equal(f.runtime.reviewNeed(taskOf(f.runtime, task.id)).recorded, true, `tickMs ${tickMs}, blocked ${blocked}: the next pass's admission recorded the need`)
+      assert.deepEqual(classified(), past, `tickMs ${tickMs}, blocked ${blocked}: and the record changes neither reader`)
+      assert.equal(f.runtime.store.list('tasks', f.mission.id).some(row => row.reviewOf === task.id), !blocked, `tickMs ${tickMs}, blocked ${blocked}: the admission admitted a review exactly when it named no blocker`)
     } finally { await f.cleanup() }
   }
 })

@@ -381,21 +381,8 @@ export const ADMIT_REVIEW = 'admit a review with swarm_propose(kind: "verificati
 export const WITHDRAW_SOURCE = 'withdraw the source with swarm_cancel(taskId, reason)'
 export const BOARD_RUNNING = `it has no live independent review path and cannot reach a verdict while the rest of the board keeps running: ${ADMIT_REVIEW}, or ${WITHDRAW_SOURCE}`
 
-/**
- * R17-G9: the runtime slice the lineage rules read, so the classifiers and the
- * delivery-time relevance check consume ONE implementation (`SwarmRuntime`
- * satisfies it structurally; a test can supply the same shape).
- */
-interface LineageRuntime {
-  readonly store: { list: (table: 'tasks', missionId: string) => Task[] }
-  readonly config: { tickMs: number }
-  readonly stallPassTimeoutMs: number
-  /** The runtime clock (`SwarmRuntime.now`). */
-  readonly now: () => number
-  reviewNeed(source: Task): { ripe: boolean; recorded: boolean }
-  unfinishedDependencies(missionId: string, task: Task, tasks?: Task[]): Task[]
-  reviewable(task: Task, tasks: Task[]): boolean
-}
+/** R17-G9: the runtime slice the lineage rules read, so the classifiers and the delivery-time relevance check consume ONE implementation (a test can supply the same shape). */
+type LineageRuntime = Pick<SwarmRuntime, 'config' | 'stallPassTimeoutMs' | 'now' | 'reviewNeed' | 'reviewPathBlocker' | 'unfinishedDependencies' | 'reviewable'>
 
 /**
  * R16-A: the ids whose obligation is carried by a live task through `replaces`,
@@ -459,7 +446,7 @@ export function waitsLegitimately(rt: LineageRuntime, task: Task, tasks: Task[])
   if (task.status === 'running') return task.attempt !== undefined
   // Submission remains in this state for the entire independent review: the
   // dispatcher's live-review rule (an admitted or parked review included), or
-  // a need the review admission has yet to process (`awaitsReviewAdmission`).
+  // a need the review admission would still serve (`awaitsReviewAdmission`).
   if (task.status === 'submitted') return rt.reviewable(task, tasks) || awaitsReviewAdmission(rt, task)
   if (task.status === 'blocked') {
     // A blocked verdict record is not outstanding on its own while its source
@@ -516,10 +503,11 @@ export function waitsLegitimately(rt: LineageRuntime, task: Task, tasks: Task[])
 
 const id = (prefix: string) => `${prefix}_${randomUUID()}`
 
-/** The review admission's sources, the one set its admission, its decisions and the interpretation read: submitted artifacts no live review can accept (before the grace is applied). A submission an older build left without an artifact is ordinary stuck work. */
-export const unreviewedSources = (rt: Pick<LineageRuntime, 'reviewable'>, tasks: Task[]): Task[] => tasks.filter(task => task.status === 'submitted' && task.artifact !== undefined && !rt.reviewable(task, tasks))
-/** Whether the host can still advance an unreviewable submission, the one rule the stall predicate and the waiting classifier read: inside its review grace (`ReviewNeed.ripe`), and for a source the review admission speaks for until that admission has processed its current need (`ReviewNeed.recorded`), admitting its review or naming its blocker. */
-export const awaitsReviewAdmission = (rt: Pick<LineageRuntime, 'reviewNeed'>, task: Task): boolean => { const need = rt.reviewNeed(task); return !need.ripe || (task.artifact !== undefined && !need.recorded) }
+/** The submissions the review admission speaks for: submitted artifacts. A submission an older build left without an artifact is ordinary stuck work. Its sources, the one set its admission, its decisions and the interpretation read, are those no live review can accept (before the grace is applied). */
+const admissionSpeaksFor = (task: Task): boolean => task.status === 'submitted' && task.artifact !== undefined
+export const unreviewedSources = (rt: Pick<LineageRuntime, 'reviewable'>, tasks: Task[]): Task[] => tasks.filter(task => admissionSpeaksFor(task) && !rt.reviewable(task, tasks))
+/** Whether the host can still advance an unreviewable submission, the review admission's own rule, which the stall predicate and the waiting classifier read: inside its review grace (`ReviewNeed.ripe`), or, for a source the admission speaks for, while the admission names no blocker under the board's own stall (`SwarmRuntime.reviewPathBlocker`): the next pass on a stalled board admits its review. */
+export const awaitsReviewAdmission = (rt: Pick<LineageRuntime, 'reviewNeed' | 'reviewPathBlocker'>, task: Task): boolean => { const need = rt.reviewNeed(task); return !need.ripe || (admissionSpeaksFor(task) && rt.reviewPathBlocker(task, need) === undefined) }
 /** A review-blocked decision's identity: one per blocker reason of one review need (`SwarmRuntime.reviewNeed`) of a source. */
 const reviewBlockedKey =(missionId: string, sourceId: string, need: string, reason: string): string => `review-blocked:${missionId}:${sourceId}:${need}:${reason}`
 /** The families of the board's own fact: the W3 stall, or an owner-assembled mission's coverage-complete (R10-14). */

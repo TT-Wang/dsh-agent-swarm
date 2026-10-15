@@ -498,8 +498,8 @@ export class Scheduling {
   /**
    * Nothing is running, reviewably submitted or dispatchable, and no submission
    * with no live review awaits the review admission (`awaitsReviewAdmission`,
-   * read from the durable rows of its review need): workers would stay idle
-   * forever. An empty board is a mission the owner has not planned yet.
+   * the admission's own rule): workers would stay idle forever. An empty board
+   * is a mission the owner has not planned yet.
    */
   stalled(tasks: Task[], members: Member[]): boolean {
     return tasks.length > 0 && this.reviewPathStalled(tasks, members)
