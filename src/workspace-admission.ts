@@ -12,10 +12,10 @@ import { isolationIssues, stopPending, subjectsOfTasks, terminal } from './task-
 import { scopesOverlap } from './scheduler.ts'
 import { claimFor, isContained, reauthorizeWorkspace, WorkspaceRevokedError, WORKSPACE_AUTHORIZATION_CODE, type WorkspaceClaim } from './authorization.ts'
 import { hasNotice } from './arena.ts'
-import { noticeIdentity, reasonDigest } from './notices.ts'
+import { isolationOpener, noticeIdentity } from './notices.ts'
 import { emitGuardTerminal, guardTerminalKey } from './refusals.ts'
 import type { SwarmRuntime } from './runtime.ts'
-import { progressed, type SchedulingPass } from './scheduling.ts'
+import { progressed, type SchedulingPass } from './kernel.ts'
 import { absoluteCheckPaths, shellSegments } from './admission.ts'
 import type { Member, Mission } from './types.ts'
 
@@ -534,6 +534,3 @@ export class WorkspaceAdmission {
     return isolationIssues(this.rt.store.list('members', missionId), this.rt.store.list('tasks', missionId), scopesOverlap)
   }
 }
-
-/** The opener of the workspace terminal one isolation violation raises: the violation's own text. */
-export function isolationOpener(message: string): string { return `isolation:${reasonDigest(message)}` }

@@ -7,12 +7,13 @@
  * site changed. The runtime reference is typed as the class and imported
  * type-only, so no runtime import cycle exists.
  */
-import { createHash, randomUUID } from 'node:crypto'
+import { randomUUID } from 'node:crypto'
 import { blockCauses, stopPending, taskSubject, terminal, type BlockCause } from './task-graph.ts'
 import { emitGuardTerminal } from './refusals.ts'
+import { stopFaultKey } from './notices.ts'
 import { memberPhaseOf } from './projection.ts'
 import { PolicyError } from './policy-error.ts'
-import { awaited, type SchedulingPass } from './scheduling.ts'
+import { awaited, formatSpan, type SchedulingPass } from './kernel.ts'
 
 /**
  * The detail a terminal message embeds. A guard's own message may already carry
@@ -30,9 +31,6 @@ const id = (prefix: string) => `${prefix}_${randomUUID()}`
 
 /** Why a fenced task still owes a stop, as the durable marker records it. */
 type StopReason = NonNullable<Task['resumeAfterStop']>['reason']
-
-/** The local key of a stop fault's decision request: one per task, stop epoch, member and failure text. */
-export const stopFaultKey = (taskId: string, marker: { epoch: number; memberId?: string }, message: string): string => `stop:${taskId}:${marker.epoch}:${marker.memberId ?? 'unresolved'}:${createHash('sha256').update(message).digest('hex')}`
 
 /** Stops the host or the owner caused: the task's automatic recovery limit does not decide where they land. */
 const recoveryLimitExempt = (reason: StopReason): boolean => reason === 'resource' || reason === 'handoff' || reason === 'invalidated'
@@ -77,13 +75,6 @@ function declaredOperationBoundMs(config: { operationBoundMs?: unknown }): numbe
   const value = config.operationBoundMs
   if (value === 0) return 0
   return typeof value === 'number' && Number.isFinite(value) && value > 0 ? Math.floor(value) : DEFAULT_OPERATION_BOUND_MS
-}
-/** Human form of an elapsed bound for a notice; the raw milliseconds stay on the witness. */
-function formatElapsed(ms: number): string {
-  const seconds = Math.max(0, Math.round(ms / 1000))
-  if (seconds < 60) return `${seconds}s`
-  const minutes = Math.floor(seconds / 60)
-  return minutes < 60 ? `${minutes}m ${seconds % 60}s` : `${Math.floor(minutes / 60)}h ${minutes % 60}m`
 }
 /** F1: one in-flight operation that has produced nothing beyond the declared bound. */
 interface SilentOperation {
@@ -412,7 +403,7 @@ export class Attempts {
     const member = this.rt.store.get('members', silent.ownerId)
     const name = member === undefined ? silent.ownerId : `${member.name} (${member.id})`
     const what = silent.tool === undefined ? `a ${silent.kind} operation` : `a ${silent.kind} operation \`${silent.tool}\``
-    const message = `${name} has held ${what} for ${formatElapsed(silent.elapsedMs)} (${silent.elapsedMs}ms) without recording anything, past its declared bound of ${formatElapsed(silent.boundMs)}: task ${task.id} "${task.title}", attempt ${silent.attemptId}. The operation no longer counts as liveness, so the lease is not renewed and the attempt expires into the existing recovery, which stops the worker and re-pends the task. Owner actions: inspect the stuck call with swarm_observe (taskId ${task.id}), raise operationBoundMs if the operation is genuinely long, or withdraw the work with swarm_cancel. [witness: activity ${silent.activityId}, kind ${silent.kind}${silent.tool === undefined ? '' : `, tool ${silent.tool}`}, attempt ${silent.attemptId}, startedAt ${silent.startedAt}, lastRecordedAt ${silent.lastRecordedAt}, elapsedMs ${silent.elapsedMs}, boundMs ${silent.boundMs}]`
+    const message = `${name} has held ${what} for ${formatSpan(silent.elapsedMs)} (${silent.elapsedMs}ms) without recording anything, past its declared bound of ${formatSpan(silent.boundMs)}: task ${task.id} "${task.title}", attempt ${silent.attemptId}. The operation no longer counts as liveness, so the lease is not renewed and the attempt expires into the existing recovery, which stops the worker and re-pends the task. Owner actions: inspect the stuck call with swarm_observe (taskId ${task.id}), raise operationBoundMs if the operation is genuinely long, or withdraw the work with swarm_cancel. [witness: activity ${silent.activityId}, kind ${silent.kind}${silent.tool === undefined ? '' : `, tool ${silent.tool}`}, attempt ${silent.attemptId}, startedAt ${silent.startedAt}, lastRecordedAt ${silent.lastRecordedAt}, elapsedMs ${silent.elapsedMs}, boundMs ${silent.boundMs}]`
     // The durable witness is the owner delivery row itself, on the
     // deliveries ledger. A dedicated
     // `task/operation-silent` event type would need its own registry row in

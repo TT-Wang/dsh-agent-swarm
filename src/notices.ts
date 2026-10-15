@@ -10,12 +10,10 @@ import { hostContextOf, memberPhaseOf } from './projection.ts'
 import { formatDiagnostic, missingReviewDiagnostic } from './admission.ts'
 import { guardTerminalKey, requireText } from './refusals.ts'
 import { TERMINAL_STATES, blockCauses, missionSubject, stopPending, subjectsOfTasks, taskGraphIndex, taskSubject } from './task-graph.ts'
-import { stopFaultKey } from './attempts.ts'
-import { isolationOpener } from './workspace-admission.ts'
 import { PolicyError } from './policy-error.ts'
 import type { SwarmRuntime } from './runtime.ts'
 import type { SwarmStore } from './store.ts'
-import { awaited, type SchedulingPass } from './scheduling.ts'
+import { awaited, type SchedulingPass } from './kernel.ts'
 import type { Actor, Delivery, Escalation, Member, Mission, NoticeClass, Task, WorkerAdapter } from './types.ts'
 
 /**
@@ -166,6 +164,10 @@ function ownerDeliveryMoot(mission: Pick<Mission, 'status'>, delivery: Pick<Deli
 export function reasonDigest(reason: string): string {
   return reason.length === 0 ? 'none' : createHash('sha256').update(reason).digest('hex').slice(0, 16)
 }
+/** The local key of a stop fault's decision request: one per task, stop epoch, member and failure text. */
+export const stopFaultKey = (taskId: string, marker: { epoch: number; memberId?: string }, message: string): string => `stop:${taskId}:${marker.epoch}:${marker.memberId ?? 'unresolved'}:${createHash('sha256').update(message).digest('hex')}`
+/** The opener of the workspace terminal one isolation violation raises: the violation's own text. */
+export function isolationOpener(message: string): string { return `isolation:${reasonDigest(message)}` }
 /**
  * R17-G3: the fact key. Identity is `subject@epoch` (or the mission root when a
  * decision names no single task) plus the triggering event plus the recorded
