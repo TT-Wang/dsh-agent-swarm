@@ -1,7 +1,7 @@
 /**
  * F1 — an in-flight operation that records nothing beyond its declared bound
- * escalates: a durable witness (the no-silent-state W2 row plus the durable
- * owner delivery) and an owner notice naming the member, the task, the tool
+ * escalates: a durable witness (the owner delivery row on the deliveries
+ * ledger) and an owner notice naming the member, the task, the tool
  * and the elapsed time, and the operation stops counting as lease liveness so
  * the existing expiry path frees the attempt. The lease-renewal rule is kept:
  * inside the bound a live operation still renews.
@@ -29,6 +29,7 @@ import { Context } from '@deepseek-ai/cordis'
 import { HarnessWorkers, ScopedEnvironment, assertCompositionScratch } from '../lib/harness-workers.js'
 import { tempDirectory } from './temp-root.mjs'
 import { FakeWorkers, eventually, makeRepo, makeRuntime, makeWorkspaces } from './faults/harness.mjs'
+import { noticeFamily } from '../lib/notices.js'
 
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
 
@@ -106,19 +107,14 @@ test('F1: a silent in-flight operation escalates with a durable witness naming m
   assert.equal(escalation.from, 'runtime')
   assert.equal(escalation.to, 'owner')
   assert.equal(escalation.notice.class, 'stall')
+  assert.equal(noticeFamily(escalation), 'stall', 'its family is its class, never the W3 board stall (`board-stall`)')
+  assert.equal(runtime.ownerDeliveryRelevant(runtime.mission(mission.id), escalation), true, 'it stays relevant while the operation holds the attempt')
   assert.equal(escalation.notice.sentAt > 0, true)
   for (const needle of [member.name, member.id, task.id, task.title, 'job_output', 'without recording anything', 'operationBoundMs', 'swarm_cancel', 'swarm_observe']) {
     assert.ok(escalation.content.includes(needle), `the owner notice must name ${needle}: ${escalation.content}`)
   }
   assert.match(escalation.content, /for \d+m? ?\d*s \(\d+ms\)/, 'the notice states the elapsed time')
   assert.match(escalation.content, new RegExp(`\\[witness: activity op-stuck, kind tool, tool job_output, attempt attempt_[^,]+, startedAt ${startedAt}, lastRecordedAt 0, elapsedMs \\d+, boundMs 50\\]`), 'the durable record carries the operation identity, the tool and the elapsed silence')
-
-  // The no-silent-state witness: durable on the mission row, for the board the
-  // notice was emitted for.
-  const witness = runtime.store.get('missions', mission.id).witness
-  assert.equal(witness?.kind, 'W2')
-  assert.equal(typeof witness.fingerprint, 'string')
-  assert.ok(witness.at >= escalation.createdAt - 1000 && witness.at <= escalation.createdAt + 1000, 'the witness and the notice describe the same state')
 
   // The board-level stall notice stays silent: a named in-flight operation is
   // the whole story, and `stalled` must not claim the board while it holds a

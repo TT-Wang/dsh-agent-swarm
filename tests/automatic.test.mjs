@@ -3,7 +3,7 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { join } from 'node:path'
 import { registerTools } from '../lib/tools.js'
-import { FakeWorkers, SwarmRuntime, budget as sharedBudget, eventually, makeRuntime } from './faults/harness.mjs'
+import { FakeClock, FakeWorkers, SwarmRuntime, budget as sharedBudget, eventually, makeRuntime } from './faults/harness.mjs'
 
 const budget = { ...sharedBudget, maxTokens: 100000, maxSteps: 100, maxTasks: 12, maxExperiments: 2 }
 const deferred = () => { let resolve; const promise = new Promise(done => { resolve = done }); return { promise, resolve } }
@@ -29,9 +29,9 @@ function plan(workspace) {
       { key: 'review', workstreamKey: 'main', title: 'Review', objective: 'Verify immutable artifact', kind: 'verification', outputs: [], scope: ['src/'], acceptance: ['works'], assigneeKey: 'reviewer', reviewOf: 'deliver', maxRecoveryAttempts: 5 },
     ] }
 }
-/** `extra` extends the runtime configuration, e.g. with the loaded `grants` the plugin always wires. */
-async function fixture(t, extra = {}) {
-  const { dir: directory, config, workers, runtime } = await makeRuntime(t, { workers: new Workers(), config: { maxMessageChars: 10000, maxEvents: 100, checkTimeoutMs: undefined, ...extra } })
+/** `extra` extends the runtime configuration, e.g. with the loaded `grants` the plugin always wires; with a `clock` (FakeClock) the test ticks by hand. */
+async function fixture(t, extra = {}, clock) {
+  const { dir: directory, config, workers, runtime } = await makeRuntime(t, { workers: new Workers(), clock, config: { maxMessageChars: 10000, maxEvents: 100, checkTimeoutMs: undefined, ...extra } })
   const owner = { sessionId: 'automatic-owner' }
   const requestInput = { commandId: 'command-1', goal: 'Make the requested change and verify it.', workspace: directory }
   return { directory, config, workers, runtime, owner, requestInput, input: plan(directory) }
@@ -97,6 +97,21 @@ async function accept(f, snapshot, { evidence = false } = {}) {
   await f.runtime.verify(verifier, missionId, { taskId: assigned.id, attemptId: assigned.attempt.id, verdict: 'accept', reason: 'Checked the exact submitted commit' })
   return { actor, verifier, builder, reviewer, finding }
 }
+
+test('an automatic mission at full coverage completes on its pass and writes no stall event: coverage-complete is never its decision, nor a W3 stall', async t => {
+  const clock = new FakeClock()
+  const f = await fixture(t, {}, clock)
+  const { snapshot } = await launch(f)
+  const missionId = snapshot.mission.id
+  await accept(f, snapshot)
+  await f.runtime.settle(missionId)
+  for (let tick = 0; tick < 3; tick += 1) { clock.advance(f.runtime.config.tickMs); await f.runtime.tick() }
+  assert.equal(f.runtime.mission(missionId).status, 'completed', 'the automatic mission completes itself')
+  const events = f.runtime.store.events(missionId, 500)
+  assert.equal(events.filter(event => event.type === 'automatic/completed').length, 1)
+  assert.deepEqual(events.filter(event => event.type === 'mission/stalled'), [], 'and records no stall')
+  assert.deepEqual(f.runtime.store.list('deliveries', missionId).filter(delivery => delivery.notice?.dedupKey.startsWith('coverage-complete:')), [], 'its coverage is its completion, never a decision for the owner')
+})
 
 test('automatic request admission is durable, owner-scoped, bounded and command-idempotent', async t => {
   const f = await fixture(t)

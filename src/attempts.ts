@@ -8,7 +8,6 @@
  * type-only, so no runtime import cycle exists.
  */
 import { createHash, randomUUID } from 'node:crypto'
-import { hasNotice } from './arena.ts'
 import { taskSubject } from './notices.ts'
 import { emitGuardTerminal } from './refusals.ts'
 import { memberPhaseOf } from './projection.ts'
@@ -277,7 +276,7 @@ export class Attempts {
               taskId: fresh.id, ...(state.memberId === undefined ? { memberIds: ownerIds } : { memberId: state.memberId }), reason, retries: state.retries,
             })
           })
-          if (recoveryExhausted && mission.status === 'active' && fresh.status !== 'cancelled') emitGuardTerminal(this.rt, missionId, 'attempt_lease', { taskId: fresh.id, memberId: state.memberId, detail: `${reason === 'lease-expired' ? 'lease expiry exhausted' : 'idle close-out reached'} the recovery limit (${fresh.recoveryCount ?? 0}/${fresh.maxRecoveryAttempts ?? this.rt.config.maxTasksPerMember}) and left the task blocked` })
+          if (recoveryExhausted && mission.status === 'active' && fresh.status !== 'cancelled') emitGuardTerminal(this.rt, missionId, 'attempt_lease', { taskId: fresh.id, memberId: state.memberId, localKey: `recovery-exhausted:${taskSubject(fresh)}`, detail: `${reason === 'lease-expired' ? 'lease expiry exhausted' : 'idle close-out reached'} the recovery limit (${fresh.recoveryCount ?? 0}/${fresh.maxRecoveryAttempts ?? this.rt.config.maxTasksPerMember}) and left the task blocked` })
         })
         if (this.stopRetries.get(task.id) === state) this.stopRetries.delete(task.id)
         if (state.memberId === undefined) for (const peer of this.rt.store.list('tasks', missionId)) if (peer.id !== task.id && stopPending(peer)) this.resumeStoppedAttempt(missionId, peer)
@@ -478,25 +477,20 @@ export class Attempts {
    * watch).
    */
   private escalateSilentOperation(mission: Mission, task: Task, silent: SilentOperation): void {
-    const dedupKey = `operation-silent:${silent.attemptId}:${silent.activityId}:${silent.silentSince}`
-    if (hasNotice(this.rt.store.list('deliveries', mission.id), { class: 'stall', dedupKey, from: 'runtime' })) return
     const member = this.rt.store.get('members', silent.ownerId)
     const name = member === undefined ? silent.ownerId : `${member.name} (${member.id})`
     const what = silent.tool === undefined ? `a ${silent.kind} operation` : `a ${silent.kind} operation \`${silent.tool}\``
     const message = `${name} has held ${what} for ${formatElapsed(silent.elapsedMs)} (${silent.elapsedMs}ms) without recording anything, past its declared bound of ${formatElapsed(silent.boundMs)}: task ${task.id} "${task.title}", attempt ${silent.attemptId}. The operation no longer counts as liveness, so the lease is not renewed and the attempt expires into the existing recovery, which stops the worker and re-pends the task. Owner actions: inspect the stuck call with swarm_observe (taskId ${task.id}), raise operationBoundMs if the operation is genuinely long, or withdraw the work with swarm_cancel. [witness: activity ${silent.activityId}, kind ${silent.kind}${silent.tool === undefined ? '' : `, tool ${silent.tool}`}, attempt ${silent.attemptId}, startedAt ${silent.startedAt}, lastRecordedAt ${silent.lastRecordedAt}, elapsedMs ${silent.elapsedMs}, boundMs ${silent.boundMs}]`
-    this.rt.commit(mission.id, () => {
-      // The durable witness is the no-silent-state W2 row `notify` records on
-      // the mission, together with the durable owner delivery itself — this
-      // runtime's witness for an owner notice. A dedicated
-      // `task/operation-silent` event type would need its own registry row in
-      // src/events.ts, outside this task's write scope; that exact change is
-      // named as a hand-off in the submission.
-      // R15-A1: the silent operation names its own task. Guard pair: F1 operation
-      // silence x lease expiry x the board-level stall — the subject is this task's
-      // identity, so a healthy sibling's notices never consume the clock of this
-      // one (they carry different subjects and different dedup keys).
-      this.rt.notify(mission.id, message, [taskSubject(task)], { noticeClass: 'stall', dedupe: true, dedupKey })
-    })
+    // The durable witness is the owner delivery row itself, on the
+    // deliveries ledger. A dedicated
+    // `task/operation-silent` event type would need its own registry row in
+    // src/events.ts, outside this task's write scope; that exact change is
+    // named as a hand-off in the submission.
+    // R15-A1: the silent operation names its own task. Guard pair: F1 operation
+    // silence x lease expiry x the board-level stall — the subject is this task's
+    // identity, so a healthy sibling's notices never consume the clock of this
+    // one (they carry different subjects and different dedup keys).
+    this.rt.tell(mission.id, message, [taskSubject(task)], { noticeClass: 'stall', dedupKey: `operation-silent:${silent.attemptId}:${silent.activityId}:${silent.silentSince}` })
   }
   /**
    * Renew only a still-owned native operation, bounded by the owner's actual
@@ -601,7 +595,7 @@ export class Attempts {
       // checkpoint guard (a dirty or unprovisioned worktree) and the close-out
       // guard co-fire here, so the owner gets the shared coded decision request
       // naming the task and the exits instead of a prose-only reason.
-      emitGuardTerminal(this.rt, mission.id, 'attempt_lease', { taskId: failed.id, memberId: member.id, detail: terminalDetail(failed.output!) })
+      emitGuardTerminal(this.rt, mission.id, 'attempt_lease', { taskId: failed.id, memberId: member.id, localKey: `closeout-failed:${taskSubject(failed)}`, detail: terminalDetail(failed.output!) })
       this.resumeStoppedAttempt(mission.id, failed)
       return
     }
@@ -628,7 +622,7 @@ export class Attempts {
     // chain fires with the workspace capture guard that produced the checkpoint,
     // with the dispatch sweep that re-pends the task, and (when the recovery
     // limit is already spent) with the close-out exhaustion terminal below.
-    emitGuardTerminal(this.rt, mission.id, 'attempt_lease', { taskId: current.id, memberId: member.id, detail: `idle close-out abandoned attempt ${task.attempt?.id ?? 'unknown'}: the workspace was checkpointed at ${checkpoint.commit} and the task was re-pended (recovery ${current.recoveryCount ?? 0})` })
+    emitGuardTerminal(this.rt, mission.id, 'attempt_lease', { taskId: current.id, memberId: member.id, localKey: `closeout-abandoned:${task.attempt!.id}`, detail: `idle close-out abandoned attempt ${task.attempt?.id ?? 'unknown'}: the workspace was checkpointed at ${checkpoint.commit} and the task was re-pended (recovery ${current.recoveryCount ?? 0})` })
     this.idleSignals.delete(member.id)
     this.resumeStoppedAttempt(mission.id, current)
   }
@@ -707,7 +701,7 @@ export class Attempts {
                   // the attempt/lease chain for this attempt: the workspace guard
                   // refused the capture, so recovery will refuse a dirty
                   // workspace too. The coded decision request replaces the prose.
-                  emitGuardTerminal(this.rt, missionId, 'attempt_lease', { taskId: task.id, memberId: oldOwner, detail: terminalDetail(reason) })
+                  emitGuardTerminal(this.rt, missionId, 'attempt_lease', { taskId: task.id, memberId: oldOwner, localKey: `checkpoint-failed:${attemptId}`, detail: terminalDetail(reason) })
                 }
               }
             }

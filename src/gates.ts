@@ -7,14 +7,15 @@
  * thin forwarding methods and re-exports the symbols its public surface had.
  */
 import { randomUUID, createHash } from 'node:crypto'
-import { arenaView as projectArenaView } from './arena.ts'
+import { arenaView as projectArenaView, hasNotice } from './arena.ts'
 import { currentEvidenceIds } from './attempts.ts'
 import { excerpt } from './declared-checks.ts'
 import { executionElapsed } from './resource-time.ts'
 import { memberPhaseOf } from './projection.ts'
 import { emitGuardTerminal } from './refusals.ts'
+import { noticeFamily, noticeIdentity, subjectsOfTasks } from './notices.ts'
 import type { SwarmRuntime } from './runtime.ts'
-import type { Delivery, Evidence, Member, Mission, Post, Task, UsageBuckets, UsageSnapshotSource } from './types.ts'
+import type { Delivery, Member, Mission, Post, Task, UsageBuckets, UsageSnapshotSource } from './types.ts'
 
 const USAGE_KEYS = ['uncachedInputTokens', 'cacheReadTokens', 'cacheWriteTokens', 'outputTokens', 'reasoningTokens', 'requests'] as const
 
@@ -68,8 +69,9 @@ interface MissionFingerprintTask {
 /**
  * Stable digest `F(S)` of the owner-observable board (docs/no-silent-state-spec.md
  * §4). Every field is durable state; wall-clock fields are excluded by
- * construction, so an idle tick never changes the fingerprint and an unchanged
- * board cannot re-notify. Pure so a test can recompute it from the board.
+ * construction, so an idle tick never changes the fingerprint. It is an owner
+ * instrument and an audit field, never a notice's identity. Pure so a test can
+ * recompute it from the board.
  */
 export function missionFingerprint(board: MissionFingerprintBoard): string {
   const order = (a: { id: string }, b: { id: string }) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0)
@@ -128,11 +130,10 @@ export class RuntimeGates {
 
   constructor(private readonly rt: SwarmRuntime) {}
 
-  /** Current `F(S)`; the dedup key every owner notice and stall notice is emitted under. */
+  /** Current `F(S)`: the board digest the owner instruments and the audit fields of the stall events carry. */
   fingerprint(missionId: string): string {
     // Cache per store revision: F(S) is pure over durable state, so a tick that
-    // changed nothing cannot change it, and the scheduler's per-tick witness
-    // check stays cheap under a large board. Never trust the cache inside an open
+    // changed nothing cannot change it. Never trust the cache inside an open
     // transaction: the revision has not advanced yet while the board is mutating.
     if (this.rt.commitDepth > 0) return missionFingerprint(this.fingerprintBoard(missionId))
     const revision = this.rt.store.revision()
@@ -141,16 +142,6 @@ export class RuntimeGates {
     const fingerprint = missionFingerprint(this.fingerprintBoard(missionId))
     this.fingerprintCache.set(missionId, { revision, fingerprint })
     return fingerprint
-  }
-
-  fingerprintRecords(missionId: string): { mission: Mission; tasks: Task[]; members: Member[]; evidence: Evidence[]; deliveries: Delivery[] } {
-    return {
-      mission: this.rt.mission(missionId),
-      tasks: this.rt.store.list('tasks', missionId),
-      members: this.rt.store.list('members', missionId),
-      evidence: this.rt.store.list('evidence', missionId),
-      deliveries: this.rt.store.list('deliveries', missionId),
-    }
   }
 
   /**
@@ -162,10 +153,7 @@ export class RuntimeGates {
     const mission = this.rt.mission(missionId)
     const tasks = this.rt.store.list('tasks', missionId)
     const members = this.rt.store.list('members', missionId)
-    // Spec §2: dispatchable means a pending task at least one member whose
-    // status is idle or waiting can run. A working member is already busy.
-    const runnable = members.filter(member => member.status === 'idle' || member.status === 'waiting')
-    const ready = new Set(tasks.filter(task => task.status === 'pending' && runnable.some(member => this.rt.ready(task, member, tasks))).map(task => task.id))
+    const ready = new Set(this.rt.dispatchable(tasks, members).map(task => task.id))
     const unreviewed = new Set(tasks.filter(task => task.status === 'submitted' && !this.rt.reviewable(task, tasks)).map(task => task.id))
     return {
       status: mission.status,
@@ -174,9 +162,9 @@ export class RuntimeGates {
         ready: ready.has(task.id), unreviewed: unreviewed.has(task.id) })),
       members: members.map(member => ({ id: member.id, status: member.status })),
       // Owner-observable outbox backlog only: a delivery to a live member is the
-      // wake channel and is flushed in the same scheduling pass, and the owner
-      // notice being emitted is the witness for this state. Counting either
-      // would make every notice change the fingerprint it was keyed by.
+      // wake channel and is flushed in the same scheduling pass, and an owner
+      // notice is the ledger's record of a fact told about this board, not
+      // board state, so telling one never moves the digest.
       pendingDeliveries: this.rt.store.list('deliveries', missionId).filter(delivery => delivery.deliveredAt === undefined
         && delivery.to !== 'owner'
         && !members.some(member => member.id === delivery.to && member.status !== 'stopped')).length,
@@ -190,23 +178,21 @@ export class RuntimeGates {
 
   /**
    * Read-only owner instruments (docs/no-silent-state-spec.md §6): the current
-   * no-silent-state fingerprint `F(S)`, the last witness class and time, the
+   * board digest `F(S)`, the last witness (the newest ledger row) with its family and time, the
    * pending-dispatchable count, the notice-delivery ledger and durable
    * escalations. `full` adds the per-member arena rows and the ledger page; the
    * compact form keeps the owner's routine observe response small. A pure
    * projection of durable records; it writes nothing.
    */
   ownerInstruments(missionId: string, full: boolean): Record<string, unknown> {
-    const records = this.fingerprintRecords(missionId)
+    const records = { mission: this.rt.mission(missionId), tasks: this.rt.store.list('tasks', missionId), members: this.rt.store.list('members', missionId), deliveries: this.rt.store.list('deliveries', missionId) }
     const view = projectArenaView({ ...records, missionId, now: this.rt.now(), leaseMs: this.rt.config.leaseMs })
     const counts = { sent: view.notices.length, queued: view.notices.filter(entry => entry.state === 'queued').length, claimed: view.notices.filter(entry => entry.state === 'claimed').length }
     return {
-      // T3d: the owner-visible fingerprint is the no-silent-state F(S) the
-      // witness record and F19 use, never the arena ledger's dedup digest.
+      // T3d: the owner-visible fingerprint is the board digest F(S); no notice is keyed by it.
       fingerprint: this.fingerprint(missionId),
-      noticeDedupKey: this.rt.noticeKey(missionId),
       pendingDispatchable: this.fingerprintBoard(missionId).tasks.filter(task => task.ready).length,
-      ...(view.lastNotice === undefined ? {} : { lastWitness: view.lastNotice }),
+      ...(view.lastNotice === undefined ? {} : { lastWitness: { ...view.lastNotice, family: noticeFamily(records.deliveries.find(delivery => delivery.id === view.notices[0]!.deliveryId)!) } }),
       notices: counts,
       // L3: the receipts nobody has settled yet. A question with no answer is a
       // silent state by the same argument the board uses, so it is named here
@@ -330,8 +316,10 @@ export class RuntimeGates {
   }
 
   /**
-   * Emit at most one approaching-limit warning per dimension per threshold. The
-   * first signal is a durable owner review notice; thresholds default to 0.7/0.9.
+   * Emit at most one approaching-limit warning per allocation (scope, dimension
+   * and limit) and threshold: a durable owner review notice; thresholds default
+   * to 0.7/0.9. The deliveries ledger is the one record of a warning, so a
+   * crossing the owner holds at that threshold or a higher one is not told again.
    */
   warnBudget(mission: Mission): void {
     if (mission.status !== 'active' || mission.budgetPause) return
@@ -357,14 +345,16 @@ export class RuntimeGates {
       // A claim a rework archived is history of a rejected round, so it counts toward no round's findings.
       if (task.maxFindings !== undefined) dimensions.push({ dimension: 'maxFindings', used: currentEvidenceIds(task).length, limit: task.maxFindings, inFlight: 0, task })
     }
-    const warnings: Array<{ gate: string; threshold: number; key: string; content: string; subjects: string[]; data: Record<string, string | number> }> = []
+    const warnings: Array<{ key: string; content: string; subjects: string[]; data: Record<string, string | number> }> = []
     let missionProgress: string | undefined
+    let ledger: Delivery[] | undefined
     for (const item of dimensions) {
       if (!(item.limit > 0)) continue
       const projected = item.used + item.inFlight + (item.reviewSlots ?? 0)
       const crossed = thresholds.filter(threshold => projected / item.limit >= threshold).at(-1)
-      const gate = `${item.task?.id ?? 'mission'}:${item.dimension}:${item.limit}`
-      if (crossed === undefined || crossed <= (this.rt.mission(mission.id).budgetWarned?.[gate] ?? 0)) continue
+      const review = `budget-review:${mission.id}:${item.task?.id ?? 'mission'}:${item.dimension}:${item.limit}`, subjects = subjectsOfTasks(item.task === undefined ? [] : [item.task], mission)
+      if (crossed === undefined || thresholds.some(threshold => threshold >= crossed
+        && hasNotice(ledger ??= this.rt.store.list('deliveries', mission.id), noticeIdentity(mission.id, subjects, { noticeClass: 'budget', dedupKey: `${review}:${threshold}` }).identity))) continue
       // This is only the numeric floor that restores threshold headroom, never
       // an estimate of the resources needed to finish the mission.
       const recommendation = Math.max(item.limit + 1, Math.ceil(Number((projected / thresholds[0]!).toFixed(6))))
@@ -378,28 +368,21 @@ export class RuntimeGates {
         projectionBasis: item.dimension === 'maxTokens' ? 'settled-plus-current-model-requests' : item.reviewSlots !== undefined ? 'admitted-plus-unpaired-reviews' : 'settled-plus-in-flight',
         ...(item.reviewSlots === undefined ? {} : { pendingReviewSlots: item.reviewSlots, remainingAfterReviews: Math.max(0, item.limit - projected) }),
         ...(suggestedLimit === undefined ? {} : { suggestedLimit, suggestedLimitBasis: 'threshold-headroom-only' }), ...(item.task === undefined ? {} : { taskId: item.task.id }), progress }
-      warnings.push({ gate, threshold: crossed, key: `budget-review:${mission.id}:${gate}:${crossed}`, data,
-        subjects: this.rt.noticeSubjectsFor(mission.id, item.task === undefined ? {} : { taskId: item.task.id }),
+      warnings.push({ key: `${review}:${crossed}`, data, subjects,
         content: `${scope}: ${item.dimension} ${item.reviewSlots === undefined ? 'settled' : 'admitted'} ${item.used}/${item.limit}, remaining ${data.remaining}; ${item.reviewSlots === undefined ? `in-flight estimate ${item.inFlight}` : `${item.reviewSlots} known review slots still needed`}, projected ${projected}, threshold ${crossed}.${suggestedLimit === undefined ? '' : ` Threshold-headroom floor for ${item.dimension}: ${suggestedLimit}; decide the actual allowance from remaining work.`} Progress: ${progress}.${item.dimension === 'maxTokens' ? ' Token projection covers current requests only, not the cost of completing remaining tasks.' : ''}${item.dimension === 'maxFindings' ? ' Finding count is advisory.' : ''}` })
     }
     if (!warnings.length) return
     // One owner wake for this pass; each dimension keeps its durable event and
     // identity so a later threshold, changed limit or restart remains distinct.
     this.rt.commit(mission.id, () => {
-      const current = this.rt.mission(mission.id)
-      current.budgetWarned = { ...(current.budgetWarned ?? {}) }
-      for (const warning of warnings) {
-        current.budgetWarned[warning.gate] = warning.threshold
-        this.rt.store.event(mission.id, 'mission/budget-warning', 'runtime', warning.data)
-      }
-      this.rt.store.put('missions', current)
+      for (const warning of warnings) this.rt.store.event(mission.id, 'mission/budget-warning', 'runtime', warning.data)
       const keys = warnings.map(warning => warning.key)
       const dedupKey = warnings.length === 1 ? keys[0]! : `budget-review:${mission.id}:batch:${createHash('sha256').update(keys.join('\n')).digest('hex').slice(0, 20)}`
       const instructions = 'Review remaining work and use swarm_budget with reason: budget for the mission, or taskId and taskBudget for a task. Exhaustion preserves work; an extension never overrides a user pause or fixed deadline.'
       this.rt.notify(mission.id, `Resource review (${warnings.length} threshold${warnings.length === 1 ? '' : 's'}):\n${warnings.map(warning => `- ${warning.content}`).join('\n')}\n${instructions}`,
-        [...new Set(warnings.flatMap(warning => warning.subjects))], { noticeClass: 'budget', dedupe: true, dedupKey, trigger: 'mission/budget-warning', reason: keys.join('\n'),
+        [...new Set(warnings.flatMap(warning => warning.subjects))], { noticeClass: 'budget', dedupKey, trigger: 'mission/budget-warning', reason: keys.join('\n'),
           facts: [...warnings.map(warning => warning.content), instructions],
-          aggregatedIdentities: warnings.map(warning => ({ class: 'budget', dedupKey: warning.key, from: 'runtime', contentDigest: createHash('sha256').update(warning.content).digest('hex') })) })
+          aggregatedIdentities: warnings.map(warning => ({ ...noticeIdentity(mission.id, warning.subjects, { noticeClass: 'budget', dedupKey: warning.key }).identity, contentDigest: createHash('sha256').update(warning.content).digest('hex') })) })
     })
   }
 
@@ -431,7 +414,7 @@ export class RuntimeGates {
     // Co-firing guards: the budget guard fires with the attempt/lease chain (the
     // preserved attempts) and with the dispatch sweep (nothing new is admitted
     // while the pause holds).
-    emitGuardTerminal(this.rt, mission.id, 'budget', { detail: mission.reason! })
+    emitGuardTerminal(this.rt, mission.id, 'budget', { detail: mission.reason!, localKey: `budget-pause:${mission.budgetPause.id}` })
     this.beginBudgetStop(mission.id, mission.budgetPause.id)
   }
 

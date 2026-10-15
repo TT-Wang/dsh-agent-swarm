@@ -170,7 +170,7 @@ test('R11-03: a second implementation branch without an integration task warns a
   const notice = await eventually(() => ownerNotices(f).find(item => /Coding missions require/.test(item.content)), 'admitting a second branch must warn immediately')
   assert.match(notice.content, /Coding missions require an independently accepted integration artifact, or exactly one independently accepted implementation artifact when the plan has no integration task/)
   assert.match(notice.content, /integration task depending on every branch/)
-  assert.equal(f.runtime.store.get('missions', f.mission.id).witness.fingerprint, f.runtime.fingerprint(f.mission.id), 'the diagnostic is a W2 witness for the current F(S)')
+  assert.equal(f.runtime.ownerDeliveryRelevant(f.runtime.mission(f.mission.id), notice), true, 'the diagnostic is an open row of its own family: the witness for this board')
   await new Promise(resolve => setTimeout(resolve, 80))
   assert.equal(ownerNotices(f).filter(item => /Coding missions require/.test(item.content)).length, 1, 'an unchanged board does not repeat the admission diagnostic')
 })

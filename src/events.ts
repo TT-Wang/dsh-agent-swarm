@@ -138,7 +138,7 @@ export const EVENTS = {
   // Round 11 arena protocols: the typed owner escalation and the bounded
   // per-member proposal allowance refusal (both recorded before the owner
   // notice that carries the decision).
-  'escalation/raised': { description: 'A member raised a typed durable owner escalation with its mission-state fingerprint', panel: { en: 'A worker escalated to the owner', zh: '成员已向主对话发起升级' } },
+  'escalation/raised': { description: 'A member raised a typed durable owner escalation', panel: { en: 'A worker escalated to the owner', zh: '成员已向主对话发起升级' } },
   'task/proposal-refused': { description: 'A worker proposal was refused for the per-member allowance or a mission budget/ceiling reason; the owner was notified', panel: { en: 'Work proposal refused', zh: '工作提议被拒绝' } },
   // Round 11 host caps: provider-outage routing, store snapshot, per-task
   // restart and the measured check envelope (D2/D6/D8).

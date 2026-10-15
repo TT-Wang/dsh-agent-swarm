@@ -146,13 +146,16 @@ export async function toolSchemaIndex(budget) {
   return { definitions, toolNames, propertyNames, ownProperties, names: [...SWARM_TOOLS] }
 }
 
-/** The owner's registered tools on a fixture's real runtime (`setup`'s shape): every call is checked against its published schema. */
-export async function ownerTools(f) {
+/** The registered tools as one session calls them on a fixture's real runtime (`setup`'s shape): every call is checked against its published schema. */
+export async function sessionTools(f, sessionId) {
   const { registerTools } = await import('../lib/tools.js')
   const definitions = new Map()
   registerTools({ tools: { register: definition => definitions.set(definition.name, definition) } }, f.runtime, f.mission.budget)
-  return async (name, args) => (await definitions.get(name).execute({ missionId: f.mission.id, ...args }, { signal: new AbortController().signal, agent: { id: f.owner.sessionId } })).result
+  return async (name, args) => (await definitions.get(name).execute({ missionId: f.mission.id, ...args }, { signal: new AbortController().signal, agent: { id: sessionId } })).result
 }
+
+/** The owner's registered tools. */
+export const ownerTools = f => sessionTools(f, f.owner.sessionId)
 
 /** The `swarm_*(...)` calls a text names, in order, each with the parameter names it gives (a given value is dropped). */
 const namedCallParams = text => [...text.matchAll(/(swarm_\w+)\(([^()]*)\)/g)].map(([, tool, args]) => [tool, args.replace(/"[^"]*"/g, '').match(/[A-Za-z]\w*/g) ?? []])

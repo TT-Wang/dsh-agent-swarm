@@ -32,7 +32,7 @@
  *  I3 the work the wedge blocked is dispatched by a later tick once the wedged
  *     await reaches its own bound (the mission queue owns that physical
  *     operation until it settles), without re-arming the stall;
- *  I4 fingerprint dedup keeps one escalation per unchanged board.
+ *  I4 fact dedup keeps one escalation per naming fact (the ledger row the event names).
  * Two variants cover a naming that cannot land on its first tick:
  *  I5 the naming tick's commit fails once (a real SQLite writer lock held by a
  *     second connection for exactly that tick): a later tick names the wedge
@@ -92,7 +92,7 @@ async function namingCommitFailsOnce() {
   // fixture gap: makeRuntime takes a node:test context and a scenario has none, so its cleanup is collected here and run in finally.
   let cleanup
   const { dir, config: { statePath }, runtime } = await makeRuntime({ after: fn => { cleanup = fn } }, { workers,
-    config: { stallPassTimeoutMs: 60, stallPasses: 30, workerStartTimeoutMs: 1_500 }, storeOptions: { busyTimeoutMs: 5, writerAttempts: 1, writerDelayMs: 0 } })
+    config: { stallPassTimeoutMs: 60, workerStartTimeoutMs: 1_500 }, storeOptions: { busyTimeoutMs: 5, writerAttempts: 1, writerDelayMs: 0 } })
   const tickFailures = []
   const write = process.stderr.write.bind(process.stderr)
   process.stderr.write = (chunk, ...rest) => { if (/tick failed/.test(String(chunk))) { tickFailures.push(String(chunk)); return true } return write(chunk, ...rest) }
@@ -136,7 +136,7 @@ async function namingCommitFailsOnce() {
 async function pauseAndResumeAcrossTheBound() {
   const workers = new SlowPrepareWorkers(1_500)
   workers.autoIdle = true
-  const f = await setup({ workers, config: { tickMs: 10, stallPassTimeoutMs: 60, stallPasses: 30, workerStartTimeoutMs: 5_000 } })
+  const f = await setup({ workers, config: { tickMs: 10, stallPassTimeoutMs: 60, workerStartTimeoutMs: 5_000 } })
   try {
     const task = f.propose()
     await eventually(() => workers.enteredAt !== undefined ? true : undefined, 'I6: the pass body must enter its long preparation', 4_000)
@@ -165,7 +165,7 @@ await runScenario({
     // The wedged await's own bound: far past the pass bound, so I1 and I2 are
     // observed while the pass body is still wedged.
     const startBoundMs = 1_500
-    const f = await setup({ workers, config: { tickMs: 10, stallPassTimeoutMs: boundMs, stallPasses: 30, workerStartTimeoutMs: startBoundMs } })
+    const f = await setup({ workers, config: { tickMs: 10, stallPassTimeoutMs: boundMs, workerStartTimeoutMs: startBoundMs } })
     let evidence
     try {
       const task = f.propose()
@@ -195,15 +195,15 @@ await runScenario({
       assert.ok(typeof event.data.runId === 'string' && event.data.runId.length > 0, 'I1: the pass execution identity is named')
       assert.ok(Number.isSafeInteger(event.data.revisionBefore) && Number.isSafeInteger(event.data.revisionAtStall), 'I1: the revision window is named')
       assert.ok(Array.isArray(event.data.unschedulable), 'I1: what was unschedulable is named')
-      assert.equal(event.data.ownerNotified, true, 'I1: the escalation is the notice witness for this state')
       assert.equal(wedgeEvents(f.runtime, f.mission.id).length, 1,
-        'I4: fingerprint dedup keeps exactly one wedge escalation per unchanged board')
+        'I4: fact dedup keeps exactly one wedge escalation per naming fact')
 
       // I2: the owner notice is durable and delivered without the wedged queue.
       const content = new RegExp(`did not return within ${boundMs}ms`)
       const notice = f.runtime.store.list('deliveries', f.mission.id)
         .find(delivery => delivery.to === 'owner' && content.test(delivery.content))
       assert.ok(notice !== undefined, 'I2: the owner notice is recorded durably')
+      assert.equal(event.data.noticeKey, notice.notice.dedupKey, 'I1: the escalation names the notice row that is the witness for this state')
       const delivered = await eventually(() => f.workers.deliveries.some(item => item.memberId === 'owner' && item.content === notice.content),
         'I2: the owner notice is delivered even though the mission queue is wedged', 4_000)
       assert.equal(delivered, true)
@@ -225,7 +225,7 @@ await runScenario({
 
       evidence = {
         passId: event.data.passId, boundMs, wedgedPassStalled: true, stateUnchanged: true,
-        ownerNotified: delivered, deliveredWhileWedged: true, dispatchedTask: task.id, dispatchedAfterSettle: true, escalations: 1,
+        namingRow: event.data.noticeKey === notice.notice.dedupKey, noticeDelivered: delivered, deliveredWhileWedged: true, dispatchedTask: task.id, dispatchedAfterSettle: true, escalations: 1,
       }
     } finally { await f.cleanup() }
     return { ...evidence, namingCommitFailsOnce: await namingCommitFailsOnce(), pauseAndResumeAcrossTheBound: await pauseAndResumeAcrossTheBound() }

@@ -591,11 +591,13 @@ export class SwarmStore {
    * Append an immutable coordination event inside the same state transaction.
    * `type` is the registered kind set, so an unregistered kind fails to compile
    * at the emit site instead of reaching the durable log as an undescribed row.
+   * Returns the event's sequence, its durable identity.
    */
-  event(missionId: string, type: EventKind, actor: string, data: unknown): void {
+  event(missionId: string, type: EventKind, actor: string, data: unknown): number {
     const statement = this.db.prepare('INSERT INTO events(mission_id,type,actor,data,created_at) VALUES(?,?,?,?,?)')
-    withWriterRetry(() => statement.run(missionId, type, actor, JSON.stringify(data), this.now()), { attempts: this.writerAttempts, delayMs: this.writerDelayMs })
+    const { lastInsertRowid } = withWriterRetry(() => statement.run(missionId, type, actor, JSON.stringify(data), this.now()), { attempts: this.writerAttempts, delayMs: this.writerDelayMs })
     this.transactionScopes?.add(missionId)
+    return Number(lastInsertRowid)
   }
   /**
    * Upsert one admission decision. A repeated refusal for the same candidate and

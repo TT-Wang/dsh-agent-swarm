@@ -9,8 +9,6 @@
 import { admissionRowId, decideAdmission, defaultLimitRules, scopeKeysOverlap, type AdmissionCandidate, type AdmissionDecision, type AdmissionRecord, type AdmissionUsage, type LimitRule } from './scheduler.ts'
 import { WriterBusyError } from './store.ts'
 import { PolicyError } from './policy-error.ts'
-import { hasNotice } from './arena.ts'
-import { missionSubject } from './notices.ts'
 import type { SwarmRuntime } from './runtime.ts'
 import type { Budget, Member, Mission, Task } from './types.ts'
 
@@ -60,12 +58,12 @@ type WriterBusyRecovery = { at: number; attempts: number; detail: string } & (
 )
 const writerRecoveries = new WeakMap<SwarmRuntime, Map<string, WriterBusyRecovery & { count: number }>>()
 
-/** Coalesce one failed origin, retaining distinct admissions and guard failures. */
+/** Coalesce one failed origin: an admission by its refusal row, a guard terminal by the request (`guardTerminalKey`) it could not write. */
 export function queueWriterBusy(rt: SwarmRuntime, recovery: WriterBusyRecovery): void {
   const pending = writerRecoveries.get(rt) ?? new Map<string, WriterBusyRecovery & { count: number }>()
   writerRecoveries.set(rt, pending)
   const key = 'candidate' in recovery ? `admission:${recovery.candidate.missionId}:${admissionRowId(recovery.candidate, 'writer_busy')}`
-    : `guard:${JSON.stringify([recovery.missionId, recovery.chain, recovery.context.taskId, recovery.context.memberId])}`
+    : `guard:${recovery.missionId}:${guardTerminalKey(recovery.chain, recovery.context)}`
   const previous = pending.get(key)
   pending.set(key, { ...recovery, at: previous?.at ?? recovery.at, count: (previous?.count ?? 0) + 1 })
 }
@@ -187,12 +185,12 @@ export class RefusalRegistry {
             record.count = busy.count; record.firstAt = busy.at
             this.upsertAdmission(record)
           } else {
-            // This was a failed escalation write, never an admission decision.
-            // Record the historical failure; normal guards re-evaluate today's state.
+            // This was a failed escalation write, never an admission decision. No row
+            // was written, so its cause and chain name it; the chain re-derives the request.
             this.rt.store.event(missionId, 'mission/stalled', 'runtime', {
               cause: 'guard-terminal-write-failed', chain: busy.chain,
               taskId: busy.context.taskId ?? null, memberId: busy.context.memberId ?? null,
-              detail: busy.detail, attempts: busy.attempts, count: busy.count, firstAt: busy.at, ownerNotified: false,
+              detail: busy.detail, attempts: busy.attempts, count: busy.count, firstAt: busy.at,
             })
           }
         })
@@ -205,32 +203,19 @@ export class RefusalRegistry {
   }
 
   /**
-   * Refuse a worker proposal for an allowance, budget or ceiling reason and
-   * make it an owner decision: the refusal is recorded durably, an owner notice
-   * names the member, the limit and the reason, and the same refusal is thrown
-   * so the worker's tool result carries it. Never called for the owner, who
-   * sees the error directly and is the actor who can raise the ceiling.
+   * Refuse a proposal at a mission admission limit, whoever proposed it. The
+   * limit is one coded owner decision request, the task-ceiling chain's
+   * terminal keyed by the limit it met: a refusal under a limit the owner holds
+   * never wakes it again, and a raised limit that refuses is a new request. A
+   * worker's refusal is also recorded and thrown, so its tool result carries
+   * it; the owner, the actor who can raise the limit, is refused by its caller.
    */
-  refuseProposal(mission: Mission, proposer: string, title: string, reason: string, limit: number): never {
-    const message = `Worker ${proposer} cannot propose ${JSON.stringify(title)}: ${reason} (limit ${limit}). The owner can raise the mission ceiling with swarm_budget or admit the work with swarm_propose.`
-    // Round 14: the budget chain's terminal element is the *owner decision*, not
-    // the worker's tool error. The worker keeps the round-13 refusal text; the
-    // owner notice becomes the coded decision request naming the executable
-    // exits. The notice keeps the round-11 ledger invariant — a budget-class
-    // notice is deduplicated by the mission-state fingerprint, not by a custom
-    // key — so one unchanged board never re-wakes the owner.
-    const terminal = guardTerminal('budget', { memberId: proposer, detail: `the proposal ${JSON.stringify(title)} was refused: ${reason} (limit ${limit})` })
-    this.rt.commit(mission.id, () => {
-      this.rt.store.event(mission.id, 'task/proposal-refused', proposer, { memberId: proposer, title, reason, limit })
-      // R15-A1: a refused proposal has no task to name yet, so the mission root is
-      // the exact lineage root of the decision. Guard pair: budget refusal x
-      // reason-less writer-busy (the `WriterBusyError` catch below) — the subject is
-      // computed before the write, so a busy writer never turns it into silence.
-      this.rt.notify(mission.id, terminal.message, [missionSubject(mission)], { from: proposer, noticeClass: 'budget', dedupe: true })
-    })
-    // The owner notice must not wait for the next scheduler tick; flush it now.
-    this.rt.kick(mission.id)
-    throw new Error(message)
+  refuseProposal(mission: Mission, proposer: string | undefined, title: string, budget: 'task' | 'experiment', admitted: number, limit: number): void {
+    const reason = `mission ${budget} budget exhausted (${admitted}/${limit} ${budget}s admitted)`
+    emitGuardTerminal(this.rt, mission.id, 'task_ceiling', { detail: reason, localKey: `${budget}-budget:${limit}` })
+    if (proposer === undefined) return
+    this.rt.commit(mission.id, () => this.rt.store.event(mission.id, 'task/proposal-refused', proposer, { memberId: proposer, title, reason, limit }))
+    throw new Error(`Worker ${proposer} cannot propose ${JSON.stringify(title)}: ${reason} (limit ${limit}). The owner can raise the mission ceiling with swarm_budget or admit the work with swarm_propose.`)
   }
 }
 
@@ -248,8 +233,8 @@ export class RefusalRegistry {
  * durable decision request naming the executable exits. It has no conditions of
  * its own — it cannot be skipped, deduplicated away into silence, or left
  * waiting for a later pass — and the only thing that may suppress a repeat is
- * the fact that the *same* decision request is already durable for the same
- * board fingerprint.
+ * the fact that the *same* decision request, its chain and the fact that opened
+ * it, is already on the deliveries ledger.
  *
  * `guardTerminal` is the single builder of those requests, so the dispatch path
  * that emits them, the test-side board model in `tests/guard-model.mjs` and the
@@ -283,15 +268,22 @@ export interface GuardTerminal {
   exits: DecisionExit[]
 }
 
-/** Free text a caller knows at emission time; never a condition on the escalation. */
-export interface GuardTerminalContext {
+/** What a caller knows at emission time; never a condition on the escalation. */
+interface GuardTerminalScope {
   taskId?: string
   memberId?: string
+  /** The subjects the request names, when its caller has computed them (`noticeSubjectsFor`). */
+  subjects?: readonly string[]
   detail?: string
-  /** A receipt or local fault identity must not churn with unrelated board work. */
-  questionId?: string
-  localKey?: string
 }
+/**
+ * The scope and the durable fact that opened the terminal: the question it
+ * leaves unanswered, or the opener its call site declares (`localKey`: an
+ * attempt, a pause, a limit value, a task at its epoch, a violation). The
+ * request's identity is its chain and that opener, never the board digest, so
+ * distinct failures of one chain are distinct requests and a repeat is none.
+ */
+export type GuardTerminalContext = GuardTerminalScope & ({ questionId: string; localKey?: never } | { localKey: string; questionId?: never })
 
 const GUARD_TERMINAL_CODES: Record<GuardChainId, string> = {
   budget: 'budget_terminal',
@@ -304,7 +296,7 @@ const GUARD_TERMINAL_CODES: Record<GuardChainId, string> = {
   owner_reply: 'owner_reply_missing',
 }
 
-const described = (context: GuardTerminalContext, fallback: string): string => context.detail ?? fallback
+const described = (context: GuardTerminalScope, fallback: string): string => context.detail ?? fallback
 
 /**
  * Build the unconditional terminal escalation of one guard chain. Pure and
@@ -312,7 +304,7 @@ const described = (context: GuardTerminalContext, fallback: string): string => c
  * element of the chain can prevent it from existing. The dispatch path wraps
  * the result in a durable event and owner decision notice.
  */
-export function guardTerminal(chain: GuardChainId, context: GuardTerminalContext = {}): GuardTerminal {
+export function guardTerminal(chain: GuardChainId, context: GuardTerminalScope = {}): GuardTerminal {
   const task = context.taskId ?? 'the held work'
   const member = context.memberId ?? 'the member'
   const messages: Record<GuardChainId, string> = {
@@ -359,40 +351,26 @@ export function guardTerminal(chain: GuardChainId, context: GuardTerminalContext
   return { chain, code: GUARD_TERMINAL_CODES[chain], message: messages[chain], exits: exits[chain] }
 }
 
-/** The durable dedup key of one terminal decision request: one per chain and board state, `question:<id>` or `localKey`. */
-export function guardTerminalKey(chain: GuardChainId, fingerprint: string): string {
-  return `guard-terminal:${chain}:${GUARD_TERMINAL_CODES[chain]}:${fingerprint}`
-}
-
-/** The dedup `emitGuardTerminal` applies: the owner already holds the decision request `key` names. */
-export function guardTerminalHeld(rt: SwarmRuntime, missionId: string, key: string): boolean {
-  return hasNotice(rt.store.list('deliveries', missionId), { class: 'decision', dedupKey: key, from: 'runtime' })
+/** The identity of one terminal decision request on the deliveries ledger: its chain and the fact that opened it. */
+export function guardTerminalKey(chain: GuardChainId, context: GuardTerminalContext): string {
+  return `guard-terminal:${chain}:${GUARD_TERMINAL_CODES[chain]}:${context.localKey ?? `question:${context.questionId}`}`
 }
 
 /**
- * Emit one guard-chain terminal: the durable decision request and the owner
- * notice that make it unconditional.
+ * Emit one guard-chain terminal: the owner's durable decision request and the
+ * stall event that names its row. Any module ends a guard chain here; it names
+ * the chain and passes the scope it already has with the fact that opened it:
  *
- * This is the *mechanical opt-in* for every call site that still ends a guard
- * chain in prose or in silence, including the ones outside this branch's scope
- * (`src/attempts.ts`, `src/workspace-admission.ts`, `src/notices.ts`,
- * `src/runtime.ts`). Wiring a site is a two-line change:
+ *     emitGuardTerminal(this.rt, missionId, '<chain>', { taskId, memberId, detail, localKey: '<opener>' })
  *
- *     const terminal = guardTerminal('<chain>', { taskId, memberId, detail })
- *     emitGuardTerminal(this.rt, missionId, '<chain>', { taskId, memberId, detail })
- *
- * The helper takes the runtime as its first argument (not a method on one
- * class), so a caller in any module can reach it without importing the
- * scheduling seam or the runtime class; `Scheduling.escalateGuardTerminal`
- * delegates here and keeps the dispatch path's call shape unchanged.
- *
- * Behaviour, in one sentence: the terminal is always built, and a durable row is
- * written unless the *same* decision request for the *same* board fingerprint is
- * already on the delivery ledger. Nothing else can suppress it; a writer-busy
- * transaction is recorded on the runtime's writer-busy flag and the state is
- * re-derived by the next pass.
+ * The terminal is always built, and its request is told (`Notices.tell`) unless
+ * the same request is already on the deliveries ledger. Nothing else suppresses
+ * it: a failure of the chain under another opener is another request whatever
+ * the board looks like, and a busy writer is recorded (`queueWriterBusy`), never
+ * silent. It names its caller's subjects, else the task it was asked about,
+ * else the member's unfinished work, else the mission root (`noticeSubjectsFor`).
  */
-export function emitGuardTerminal(rt: SwarmRuntime, missionId: string, chain: GuardChainId, context: GuardTerminalContext = {}): GuardTerminal | undefined {
+export function emitGuardTerminal(rt: SwarmRuntime, missionId: string, chain: GuardChainId, context: GuardTerminalContext): GuardTerminal | undefined {
   const mission = rt.store.get('missions', missionId)
   // S4r-D5: only a terminal mission (completed/stopped) ends the chain's duty to
   // speak. A mission that left `active` without reaching a terminal status —
@@ -400,38 +378,23 @@ export function emitGuardTerminal(rt: SwarmRuntime, missionId: string, chain: Gu
   // the executable exit most — still emits the terminal.
   if (mission === undefined || rt.isMissionTerminal(mission)) return undefined
   const terminal = guardTerminal(chain, context)
-  const fingerprint = context.questionId !== undefined ? `question:${context.questionId}` : context.localKey ?? rt.fingerprint(missionId)
-  const key = guardTerminalKey(chain, fingerprint)
-  if (guardTerminalHeld(rt, missionId, key)) return terminal
+  const key = guardTerminalKey(chain, context)
+  const subjects = context.subjects ?? rt.noticeSubjectsFor(missionId, { taskId: context.taskId, memberId: context.memberId })
   try {
-    rt.commit(missionId, () => {
-      // The board-stall event type is reused with `cause: 'guard-terminal'`, so
-      // the durable log names the chain and the code without inventing an
-      // unregistered event type (the vocabulary is a separate owner surface).
-      rt.store.event(missionId, 'mission/stalled', 'runtime', {
-        cause: 'guard-terminal', chain: terminal.chain, code: terminal.code,
-        taskId: context.taskId ?? null, memberId: context.memberId ?? null, detail: context.detail ?? null,
-        fingerprint, ownerNotified: true,
-      })
-      // R15-A1: the guard chain names the subject it terminated for: the task it
-      // was asked about, else the member's own unfinished work, else the mission
-      // root. Guard pair: guard-terminal x writer-busy, x the board-level witness
-      // (both are recorded for the same fingerprint; the subject is what tells the
-      // two apart without reparsing prose).
-      rt.notify(missionId, terminal.message, rt.noticeSubjectsFor(missionId, { taskId: context.taskId, memberId: context.memberId }), { dedupe: true, dedupKey: key, questionId: context.questionId })
-    })
+    // The board-stall event type is reused with `cause: 'guard-terminal'`, so the
+    // durable log names the chain and the code without inventing an unregistered
+    // event type (the vocabulary is a separate owner surface). It exists only
+    // with the row its `noticeKey` names. The notice path must not share the fate
+    // of the pass that could not report it: the queue-external pump delivers it.
+    if (rt.tell(missionId, terminal.message, [...new Set(subjects)], { dedupKey: key, reason: context.detail, questionId: context.questionId }, () => rt.store.event(missionId, 'mission/stalled', 'runtime', {
+      cause: 'guard-terminal', chain, code: terminal.code, taskId: context.taskId ?? null, memberId: context.memberId ?? null, detail: context.detail ?? null, noticeKey: key,
+    }))) rt.pumpOutbox()
   } catch (error) {
-    // A busy writer must not turn an escalation into an unhandled rejection.
-    // The state is re-derived on the next pass, and the board-level witness path
-    // still speaks for a stalled board, so no silence follows.
-    if (error instanceof WriterBusyError) {
-      queueWriterBusy(rt, { at: rt.now(), attempts: error.attempts, missionId, chain, context, detail: error.message })
-      return terminal
-    }
-    throw error
+    // The best-effort contract of a busy writer: an escalation it refused is
+    // recorded once the writer is free (`recordWriterBusyRecovery`), never an
+    // unhandled rejection, and the chain re-derives its state on the next pass.
+    if (!(error instanceof WriterBusyError)) throw error
+    queueWriterBusy(rt, { at: rt.now(), attempts: error.attempts, missionId, chain, context, detail: error.message })
   }
-  // The notice path must not share the fate of the pass that could not report
-  // it: the queue-external pump delivers it.
-  rt.pumpOutbox()
   return terminal
 }

@@ -11,7 +11,7 @@ import assert from 'node:assert/strict'
 import { setup, acceptThroughReview } from './faults/harness.mjs'
 
 test('S6: the critical path is the longest dependent chain, and adding a worker never shortens it', async () => {
-  const f = await setup({ config: { tickMs: 10, stallPassTimeoutMs: 60_000, stallPasses: 50 } })
+  const f = await setup({ config: { tickMs: 10, stallPassTimeoutMs: 60_000 } })
   try {
     // A -> B -> C is the longest chain; A -> D is the short branch.
     const a = f.propose({ title: 'A' })
@@ -52,7 +52,7 @@ test('S6: the critical path is the longest dependent chain, and adding a worker 
 })
 
 test('S6: the observe payload and the snapshot carry the critical path beside the mission spend', async () => {
-  const f = await setup({ config: { tickMs: 10, stallPassTimeoutMs: 60_000, stallPasses: 50 } })
+  const f = await setup({ config: { tickMs: 10, stallPassTimeoutMs: 60_000 } })
   try {
     const first = f.propose({ title: 'First' })
     const second = f.propose({ title: 'Second', dependencies: [first.id] })
@@ -70,7 +70,7 @@ test('S6: the observe payload and the snapshot carry the critical path beside th
 })
 
 test('S6: a malformed graph cannot throw the accounting path', async () => {
-  const f = await setup({ config: { tickMs: 10, stallPassTimeoutMs: 60_000, stallPasses: 50 } })
+  const f = await setup({ config: { tickMs: 10, stallPassTimeoutMs: 60_000 } })
   try {
     const a = f.propose({ title: 'A' })
     const b = f.propose({ title: 'B', dependencies: [a.id] })

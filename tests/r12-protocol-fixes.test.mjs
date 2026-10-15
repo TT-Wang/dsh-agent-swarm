@@ -3,12 +3,14 @@ import assert from 'node:assert/strict'
 import { join } from 'node:path'
 import { OwnerReplyGuard } from '../lib/owner-reply.js'
 import { RoleScoper } from '../lib/roles.js'
-import { RefusalRegistry, emitGuardTerminal } from '../lib/refusals.js'
+import { RefusalRegistry, emitGuardTerminal, guardTerminalKey } from '../lib/refusals.js'
 import { WriterBusyError } from '../lib/store.js'
-import { pendingReadiness } from '../lib/arena.js'
 import { Attempts, pendingStopOwner } from '../lib/attempts.js'
 import { wakePrecision } from './instruments.mjs'
-import { FakeWorkers, makeRuntime, makeRuntimeStub } from './faults/harness.mjs'
+import { FakeClock, FakeWorkers, MISSION_ACCEPTANCE, makeRuntime, makeRuntimeStub, setup } from './faults/harness.mjs'
+
+/** A stub runtime's `tell`: the fact's own transaction, then the record that exists only with it (the ledger is not modelled). */
+function tell(missionId, _content, _subjects, _options, then) { return this.commit(missionId, () => { then?.(); return true }) }
 
 function guardFixture() {
   const mission = { id: 'm', ownerSessionId: 'owner', status: 'active' }
@@ -85,7 +87,7 @@ function refusalFixture() {
       get: (table, id) => table === 'missions' ? { id, status: 'active' } : admissions.get(id), list: () => [],
       recordAdmission: row => admissions.set(row.id, structuredClone(row)),
       event: (missionId, type, actor, data) => events.push({ missionId, type, actor, data }),
-    }, fingerprint: () => 'stable', isMissionTerminal: () => false, noticeSubjectsFor: () => [], notify() {}, pumpOutbox() {},
+    }, fingerprint: () => 'stable', isMissionTerminal: () => false, noticeSubjectsFor: () => [], notify() {}, tell, pumpOutbox() {},
   })
   return { rt, registry: new RefusalRegistry(rt), admissions, events, release: () => { busy = false } }
 }
@@ -109,7 +111,7 @@ test('R12: writer recovery retains distinct refusals and flushes them only under
 
 test('R12: failed guard writes preserve their origin without manufacturing an admission', () => {
   const f = refusalFixture()
-  emitGuardTerminal(f.rt, 'mission', 'attempt_lease', { taskId: 'task', memberId: 'member', detail: 'lease stop failed' })
+  emitGuardTerminal(f.rt, 'mission', 'attempt_lease', { taskId: 'task', memberId: 'member', detail: 'lease stop failed', localKey: 'stop:task' })
   f.release()
   f.registry.recordWriterBusyRecovery()
   assert.equal(f.admissions.size, 0)
@@ -117,18 +119,68 @@ test('R12: failed guard writes preserve their origin without manufacturing an ad
   assert.equal(f.events[0].data.cause, 'guard-terminal-write-failed')
   assert.equal(f.events[0].data.chain, 'attempt_lease')
   assert.equal(f.events[0].data.taskId, 'task')
-  assert.equal(f.events[0].data.ownerNotified, false)
+  assert.equal(Object.hasOwn(f.events[0].data, 'noticeKey'), false, 'no row was written, so the record names none: its cause and chain name it')
+  assert.equal(Object.hasOwn(f.events[0].data, 'ownerNotified'), false, 'the cause states the condition: no field restates what the ledger did')
 })
 
-test('R12: pending readiness requires a submitted source and an idle independent reviewer', () => {
-  const source = { id: 'source', status: 'pending', assigneeId: 'author', priorOwnerIds: ['old-author'], dependencies: [] }
-  const review = { id: 'review', status: 'pending', reviewOf: 'source', dependencies: [] }
-  const members = [{ id: 'author', status: 'idle' }, { id: 'old-author', status: 'waiting' }, { id: 'reviewer', status: 'working' }]
-  assert.equal(pendingReadiness([source, review], members).ready, 1, 'only the source can run')
-  source.status = 'submitted'
-  assert.equal(pendingReadiness([source, review], members).ready, 0)
-  members[2].status = 'idle'
-  assert.equal(pendingReadiness([source, review], members).ready, 1)
+test('a busy writer records each guard request it could not write: distinct openers of one chain are distinct records, and a repeat of one is counted on its record', () => {
+  const f = refusalFixture()
+  // One task and member, two facts that end the attempt chain; one ceiling chain under two limits.
+  const failures = [
+    ['attempt_lease', { taskId: 'task', memberId: 'member', detail: 'idle close-out abandoned attempt_1', localKey: 'closeout-abandoned:attempt_1' }],
+    ['attempt_lease', { taskId: 'task', memberId: 'member', detail: 'idle close-out reached the recovery limit', localKey: 'recovery-exhausted:task@2' }],
+    ['task_ceiling', { detail: 'mission task budget exhausted', localKey: 'task-budget:1' }],
+    ['task_ceiling', { detail: 'mission experiment budget exhausted', localKey: 'experiment-budget:0' }],
+    ['attempt_lease', { taskId: 'task', memberId: 'member', detail: 'idle close-out abandoned attempt_1', localKey: 'closeout-abandoned:attempt_1' }],
+  ]
+  for (const [chain, context] of failures) emitGuardTerminal(f.rt, 'mission', chain, context)
+  f.release()
+  f.registry.recordWriterBusyRecovery()
+  assert.deepEqual(f.events.map(event => [event.data.cause, event.data.chain, event.data.taskId, event.data.count]), [
+    ['guard-terminal-write-failed', 'attempt_lease', 'task', 2],
+    ['guard-terminal-write-failed', 'attempt_lease', 'task', 1],
+    ['guard-terminal-write-failed', 'task_ceiling', null, 1],
+    ['guard-terminal-write-failed', 'task_ceiling', null, 1],
+  ])
+  f.registry.recordWriterBusyRecovery()
+  assert.equal(f.events.length, 4, 'a drained record is not written twice')
+})
+
+test('a guard request a busy writer could not write is named by its cause and chain: once the chain fires again and writes it, exactly one stall event carries that row\'s key', async t => {
+  const f = await setup({ clock: new FakeClock() })
+  t.after(f.cleanup)
+  const context = { detail: 'mission task budget exhausted (1/1 tasks admitted)', localKey: 'task-budget:1' }
+  f.runtime.commit = () => { throw new WriterBusyError('database is locked', 3) }
+  emitGuardTerminal(f.runtime, f.mission.id, 'task_ceiling', context)
+  delete f.runtime.commit
+  f.clock.advance(f.runtime.config.tickMs)
+  await f.runtime.tick()
+  const stalls = () => f.runtime.store.events(f.mission.id, 500).filter(event => event.type === 'mission/stalled').map(event => event.data)
+  assert.deepEqual(stalls().map(data => [data.cause, data.chain]), [['guard-terminal-write-failed', 'task_ceiling']], 'the writer\'s refusal is recorded')
+  emitGuardTerminal(f.runtime, f.mission.id, 'task_ceiling', context)
+  const requests = f.runtime.store.list('deliveries', f.mission.id).filter(delivery => delivery.notice?.dedupKey.startsWith('guard-terminal:task_ceiling:'))
+  assert.equal(requests.length, 1, 'the request is written once the writer is free')
+  assert.deepEqual(stalls().filter(data => data.noticeKey === requests[0].notice.dedupKey).map(data => data.cause), ['guard-terminal'], 'one stall event names that row: the one written with it, never the record of the write that failed')
+})
+
+test('R12: a pending review is dispatchable only once its source is submitted, to an idle live member independent of it', async t => {
+  const f = await setup({ clock: new FakeClock() })
+  t.after(f.cleanup)
+  const busy = f.propose({ title: 'The reviewer\'s own work', assigneeId: f.reviewer.id })
+  const working = await f.runtime.claim(f.actor(f.reviewer), f.mission.id, busy.id)
+  const source = f.propose({ title: 'Source' })
+  const review = f.runtime.propose(f.owner, f.mission.id, { outputs: [], workstreamId: f.stream.id, title: 'Review', objective: 'Independent review',
+    kind: 'verification', reviewOf: source.id, scope: ['**'], acceptance: MISSION_ACCEPTANCE })
+  // The owner instruments' dispatchable set: the dispatcher's eligibility over idle or waiting members.
+  const dispatchable = () => f.runtime.fingerprintBoard(f.mission.id).tasks.filter(task => task.ready).map(task => task.id)
+  assert.deepEqual(dispatchable(), [source.id], 'only the source can run')
+  const claimed = await f.runtime.claim(f.actor(f.author), f.mission.id, source.id)
+  await f.runtime.submit(f.actor(f.author), f.mission.id, { taskId: source.id, attemptId: claimed.attempt.id, output: 'candidate' })
+  assert.deepEqual(dispatchable(), [], 'the source\'s author may not review it, and the reviewer is working')
+  await f.runtime.submit(f.actor(f.reviewer), f.mission.id, { taskId: busy.id, attemptId: working.attempt.id, output: 'done' })
+  assert.deepEqual(dispatchable(), [review.id], 'the idle independent reviewer can run it')
+  f.runtime.commit(f.mission.id, () => f.runtime.store.put('members', { ...f.runtime.store.get('members', f.reviewer.id), phase: 'stopped' }))
+  assert.deepEqual(dispatchable(), [], 'a stopped member runs nothing')
 })
 
 // Instrument self-test: the decision metric lives in tests/instruments.mjs since
@@ -166,7 +218,7 @@ function stopFixture(reason, stop) {
     task: (_mission, id) => structuredClone(rows.get(id)), mission: () => mission,
     isMissionTerminal: value => ['stopped', 'completed'].includes(value.status),
     defer: fn => { pending.push(Promise.resolve().then(fn)) }, exclusive: (_id, fn) => fn(), commit: (_id, fn) => fn(),
-    kick() {}, fingerprint: () => 'stable', noticeSubjectsFor: () => [], notify() {}, pumpOutbox() {},
+    kick() {}, fingerprint: () => 'stable', noticeSubjectsFor: () => [], notify() {}, tell, pumpOutbox() {},
   })
   return { mission, rows, pending, events, stopped, attempts: new Attempts(rt) }
 }

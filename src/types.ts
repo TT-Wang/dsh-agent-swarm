@@ -230,31 +230,8 @@ export interface Mission {
   workerUsage?: UsageBuckets
   /** Owner-session usage attributed by time window (planning and coordination). Outside the worker pool budget. */
   ownerUsage?: UsageBuckets
-  /** Fingerprint of the last stalled state the owner was notified about; suppresses repeats. */
-  stallNotice?: string
-  /**
-   * S1: fingerprint of the last state the scheduling-pass watchdog escalated.
-   * Kept separate from `stallNotice` so the pass-level witness (a pass that
-   * neither advanced nor terminated, or one that never returned) does not
-   * silence the board-level stall notice, while still deduplicating repeats for
-   * one unchanged board. Cleared when a pass advances durable state.
-   */
-  schedulingStallNotice?: string
-  /** Separate timeout witness: an earlier no-progress notice cannot suppress a wedge. */
-  schedulingWedgeNotice?: string
-  /**
-   * No-silent-state witness (docs/no-silent-state-spec.md §2): the fingerprint
-   * `F(S)` of the board state at the moment the last owner-decision notice was
-   * emitted, and its witness class. A notice is fresh only for the fingerprint
-   * it was emitted for, so an unchanged board never re-notifies and a board that
-   * changes and changes back does. Wall-clock `at` is never part of `F(S)`.
-   */
-  witness?: { fingerprint: string; kind: 'W2' | 'W3'; at: number }
-  /** R10-14: fingerprint of the coverage-complete state the owner was told about. */
-  coverageNotice?: string
-  /** Highest approaching-limit threshold already warned per budget dimension. */
+  /** When the owner last set the mission budget: a mission-root budget notice recorded before it is resolved. */
   budgetReviewedAt?: number
-  budgetWarned?: Record<string, number>
   /** Last successful delivery application; projected for the client after the event window scrolls. */
   appliedDelivery?: { resultCommit: string; appliedAt: number }
   /**
@@ -263,12 +240,6 @@ export interface Mission {
    * the hung call ever returning; cleared by the next successful delivery.
    */
   outboxStarved?: { deliveryId: string; attempts: number; at: number }
-  /**
-   * S7: the isolation invariant refusal already recorded for this mission
-   * (`<memberId>:<violation>`). Dedup only: an unchanged violation is not
-   * re-announced, and a changed one is.
-   */
-  isolationRefusal?: string
 }
 /** Host-observed operation; lifecycle timestamps are not a completion estimate. */
 export interface WorkerActivity {
@@ -323,6 +294,9 @@ export interface Member {
    * a successful start or a successful operation.
    */
   providerOutage?: MemberProviderOutage
+  /** S5c: consecutive `workers.start` failures and the last one's error, cleared by the next successful start; a restart continues the count. */
+  startFailures?: number
+  startError?: string
 }
 /**
  * R17-G12 (mission acceptance 12): the fixed pool a worker name is drawn from,
@@ -475,8 +449,6 @@ export interface Task {
   usedSteps?: number
   /** Durable block reason when the task exhausted one of its own ceilings. */
   ceiling?: TaskCeiling
-  /** Highest warning per dimension and allocation; runtime estimates never refill themselves. */
-  budgetWarned?: Record<string, number>
   preparationFailure?: { reason: string; transient: boolean; attempts: number; retryAt?: number }
   verificationRecovery?: { sourceTaskId: string; commit: string; reason: string; at: number }
   /** Per-command host verification timeout chosen for this task. */
@@ -637,19 +609,16 @@ export interface BoardQuery {
   postId?: string
 }
 /**
- * Closed owner-notice classes. The runtime dedups its own budget/ceiling
- * refusals per (class, mission-state fingerprint, sender) so an unchanged board
- * cannot spam the owner; decision notices carry the liveness engine's own
- * witness dedup and are always recorded, so a state that changes and returns
- * can re-notify. Escalations are never deduplicated.
+ * Closed owner-notice classes. A notice is deduplicated on the deliveries
+ * ledger by (class, key, sender); escalations are never deduplicated.
  */
 export type NoticeClass = 'decision' | 'blocker' | 'failure' | 'budget' | 'stall' | 'progress' | 'completion' | 'escalation'
 /**
  * Delivery lifecycle of one owner notice. `sent` is the durable record,
  * `queued` is the outbox entry awaiting the owner session, and `claimed` is the
  * adapter delivery that put it in front of the owner. The dedup key is the
- * mission-state fingerprint the notice was emitted for, so the ledger proves
- * which states were announced and which are still silent.
+ * identity of the fact the notice tells (an escalation, never deduplicated,
+ * carries its own id), so the ledger proves which facts were announced.
  */
 export interface NoticeEnvelope {
   dedupKey: string
@@ -666,7 +635,7 @@ export interface NoticeEnvelope {
   aggregatedFacts?: Array<{
     class: NoticeClass; dedupKey: string; from: string; factStart: number; factCount: number
     subjects: string[]; trigger: string; reason: string; createdAt: number
-    questionId?: string; deliveryFailureId?: string
+    questionId?: string; deliveryFailureId?: string; escalation?: Escalation
     /** Reminders spent on this constituent: each summarized fact has its own allowance. */
     followupCount?: number
   }>
@@ -688,11 +657,9 @@ export interface Escalation {
   taskId?: string
   attemptId?: string
   body: string
-  /** Mission-state fingerprint F(S) at raise time. */
+  /** Its own identity on the deliveries ledger, `escalation:<id>`: an escalation is never deduplicated. */
   dedupKey: string
   createdAt: number
-  /** Delivery record that carries it to the owner through the notice path. */
-  deliveryId: string
 }
 export interface Delivery {
   id: string
@@ -1068,10 +1035,11 @@ export interface WorkerCallbacks {
   verificationCleanupFailure?(info: VerificationCleanupFailure): void
   /**
    * R11-01: a classified provider outage (quota, rate limit, provider
-   * unavailable). The adapter classifies; the runtime emits the durable event,
-   * keeps the attempt alive and never spends recovery credit on the pause.
+   * unavailable). The adapter classifies, and this is the error's one report
+   * (never also a `failure`); the runtime emits the durable event, keeps the
+   * attempt alive and never spends recovery credit on the pause.
    */
-  providerOutage?(memberId: string, outage: ProviderOutage): void
+  providerOutage(memberId: string, outage: ProviderOutage): void
 }
 /** One declared check `/bin/sh` could not parse: its position in the probed list and the parser's own diagnostic. */
 export interface CheckSyntaxIssue { index: number; message: string }
@@ -1083,7 +1051,8 @@ export interface WorkerAdapter {
   inspectDelivery(mission: Mission, resultCommit: string, signal?: AbortSignal): Promise<DeliveryInspection>
   applyDelivery(mission: Mission, resultCommit: string, signal?: AbortSignal): Promise<DeliveryApplication>
   prepareWorkspace(mission: Mission, memberId: string): Promise<string>
-  start(spec: WorkerSpec, signal?: AbortSignal): Promise<void>
+  /** Resolves true when it adopted the member's session already running: that start opened nothing. */
+  start(spec: WorkerSpec, signal?: AbortSignal): Promise<boolean>
   deliver(member: Member, delivery: Delivery): Promise<void>
   stop(memberId: string): Promise<void>
   /** Only returns operations still owned by a live, uncancelled adapter execution. */
@@ -1129,9 +1098,8 @@ export interface RuntimeConfig {
   statePath: string
   leaseMs: number
   /**
-   * Tick timer period, and the unit of every tick-derived window (the
-   * unreviewed-submission grace, the no-progress window, the back-off bound,
-   * the start retry).
+   * Tick timer period, and the unit of every tick-derived window (the review
+   * grace, the back-off bound, the start retry).
    */
   tickMs: number
   /**
@@ -1161,13 +1129,6 @@ export interface RuntimeConfig {
   maxOwnerReplyNudges?: number
   /** Approaching-limit fractions per budget dimension; defaults to [0.7, 0.9]. */
   budgetWarnAt?: number[]
-  /**
-   * S1: consecutive scheduling passes that advance no durable mission state and
-   * terminate nothing before the mission escalates. Defaults to 3, i.e. a
-   * window of 3 × `tickMs`; the count and the window are configuration, never a
-   * constant a stalled board can be trapped behind.
-   */
-  stallPasses?: number
   /**
    * S1: bound on one scheduling pass before the runtime declares it wedged and
    * escalates it. Defaults to 30 × `tickMs`. While the mission has a live lease

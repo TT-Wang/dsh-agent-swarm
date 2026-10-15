@@ -79,7 +79,7 @@ test('successful startup bookkeeping failures do not cancel the handle or spend 
   const f = await fixture(t)
   let signal
   f.workers.start = async (_spec, value) => { signal = value }
-  f.runtime.clearProviderOutage = () => { throw new Error('injected bookkeeping failure') }
+  f.runtime.recordStarted = () => { throw new Error('injected bookkeeping failure') }
   await assert.rejects(f.runtime.startWorker(f.mission, f.a), /bookkeeping/)
   assert.equal(signal.aborted, false)
   assert.equal(f.runtime.store.events(f.mission.id, 100).filter(e => e.type === 'member/resume-failed').length, 0)
@@ -123,10 +123,11 @@ test('submission and missing-review identity survive event-window truncation and
   f.runtime.store.transaction(() => f.runtime.store.event(f.mission.id, 'task/submitted', f.a.id, { taskId: task.id }))
   const need = f.runtime.reviewNeed(task)
   assert.ok(need.seq > 0)
-  assert.equal(f.runtime.reportMissingReview(f.mission, task, need), true)
+  assert.equal(need.recorded, false)
+  f.runtime.reportMissingReview(f.mission, task)
   f.runtime.store.transaction(() => { for (let i = 0; i < 5; i++) f.runtime.store.event(f.mission.id, 'noise', 'runtime', {}) })
   assert.equal(f.runtime.reviewNeed(task).seq, need.seq)
-  assert.equal(f.runtime.reportMissingReview(f.mission, task, need), false)
+  assert.equal(f.runtime.reviewNeed(task).recorded, true, 'the missing review stays recorded for this need')
 })
 
 test('owner can settle receipts after stop without queuing work or reactivating the mission', async t => {

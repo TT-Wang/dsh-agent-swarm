@@ -39,7 +39,7 @@ test('R14-F2(a): an owner notice carries the task subjects it was produced for',
   // A notice written for one task is not consumed by another task's notice: the
   // dedup key is the root's identity, not the board fingerprint.
   const unrelated = f.propose('Unrelated work')
-  f.runtime.notify(f.mission.id, 'Unrelated owner notice about another task', [`${unrelated.id}@1`], { from: 'runtime', noticeClass: 'decision', dedupe: false })
+  f.runtime.notify(f.mission.id, 'Unrelated owner notice about another task', [`${unrelated.id}@1`], { trigger: 'test/unrelated', reason: 'another task' })
   await sleep(150)
   assert.equal(f.notices().filter(delivery => typeof delivery.notice?.dedupKey === 'string' && delivery.notice.dedupKey.startsWith('stall-root:')).length, 1, 'an unrelated notice does not consume or duplicate the stall root')
 })

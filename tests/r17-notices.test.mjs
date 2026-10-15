@@ -80,7 +80,7 @@ test('R17-G3: repetition is keyed on the fact — same fact once, unrelated boar
   const f = await fixture(t)
   const task = f.propose('Fact task')
   const subject = `${task.id}@${task.epoch}`
-  const fact = { trigger: 'task/blocked', reason: 'blocked for repair', family: 'stall-root' }
+  const fact = { trigger: 'task/blocked', reason: 'blocked for repair', statement: { family: 'stall-root', counts: {} } }
   f.emit('fact body', [subject], fact)
   f.emit('fact body', [subject], fact)
   const afterFirst = f.ownerNotices().filter(delivery => delivery.notice.dedupKey.startsWith('stall-root:'))
@@ -118,8 +118,8 @@ test('one enforcement point: a no-live-path decision is withheld at delivery whi
   const repair = f.propose('Repair', { replaces: [original.id], assigneeId: builder.id })
   await f.runtime.claim({ sessionId: builder.sessionId }, f.mission.id, repair.id)
   const covered = `${original.id}@${original.epoch}`
-  f.emit('covered fall-through', [covered], { family: 'fallthrough', trigger: 'mission/stalled', reason: 'no live path advances it' })
-  f.emit('covered stall root', [covered], { family: 'stall-root', dedupKey: `stall-root:${f.mission.id}:${covered}`, stampWitness: false })
+  f.emit('covered fall-through', [covered], { statement: { family: 'fallthrough', counts: {} }, trigger: 'mission/stalled', reason: 'no live path advances it' })
+  f.emit('covered stall root', [covered], { dedupKey: `stall-root:${f.mission.id}:${covered}` })
   const fallthrough = f.ownerNotices().find(delivery => delivery.notice.dedupKey.startsWith('fallthrough:'))
   const coveredRoot = f.ownerNotices().find(delivery => delivery.notice.dedupKey === `stall-root:${f.mission.id}:${covered}`)
   assert.ok(fallthrough && coveredRoot, 'emission records the facts; it no longer judges them')
@@ -247,7 +247,7 @@ const subjectOf = task => `${task.id}@${task.epoch}`
 /** Every tool each reviewed body names, bound to the action it is named for, and the exit the body leaves open. */
 const DECISIONS = {
   'stall-root': ['allocation with swarm_budget', 'swarm_propose with replaces', 'swarm_cancel to withdraw'],
-  stall: ['assignee with swarm_control', 'review with swarm_propose', 'explicitly with swarm_cancel', 'swarm_control stop'],
+  'board-stall': ['assignee with swarm_control', 'review with swarm_propose', 'explicitly with swarm_cancel', 'swarm_control stop'],
   fallthrough: ['review with swarm_propose', 'decide with swarm_control'],
   parked: ['held by a parked member', 'without spending a recovery attempt'],
   'integration-gap': ['integration task depending on every branch'],
@@ -303,15 +303,17 @@ test('R17-G2a: the stall-root body replays from the blocked row alone', async t 
 test('R17-G2b: the W3 stall body replays from the unschedulable rows alone', async t => {
   const f = await fixture(t)
   const member = await f.addMember('Ada')
-  f.propose('Waiting work')
+  const waiting = f.propose('Waiting work'), prerequisite = f.propose('Prerequisite')
+  dependOn(f, waiting, prerequisite)
+  dependOn(f, prerequisite, waiting)
   const stall = () => {
     const view = f.runtime.interpretation(f.mission.id)
-    const reason = f.runtime.completionError(view.mission) ?? 'no task can make progress'
-    f.runtime.notices.notifyStall(view, reason)
-    return { view, reason, notice: f.ownerNotices().filter(delivery => delivery.notice.dedupKey.startsWith('mission/stalled')).at(-1) }
+    f.runtime.notices.notifyBoard(view)
+    return { view, reason: f.runtime.completionError(view.mission), notice: f.ownerNotices().filter(delivery => delivery.notice.dedupKey.startsWith('board-stall:')).at(-1) }
   }
-  // First nothing is unschedulable (the body names every non-terminal row);
-  // then a blocked row and its dependent are, so the body counts and names them.
+  // First nothing is unschedulable: two pending rows wait on each other, so the
+  // body names every non-terminal row; then a blocked row and its dependent
+  // are unschedulable, so the body counts and names them.
   const stalls = [stall()]
   const dead = blockTask(f, f.propose('Dead end', { assigneeId: member.id }))
   dependOn(f, f.propose('Waits on the dead end'), dead)
@@ -321,14 +323,14 @@ test('R17-G2b: the W3 stall body replays from the unschedulable rows alone', asy
     assert.ok(notice, 'the W3 stall was reported')
     const stuck = view.unschedulable.length ? view.unschedulable : view.nonTerminal
     const subjects = stuck.map(subjectOf)
-    assert.deepEqual(notice.notice.statement, { family: 'stall', counts: { unschedulable: view.unschedulable.length } }, 'the body is the stall template and states the unschedulable count of the rows')
+    assert.deepEqual(notice.notice.statement, { family: 'board-stall', counts: { unschedulable: view.unschedulable.length } }, 'the body is the board-stall template and states the unschedulable count of the rows')
     assert.deepEqual(notice.notice.subjects, subjects, 'the subjects are the unschedulable rows, or every non-terminal row when none is')
     assert.equal(notice.notice.reason, reason, 'the recorded reason is the completion diagnostic')
-    assert.equal(notice.content, NOTICE_TEMPLATES.stall.build({ reason, unschedulable: view.unschedulable, subjects }), 'the body is the template rebuilt from the unschedulable rows')
+    assert.equal(notice.content, NOTICE_TEMPLATES['board-stall'].build({ reason, unschedulable: view.unschedulable, subjects }), 'the body is the template rebuilt from the unschedulable rows')
     assert.ok(notice.content.includes(reason), 'the body states the recorded completion diagnostic')
     for (const subject of subjects) assert.ok(notice.content.includes(subject), `the body names ${subject}`)
     for (const row of view.unschedulable) assert.ok(notice.content.includes(`${row.id} (${row.kind}, ${row.status}`), `the body counts ${row.id} as unschedulable`)
-    assertDecision(notice, 'stall')
+    assertDecision(notice, 'board-stall')
   }
 })
 
@@ -345,7 +347,7 @@ test('R17-G2c: the fall-through body replays from the unrecognised rows alone', 
   await f.runtime.cancel(f.owner, f.mission.id, { taskId: dead.id, reason: 'withdrawn' })
   const waiting = f.propose('Waiting on the withdrawn task')
   dependOn(f, waiting, dead)
-  f.runtime.notices.ensureWitness(f.mission.id, { offPass: true, wedged: true })
+  f.runtime.notices.ensureWitness(f.mission.id, { wedged: true })
   const notice = ownerNotice(f, 'fallthrough:')
   assert.ok(notice, 'the fall-through was reported')
   const row = f.runtime.store.get('tasks', waiting.id)
@@ -374,15 +376,20 @@ test('R17-G2d: the integration-gap and coverage-complete bodies replay from the 
   for (const task of implementations) assert.ok(gap.content.includes(task.id), `the gap body names ${task.id}`)
   assertDecision(gap, 'integration-gap')
 
-  // Coverage-complete: accept the only task and report with the mission still active.
+  // Coverage-complete: accept one implementation's artifact, withdraw the other,
+  // and report with the mission still active.
   const accepted = f.runtime.store.get('tasks', implementations[0].id)
-  accepted.status = 'accepted'
-  f.runtime.store.put('tasks', accepted)
-  f.runtime.notices.notifyCoverageComplete(f.runtime.store.get('missions', f.mission.id))
-  const coverage = ownerNotice(f, 'task/accepted:')
+  const withdrawn = f.runtime.store.get('tasks', implementations[1].id)
+  f.runtime.commit(f.mission.id, () => {
+    // The accepted deliverable cites every mission criterion by id, as completion counts them.
+    f.runtime.store.put('tasks', { ...accepted, status: 'accepted', covers: f.mission.acceptance.map((_, index) => `c${index + 1}`), artifact: { commit: 'c', baseCommit: 'b', workspace: '/isolated', changedPaths: [] } })
+    f.runtime.store.put('tasks', { ...withdrawn, status: 'cancelled' })
+  })
+  f.runtime.notices.notifyBoard(f.runtime.interpretation(f.mission.id))
+  const coverage = ownerNotice(f, 'coverage-complete:')
   assert.ok(coverage, 'the coverage-complete notice was reported')
   assert.deepEqual(coverage.notice.statement, { family: 'coverage-complete', counts: {} }, 'the body is the coverage-complete template and states no count')
-  assert.deepEqual(coverage.notice.subjects, [subjectOf(accepted)], 'the subject is the accepted deliverable')
+  assert.deepEqual(coverage.notice.subjects, [subjectOf(accepted), subjectOf(withdrawn)], 'the subjects are the terminal work: the accepted deliverable and the withdrawn branch')
   assert.equal(coverage.content, NOTICE_TEMPLATES['coverage-complete'].build({ missionTitle: f.mission.title }), 'the body is the template rebuilt from the mission row')
   assert.ok(coverage.content.includes(f.mission.title), 'the body names the mission')
   assertDecision(coverage, 'coverage-complete')
@@ -429,11 +436,11 @@ test('R17-G2f: the review-blocked body replays from the submitted source row and
   const review = f.runtime.store.list('tasks', f.mission.id).find(item => item.kind === 'verification' && item.reviewOf === source.id)
   assert.ok(review, 'the automatic review is admitted')
   f.runtime.cancel(f.owner, f.mission.id, { taskId: review.id, reason: 'withdrawn for the replay check' })
-  // The off-pass witness (a tick or a transition between passes) may judge the
+  // A publication between passes may judge the
   // board before the next pass does; under load it did. Nothing else can
   // progress, so the runtime's own review admission owns this board and the
   // witness adds no second, generic review-blocked fact whichever runs first.
-  f.runtime.notices.ensureWitness(f.mission.id, { offPass: true })
+  f.runtime.notices.ensureWitness(f.mission.id)
   await f.pass()
   const blocked = f.ownerNotices().filter(delivery => delivery.notice?.dedupKey?.startsWith('review-blocked:'))
   assert.equal(blocked.length, 1, `one review-blocked fact for one blocked path: ${JSON.stringify(blocked.map(delivery => delivery.content.slice(0, 80)))}`)
@@ -523,14 +530,14 @@ test('pair: the absence net and the off-pass classifier report different facts a
   const task = f.propose('Stalled work', { assigneeId: member.id })
   // A genuine stall root (blocked, no live replacement) plus a zero absence
   // bound so both reports are owed at once. Co-firing guards, named: the
-  // absence net (absence + elapsed clock only) and the off-pass classifier
+  // absence net (absence + elapsed clock only) and the board classifier
   // (its stall-root family), which share the notice ledger but not the fact.
   const row = f.runtime.store.get('tasks', task.id)
   row.status = 'blocked'; row.epoch += 1; row.output = 'blocked for repair'
   f.runtime.store.put('tasks', row)
   f.runtime.notices.absenceBoundMs = 0
   f.runtime.notices.absenceNet(f.mission.id)
-  f.runtime.notices.ensureWitness(f.mission.id, { offPass: true })
+  f.runtime.notices.ensureWitness(f.mission.id)
   const keys = f.ownerNotices().map(delivery => delivery.notice.dedupKey)
   assert.ok(keys.some(key => key.startsWith('absence:')), 'the absence net reported the absence')
   assert.ok(keys.some(key => key.startsWith('stall-root:')), 'the classifier reported the stall root')

@@ -14,9 +14,9 @@
  *
  * It lived in src/scheduling.ts until nothing in src/ called it: the dispatch
  * path decides with its own predicates and escalates through
- * `Scheduling.escalateGuardTerminal` -> `emitGuardTerminal`, never through
- * `guardActions`. Moving it here keeps the census and the property test while
- * shipping no decision code production does not run.
+ * `emitGuardTerminal`, never through `guardActions`. Moving it here keeps the
+ * census and the property test while shipping no decision code production does
+ * not run.
  *
  * The model is pure: no store, no clock, no cache. `guardBoard` is the one
  * reader of a live runtime: it projects the durable rows into the board shape,

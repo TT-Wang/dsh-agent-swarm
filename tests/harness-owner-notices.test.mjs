@@ -159,3 +159,39 @@ test('completed mission facts still reach the owner after automatic completion o
   assert.match(JSON.stringify(f.requests[0]), /COMPLETION_FACT_MUST_SURVIVE/)
   assert.ok(f.rt.store.get('deliveries', notice.id).notice.consumedAt)
 })
+
+test('a wedged pass\'s naming handed to a busy owner is read once the body has settled, and tells the later bodies that wedge on the same fact', async t => {
+  const entered = deferred(), release = deferred(); t.after(() => release.resolve())
+  const f = await fixture(t, async (_request, n) => {
+    if (n === 1) { entered.resolve(); await release.promise; return text('Finished ordinary work') }
+    return text('Handled')
+  })
+  const rt = f.rt, mid = f.mission.id, scheduling = rt.scheduling
+  /** A scheduling body past its bound, as the tick watchdog finds and names it. */
+  const wedge = operationId => {
+    const pass = { id: scheduling.passKey(mid), operationId, missionId: mid, startedAt: rt.now() - rt.stallPassTimeoutMs - 1, revisionBefore: rt.store.revision(), fingerprintBefore: rt.fingerprint(mid) }
+    scheduling.passes.set(mid, pass)
+    t.after(() => scheduling.closePass(mid, pass))
+    scheduling.checkSchedulingPasses()
+    return pass
+  }
+  const namings = () => rt.store.list('deliveries', mid).filter(row => row.to === 'owner' && row.notice?.trigger === 'scheduling-pass')
+  const read = () => f.requests.filter(request => JSON.stringify(request).includes('did not return within')).length
+  // The owner is inside a model request when the first body wedges.
+  f.agent.send(input('ordinary-work', 'Ordinary independent owner work'), 'next-turn', true)
+  await entered.promise
+  const first = wedge('operation_host_1')
+  await rt.flushOutbox(mid)
+  assert.ok(namings()[0]?.deliveredAt !== undefined && f.agent.inbox.nextStep.some(message => message.source.kind === 'swarm'), 'the naming waits in the owner\'s inbox for its step to end')
+  // The hung call returns at its own bound while that request is still streaming.
+  scheduling.closePass(mid, first)
+  release.resolve(); await f.agent.whenIdle()
+  assert.deepEqual([read(), namings()[0].notice.consumedAt !== undefined], [1, true], 'the owner reads it at its next step, though no body is wedged any more')
+  // The same call hangs again for later bodies: the naming fact the owner holds.
+  for (const operationId of ['operation_host_2', 'operation_host_3']) {
+    const pass = wedge(operationId)
+    await rt.flushOutbox(mid); await f.agent.whenIdle()
+    assert.deepEqual([pass.escalatedAt !== undefined, namings().length, read()], [true, 1, 1], 'a body on the held fact is marked named by the row the owner has read')
+    scheduling.closePass(mid, pass)
+  }
+})

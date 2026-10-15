@@ -12,6 +12,7 @@ import { FakeWorkers, makeRuntimeStub, workspaceOptions } from './faults/harness
 const sourceMode = process.env.SWARM_TEST_SOURCE === '1'
 const moduleOf = name => import(new URL(`../${sourceMode ? 'src' : 'lib'}/${name}.${sourceMode ? 'ts' : 'js'}`, import.meta.url))
 const { Scheduling } = await moduleOf('scheduling')
+const { Notices } = await moduleOf('notices')
 const { Workspaces, runProcess } = await moduleOf('workspaces')
 const { WorkspaceAdmission, isolationIssues } = await moduleOf('workspace-admission')
 const { SwarmStore } = await moduleOf('store')
@@ -40,14 +41,28 @@ async function fixture(t) {
   return { root, source, baseline, options, workspaces, mission, member, task }
 }
 
-test('M2-1: no-progress and pass-timeout each record once on the same board', () => {
-  const mission = { id: 'mission', status: 'active' }, records = []
-  const rt = makeRuntimeStub({ store: { get: () => structuredClone(mission), list: () => [], put: (_table, row) => Object.assign(mission, row), event: (_m, _t, _a, data) => records.push(data) },
-    isMissionTerminal: () => false, commit: (_id, fn) => fn(), expectWedgedRelease() {}, notify() {}, pumpOutbox() {} })
+test('M2-1: a repeated pass-timeout naming is recorded once, through the ledger', () => {
+  const mission = { id: 'mission', status: 'active' }, records = [], deliveries = []
+  // The stub store writes only ledger rows: a naming that wrote the mission row would throw.
+  const rt = makeRuntimeStub({ store: { get: () => structuredClone(mission), list: table => table === 'deliveries' ? deliveries : [], event: (_m, _t, _a, data) => records.push(data), revision: () => 0,
+    put: (table, row) => { assert.equal(table, 'deliveries'); deliveries.push(row) } },
+    stallPassTimeoutMs: 1000, fingerprint: () => 'same', commit: (_id, fn) => fn(), expectWedgedRelease() {}, pumpOutbox() {}, passSettled() {} })
+  // The runtime's own telling, over this store.
+  const notices = new Notices(rt)
+  rt.tell = notices.tell.bind(notices)
   const scheduling = new Scheduling(rt)
-  const info = { pass: { id: 'pass', operationId: 'one', startedAt: 0, fingerprintBefore: 'same', revisionBefore: 0, noProgressPasses: 3 }, unschedulable: [], reason: 'no-progress', boundMs: 1000, revisionNow: 0, fingerprintNow: 'same' }
-  for (const reason of ['no-progress', 'pass-timeout', 'no-progress', 'pass-timeout']) scheduling.escalateSchedulingStall('mission', { ...info, reason })
-  assert.deepEqual(records.map(row => row.wedged), [false, true])
+  // Two bodies wedge in turn on one naming fact. The first naming's row is the
+  // record: the second body is marked named and writes neither row nor event.
+  const named = []
+  for (const operationId of ['one', 'two']) {
+    const pass = { id: 'pass', operationId, missionId: mission.id, startedAt: 0, fingerprintBefore: 'same', revisionBefore: 0 }
+    scheduling.passes.set(mission.id, pass)
+    scheduling.checkSchedulingPasses()
+    named.push(pass.escalatedAt !== undefined)
+    scheduling.closePass(mission.id, pass)
+  }
+  assert.deepEqual(records.map(row => [row.runId, row.wedged, row.noticeKey]), [['one', true, deliveries[0].notice.dedupKey]])
+  assert.deepEqual({ rows: deliveries.length, named }, { rows: 1, named: [true, true] })
 })
 
 test('M2-2: submission grace survives newer unrelated events without aging a new submission', async t => {
@@ -61,24 +76,34 @@ test('M2-2: submission grace survives newer unrelated events without aging a new
   } finally { Date.now = clock }
   store.transaction(() => { for (let index = 0; index < 5; index++) store.event('mission', 'message/sent', 'runtime', { index }) })
   const rt = makeRuntimeStub({ store, config: { tickMs: 100, maxEvents: 1 } })
-  // The runtime's own review-need derivation, over this store.
-  rt.reviewNeed = SwarmRuntime.prototype.reviewNeed.bind(rt)
-  const scheduling = new Scheduling(rt)
+  // The runtime's own review-need derivation, over this store: its grace is the one every reader of a need asks.
+  const reviewNeed = SwarmRuntime.prototype.reviewNeed.bind(rt)
   const submitted = id => ({ id, missionId: 'mission', epoch: 0, evidenceIds: [] })
-  assert.equal(scheduling.unreviewedStall([submitted('old')]), true)
+  assert.equal(reviewNeed(submitted('old')).ripe, true)
   store.transaction(() => store.event('mission', 'task/submitted', 'runtime', { taskId: 'new' }))
-  assert.equal(scheduling.unreviewedStall([submitted('new')]), false)
+  assert.equal(reviewNeed(submitted('new')).ripe, false)
 })
 
-test('M2-3: dispatch explanations name isolation without inventing budget refusals', () => {
-  const rt = makeRuntimeStub({ workers: new FakeWorkers({ autoIdle: true }), scopesOverlap: () => true })
+test('M2-3: the dispatch question is asked on its own condition, beside the isolation invariant\'s refusal, about each undispatched task not yet asked about at its epoch, without inventing budget refusals', () => {
+  // The question is a predicate of the board, the handles and the ledger's own rows.
+  const deliveries = []
+  const rt = makeRuntimeStub({ workers: new FakeWorkers({ autoIdle: true }), store: { list: table => table === 'deliveries' ? deliveries : [] } })
   const scheduling = new Scheduling(rt); scheduling.ready = () => true
+  const asked = dedupKey => deliveries.push({ to: 'owner', from: 'runtime', notice: { class: 'decision', dedupKey } })
   const member = { id: 'one', name: 'One', phase: 'ready', status: 'idle', workspace: '/one' }
   const independent = { id: 't', title: 'Work', epoch: 0, objective: 'Write a new file from the baseline.', acceptance: [], dependencies: [], scope: ['**'] }
-  const isolated = scheduling.dispatchQuestion('m', [independent], [{ ...member, workspace: '' }], [independent])
-  assert.match(isolated.message, /Workspace isolation prevents dispatch/)
-  const unknown = scheduling.dispatchQuestion('m', [independent], [member], [independent])
-  assert.match(unknown.message, /idle handle alone does not identify the dispatch blocker/)
+  const later = { ...independent, id: 'later', title: 'Later work' }
+  // The isolation invariant refuses the only startable member (it has no provisioned worktree): its request is not this question's answer.
+  const refused = [{ ...member, workspace: '' }]
+  const question = scheduling.dispatchQuestion('m', [independent, later], refused, [independent, later])
+  assert.deepEqual([question.task.id, question.dedupKey], ['t', 'dispatch-question:m:t@0'])
+  assert.match(question.message, /idle handle alone does not identify the dispatch blocker/)
+  // Once the ledger holds it, the next pass asks about the later work, then about nothing; a new epoch is asked about again.
+  asked(question.dedupKey)
+  assert.equal(scheduling.dispatchQuestion('m', [independent, later], refused, [independent, later]).dedupKey, 'dispatch-question:m:later@0')
+  asked('dispatch-question:m:later@0')
+  assert.equal(scheduling.dispatchQuestion('m', [independent, later], refused, [independent, later]), undefined)
+  assert.equal(scheduling.dispatchQuestion('m', [{ ...independent, epoch: 1 }], refused, [{ ...independent, epoch: 1 }]).dedupKey, 'dispatch-question:m:t@1')
 })
 
 test('stop recovery owns its member until quiescence, including before native startup', async () => {
@@ -246,7 +271,7 @@ test('M2-10: inline # remains word data, while actual shell comments remain igno
 
 test('M2-11: isolation uses explicit member IDs including task workspace conflicts', () => {
   const members = [{ id: 'bad', name: 'victim', workspace: '', status: 'idle' }, { id: 'victim', name: 'Safe', workspace: '/safe', status: 'idle' }]
-  const admission = new WorkspaceAdmission(makeRuntimeStub({ store: { list: table => table === 'members' ? members : [], get: () => undefined }, refuseIsolation() {}, scopesOverlap: () => false }))
+  const admission = new WorkspaceAdmission(makeRuntimeStub({ store: { list: table => table === 'members' ? members : [], get: () => undefined }, scopesOverlap: () => false, noticeSubjectsFor: () => [] }))
   assert.equal(admission.isolationAllows('m', members[1]), true)
   assert.equal(admission.isolationAllows('m', members[0]), false)
   const tasks = ['a', 'b'].map(id => ({ id, status: 'running', scope: ['**'], attempt: { ownerId: 'victim' } }))

@@ -3,7 +3,6 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { join } from 'node:path'
 import { assignmentAllows, authorIdsOf, canBorrowTask } from '../lib/assignment.js'
-import { pendingReadiness } from '../lib/arena.js'
 import { FakeWorkers, SwarmRuntime, makeRuntime } from './faults/harness.mjs'
 
 class Workers extends FakeWorkers {
@@ -142,13 +141,13 @@ test('attempted work, budget resumes and stop transitions cannot be borrowed', a
   await assert.rejects(f.runtime.claim(f.actor(f.spare), f.mission.id, untouched.id), /previous attempt to stop/)
 })
 
-test('a retired preference does not make untouched work dead or invisible in the arena', async t => {
+test('a retired preference does not make untouched work dead or undispatchable', async t => {
   const f = await fixture(t), task = f.propose()
   const preferred = f.runtime.store.get('members', f.preferred.id); preferred.phase = 'stopped'
   f.runtime.commit(f.mission.id, () => f.runtime.store.put('members', preferred))
   const tasks = f.runtime.store.list('tasks', f.mission.id), members = f.runtime.store.list('members', f.mission.id)
   assert.deepEqual(f.runtime.unschedulable(f.mission, tasks, members), [])
-  assert.deepEqual(pendingReadiness(tasks, members), { ready: 1, notReady: 0 })
+  assert.deepEqual(f.runtime.fingerprintBoard(f.mission.id).tasks.filter(row => row.ready).map(row => row.id), [task.id])
   const claimed = await f.runtime.claim(f.actor(f.spare), f.mission.id, task.id)
   assert.equal(claimed.assigneeId, f.spare.id)
 })
