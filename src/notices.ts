@@ -1252,34 +1252,17 @@ export class Notices {
     const dispatchable = options.wedged === true
       ? tasks.filter(task => task.status === 'pending' && members.some(member => view.eligible(task, member)))
       : view.dispatchable
-    if (dispatchable.length) {
-      // A handle that is working is not a silent board: when no runnable member
-      // could be started at all, those members are working and no witness is owed
-      // (the T3 integration rule; a false stall notice is as bad as a missing
-      // one). The dispatcher's question is owed only when the board LOOKS
-      // dispatchable — at least one startable member exists — and the task still
-      // did not dispatch.
-      //
-      // R15-A4: the false-cause sentence is then replaced by the dispatcher's own
-      // question, asked per (task, assignee) with the sweep's predicates. It names
-      // the member whose handle holds the task when that is the blocker, and it
-      // stays silent when the question has no blocker to name (an open attempt the
-      // W6 close-out path is already nudging, or no eligible member at all).
-      // Co-firing guard pairs: dispatch question x parked-member hatch, x W6
-      // open-attempt close-out, x admission refusal — see
-      // `Scheduling.dispatchQuestion`.
-      // R15-D1: a wedged pass never reached its own dispatch question, so the
-      // startable gate must not silence the subject: the question is asked even
-      // when every eligible handle is busy, and the holder-naming answer is what
-      // tells the owner which member is holding the task while the pass is dead.
-      // For a completed pass the T3 rule stands: an all-busy board is working, not
-      // silent, and owes no witness.
-      if (options.wedged !== true && !members.some(member => member.status === 'waiting' || (member.status === 'idle' && this.rt.workers.isIdle(member.id)))) return
+    // The dispatchable work is the dispatcher's own question's to name (R15-A4),
+    // one emitter among the board's: it names the member whose handle holds the
+    // task, or an unexplained dispatch gap (its co-firing guards are in
+    // `Scheduling.dispatchQuestion`). A handle that is working is not a silent
+    // board: with no member startable the question is not asked (the T3 rule),
+    // except by a wedged pass, which never reached its own question (R15-D1).
+    // The dedup key is the task at its epoch, so every judgement re-asks it
+    // without repeating the wake.
+    if (dispatchable.length && (options.wedged === true || members.some(member => member.status === 'waiting' || (member.status === 'idle' && this.rt.workers.isIdle(member.id))))) {
       const question = this.rt.dispatchQuestion(missionId, tasks, members, dispatchable)
-      // The dedup key belongs to the task and its epoch, so every pass end and
-      // the wedged path re-ask it without repeating the same wake.
       if (question !== undefined) this.tell(missionId, question.message, view.subjectsOf([question.task]), { dedupKey: question.dedupKey })
-      return
     }
     // Row 3 (documented scope): a board whose *every* non-terminal task is
     // running under a live lease is exempt outright. Running work plus a pending
@@ -1300,11 +1283,12 @@ export class Notices {
     // R14-F2(c): the unnamed fallback is replaced. While every unfinished task is
     // legitimately waiting, the runtime stays silent; otherwise it escalates
     // UNCONDITIONALLY and names every task its classifier did not recognise, so
-    // no state can be silent and unnamed at the same time.
-    // A task the root classifier already named is recognised: the fall-through
-    // names only what no other witness speaks for.
+    // no state can be silent and unnamed at the same time. A stall root and a
+    // dispatchable task have their own board namer (the root's notice, the
+    // dispatch question); every other task no live path advances is named here,
+    // whatever owner decision also names it.
     const roots = new Set(view.stallRoots.map(task => task.id))
-    const unrecognised = nonTerminal.filter(task => !roots.has(task.id) && !this.waitsLegitimately(task, tasks))
+    const unrecognised = nonTerminal.filter(task => !roots.has(task.id) && !dispatchable.includes(task) && !this.waitsLegitimately(task, tasks))
     if (!unrecognised.length) return
     // R17-G3: the fact is the named subjects and the recorded reason (the
     // classifier's verdict), never the board digest.

@@ -905,6 +905,39 @@ test('a cancellation that strands a dependent leaves it to the board classifier:
   }
 })
 
+test('the dispatch question is one emitter among the board\'s: a dependent a cancellation strands beside dispatchable work is named by the fall-through, beside ready work whose member\'s handle is busy (GATE-BUSY) and beside isolation-refused work (GATE-ISO), and the dispatchable work is the question\'s alone', async t => {
+  const boards = {
+    // Every handle is busy (the fixture's workers report none idle), so the T3 rule asks no question about the ready work.
+    'GATE-BUSY': async () => {
+      const f = await setup({ clock: new FakeClock(), budget: LONG })
+      t.after(f.cleanup)
+      return { f, ready: f.propose({ title: 'Ready behind a busy handle', kind: 'research', checks: [] }), questions: [] }
+    },
+    // The reviewer is moved into the author's worktree and given work: the isolation invariant refuses it on every pass.
+    'GATE-ISO': async () => {
+      const f = await setup({ clock: new FakeClock(), workers: new FakeWorkers({ autoIdle: true }), budget: LONG })
+      t.after(f.cleanup)
+      f.runtime.store.transaction(() => f.runtime.store.put('members', { ...f.runtime.store.get('members', f.reviewer.id), workspace: f.runtime.store.get('members', f.author.id).workspace }))
+      const ready = f.propose({ title: 'Isolation-refused work', assigneeId: f.reviewer.id, kind: 'research', checks: [] })
+      return { f, ready, questions: [ready] }
+    },
+  }
+  for (const [board, build] of Object.entries(boards)) await t.test(board, async () => {
+    const { f, ready, questions } = await build()
+    await quiet(f)
+    const prerequisite = f.propose({ title: 'Prerequisite', kind: 'research', checks: [] })
+    const dependent = f.propose({ title: 'Dependent', kind: 'research', checks: [], dependencies: [prerequisite.id] })
+    f.runtime.cancel(f.owner, f.mission.id, { taskId: prerequisite.id, reason: 'Not needed' })
+    await quiet(f)
+    await ticks(f, 10)
+    assert.deepEqual([taskOf(f.runtime, ready.id).status, f.runtime.interpretation(f.mission.id).dispatchable.map(task => task.id)], ['pending', [ready.id]], `${board}: the ready work is dispatchable and was not dispatched`)
+    const namings = task => ownerRows(f).filter(delivery => (delivery.subjects ?? []).includes(subjectOf(f, task)) && delivery.notice.trigger !== 'owner-decision-unresolved' && !delivery.notice.dedupKey.startsWith('guard-terminal:'))
+    assert.deepEqual(namings(dependent).map(delivery => noticeFamily(delivery)), ['fallthrough'], `${board}: the fall-through names the stranded dependent, once`)
+    assert.deepEqual([namings(dependent)[0].subjects, relevant(f, namings(dependent)[0])], [[subjectOf(f, dependent)], true], `${board}: it names the dependent alone, and is outstanding`)
+    assert.deepEqual(namings(ready).map(delivery => noticeFamily(delivery)), questions.map(() => 'dispatch-question'), `${board}: the ready work is named by the dispatch question when its condition holds, and by nothing else`)
+  })
+})
+
 test('a provider outage\'s notice names the member\'s open work or the mission root, never the pending work it is assigned: the dispatch question about that work is asked, once, on an unchanged board', async t => {
   const f = await setup({ clock: new FakeClock(), workers: new FakeWorkers({ autoIdle: true }) })
   t.after(f.cleanup)
