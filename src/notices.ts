@@ -484,21 +484,6 @@ export class Notices {
   }
 
   /**
-   * Tell the owner one escalation that must not share the fate of the work it
-   * reports (a guard terminal, the watchdog's naming of a wedged pass): `tell`,
-   * and once its row is written, request the queue-external pump at that
-   * instant. A pump already in flight listed its deliveries before the row
-   * existed, so the row is delivered by a pump that starts after it, never by a
-   * mission queue: a new one, or, while one in flight is still inside its bound
-   * (`pumpOutbox`), the next one after it.
-   */
-  escalate(missionId: string, content: string, subjects: string[], options: NotifyOptions, then?: () => void): boolean {
-    const told = this.tell(missionId, content, subjects, options, then)
-    if (told) this.pumpOutbox()
-    return told
-  }
-
-  /**
    * End a guard chain: tell the owner its terminal decision request
    * (`guardTerminal`) with the stall event that names its row. A caller names
    * the chain and passes the scope it already has with the fact that opened it
@@ -526,10 +511,11 @@ export class Notices {
       // The board-stall event type is reused with `cause: 'guard-terminal'`, so the
       // durable log names the chain and the code without inventing an unregistered
       // event type (the vocabulary is a separate owner surface). It exists only
-      // with the row its `noticeKey` names.
-      this.escalate(missionId, request.message, [...new Set(subjects)], { dedupKey: key, reason: context.detail, questionId: context.questionId }, () => this.rt.store.event(missionId, 'mission/stalled', 'runtime', {
+      // with the row its `noticeKey` names. The notice path must not share the fate
+      // of the pass that could not report it: the queue-external pump delivers it.
+      if (this.tell(missionId, request.message, [...new Set(subjects)], { dedupKey: key, reason: context.detail, questionId: context.questionId }, () => this.rt.store.event(missionId, 'mission/stalled', 'runtime', {
         cause: 'guard-terminal', chain, code: request.code, taskId: context.taskId ?? null, memberId: context.memberId ?? null, detail: context.detail ?? null, noticeKey: key,
-      }))
+      }))) this.pumpOutbox()
     } catch (error) {
       // The best-effort contract of a busy writer: an escalation it refused is
       // recorded once the writer is free (`RefusalRegistry.recordWriterBusyRecovery`),
@@ -1459,14 +1445,16 @@ export class Notices {
    */
   pumpOutbox(): void {
     if (this.rt.shuttingDown || this.rt.closed) return
-    // Bounded coalescing: concurrent requests join a pump that is inside its
-    // declared bound, but a pump whose deliveries hang past the bound never
-    // suppresses the next one — the flag ages out instead of starving the
-    // outbox (the reviewer's D2).
-    const now = this.rt.now()
-    if (this.pumpingSince !== undefined && now - this.pumpingSince < this.rt.bounds.stallPassTimeoutMs) return
-    this.pumpingSince = now
     this.rt.defer(async () => {
+      // Bounded coalescing: a request joins a pump that is inside its declared
+      // bound, but a pump whose deliveries hang past the bound never suppresses
+      // the next one — the flag ages out instead of starving the outbox (the
+      // reviewer's D2). The join is judged when this pump would start, after
+      // the synchronous work that requested it (every guard of a tick), so a
+      // pump that aged out meanwhile suppresses nothing that work committed.
+      const now = this.rt.now()
+      if (this.pumpingSince !== undefined && now - this.pumpingSince < this.rt.bounds.stallPassTimeoutMs) return
+      this.pumpingSince = now
       try {
         for (const mission of this.rt.store.list('missions')) {
           if (this.rt.closed || this.rt.shuttingDown) return
