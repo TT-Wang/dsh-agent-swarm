@@ -1661,7 +1661,7 @@ test('the fall-through names stuck work at its epoch, once, beside an open reque
   }
 })
 
-test('P1d: no stuck task is without a notice: a member\'s blocked task is named by its stall root beside the open request raised for that member, on each board where B1\'s deferral to that request went silent: a real handoff whose old owner never stops, beside the new assignee\'s failing dispatch; a dead end beside a failing dispatch; a dead end beside an isolation request', async t => {
+test('P1d: a member\'s blocked task is named by its stall root beside an open member-scoped request: a real handoff whose old owner never stops, beside the new assignee\'s failing dispatch; a dead end beside a failing dispatch; a dead end beside an isolation request', async t => {
   /** The author's dispatch chain throws on every pass: its request names all of the author's unfinished work. */
   const failDispatch = f => {
     const isolationAllows = f.runtime.isolationAllows.bind(f.runtime)
