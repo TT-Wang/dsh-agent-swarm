@@ -1447,22 +1447,14 @@ export class Notices {
       { dedupKey: `integration-gap:${mission.id}:${implementations.length}`, trigger: NOTICE_TEMPLATES['integration-gap'].trigger, reason: diagnostic, statement })
   }
 
-  /** Record an unreviewable submitted deliverable's blocker whenever it changes, and wake the owner once per blocker and review need (`SwarmRuntime.reviewNeed`). */
+  /** Record an unreviewable submitted deliverable's blocker whenever it changes, and wake the owner once per blocker and review need (`SwarmRuntime.reviewNeed`): its decision is told with its record (`tell`, whose ledger dedup gates the wake across restarts), and a changed blocker whose decision the owner holds is recorded alone. */
   notifyReviewBlocked(mission: Mission, source: Task, need: string, reason: string): void {
     const view = this.interpretation(mission.id)
     const row = view.tasks.find(candidate => candidate.id === source.id) ?? source
-    const key = reviewBlockedKey(mission.id, row.id, need, reason)
-    // S5: the durable notice ledger (class, key, sender) gates the wake; its row is
-    // written in this call, so neither a restart nor a repeat can re-emit it.
-    const woken = hasNotice(this.rt.store.list('deliveries', mission.id), { class: 'decision', dedupKey: key, from: 'runtime' })
-    if (woken && (this.rt.store.latestTaskEvent(mission.id, source.id, 'task/review-blocked')?.data as { reason?: string } | undefined)?.reason === reason) return
-    this.rt.commit(mission.id, () => {
-      this.rt.store.event(mission.id, 'task/review-blocked', 'runtime', { taskId: source.id, kind: source.kind, reason })
-      if (woken) return
-      const { content, statement } = renderNotice('review-blocked', { sourceId: row.id, reason })
-      this.notify(mission.id, content, view.subjectsOf([row]),
-        { dedupKey: key, trigger: NOTICE_TEMPLATES['review-blocked'].trigger, reason, statement })
-    })
+    const record = () => this.rt.store.event(mission.id, 'task/review-blocked', 'runtime', { taskId: source.id, kind: source.kind, reason })
+    const { content, statement } = renderNotice('review-blocked', { sourceId: row.id, reason })
+    if (this.tell(mission.id, content, view.subjectsOf([row]), { dedupKey: reviewBlockedKey(mission.id, row.id, need, reason), trigger: NOTICE_TEMPLATES['review-blocked'].trigger, reason, statement }, record)) return
+    if ((this.rt.store.latestTaskEvent(mission.id, source.id, 'task/review-blocked')?.data as { reason?: string } | undefined)?.reason !== reason) this.rt.commit(mission.id, record)
   }
 
   topicDelivery(missionId: string, from: string, topic: string, content: string): void {

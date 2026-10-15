@@ -9,7 +9,6 @@
 import { admissionRowId, decideAdmission, defaultLimitRules, scopeKeysOverlap, type AdmissionCandidate, type AdmissionDecision, type AdmissionRecord, type AdmissionUsage, type LimitRule } from './scheduler.ts'
 import { WriterBusyError } from './store.ts'
 import { PolicyError } from './policy-error.ts'
-import { hasNotice } from './arena.ts'
 import type { SwarmRuntime } from './runtime.ts'
 import type { Budget, Member, Mission, Task } from './types.ts'
 
@@ -355,11 +354,6 @@ export function guardTerminal(chain: GuardChainId, context: GuardTerminalScope =
 /** The identity of one terminal decision request on the deliveries ledger: its chain and the fact that opened it. */
 export function guardTerminalKey(chain: GuardChainId, context: GuardTerminalContext): string {
   return `guard-terminal:${chain}:${GUARD_TERMINAL_CODES[chain]}:${context.localKey ?? `question:${context.questionId}`}`
-}
-
-/** Whether the owner already holds the decision request `key` names: the ledger's dedup every request is told under (`Notices.tell`). */
-export function guardTerminalHeld(rt: SwarmRuntime, missionId: string, key: string): boolean {
-  return hasNotice(rt.store.list('deliveries', missionId), { class: 'decision', dedupKey: key, from: 'runtime' })
 }
 
 /**

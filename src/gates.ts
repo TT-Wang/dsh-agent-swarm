@@ -13,7 +13,7 @@ import { excerpt } from './declared-checks.ts'
 import { executionElapsed } from './resource-time.ts'
 import { memberPhaseOf } from './projection.ts'
 import { emitGuardTerminal } from './refusals.ts'
-import { noticeFamily } from './notices.ts'
+import { noticeFamily, noticeIdentity, subjectsOfTasks } from './notices.ts'
 import type { SwarmRuntime } from './runtime.ts'
 import type { Delivery, Member, Mission, Post, Task, UsageBuckets, UsageSnapshotSource } from './types.ts'
 
@@ -352,9 +352,9 @@ export class RuntimeGates {
       if (!(item.limit > 0)) continue
       const projected = item.used + item.inFlight + (item.reviewSlots ?? 0)
       const crossed = thresholds.filter(threshold => projected / item.limit >= threshold).at(-1)
-      const review = `budget-review:${mission.id}:${item.task?.id ?? 'mission'}:${item.dimension}:${item.limit}`
+      const review = `budget-review:${mission.id}:${item.task?.id ?? 'mission'}:${item.dimension}:${item.limit}`, subjects = subjectsOfTasks(item.task === undefined ? [] : [item.task], mission)
       if (crossed === undefined || thresholds.some(threshold => threshold >= crossed
-        && hasNotice(ledger ??= this.rt.store.list('deliveries', mission.id), { class: 'budget', dedupKey: `${review}:${threshold}`, from: 'runtime' }))) continue
+        && hasNotice(ledger ??= this.rt.store.list('deliveries', mission.id), noticeIdentity(mission.id, subjects, { noticeClass: 'budget', dedupKey: `${review}:${threshold}` }).identity))) continue
       // This is only the numeric floor that restores threshold headroom, never
       // an estimate of the resources needed to finish the mission.
       const recommendation = Math.max(item.limit + 1, Math.ceil(Number((projected / thresholds[0]!).toFixed(6))))
@@ -368,8 +368,7 @@ export class RuntimeGates {
         projectionBasis: item.dimension === 'maxTokens' ? 'settled-plus-current-model-requests' : item.reviewSlots !== undefined ? 'admitted-plus-unpaired-reviews' : 'settled-plus-in-flight',
         ...(item.reviewSlots === undefined ? {} : { pendingReviewSlots: item.reviewSlots, remainingAfterReviews: Math.max(0, item.limit - projected) }),
         ...(suggestedLimit === undefined ? {} : { suggestedLimit, suggestedLimitBasis: 'threshold-headroom-only' }), ...(item.task === undefined ? {} : { taskId: item.task.id }), progress }
-      warnings.push({ key: `${review}:${crossed}`, data,
-        subjects: this.rt.noticeSubjectsFor(mission.id, item.task === undefined ? {} : { taskId: item.task.id }),
+      warnings.push({ key: `${review}:${crossed}`, data, subjects,
         content: `${scope}: ${item.dimension} ${item.reviewSlots === undefined ? 'settled' : 'admitted'} ${item.used}/${item.limit}, remaining ${data.remaining}; ${item.reviewSlots === undefined ? `in-flight estimate ${item.inFlight}` : `${item.reviewSlots} known review slots still needed`}, projected ${projected}, threshold ${crossed}.${suggestedLimit === undefined ? '' : ` Threshold-headroom floor for ${item.dimension}: ${suggestedLimit}; decide the actual allowance from remaining work.`} Progress: ${progress}.${item.dimension === 'maxTokens' ? ' Token projection covers current requests only, not the cost of completing remaining tasks.' : ''}${item.dimension === 'maxFindings' ? ' Finding count is advisory.' : ''}` })
     }
     if (!warnings.length) return
@@ -383,7 +382,7 @@ export class RuntimeGates {
       this.rt.notify(mission.id, `Resource review (${warnings.length} threshold${warnings.length === 1 ? '' : 's'}):\n${warnings.map(warning => `- ${warning.content}`).join('\n')}\n${instructions}`,
         [...new Set(warnings.flatMap(warning => warning.subjects))], { noticeClass: 'budget', dedupKey, trigger: 'mission/budget-warning', reason: keys.join('\n'),
           facts: [...warnings.map(warning => warning.content), instructions],
-          aggregatedIdentities: warnings.map(warning => ({ class: 'budget', dedupKey: warning.key, from: 'runtime', contentDigest: createHash('sha256').update(warning.content).digest('hex') })) })
+          aggregatedIdentities: warnings.map(warning => ({ ...noticeIdentity(mission.id, warning.subjects, { noticeClass: 'budget', dedupKey: warning.key }).identity, contentDigest: createHash('sha256').update(warning.content).digest('hex') })) })
     })
   }
 

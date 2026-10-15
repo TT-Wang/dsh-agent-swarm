@@ -10,8 +10,9 @@
 import { tmpdir } from 'node:os'
 import { stopPending } from './attempts.ts'
 import { claimFor, isContained, reauthorizeWorkspace, WorkspaceRevokedError, WORKSPACE_AUTHORIZATION_CODE, type WorkspaceClaim } from './authorization.ts'
-import { reasonDigest, subjectsOfTasks } from './notices.ts'
-import { emitGuardTerminal, guardTerminalHeld, guardTerminalKey } from './refusals.ts'
+import { hasNotice } from './arena.ts'
+import { noticeIdentity, reasonDigest, subjectsOfTasks } from './notices.ts'
+import { emitGuardTerminal, guardTerminalKey } from './refusals.ts'
 import type { SwarmRuntime } from './runtime.ts'
 import { progressed, type SchedulingPass } from './scheduling.ts'
 import { absoluteCheckPaths, shellSegments } from './admission.ts'
@@ -412,9 +413,9 @@ export class WorkspaceAdmission {
     const blocked = this.rt.store.list('tasks', missionId).filter(task => task.status === 'pending' || task.status === 'running')
     // A revocation lasts this process (above), so its decision is keyed on it.
     const revocation = `workspace-revoked:${this.rt.instanceId}`
-    // Idempotent from mission state: nothing left to block, and the owner
-    // already holds this revocation's decision, means the mission is fenced.
-    if (blocked.length === 0 && guardTerminalHeld(this.rt, missionId, guardTerminalKey('workspace', { localKey: revocation }))) return
+    // Idempotent from mission state: nothing left to block, and the owner already
+    // holds this revocation's request, under the identity it is told with, means the mission is fenced.
+    if (blocked.length === 0 && hasNotice(this.rt.store.list('deliveries', missionId), noticeIdentity(missionId, subjectsOfTasks(blocked, mission), { dedupKey: guardTerminalKey('workspace', { localKey: revocation }) }).identity)) return
     this.rt.commit(missionId, () => {
       for (const task of blocked) {
         // A running task here holds a live attempt and a live handle. Setting the
