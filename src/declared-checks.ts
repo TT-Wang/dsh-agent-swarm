@@ -9,10 +9,9 @@
  * failures can defer review without converting infrastructure into a code verdict.
  */
 import type { SwarmRuntime } from './runtime.ts'
-import { randomUUID } from 'node:crypto'
+import { id } from './store.ts'
 import type { Artifact, CheckResult, Member, Task, ToolRun } from './types.ts'
 
-const id = (prefix: string) => `${prefix}_${randomUUID()}`
 
 /** Host verification timeout when a task chose none; matches the plugin config default. */
 const DEFAULT_CHECK_TIMEOUT_MS = 60000

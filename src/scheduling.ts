@@ -7,7 +7,7 @@
  * thin forwarding methods and `schedule` calls `dispatch` exactly where its
  * member loop used to be.
  */
-import { randomUUID } from 'node:crypto'
+import { id } from './store.ts'
 import { pendingStopOwner, selectAcceptedDelivery, stopPending, subjectsOfTasks, taskSubject, terminal } from './task-graph.ts'
 import { assignmentAllows, canBorrowTask, canOwnReview, strandedReview } from './assignment.ts'
 import { liveReviewFor } from './admission.ts'
@@ -21,8 +21,6 @@ import { memberPhaseOf } from './projection.ts'
 import { PolicyError } from './policy-error.ts'
 import type { SwarmRuntime } from './runtime.ts'
 import { type Actor, type Attempt, type Member, type Mission, type Task } from './types.ts'
-
-const id = (prefix: string) => `${prefix}_${randomUUID()}`
 
 /**
  * R15-A4: the dispatcher's answer to "why did this ready task not dispatch?",

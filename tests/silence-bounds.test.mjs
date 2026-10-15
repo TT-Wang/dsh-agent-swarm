@@ -309,7 +309,7 @@ test('R16-D6 pair: F1\'s operation silence owns the clock while an operation is 
   // The adapter reports that same operation as its live one. The row is written
   // directly (not through reportActivity) so no member/activity event records progress.
   f.workers.activity = member.activity
-  assert.equal(f.runtime.sweepSilentAttempts(f.mission.id), 0, 'the attempt bound yields to the in-flight operation')
+  assert.equal(f.runtime.scheduling.sweepSilentAttempts(f.mission.id), 0, 'the attempt bound yields to the in-flight operation')
   const operation = await eventually(() => f.escalations('operation-silent:')[0], 'F1 names the stuck operation', 3000)
   assert.equal(operation.notice.dedupKey, `operation-silent:${claimed.attempt.id}:activity_stuck:${member.activity.startedAt}`)
   await sleep(250)

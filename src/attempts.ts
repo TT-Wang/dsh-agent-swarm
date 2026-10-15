@@ -7,7 +7,7 @@
  * site changed. The runtime reference is typed as the class and imported
  * type-only, so no runtime import cycle exists.
  */
-import { randomUUID } from 'node:crypto'
+import { id } from './store.ts'
 import { blockCauses, stopPending, taskSubject, terminal, type BlockCause } from './task-graph.ts'
 import { emitGuardTerminal } from './refusals.ts'
 import { stopFaultKey } from './notices.ts'
@@ -26,8 +26,6 @@ import { awaited, formatSpan, type SchedulingPass } from './kernel.ts'
 const terminalDetail = (text: string): string => text.replace(/\[[a-z][a-z0-9_]{2,63}\]\s*/g, '').trim()
 import type { SwarmRuntime } from './runtime.ts'
 import type { Actor, Artifact, Member, Mission, Task, WorkerActivity } from './types.ts'
-
-const id = (prefix: string) => `${prefix}_${randomUUID()}`
 
 /** Why a fenced task still owes a stop, as the durable marker records it. */
 type StopReason = NonNullable<Task['resumeAfterStop']>['reason']

@@ -20,6 +20,9 @@ import { taskGraphIndex } from './task-graph.ts'
 // R17-G7: one derivation for the derived member status; the store never persists it.
 import { deriveMemberStatus, memberPhaseOf } from './projection.ts'
 
+/** A fresh row id: the row kind, then a random UUID (`task_<uuid>`). */
+export const id = (prefix: string): string => `${prefix}_${randomUUID()}`
+
 interface Tables {
   missions: Mission
   members: Member

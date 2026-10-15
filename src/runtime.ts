@@ -1,7 +1,7 @@
 /** Durable collaboration policy. Worker lifecycle and filesystem effects belong to the adapter. */
 import { createHash, randomUUID } from 'node:crypto'
 import { isAbsolute, join } from 'node:path'
-import { SwarmStore, WriterBusyError, StoreRecoveryError, stageRestore, type PendingRestore, type PostFilter, type StoreOptions } from './store.ts'
+import { SwarmStore, WriterBusyError, StoreRecoveryError, id, stageRestore, type PendingRestore, type PostFilter, type StoreOptions } from './store.ts'
 import { Attempts } from './attempts.ts'
 import { PolicyError } from './policy-error.ts'
 export { WorkspaceRevokedError } from './authorization.ts'
@@ -30,7 +30,6 @@ import { checkSyntaxDetail, declaredPlanChecks, orderedTasks, pairReviews, planA
 import { OWNER_ONLY_TOOLS, type Actor, type AutoStart, BoardQuery, Budget, CheckAttribution, CheckEnvelope, CheckEnvironment, CheckResult, CreateMissionInput, CriticalPath, criterionId, Delivery, DraftPlan, Escalation, Evidence, EvidenceStatus, Member, MemberStatus, Mission, nextWorkerName, ObserveQuery, MessageInput, PlanInput, Post, PostInput, PostKind, ProposeTaskInput, ProviderOutage, PublishInput, RecoveryFallback, RequestStartInput, RuntimeConfig, Snapshot, Task, TaskAmendment, TaskRejection, TaskCeiling, ToolRun, UsageBuckets, UsageSnapshotSource, VerificationCleanupFailure, WorkerAdapter, WorkerActivity, Workstream } from './types.ts'
 import { requireArtifactChecks } from './artifact-policy.ts'
 
-const id = (prefix: string) => `${prefix}_${randomUUID()}`
 /** Release a prelaunch caller even when an adapter ignores cancellation. Its late writes remain fenced. */
 async function abortableStart<T>(operation: Promise<T>, signal: AbortSignal): Promise<T> {
   if (signal.aborted) { void operation.catch(() => {}); throw signal.reason }
@@ -275,9 +274,8 @@ export class SwarmRuntime {
    *     review need (`ReviewNeed.recorded`).
    *  cache-only (loss changes no durable outcome; each is covered by a test that
    *  clears it and asserts the durable result is unchanged):
-   *   - `idleSignals` (durable `Task.idleSignal`),
-   *     `startFailures`, `operations`, `startControllers`, `listeners`,
-   *     `fingerprintCache` (keyed by store revision), `observeCursors`, `ownerObserveCursors`.
+   *   - `startFailures`, `operations`, `startControllers`, `listeners`,
+   *     `observeCursors`, `ownerObserveCursors`.
    *  physical ownership: `queues` retains in-flight operations until they settle.
    *  It is not a disposable cache while adapter I/O can still affect a checkout.
    *  The scheduling pass guard (`Scheduling.passes`) is the same kind of state:
@@ -342,10 +340,8 @@ export class SwarmRuntime {
   private readonly refusals = new RefusalRegistry(this)
   private admissionDecision(mission: Mission, member: Member, task: Task): { candidate: AdmissionCandidate; decision: AdmissionDecision } { return this.refusals.admissionDecision(mission, member, task) }
   private admissionRecord(candidate: AdmissionCandidate, decision: AdmissionDecision, latencyMs: number): AdmissionRecord { return this.refusals.admissionRecord(candidate, decision, latencyMs) }
-  upsertAdmission(record: AdmissionRecord): void { return this.refusals.upsertAdmission(record) }
   private recordRefusal(candidate: AdmissionCandidate, decision: AdmissionDecision, latencyMs: number): void { return this.refusals.recordRefusal(candidate, decision, latencyMs) }
   upsertBudgetRefusals(mission: Mission, reason: string): void { return this.refusals.upsertBudgetRefusals(mission, reason) }
-  private recordWriterBusyRecovery(mission: Mission): void { return this.refusals.recordWriterBusyRecovery(mission) }
   private refuseProposal(mission: Mission, proposer: string | undefined, title: string, budget: 'task' | 'experiment', admitted: number, limit: number): void { return this.refusals.refuseProposal(mission, proposer, title, budget, admitted, limit) }
 
   /** M1a seam 3/7: owner notices, witnesses and the outbox that delivers them. */
@@ -906,29 +902,6 @@ export class SwarmRuntime {
     if (defects.length) throw new TaskGraphAdmissionError(defects)
   }
   /**
-   * R16-A: whether a dependency reference still has a live path. `dependencySatisfied`
-   * answers the dispatcher's question ("may the dependent start?"); this answers the
-   * notice classifier's ("can the obligation still advance?"). Both read the same
-   * `lineage`, so an owner decision and the dispatcher cannot disagree about a
-   * dependency whose original row is cancelled or blocked but whose repair is live.
-   *
-   * A dependency is unfinished exactly when its EFFECTIVE carrier is neither
-   * accepted (done) nor cancelled without a live repair (dead). A missing row is
-   * not a live path: the classifier must escalate a dangling reference, never throw.
-   *
-   * Co-fires with: `dependencySatisfied` (a satisfied dependency is never waiting),
-   * the stall-root classifier (a blocked effective dependency is the ROOT's subject,
-   * and `dependentsOf` enumerates this dependent beside it) and
-   * `unfinishedDependencies` below (one repair carrying several originals is
-   * counted once).
-   */
-  dependencyUnfinished(missionId: string, dependencyId: string, tasks?: Task[]): boolean {
-    const rows = tasks ?? this.store.list('tasks', missionId)
-    if (!rows.some(task => task.id === dependencyId)) return false
-    const effective = this.effectiveDependency(missionId, dependencyId, rows)
-    return effective.status !== 'accepted' && effective.status !== 'cancelled'
-  }
-  /**
    * R16-A: the EFFECTIVE unfinished prerequisites of one task, deduplicated in
    * reference order. This is the one seam the waking classifier reads, so a notice
    * and the scheduler resolve a replaced dependency through the same lineage.
@@ -1426,7 +1399,7 @@ export class SwarmRuntime {
     if (pendingStopOwner(this.store.list('tasks', task.missionId), member.id)) throw new Error('Worker is waiting for its previous attempt to stop')
     member = this.store.get('members', member.id) ?? member
     const mission = this.mission(task.missionId)
-    this.recordWriterBusyRecovery(mission)
+    this.refusals.recordWriterBusyRecovery(mission)
     const started = performance.now()
     const { candidate, decision } = this.admissionDecision(mission, member, task)
     const latencyMs = Math.max(0, Math.round((performance.now() - started) * 1000) / 1000)
@@ -4136,8 +4109,6 @@ export class SwarmRuntime {
    * the sweep that acts on it is `sweepDecisions`.
    */
   silentAttempt(task: Task, mission: Mission): ReturnType<Scheduling['silentAttempt']> { return this.scheduling.silentAttempt(task, mission) }
-  /** R16-D: the bounded sweep behind the escalation; returns how many attempts it named. */
-  sweepSilentAttempts(missionId: string): number { return this.scheduling.sweepSilentAttempts(missionId) }
   
   /**
    * Queue one scheduling body on the mission's serial queue, unless one is

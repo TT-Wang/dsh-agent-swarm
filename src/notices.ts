@@ -4,7 +4,7 @@
  * the bounded outbox that delivers it outside the mission queue, and the board
  * classifier whose families each tell their own fact. M1a seam 3/7.
  */
-import { createHash, randomUUID } from 'node:crypto'
+import { createHash } from 'node:crypto'
 import { covered, hasNotice, noticeLedger as projectNoticeLedger } from './arena.ts'
 import { hostContextOf, memberPhaseOf } from './projection.ts'
 import { formatDiagnostic, missingReviewDiagnostic } from './admission.ts'
@@ -12,7 +12,7 @@ import { guardTerminalKey, requireText } from './refusals.ts'
 import { TERMINAL_STATES, blockCauses, missionSubject, stopPending, subjectsOfTasks, taskGraphIndex, taskSubject } from './task-graph.ts'
 import { PolicyError } from './policy-error.ts'
 import type { SwarmRuntime } from './runtime.ts'
-import type { SwarmStore } from './store.ts'
+import { id, type SwarmStore } from './store.ts'
 import { awaited, type SchedulingPass } from './kernel.ts'
 import type { Actor, Delivery, Escalation, Member, Mission, NoticeClass, Task, WorkerAdapter } from './types.ts'
 
@@ -504,7 +504,6 @@ export function waitsLegitimately(rt: LineageRuntime, task: Task, tasks: Task[])
   return false
 }
 
-const id = (prefix: string) => `${prefix}_${randomUUID()}`
 
 /** The submissions the review admission speaks for: submitted artifacts. A submission an older build left without an artifact is ordinary stuck work. Its sources, the one set its admission, its decisions and the interpretation read, are those no live review can accept (before the grace is applied). */
 const admissionSpeaksFor = (task: Task): boolean => task.status === 'submitted' && task.artifact !== undefined

@@ -6,7 +6,8 @@
  * Behaviour-identical to the code moved from src/runtime.ts; the runtime keeps
  * thin forwarding methods and re-exports the symbols its public surface had.
  */
-import { randomUUID, createHash } from 'node:crypto'
+import { createHash } from 'node:crypto'
+import { id } from './store.ts'
 import { arenaView as projectArenaView, hasNotice } from './arena.ts'
 import { currentEvidenceIds, subjectsOfTasks, terminal } from './task-graph.ts'
 import { excerpt } from './declared-checks.ts'
@@ -121,8 +122,6 @@ export function postView(post: Post, now: number, full = false): Record<string, 
 
 /** A board page shows a bounded body excerpt; the full body is read by postId. */
 const BOARD_BODY_EXCERPT = 600
-
-const id = (prefix: string) => `${prefix}_${randomUUID()}`
 
 export class RuntimeGates {
   /** F(S) cache keyed by the store revision: the digest is pure over durable state. */
