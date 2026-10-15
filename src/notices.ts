@@ -6,15 +6,15 @@
  */
 import { createHash } from 'node:crypto'
 import { covered, hasNotice, noticeLedger as projectNoticeLedger } from './arena.ts'
-import { hostContextOf, memberPhaseOf } from './projection.ts'
+import { hostContextOf } from './projection.ts'
 import { formatDiagnostic, missingReviewDiagnostic } from './admission.ts'
 import { guardTerminal, guardTerminalKey, requireText, type GuardChainId, type GuardTerminal, type GuardTerminalContext, type RefusalRegistry } from './refusals.ts'
-import { TERMINAL_STATES, blockCauses, missionSubject, stopPending, subjectsOfTasks, taskGraphIndex, taskSubject, terminal } from './task-graph.ts'
+import { TERMINAL_STATES, missionSubject, stopPending, taskSubject, terminal } from './task-graph.ts'
 import { PolicyError } from './policy-error.ts'
 import type { SwarmRuntime } from './runtime.ts'
 import { WriterBusyError, id } from './store.ts'
 import { awaited, type SchedulingPass } from './kernel.ts'
-import { awaitsReviewAdmission, completionError, dispatchable, eligible, newestReviewBlock, noticeSubjectsFor, reviewable, reviewNeed, reviewPathBlocker, reviewPathStalled, stalled, startBlocker, unreviewedSources, unschedulable, type Board } from './board.ts'
+import { completionError, dependentsOf, eligible, interpret, newestReviewBlock, noticeSubjectsFor, reviewNeed, reviewPathBlocker, reviewPathStalled, stallRoots, startBlocker, unreviewedSources, waitsLegitimately, type Board, type Interpretation } from './board.ts'
 import type { Actor, Delivery, Escalation, Member, Mission, NoticeClass, Task, WorkerAdapter } from './types.ts'
 
 /**
@@ -309,27 +309,6 @@ export function noticeTemplateKey(delivery: Pick<Delivery, 'notice'>): keyof typ
   return prefix in NOTICE_TEMPLATES ? prefix as keyof typeof NOTICE_TEMPLATES : undefined
 }
 
-/** R17-G1: the shared interpretation one mission's notice generators consume: one board, and what the dispatcher's predicates answer over it. */
-export interface MissionInterpretation extends Board {
-  nonTerminal: Task[]
-  stallRoots: Task[]
-  replaced: Set<string>
-  /** The dispatchable work (`dispatchable`), the dispatcher's question. */
-  dispatchable: Task[]
-  /** The review admission's sources (`unreviewedSources`). */
-  unreviewed: Task[]
-  /** The dispatcher's unschedulable set for this board. */
-  unschedulable: Task[]
-  /** The scheduler's stalled predicate for this board. */
-  stalled: boolean
-  /** Running tasks whose owning member is durably parked (the R10-15 holder family). */
-  parkedHolders: Array<{ task: Task; member: Member }>
-  implementations: Task[]
-  /** Latest task, evidence or owner-decision progress; telemetry does not reset this clock. */
-  lastTransitionAt: number
-  subjectsOf: (tasks: readonly Pick<Task, 'id' | 'epoch'>[]) => string[]
-}
-
 /**
  * R16-A: the durable families of owner decisions. A family is read from the
  * dedup key the runtime itself writes (never from prose), because that key is the
@@ -367,124 +346,6 @@ export function taskFromSubject(subject: string, tasks: readonly Task[]): Task |
 }
 /** The task a subject names while it is unfinished at that epoch: the term a subject-judged notice is deliverable and reminded by. */
 const unfinished = (subject: string, tasks: readonly Task[]): Task | undefined => { const task = taskFromSubject(subject, tasks); return task === undefined || TERMINAL_STATES.has(task.status) ? undefined : task }
-
-/**
- * R16-A: the ids whose obligation is carried by a live task through `replaces`,
- * transitively. Shared by `stallRoots` (a covered task is not a root) and
- * `waitsLegitimately` (a covered task is waiting on its repair), so the two
- * classifiers cannot disagree about a task that is inside a live lineage.
- * Co-fires with: the lineage-resolved dependency rule (both read the same durable
- * `replaces` edges the dispatcher's `effectiveDependency` walks) and the
- * fall-through, which may name a subject only when this set does not contain it.
- * The walk is the task graph's `replacedLineage`.
- */
-function replacementCoverage(tasks: Task[]): Set<string> {
-  const graph = taskGraphIndex(tasks)
-  const replaced = new Set<string>()
-  for (const task of tasks) if (!TERMINAL_STATES.has(task.status)) for (const origin of graph.replacedLineage(task.id).slice(1)) replaced.add(origin.id)
-  return replaced
-}
-
-/**
- * R14-F2(b): the stall roots of one board, in board order. Purely a function of
- * durable rows, so the pass, the timer-driven notice path, the delivery-time
- * relevance check and a test all classify the same board identically.
- */
-export function stallRoots(board: Pick<Board, 'tasks' | 'clock' | 'bounds'>): Task[] {
-  // A live replacement marks every id in its transitive lineage as covered.
-  const replaced = replacementCoverage(board.tasks)
-  return board.tasks.filter(task => {
-    if (task.status !== 'blocked' || replaced.has(task.id)) return false
-    // A verdict record is not a repairable root: its source carries the repair.
-    if (task.reviewOf !== undefined) return false
-    const stop = stopPending(task) ? task.resumeAfterStop : undefined
-    if (stop === undefined) return true
-    const at = stop.at
-    // R14-F2v D2: a stop inside the declared bound is progress, not a root, but an
-    // absent timestamp is UNBOUNDED — the bound cannot be shown to hold, so the
-    // state escalates as a root rather than becoming silence (a pre-upgrade
-    // durable row reaches exactly this state).
-    return at === undefined || board.clock() - at > board.bounds.stallPassTimeoutMs
-  })
-}
-
-/**
- * R14-F2(c) / R16-A: whether an unfinished task is waiting on something still
- * alive — a live lease, the bounded review grace, a stop inside its bound, or an
- * unfinished dependency/predecessor edge. One implementation for the classifiers
- * and the delivery-time relevance check (`ownerDeliveryRelevant`).
- *
- * Co-firing guards, named: this classifier x the stall-root classifier (a blocked
- * predecessor is the ROOT's subject, named by the root notice with its
- * dependents, never re-named here) x the review grace (`reviewable` and the
- * review-blocked emitter) x the wedged-pass classification.
- */
-export function waitsLegitimately(board: Board, task: Task): boolean {
-  const tasks = board.tasks
-  if (TERMINAL_STATES.has(task.status)) return false
-  // R16-A: a task whose obligation is carried by a live replacement has a live
-  // path whatever its own row says — the repair advances it.
-  if (replacementCoverage(tasks).has(task.id)) return true
-  // R17-G3: a running task with a live attempt row is NOT dead — the lease path
-  // owns its expiry (fence, re-pend, re-route). Only a running row with no
-  // attempt at all is unrecognised.
-  if (task.status === 'running') return task.attempt !== undefined
-  // Submission remains in this state for the entire independent review: the
-  // dispatcher's live-review rule (an admitted or parked review included), or
-  // a need the review admission would still serve (`awaitsReviewAdmission`).
-  if (task.status === 'submitted') return reviewable(board, task) || awaitsReviewAdmission(board, task)
-  if (task.status === 'blocked') {
-    // A blocked verdict record is not outstanding on its own while its source
-    // speaks for it: a live replacement carries the repair, or the source is a
-    // stall root whose notice lists this record as a dependent. Naming the
-    // record again (a W3 reminder, a fall-through) repeats the root's decision.
-    if (task.reviewOf !== undefined && (replacementCoverage(tasks).has(task.reviewOf)
-      || stallRoots(board).some(root => root.id === task.reviewOf))) return true
-    const stop = stopPending(task) ? task.resumeAfterStop : undefined
-    // R15-A3: an absent `at` is UNBOUNDED, so it is not legitimate waiting. The
-    // "cannot judge" case must never be the silent one: `stallRoots` classifies
-    // the same row as a root, and this classifier refusing it here keeps the two
-    // in agreement instead of leaving the state both silent and unnamed.
-    if (stop !== undefined) return stop.at !== undefined && board.clock() - stop.at <= board.bounds.stallPassTimeoutMs
-    return board.graph.unfinishedDependencies(task).length > 0
-  }
-  if (task.status === 'pending') {
-    // Reviews wait on their exact source; no worker stop can repair a missing
-    // or terminal source, and a review path no live member may own (the one
-    // live-review rule, `reviewable`) waits on nothing. Ordinary prerequisites
-    // keep the shared lineage rule.
-    if (task.reviewOf !== undefined) {
-      const source = tasks.find(candidate => candidate.id === task.reviewOf)
-      return source !== undefined && !TERMINAL_STATES.has(source.status) && reviewable(board, source)
-    }
-    if (board.graph.unfinishedDependencies(task).length > 0) return true
-    if (!task.dependencies.every(dependency => board.graph.dependencyMet(dependency))) return false
-    // A preparation failure the host will not retry is a block cause the owner
-    // repairs (`blockCauses` owns that distinction). One carrying `retryAt` is the
-    // host's own bounded back-off: a live wait until one tick past `retryAt`.
-    // Past that bound the back-off explains nothing and the task is judged like
-    // any other ready work below.
-    const failure = task.preparationFailure
-    if (failure !== undefined) {
-      if (blockCauses(task, () => undefined, Number.POSITIVE_INFINITY).has('preparation-failed')) return false
-      if (failure.retryAt !== undefined && board.clock() <= failure.retryAt + board.bounds.tickMs) return true
-    }
-    // The same marker that fences dispatch is a live wait only while every
-    // matching stop is inside its bound. An unknown owner reserves all members.
-    const memberId = task.assigneeId ?? task.plannedAssigneeId
-    const stops = tasks.filter(candidate => stopPending(candidate)
-      && (candidate.id === task.id || candidate.resumeAfterStop.memberId === undefined
-        || (memberId !== undefined && candidate.resumeAfterStop.memberId === memberId)))
-    if (stops.length > 0) return stops.every(candidate => candidate.resumeAfterStop!.at !== undefined
-      && board.clock() - candidate.resumeAfterStop!.at! <= board.bounds.stallPassTimeoutMs)
-    // Once the stop settles, another live attempt may take the selected member
-    // first. Its bounded lease provides the next chance to run this ready work.
-    return memberId !== undefined && tasks.some(candidate => candidate.status === 'running'
-      && candidate.attempt?.ownerId === memberId && candidate.attempt.leaseUntil >= board.clock())
-  }
-  return false
-}
-
 
 /**
  * R15-A4: the dispatcher's answer to "why did this ready task not dispatch?",
@@ -868,37 +729,8 @@ export class Notices {
     return text
   }
 
-  /**
-   * R17-G1: the ONE shared interpretation of a mission's durable state. Every
-   * owner-facing generator reads this view instead of re-reading raw rows and
-   * re-deriving its own answer: it is a board, so the dispatcher's own
-   * predicates (`eligible`, `reviewable`, `completionError`) are asked of it
-   * directly, and a notice can never describe a board the dispatcher would act
-   * on differently. Read-only: it writes nothing and holds no cache.
-   */
-  interpretation(missionId: string): MissionInterpretation {
-    const board = this.rt.boardOf(missionId)
-    const { mission, tasks, members } = board
-    return {
-      ...board,
-      nonTerminal: tasks.filter(task => !TERMINAL_STATES.has(task.status)),
-      stallRoots: stallRoots(board),
-      replaced: replacementCoverage(tasks),
-      // The dispatcher's own question and its own predicates, computed once here
-      // so a notice can never describe a board the dispatcher would act on
-      // differently (`eligible`, `reviewable`, `unschedulable`, `stalled`).
-      dispatchable: dispatchable(board),
-      unreviewed: unreviewedSources(board),
-      unschedulable: unschedulable(board),
-      stalled: stalled(board),
-      parkedHolders: tasks.filter(task => task.status === 'running' && task.attempt !== undefined
-        && members.some(member => member.id === task.attempt?.ownerId && memberPhaseOf(member) === 'parked'))
-        .map(task => ({ task, member: members.find(member => member.id === task.attempt?.ownerId)! })),
-      implementations: tasks.filter(task => task.kind === 'implementation'),
-      lastTransitionAt: this.rt.store.progressAt(mission),
-      subjectsOf: list => subjectsOfTasks(list, mission),
-    }
-  }
+  /** R17-G1: the interpretation of one mission's board as the store holds it now (`interpret`), the one every notice generator and the dispatch sweep read. */
+  interpretation(missionId: string): Interpretation { return interpret(this.rt.boardOf(missionId)) }
 
   /**
    * R17-G5: the absence net — one of the two absence instruments a sampled tick
@@ -934,7 +766,7 @@ export class Notices {
    * stays open cannot spend the reminders of one that is resolved for a while
    * and then reopens.
    */
-  private followupObligations(view: MissionInterpretation): void {
+  private followupObligations(view: Interpretation): void {
     const mission = view.mission
     if (!['active', 'blocked'].includes(mission.status)) return
     const now = this.rt.now()
@@ -971,7 +803,7 @@ export class Notices {
   }
 
   /** The current obligation, shared by reminder generation and queued reminders. */
-  private unresolvedSubjects(view: MissionInterpretation, delivery: Delivery): string[] {
+  private unresolvedSubjects(view: Interpretation, delivery: Delivery): string[] {
     const mission = view.mission
     if (!['active', 'blocked'].includes(mission.status)) return []
     if (delivery.notice !== undefined && (['progress', 'completion'].includes(delivery.notice.class)
@@ -996,7 +828,7 @@ export class Notices {
           || (view.tasks.length > 0 && view.nonTerminal.length === 0)
       }
       const task = unfinished(subject, view.tasks)
-      return task !== undefined && !this.waitsLegitimately(view, task)
+      return task !== undefined && !waitsLegitimately(view, task)
     })
   }
 
@@ -1056,7 +888,7 @@ export class Notices {
         if (subject === missionSubject(mission)) return true
         const task = unfinished(subject, tasks)
         if (task === undefined) return false
-        if (family === 'fallthrough') return !this.waitsLegitimately(board, task)
+        if (family === 'fallthrough') return !waitsLegitimately(board, task)
         if (family === 'dispatch-question') return task.status === 'pending'
         return this.interpretation(mission.id).parkedHolders.some(holder => holder.task.id === task.id)
       })
@@ -1100,7 +932,7 @@ export class Notices {
    * body, count and event state. Completion allowed: coverage-complete of an
    * owner-assembled mission (no start request), keyed by its terminal work.
    */
-  private boardFact(view: MissionInterpretation): { key: string; subjects: string[]; reason: string; content: string; statement: NoticeStatement } | undefined {
+  private boardFact(view: Interpretation): { key: string; subjects: string[]; reason: string; content: string; statement: NoticeStatement } | undefined {
     const fact = (body: { content: string; statement: NoticeStatement }, subjects: string[], reason: string) =>
       ({ ...body, subjects, reason, key: factKey(view.missionId, { trigger: NOTICE_TEMPLATES[body.statement.family].trigger, reason, subjects, statement: body.statement }) })
     const refusal = completionError(view)
@@ -1112,7 +944,7 @@ export class Notices {
   }
 
   /** A W3 stall or coverage-complete decision is outstanding while it is the board's fact under the identity it was told with; a mission blocked on its budget keeps it, like every decision (`ownerDeliveryMoot`), and only an active one is told a new fact (`ensureWitness`). */
-  private boardFactOpen(view: MissionInterpretation, delivery: Pick<Delivery, 'notice'>): boolean {
+  private boardFactOpen(view: Interpretation, delivery: Pick<Delivery, 'notice'>): boolean {
     return this.boardFact(view)?.key === delivery.notice?.dedupKey
   }
 
@@ -1289,7 +1121,7 @@ export class Notices {
   }
 
   /** The board classifiers past the stall roots and the review admission's sources: each tells its own fact once, and a fact the owner holds commits nothing. */
-  private judgeBoard(view: MissionInterpretation, options: { wedged?: boolean }): void {
+  private judgeBoard(view: Interpretation, options: { wedged?: boolean }): void {
     const missionId = view.missionId
     const mission = view.mission
     const tasks = view.tasks
@@ -1326,7 +1158,7 @@ export class Notices {
     // left to it, asked once a member can start; every other task no live path
     // advances is named here, whatever owner decision also names it.
     const roots = new Set(view.stallRoots.map(task => task.id))
-    const unrecognised = view.nonTerminal.filter(task => !roots.has(task.id) && !dispatchable.includes(task) && !this.waitsLegitimately(view, task))
+    const unrecognised = view.nonTerminal.filter(task => !roots.has(task.id) && !dispatchable.includes(task) && !waitsLegitimately(view, task))
     if (!unrecognised.length) return
     // R17-G3: the fact is the named subjects and the recorded reason (the
     // classifier's verdict), never the board digest.
@@ -1344,13 +1176,12 @@ export class Notices {
    * no longer bounded. The dedup key is the root's own identity, not the board
    * fingerprint, so an unrelated notice can never consume it.
    */
-  notifyStallRoots(view: MissionInterpretation): void {
+  notifyStallRoots(view: Interpretation): void {
     const mission = view.mission
-    const tasks = view.tasks
     for (const root of view.stallRoots) {
       const subject = taskSubject(root)
       const key = `stall-root:${mission.id}:${subject}`
-      const dependents = this.dependentsOf(root, tasks)
+      const dependents = dependentsOf(view, root)
       const stop = stopPending(root) ? root.resumeAfterStop : undefined
       const cause = stop !== undefined
         ? (stop.at === undefined
@@ -1401,63 +1232,13 @@ export class Notices {
   }
 
   /**
-   * R14-F2(b): the tasks that depend on one root, transitively, still unfinished.
-   *
-   * R16-A: the edge set is the durable one the board really has — `dependencies`,
-   * `replaces` AND `reviewOf`. A blocked source's notice now enumerates the
-   * pending review that waits on it, so the review's subject is not left out of
-   * the decision the source's repair owes. Co-fires with: the stall-root
-   * classifier (which is what calls this) and the review-grace rule in
-   * `waitsLegitimately` (a review whose source is terminal is dead and named;
-   * while the source is live this enumeration is how its notice names the review).
-   */
-  dependentsOf(root: Task, tasks: Task[]): Task[] {
-    const found = new Map<string, Task>()
-    let grew = true
-    while (grew) {
-      grew = false
-      for (const task of tasks) {
-        if (task.id === root.id || TERMINAL_STATES.has(task.status) || found.has(task.id)) continue
-        const dependsOnRoot = [root.id, ...found.keys()].some(id => task.dependencies.includes(id) || (task.replaces ?? []).includes(id) || task.reviewOf === id)
-        if (dependsOnRoot) { found.set(task.id, task); grew = true }
-      }
-    }
-    return [...found.values()]
-  }
-
-  /**
-   * R14-F2(c): whether an unfinished task is waiting on something still alive —
-   * a live lease, the bounded review grace, a stop inside its bound, a live
-   * repair carrying its obligation, or an unfinished EFFECTIVE predecessor.
-   * Anything else is unnamed silence and must escalate.
-   *
-   * R16-A: the predecessor edge is resolved through the dispatcher's own lineage
-   * seam (`unfinishedDependencies`), never the raw id, so a task whose
-   * cancelled dependency has a live running repair is waiting, not dead. And a
-   * task whose own obligation is carried by a live replacement is waiting too,
-   * read from the same coverage `stallRoots` uses, so the fall-through can name a
-   * subject only when its whole lineage is terminal.
-   *
-   * Co-firing guards, named: this classifier x the stall-root classifier (a
-   * blocked predecessor is the ROOT's subject, named by the root notice with its
-   * dependents, never re-named here) x the review grace (`reviewable` and the
-   * review-blocked emitter: a pending review follows its SOURCE identity, so a
-   * cancelled source with a live repair still has no review path) x the
-   * wedged-pass classification (D1/D2: the wedge changes who generates the
-   * decision, never which boards are waiting).
-   */
-  waitsLegitimately(board: Board, task: Task): boolean {
-    return waitsLegitimately(board, task)
-  }
-
-  /**
    * Tell the owner the board's fact (`boardFact`: the W3 stall, or R10-14's
    * coverage-complete, since owner-assembled plans do not auto-complete) once
    * per identity. The deliveries ledger is the record: a fact already on it
    * writes nothing, and the W3 stall's event, which carries the row's key,
    * exists only with its row.
    */
-  private notifyBoard(view: MissionInterpretation): void {
+  private notifyBoard(view: Interpretation): void {
     const missionId = view.missionId
     const fact = this.boardFact(view)
     if (fact === undefined) return

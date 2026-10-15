@@ -13,7 +13,7 @@ import { arenaView } from '../lib/arena.js'
 import { validatePlan } from '../lib/plans.js'
 import { boardIndex } from '../lib/types/client/projection.js'
 import { FakeClock, MISSION_ACCEPTANCE, setup, taskOf } from './faults/harness.mjs'
-import { capable, ready, reviewNeed, reviewPathBlocker, reviewable, unschedulable } from '../lib/board.js'
+import { capable, ready, reviewNeed, reviewPathBlocker, reviewable, unschedulable, waitsLegitimately } from '../lib/board.js'
 
 const coded = code => error => { assert.equal(error.code, code, error.message); return true }
 
@@ -180,7 +180,7 @@ test('reviewable: a pending review only a prior owner could take is not a live r
 test('waitsLegitimately: a pending review only a prior owner could take waits on nothing', async t => {
   const f = await coauthored(t)
   const open = f.review()
-  const waits = () => f.runtime.notices.waitsLegitimately(f.runtime.boardOf(f.mission.id), taskOf(f.runtime, open.id))
+  const waits = () => waitsLegitimately(f.runtime.boardOf(f.mission.id), taskOf(f.runtime, open.id))
   assert.equal(waits(), true, 'an independent live member makes the review a live wait')
   f.stopReviewer()
   assert.equal(waits(), false, 'with only the source\'s authors live, no path advances the review')

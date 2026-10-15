@@ -5,7 +5,8 @@
  */
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { factKey, stallRoots, waitsLegitimately } from '../lib/notices.js'
+import { factKey } from '../lib/notices.js'
+import { stallRoots, waitsLegitimately } from '../lib/board.js'
 import { taskGraphIndex } from '../lib/task-graph.js'
 import { wakePrecision } from './instruments.mjs'
 import { FakeClock, FakeWorkers, eventually, makeRuntime } from './faults/harness.mjs'
@@ -128,7 +129,7 @@ test('a pending task whose only eligible member still owes a stop past its bound
     assert.deepEqual(f.stallRoots().map(delivery => delivery.notice.dedupKey), [`stall-root:${f.mission.id}:${stopping.id}@${epochOf(stopping)}`], `wedged=${wedged}: the stop past its bound is a stall root`)
     assert.deepEqual(f.fallthroughs().map(delivery => delivery.subjects), [[`${queued.id}@${epochOf(queued)}`]], `wedged=${wedged}: the task queued behind it is named`)
     assert.equal(f.runtime.store.get('tasks', queued.id).status, 'pending', `wedged=${wedged}: and it was never dispatched`)
-    assert.deepEqual([f.runtime.observe(f.owner, f.mission.id).pendingDispatchable, f.runtime.interpretation(f.mission.id).dispatchable.length], [0, 0], `wedged=${wedged}: the owner instruments count no dispatchable work`)
+    assert.deepEqual([f.runtime.observe(f.owner, f.mission.id).pendingDispatchable, f.runtime.notices.interpretation(f.mission.id).dispatchable.length], [0, 0], `wedged=${wedged}: the owner instruments count no dispatchable work`)
     release()
   }
 })
@@ -600,7 +601,7 @@ test('a pending task in preparation back-off is a bounded live wait, and a named
   const epoch = f.runtime.store.get('tasks', backoff.id).epoch
   const named = () => f.fallthroughs().filter(delivery => delivery.subjects?.includes(`${backoff.id}@${epoch}`))
   const board = () => f.runtime.boardOf(f.mission.id)
-  assert.equal(f.runtime.notices.waitsLegitimately(board(), f.runtime.store.get('tasks', backoff.id)), true, 'the back-off is a live wait')
+  assert.equal(waitsLegitimately(board(), f.runtime.store.get('tasks', backoff.id)), true, 'the back-off is a live wait')
   await ticks(f, 10)
   assert.equal(named().length, 0, `no fall-through while the host's retry is scheduled: ${JSON.stringify(f.notices().map(delivery => delivery.notice?.dedupKey))}`)
   const notice = await ticksUntil(f, () => named()[0], 'the overdue retry is named once the bound passes')
@@ -610,11 +611,11 @@ test('a pending task in preparation back-off is a bounded live wait, and a named
   assert.equal(named().length, 1, 'named exactly once')
   // Past the bound the back-off explains nothing: the row is judged like any
   // other ready work, so an assignee holding a live lease is still a live wait.
-  assert.equal(f.runtime.notices.waitsLegitimately(board(), { ...f.runtime.store.get('tasks', backoff.id), assigneeId: f.member.id }), true,
+  assert.equal(waitsLegitimately(board(), { ...f.runtime.store.get('tasks', backoff.id), assigneeId: f.member.id }), true,
     'an expired back-off queued behind its assignee\'s live lease is not an obstacle')
   // A failure the host will not retry stays a block cause, never a wait.
   const { retryAt: _retryAt, ...permanent } = f.runtime.store.get('tasks', backoff.id).preparationFailure
-  assert.equal(f.runtime.notices.waitsLegitimately(board(), { ...f.runtime.store.get('tasks', backoff.id), preparationFailure: { ...permanent, transient: false } }), false)
+  assert.equal(waitsLegitimately(board(), { ...f.runtime.store.get('tasks', backoff.id), preparationFailure: { ...permanent, transient: false } }), false)
 })
 
 for (const coNotice of ['stall-root', 'permanent-preparation-failure']) {
@@ -772,20 +773,24 @@ test('a back-off whose bound passes while a pass judges the board is still judge
   const told = await ticksUntil(f, () => f.stallRoots()[0], 'the unrelated stall root is told inside both back-off windows')
   assert.ok(told.createdAt <= retryA)
   const notices = f.runtime.notices
+  const namedB = () => f.fallthroughs().find(delivery => delivery.subjects?.includes(bSubject))
   let spun
-  const judgedB = []
-  const waits = notices.waitsLegitimately.bind(notices)
-  notices.waitsLegitimately = (board, task) => { const result = waits(board, task); if (task.id === b.id) judgedB.push({ at: f.clock.now(), waits: result }); return result }
   const judge = notices.judgeBoard.bind(notices)
   notices.judgeBoard = (...args) => {
     const start = f.clock.now()
     const result = judge(...args)
-    // The first judgement after A's bound runs past B's bound: a slow tail.
-    if (spun === undefined && start > boundA && start < boundB) { spun = { start }; f.clock.advance(boundB + 2 - f.clock.now()) /* a slow judgement */ }
+    // The first judgement after A's bound runs past B's bound: a slow tail. What
+    // it found is read before the clock moves: B's wait on the board it judged
+    // (the classifier it asks, at its instant), and whether it named B.
+    if (spun === undefined && start > boundA && start < boundB) {
+      const [view] = args
+      spun = { waits: waitsLegitimately(view, view.tasks.find(task => task.id === b.id)), named: namedB() !== undefined }
+      f.clock.advance(boundB + 2 - f.clock.now()) /* a slow judgement */
+    }
     return result
   }
-  const named = await ticksUntil(f, () => f.fallthroughs().find(delivery => delivery.subjects?.includes(bSubject)), 'B\'s expired back-off is named by the fall-through', Math.ceil((Math.max(0, boundB - f.clock.now()) + 1000) / tickMs)).catch(error => error)
+  const named = await ticksUntil(f, namedB, 'B\'s expired back-off is named by the fall-through', Math.ceil((Math.max(0, boundB - f.clock.now()) + 1000) / tickMs)).catch(error => error)
   assert.ok(spun !== undefined, 'a judgement began between the two bounds and ran past B\'s')
-  assert.ok(judgedB.some(item => item.at >= spun.start && item.at < boundB && item.waits), 'that judgement found B still waiting')
+  assert.deepEqual([spun.waits, spun.named], [true, false], 'that judgement found B still waiting and named nothing for it')
   assert.ok(!(named instanceof Error), 'a later pass judged B expired and named it')
 })

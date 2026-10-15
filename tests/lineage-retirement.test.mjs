@@ -15,7 +15,8 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { FakeClock, MISSION_ACCEPTANCE, SwarmRuntime, FakeWorkers, acceptThroughReview, blockThroughReview, events, makeRuntime, taskOf } from './faults/harness.mjs'
-import { NOTICE_TEMPLATES, stallRoots } from '../lib/notices.js'
+import { NOTICE_TEMPLATES } from '../lib/notices.js'
+import { stallRoots } from '../lib/board.js'
 
 async function fixture(t) {
   const made = await makeRuntime(t, { clock: new FakeClock(), budget: { maxWorkers: 4 } })

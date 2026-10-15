@@ -268,7 +268,7 @@ for (const summary of [false, true]) test(`cancelled task preservation failure r
   const notice = f.rows().find(item => summary ? item.notice?.aggregatedFacts?.some(fact => fact.dedupKey.includes(':stop:')) : item.notice?.dedupKey.includes(':stop:'))
   assert.ok(notice)
   assert.equal(f.runtime.ownerDeliveryRelevant(f.runtime.mission(f.mission.id), notice), true)
-  assert.deepEqual(f.runtime.notices.unresolvedSubjects(f.runtime.interpretation(f.mission.id), notice), [`${row.id}@${row.epoch}`], 'cancelled execution still owes its saved workspace')
+  assert.deepEqual(f.runtime.notices.unresolvedSubjects(f.runtime.notices.interpretation(f.mission.id), notice), [`${row.id}@${row.epoch}`], 'cancelled execution still owes its saved workspace')
   const cleaned = f.runtime.task(f.mission.id, row.id); delete cleaned.resumeAfterStop
   f.runtime.commit(f.mission.id, () => f.runtime.store.put('tasks', cleaned))
   assert.equal(f.runtime.ownerDeliveryRelevant(f.runtime.mission(f.mission.id), notice), false)

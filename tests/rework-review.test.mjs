@@ -18,7 +18,7 @@ import { rm, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { assessText, toolSchemaIndex } from './refusal-inventory.mjs'
 import { FakeClock, FakeWorkers, WorkspaceWorkers, makeRepo, makeRuntime, makeWorkspaces, setup } from './faults/harness.mjs'
-import { completionError, reviewNeed, reviewPathBlocker, stalled } from '../lib/board.js'
+import { completionError, reviewNeed, reviewPathBlocker, stalled, waitsLegitimately } from '../lib/board.js'
 
 /** Every attempt captures its own commit unless `fixedCommit` pins one (an unchanged resubmission). */
 class ReworkWorkers extends FakeWorkers {
@@ -306,7 +306,7 @@ test('a challenge re-opens the grace, so the owner\'s own review of the re-opene
   await f.verify(reviewer, automatic, 'accept', 'The artifact meets the criterion')
   f.clock.advance(60_000)
   f.runtime.challenge(f.owner, f.mission.id, { evidenceId: claim.id, reason: 'A counterexample overturns the claim', toolRunIds: [] })
-  assert.equal(f.runtime.notices.waitsLegitimately(f.runtime.boardOf(f.mission.id), f.current(source)), true, 'the re-opened need waits out its own grace')
+  assert.equal(waitsLegitimately(f.runtime.boardOf(f.mission.id), f.current(source)), true, 'the re-opened need waits out its own grace')
   assert.equal(stalled(f.runtime.boardOf(f.mission.id)), false)
   await f.runtime.settle(f.mission.id)
   f.clock.advance(200)

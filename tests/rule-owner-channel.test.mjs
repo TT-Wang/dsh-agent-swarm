@@ -8,7 +8,7 @@ import { HarnessWorkers } from '../lib/harness-workers.js'
 import { registerAutomaticStart } from '../lib/planner.js'
 import { hasNotice, openAsks } from '../lib/arena.js'
 import { FakeWorkers, SwarmRuntime, makeRuntime, makeRuntimeStub } from './faults/harness.mjs'
-import { reviewNeed, reviewPathBlocker, reviewable } from '../lib/board.js'
+import { reviewNeed, reviewPathBlocker, reviewable, waitsLegitimately } from '../lib/board.js'
 
 async function fixture(t) {
   let runtime
@@ -174,7 +174,7 @@ for (const reviewStatus of ['pending', 'running', 'parked']) test(`owner reminde
   })
   t.mock.timers.tick(120000)
   assert.equal(reviewNeed(f.runtime.boardOf(f.mission.id), source).ripe, true)
-  assert.equal(f.runtime.notices.waitsLegitimately(f.runtime.boardOf(f.mission.id), source), true)
+  assert.equal(waitsLegitimately(f.runtime.boardOf(f.mission.id), source), true)
   const key = `obligation-followup:${original.id}:`
   for (let i = 0; i < 2; i++) {
     f.runtime.notices.obligationFollowupMs = 0

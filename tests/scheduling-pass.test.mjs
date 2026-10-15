@@ -24,7 +24,7 @@ import assert from 'node:assert/strict'
 import { join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { setup, makeRuntime, events, taskOf, FakeWorkers, FakeClock, SwarmRuntime, MISSION_ACCEPTANCE } from './faults/harness.mjs'
-import { reviewNeed, stalled } from '../lib/board.js'
+import { reviewNeed, stalled, waitsLegitimately } from '../lib/board.js'
 
 /** `count` ticks of the timer a fake-clock runtime does not run, one tick unit of clock time apart. */
 async function ticks(f, count) { for (let n = 0; n < count; n += 1) { f.clock.advance(f.runtime.config.tickMs); await f.runtime.tick() } }
@@ -1138,7 +1138,7 @@ test('an unreviewed submission is a stall exactly when it stops waiting legitima
       const classified = () => {
         const board = f.runtime.boardOf(f.mission.id)
         const row = board.tasks.find(candidate => candidate.id === task.id)
-        return { stall: stalled(board), waits: f.runtime.notices.waitsLegitimately(board, row) }
+        return { stall: stalled(board), waits: waitsLegitimately(board, row) }
       }
       const past = blocked ? { stall: true, waits: false } : { stall: false, waits: true }
       // One scheduler period, at least 1 s.

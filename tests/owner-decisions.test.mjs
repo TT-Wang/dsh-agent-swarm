@@ -29,9 +29,9 @@ import { HarnessWorkers, strandedInboxDecision } from '../lib/harness-workers.js
 import { sidebarState } from '../lib/types/client/progress.js'
 import { tempDirectory } from './temp-root.mjs'
 import { guardBoard } from './guard-model.mjs'
-import { noticeSubjectsFor, reviewNeed, reviewable } from '../lib/board.js'
+import { noticeSubjectsFor, reviewNeed, reviewable, stallRoots, waitsLegitimately } from '../lib/board.js'
 import { taskGraphIndex } from '../lib/task-graph.js'
-import { dispatchQuestion, stallRoots } from '../lib/notices.js'
+import { dispatchQuestion } from '../lib/notices.js'
 import { wakePrecision } from './instruments.mjs'
 import { FakeWorkers, SwarmRuntime, budget as sharedBudget, makeRuntime } from './faults/harness.mjs'
 
@@ -665,7 +665,7 @@ test('R16-A1: the waiting classifier is enumerated over every constructed board 
               f.runtime.store.put('tasks', subject)
             }
             tasks.push(subject)
-            const got = f.runtime.notices.waitsLegitimately(over(tasks), subject)
+            const got = waitsLegitimately(over(tasks), subject)
             const want = referenceWaiting(over(tasks), subject)
             if (got !== want) mismatches.push({ depStatus, replacement, subjectStatus, stopShape, reviewShape, got, want })
             const rootTask = { ...subject }
@@ -723,7 +723,7 @@ test('R16-A1: the waiting classifier is enumerated over every constructed board 
       previous = row.id
     }
     tasks.push(...rows, subject)
-    const got = f.runtime.notices.waitsLegitimately(over(tasks), subject)
+    const got = waitsLegitimately(over(tasks), subject)
     const want = referenceWaiting(over(tasks), subject)
     if (got !== want) mismatches.push({ kind: 'subjectCoverage', shape: shape.name, got, want })
     const gotRoot = stallRoots(over(tasks)).some(root => root.id === subject.id)
@@ -770,7 +770,7 @@ test("R16-A2: a cancelled predecessor with a live repair leaves its dependent wa
   assert.deepEqual(fallthroughs(), [], `the dependent waits on the running repair instead of being named: ${JSON.stringify(fallthroughs().map(delivery => delivery.content.slice(0, 80)))}`)
   assert.equal(f.runtime.boardOf(f.mission.id).graph.dependencyMetOf(original.id), false, 'the dispatcher still cannot start the dependent: its effective dependency is running, not accepted')
   const live = f.runtime.store.get('tasks', dependent.id)
-  assert.equal(f.runtime.notices.waitsLegitimately(f.runtime.boardOf(f.mission.id), live), true, 'the dependent is waiting on the live repair, not dead')
+  assert.equal(waitsLegitimately(f.runtime.boardOf(f.mission.id), live), true, 'the dependent is waiting on the live repair, not dead')
   // Pair: closing the repair's whole lineage makes the same dependent a named
   // decision — the fall-through may appear only when no live path remains.
   const repairRow = f.runtime.store.get('tasks', repair.id)
@@ -805,7 +805,7 @@ test('R16-A1r pair: a blocked subject with a running repair is never named, and 
   const namesSubject = () => f.notices().filter(delivery => Array.isArray(delivery.subjects) && delivery.subjects.some(subject => subject.startsWith(`${source.id}@`)))
   await sleep(300)
   const board = f.runtime.boardOf(f.mission.id)
-  assert.equal(f.runtime.notices.waitsLegitimately(board, f.runtime.store.get('tasks', source.id)), true, 'the blocked subject waits on its running repair')
+  assert.equal(waitsLegitimately(board, f.runtime.store.get('tasks', source.id)), true, 'the blocked subject waits on its running repair')
   assert.equal(stallRoots(board).some(root => root.id === source.id), false, 'a subject carried by a live repair is not a stall root')
   assert.deepEqual(namesSubject(), [], `no owner decision names the covered subject: ${JSON.stringify(f.notices().map(delivery => delivery.notice?.dedupKey))}`)
   // Pair: closing the whole lineage makes the same subject a named decision.
@@ -854,7 +854,7 @@ test('R16-A1r2 pair: a two-hop repair chain through a cancelled repair keeps the
   const tail = board.graph.effectiveOf(original.id)
   assert.equal(tail.id, secondRepair.id, 'the runtime seam resolves the original through the cancelled first repair to the second')
   assert.equal(tail.status, 'running', 'the seam tail is the running second repair')
-  assert.equal(f.runtime.notices.waitsLegitimately(board, f.runtime.store.get('tasks', original.id)), true, 'the original waits on the running second repair')
+  assert.equal(waitsLegitimately(board, f.runtime.store.get('tasks', original.id)), true, 'the original waits on the running second repair')
   assert.equal(stallRoots(board).some(root => root.id === original.id), false, 'a two-hop covered subject is not a stall root')
   assert.deepEqual(namesOriginal(coveredAt), [], `no owner decision names the covered original after the second repair was admitted: ${JSON.stringify(f.notices().map(delivery => delivery.notice?.dedupKey))}`)
   // Pair: closing the whole chain makes the original a named decision.
@@ -954,7 +954,7 @@ test('R16-A5: the wake-precision projection counts decisions, false wakes and mi
   assert.equal(precision.missedObligations.subjects.includes(`${repair.id}@${repair.epoch}`), false, 'the running repair is live work')
   const board = f.runtime.boardOf(f.mission.id)
   assert.equal(stallRoots(board).some(candidate => candidate.id === covered.id), false, 'the covered blocked task is not a stall root')
-  assert.equal(f.runtime.notices.waitsLegitimately(board, cover), true, 'the live cover is running work, not silence')
+  assert.equal(waitsLegitimately(board, cover), true, 'the live cover is running work, not silence')
   assert.equal(cover.replaces[0], covered.id)
   // Pair: a fall-through naming a genuinely dead subject is not a false wake, and
   // stops being a missed obligation once a decision names it.
@@ -983,8 +983,8 @@ test('R16-A6 pair: the lineage rule reaches an ordinary dependent but not a revi
   const review = put('task_r16a6_review', 'pending', { kind: 'verification', reviewOf: source.id, dependencies: [] })
   const board = f.runtime.boardOf(f.mission.id)
   assert.equal(board.graph.dependencyMetOf(source.id), false, 'the effective dependency is running, not accepted')
-  assert.equal(f.runtime.notices.waitsLegitimately(board, dependent), true, 'an ordinary dependent waits on the live repair')
-  assert.equal(f.runtime.notices.waitsLegitimately(board, review), false, 'the review follows its source IDENTITY, which is terminal: a review of a cancelled task has no path even when the obligation is repaired')
+  assert.equal(waitsLegitimately(board, dependent), true, 'an ordinary dependent waits on the live repair')
+  assert.equal(waitsLegitimately(board, review), false, 'the review follows its source IDENTITY, which is terminal: a review of a cancelled task has no path even when the obligation is repaired')
   assert.equal(stallRoots(board).some(root => root.id === review.id), false, 'a verdict record is never a stall root')
   assert.equal(stallRoots(board).some(root => root.id === dependent.id), false, 'a pending dependent is never a stall root')
   assert.equal(repair.status, 'running')
