@@ -483,5 +483,179 @@
       ]
     },
     "digest": "912e061c49739735eeb3c50e39cab971"
+  },
+  {
+    "name": "a preparation back-off, read at its revision",
+    "cacheIsLive": true,
+    "board": {
+      "status": "active",
+      "tasks": [
+        {
+          "id": "task_1",
+          "status": "submitted",
+          "attemptOwner": "member_1",
+          "ready": false,
+          "unreviewed": true
+        },
+        {
+          "id": "task_2",
+          "status": "pending",
+          "ready": false,
+          "unreviewed": false
+        },
+        {
+          "id": "task_3",
+          "status": "pending",
+          "ready": false,
+          "unreviewed": false
+        },
+        {
+          "id": "task_4",
+          "status": "running",
+          "attemptOwner": "member_1",
+          "ready": false,
+          "unreviewed": false
+        },
+        {
+          "id": "task_5",
+          "status": "pending",
+          "ready": false,
+          "unreviewed": false
+        }
+      ],
+      "members": [
+        {
+          "id": "member_1",
+          "status": "waiting"
+        },
+        {
+          "id": "member_2",
+          "status": "stopped"
+        }
+      ],
+      "pendingDeliveries": 1,
+      "challengedEvidence": 1,
+      "ceilings": [
+        "budget:pause_1",
+        "task:task_2:maxSteps"
+      ]
+    },
+    "digest": "563bb02b4106b261de6a57aa2c7b5739"
+  },
+  {
+    "name": "the back-off over on the clock, the revision unchanged",
+    "cacheIsLive": false,
+    "board": {
+      "status": "active",
+      "tasks": [
+        {
+          "id": "task_1",
+          "status": "submitted",
+          "attemptOwner": "member_1",
+          "ready": false,
+          "unreviewed": true
+        },
+        {
+          "id": "task_2",
+          "status": "pending",
+          "ready": false,
+          "unreviewed": false
+        },
+        {
+          "id": "task_3",
+          "status": "pending",
+          "ready": false,
+          "unreviewed": false
+        },
+        {
+          "id": "task_4",
+          "status": "running",
+          "attemptOwner": "member_1",
+          "ready": false,
+          "unreviewed": false
+        },
+        {
+          "id": "task_5",
+          "status": "pending",
+          "ready": true,
+          "unreviewed": false
+        }
+      ],
+      "members": [
+        {
+          "id": "member_1",
+          "status": "waiting"
+        },
+        {
+          "id": "member_2",
+          "status": "stopped"
+        }
+      ],
+      "pendingDeliveries": 1,
+      "challengedEvidence": 1,
+      "ceilings": [
+        "budget:pause_1",
+        "task:task_2:maxSteps"
+      ]
+    },
+    "digest": "c9da4c9729adc6cb191a0921fed4a88c"
+  },
+  {
+    "name": "withdrawn inside an open commit",
+    "cacheIsLive": true,
+    "board": {
+      "status": "active",
+      "tasks": [
+        {
+          "id": "task_1",
+          "status": "submitted",
+          "attemptOwner": "member_1",
+          "ready": false,
+          "unreviewed": true
+        },
+        {
+          "id": "task_2",
+          "status": "pending",
+          "ready": false,
+          "unreviewed": false
+        },
+        {
+          "id": "task_3",
+          "status": "pending",
+          "ready": false,
+          "unreviewed": false
+        },
+        {
+          "id": "task_4",
+          "status": "running",
+          "attemptOwner": "member_1",
+          "ready": false,
+          "unreviewed": false
+        },
+        {
+          "id": "task_5",
+          "status": "cancelled",
+          "ready": false,
+          "unreviewed": false
+        }
+      ],
+      "members": [
+        {
+          "id": "member_1",
+          "status": "waiting"
+        },
+        {
+          "id": "member_2",
+          "status": "stopped"
+        }
+      ],
+      "pendingDeliveries": 1,
+      "challengedEvidence": 1,
+      "ceilings": [
+        "budget:pause_1",
+        "task:task_2:maxSteps"
+      ]
+    },
+    "digest": "67058997e4e99b44e05096e176c21b4e"
   }
 ]

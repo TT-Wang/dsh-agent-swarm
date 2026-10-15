@@ -14,6 +14,13 @@
  * (revision-cached) and the digest of its board recomputed now; the board is
  * recorded with ids relabeled by first appearance, so the golden pins what F(S)
  * derives and digests, not the random ids of one run.
+ *
+ * The last states pin the revision cache itself. A preparation back-off that
+ * ends on the clock alone changes readiness at an unchanged revision, so the
+ * cached digest is the one first computed there (`cacheIsLive: false`); a read
+ * inside an open commit never answers from the cache. The adapter's idleness
+ * cannot show the cache: it never changes the ready set (a member whose
+ * idleness a borrower's readiness asks about is itself runnable and eligible).
  */
 import test from 'node:test'
 import assert from 'node:assert/strict'
@@ -96,6 +103,18 @@ test('F(S) over the fixture boards equals the recorded golden', async t => {
   put('tasks', bare)
   await step()
   record('a submission without an artifact and no live review')
+  // The revision cache: a back-off the clock ends moves readiness, not the revision.
+  const backedOff = { ...f.runtime.store.get('tasks', second.id), id: 'task_golden_backoff', title: 'Backed off', dependencies: [], preparationFailure: { reason: 'golden back-off', retryAt: clock.now() + 5_000 } }
+  delete backedOff.ceiling
+  put('tasks', backedOff)
+  record('a preparation back-off, read at its revision')
+  clock.advance(10_000)
+  record('the back-off over on the clock, the revision unchanged')
+  // An open commit reads the board it is writing, never the digest cached at the revision it has not advanced yet.
+  f.runtime.commit(f.mission.id, () => {
+    f.runtime.store.put('tasks', { ...f.runtime.store.get('tasks', backedOff.id), status: 'cancelled' })
+    record('withdrawn inside an open commit')
+  })
 
   if (process.env.UPDATE_FINGERPRINT_GOLDEN === '1') await writeFile(GOLDEN, `${JSON.stringify(states, null, 2)}\n`)
   assert.deepEqual(states, JSON.parse(await readFile(GOLDEN, 'utf8')))
