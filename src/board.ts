@@ -300,14 +300,13 @@ export function reviewPathStalled(board: Board): boolean {
 }
 
 /**
- * Nothing is running, reviewably submitted or dispatchable, and no submission
- * with no live review awaits the review admission (`awaitsReviewAdmission`,
- * the admission's own rule): workers would stay idle forever. An empty board
- * is a mission the owner has not planned yet.
+ * Nothing is running, reviewably submitted or dispatchable, and no unreviewable
+ * submission (`unreviewable`) awaits the review admission
+ * (`awaitsReviewAdmission`, the admission's own rule): workers would stay idle
+ * forever. An empty board is a mission the owner has not planned yet.
  */
 export function stalled(board: Board): boolean {
-  return board.tasks.length > 0 && reviewPathStalled(board)
-    && !board.tasks.some(task => task.status === 'submitted' && !reviewable(board, task) && awaitsReviewAdmission(board, task))
+  return board.tasks.length > 0 && reviewPathStalled(board) && !unreviewable(board).some(task => awaitsReviewAdmission(board, task))
 }
 
 /** R11-01: how long a classified provider outage keeps a member's route quiescent. */
@@ -424,7 +423,7 @@ export function reviewPathBlocker(board: Board, source: Task, need: ReviewNeed, 
 
 /** The submissions the review admission speaks for: submitted artifacts. A submission an older build left without an artifact is ordinary stuck work. */
 const admissionSpeaksFor = (task: Task): boolean => task.status === 'submitted' && task.artifact !== undefined
-/** The submissions no live review can accept (`reviewable`): F(S)'s unreviewed work (`fingerprintBoard`), whose artifacts are the review admission's sources. */
+/** The submissions no live review can accept (`reviewable`): F(S)'s unreviewed work (`fingerprintBoard`), the stall's waits on the review admission (`stalled`), and, those with an artifact, the admission's sources. */
 const unreviewable = (board: Board): Task[] => board.tasks.filter(task => task.status === 'submitted' && !reviewable(board, task))
 /** The review admission's sources, the one set its admission, its decisions and the interpretation read: the unreviewable submissions it speaks for (before the grace is applied). */
 export const unreviewedSources = (board: Board): Task[] => unreviewable(board).filter(admissionSpeaksFor)
