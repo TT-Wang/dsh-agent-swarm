@@ -6,6 +6,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { factKey, waitsLegitimately } from '../lib/notices.js'
+import { taskGraphIndex } from '../lib/task-graph.js'
 import { wakePrecision } from './instruments.mjs'
 import { FakeClock, FakeWorkers, eventually, makeRuntime } from './faults/harness.mjs'
 
@@ -203,27 +204,28 @@ test('R14-F2v D2: a stop with no recorded start is a root, never silence', async
 
 test('pending stop waits remain bounded and use the same owner scope as dispatch fencing', t => {
   const now = Date.now()
-  const rt = { bounds: { stallPassTimeoutMs: 100 }, config: { tickMs: 25 }, unfinishedDependencies: () => [], now: () => now }
+  // A board over the given rows, judged at `now` against a 100 ms stop bound.
+  const over = tasks => ({ tasks, members: [], graph: taskGraphIndex(tasks), clock: () => now, bounds: { stallPassTimeoutMs: 100, tickMs: 25 } })
   const pending = { id: 'next', missionId: 'mission', epoch: 0, status: 'pending', assigneeId: 'owner', dependencies: [] }
   const stop = (id, memberId, at, epoch = 1) => ({ id, missionId: 'mission', status: 'cancelled', epoch: 1,
     resumeAfterStop: { epoch, memberId, reason: 'handoff', ...(at === undefined ? {} : { at }) } })
   const bounded = stop('old-work', 'owner', now - 50)
-  assert.equal(waitsLegitimately(rt, pending, [pending, bounded]), true, 'the assigned member will be released by this bounded stop')
-  assert.equal(waitsLegitimately(rt, pending, [pending, stop('unknown-owner', undefined, now - 50)]), true, 'an ambiguous owner scan reserves every member')
+  assert.equal(waitsLegitimately(over([pending, bounded]), pending), true, 'the assigned member will be released by this bounded stop')
+  assert.equal(waitsLegitimately(over([pending, stop('unknown-owner', undefined, now - 50)]), pending), true, 'an ambiguous owner scan reserves every member')
   for (const expired of [stop('expired', 'owner', now - 101), stop('untimestamped', 'owner', undefined), stop('unknown-expired', undefined, now - 101)]) {
-    assert.equal(waitsLegitimately(rt, pending, [pending, expired]), false, 'an unbounded matching stop must remain actionable')
-    assert.equal(waitsLegitimately(rt, pending, [pending, bounded, expired]), false, 'one healthy stop cannot hide another matching stop past its bound')
+    assert.equal(waitsLegitimately(over([pending, expired]), pending), false, 'an unbounded matching stop must remain actionable')
+    assert.equal(waitsLegitimately(over([pending, bounded, expired]), pending), false, 'one healthy stop cannot hide another matching stop past its bound')
   }
-  assert.equal(waitsLegitimately(rt, pending, [pending, stop('unrelated', 'other', now - 50)]), false, 'another member stop is not this task path')
-  assert.equal(waitsLegitimately(rt, pending, [pending, stop('stale', 'owner', now - 50, 0)]), false, 'a stale stop epoch cannot justify waiting')
+  assert.equal(waitsLegitimately(over([pending, stop('unrelated', 'other', now - 50)]), pending), false, 'another member stop is not this task path')
+  assert.equal(waitsLegitimately(over([pending, stop('stale', 'owner', now - 50, 0)]), pending), false, 'a stale stop epoch cannot justify waiting')
   const running = { id: 'active-work', missionId: 'mission', status: 'running', epoch: 1, dependencies: [], attempt: { ownerId: 'owner', leaseUntil: now + 100 } }
-  assert.equal(waitsLegitimately(rt, pending, [pending, running]), true, 'the selected member is busy under a live lease')
-  assert.equal(waitsLegitimately(rt, pending, [pending, { ...running, attempt: { ...running.attempt, leaseUntil: now - 1 } }]), false, 'an expired lease cannot hide an overdue assignment')
-  assert.equal(waitsLegitimately(rt, { ...pending, dependencies: ['missing'] }, [pending, running]), false, 'a busy owner does not repair a missing prerequisite')
-  assert.equal(waitsLegitimately(rt, { ...pending, dependencies: ['missing'] }, [pending, bounded]), false, 'a bounded stop does not repair a missing prerequisite')
-  assert.equal(waitsLegitimately(rt, { ...pending, reviewOf: 'missing' }, [pending, bounded]), false, 'a bounded stop does not repair a missing review source')
+  assert.equal(waitsLegitimately(over([pending, running]), pending), true, 'the selected member is busy under a live lease')
+  assert.equal(waitsLegitimately(over([pending, { ...running, attempt: { ...running.attempt, leaseUntil: now - 1 } }]), pending), false, 'an expired lease cannot hide an overdue assignment')
+  assert.equal(waitsLegitimately(over([pending, running]), { ...pending, dependencies: ['missing'] }), false, 'a busy owner does not repair a missing prerequisite')
+  assert.equal(waitsLegitimately(over([pending, bounded]), { ...pending, dependencies: ['missing'] }), false, 'a bounded stop does not repair a missing prerequisite')
+  assert.equal(waitsLegitimately(over([pending, bounded]), { ...pending, reviewOf: 'missing' }), false, 'a bounded stop does not repair a missing review source')
   const accepted = { id: 'accepted', missionId: 'mission', status: 'accepted', epoch: 1, dependencies: [] }
-  assert.equal(waitsLegitimately(rt, { ...pending, dependencies: [accepted.id] }, [pending, accepted, running]), true, 'accepted prerequisites remain ready while the member is busy')
+  assert.equal(waitsLegitimately(over([pending, accepted, running]), { ...pending, dependencies: [accepted.id] }), true, 'accepted prerequisites remain ready while the member is busy')
 })
 
 test('a real review rejection names its stall root exactly once, with exactly one stall-root event', async t => {
@@ -597,8 +599,8 @@ test('a pending task in preparation back-off is a bounded live wait, and a named
   })
   const epoch = f.runtime.store.get('tasks', backoff.id).epoch
   const named = () => f.fallthroughs().filter(delivery => delivery.subjects?.includes(`${backoff.id}@${epoch}`))
-  const board = () => f.runtime.store.list('tasks', f.mission.id)
-  assert.equal(waitsLegitimately(f.runtime, f.runtime.store.get('tasks', backoff.id), board()), true, 'the back-off is a live wait')
+  const board = () => f.runtime.boardOf(f.mission.id)
+  assert.equal(f.runtime.notices.waitsLegitimately(board(), f.runtime.store.get('tasks', backoff.id)), true, 'the back-off is a live wait')
   await ticks(f, 10)
   assert.equal(named().length, 0, `no fall-through while the host's retry is scheduled: ${JSON.stringify(f.notices().map(delivery => delivery.notice?.dedupKey))}`)
   const notice = await ticksUntil(f, () => named()[0], 'the overdue retry is named once the bound passes')
@@ -608,11 +610,11 @@ test('a pending task in preparation back-off is a bounded live wait, and a named
   assert.equal(named().length, 1, 'named exactly once')
   // Past the bound the back-off explains nothing: the row is judged like any
   // other ready work, so an assignee holding a live lease is still a live wait.
-  assert.equal(waitsLegitimately(f.runtime, { ...f.runtime.store.get('tasks', backoff.id), assigneeId: f.member.id }, board()), true,
+  assert.equal(f.runtime.notices.waitsLegitimately(board(), { ...f.runtime.store.get('tasks', backoff.id), assigneeId: f.member.id }), true,
     'an expired back-off queued behind its assignee\'s live lease is not an obstacle')
   // A failure the host will not retry stays a block cause, never a wait.
   const { retryAt: _retryAt, ...permanent } = f.runtime.store.get('tasks', backoff.id).preparationFailure
-  assert.equal(waitsLegitimately(f.runtime, { ...f.runtime.store.get('tasks', backoff.id), preparationFailure: { ...permanent, transient: false } }, board()), false)
+  assert.equal(f.runtime.notices.waitsLegitimately(board(), { ...f.runtime.store.get('tasks', backoff.id), preparationFailure: { ...permanent, transient: false } }), false)
 })
 
 for (const coNotice of ['stall-root', 'permanent-preparation-failure']) {
@@ -773,7 +775,7 @@ test('a back-off whose bound passes while a pass judges the board is still judge
   let spun
   const judgedB = []
   const waits = notices.waitsLegitimately.bind(notices)
-  notices.waitsLegitimately = (task, tasks) => { const result = waits(task, tasks); if (task.id === b.id) judgedB.push({ at: f.clock.now(), waits: result }); return result }
+  notices.waitsLegitimately = (board, task) => { const result = waits(board, task); if (task.id === b.id) judgedB.push({ at: f.clock.now(), waits: result }); return result }
   const judge = notices.judgeBoard.bind(notices)
   notices.judgeBoard = (...args) => {
     const start = f.clock.now()

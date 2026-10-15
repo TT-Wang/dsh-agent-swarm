@@ -15,8 +15,9 @@ import { createHash } from 'node:crypto'
 import { writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { FakeClock, FakeWorkers, MISSION_ACCEPTANCE, acceptThroughReview, blockThroughReview, eventually, events, setup, taskOf } from './faults/harness.mjs'
+import { BOARD_RUNNING, reviewNeed } from '../lib/board.js'
 import { ownerTools } from './refusal-inventory.mjs'
-import { BOARD_RUNNING, NOTICE_TEMPLATES, factKey, noticeFamily, noticeTemplateKey } from '../lib/notices.js'
+import { NOTICE_TEMPLATES, factKey, noticeFamily, noticeTemplateKey } from '../lib/notices.js'
 
 const ownerRows = f => f.runtime.store.list('deliveries', f.mission.id).filter(delivery => delivery.to === 'owner' && delivery.notice !== undefined)
 const stallRow = f => ownerRows(f).find(delivery => delivery.notice.trigger === 'mission/stalled' && delivery.content.startsWith('Mission stalled'))
@@ -321,7 +322,7 @@ test('D3: a submission whose review need ripened, beside a dependent that waits 
     await f.runtime.submit(f.actor(f.author), f.mission.id, { taskId: source.id, attemptId: claimed.attempt.id, output: 'candidate' })
     await f.runtime.settle(f.mission.id)
     f.clock.advance(grace(f))
-    const need = f.runtime.reviewNeed(taskOf(f.runtime, source.id))
+    const need = reviewNeed(f.runtime.boardOf(f.mission.id), taskOf(f.runtime, source.id))
     assert.deepEqual([need.ripe, need.recorded, f.runtime.interpretation(f.mission.id).stalled], [true, false, false], `deliverable ${index}: before the next pass the need is ripe, the admission has yet to process it, and the board is not stalled by it`)
     return { source, dependent }
   }
@@ -373,7 +374,7 @@ test('D3: a submission whose review need ripened, beside a dependent that waits 
   await recorded.runtime.tick()
   await recorded.runtime.settle(recorded.mission.id)
   const deferred = ownerRows(recorded).filter(delivery => delivery.notice.dedupKey.startsWith(`review-blocked:${recorded.mission.id}:${source.id}:`))
-  assert.deepEqual([recorded.runtime.reviewNeed(taskOf(recorded.runtime, source.id)).recorded, deferred.map(delivery => delivery.notice.reason), admitted(recorded, source)], [true, [BOARD_RUNNING], undefined], 'the admission recorded the need by deferring its review while the other work runs')
+  assert.deepEqual([reviewNeed(recorded.runtime.boardOf(recorded.mission.id), taskOf(recorded.runtime, source.id)).recorded, deferred.map(delivery => delivery.notice.reason), admitted(recorded, source)], [true, [BOARD_RUNNING], undefined], 'the admission recorded the need by deferring its review while the other work runs')
   recorded.runtime.cancel(recorded.owner, recorded.mission.id, { taskId: running.id, reason: 'Not needed' })
   recorded.runtime.notices.expectWedgedRelease(recorded.mission.id)
   await Promise.resolve()
@@ -491,7 +492,7 @@ test('beside running work, an unreviewable source past its grace is stuck work: 
   await f.runtime.submit(f.actor(f.author), f.mission.id, { taskId: source.id, attemptId: claimed.attempt.id, output: 'candidate' })
   await f.runtime.settle(f.mission.id)
   await ticks(f, 150)
-  assert.deepEqual([taskOf(f.runtime, running.id).status, f.runtime.reviewNeed(taskOf(f.runtime, source.id)).ripe], ['running', true], 'the other work still runs under its lease, and the source is past its grace')
+  assert.deepEqual([taskOf(f.runtime, running.id).status, reviewNeed(f.runtime.boardOf(f.mission.id), taskOf(f.runtime, source.id)).ripe], ['running', true], 'the other work still runs under its lease, and the source is past its grace')
   const naming = ownerRows(f).filter(delivery => (delivery.subjects ?? []).includes(subjectOf(f, source)) && delivery.notice.trigger !== 'owner-decision-unresolved')
   assert.deepEqual(naming.map(delivery => noticeFamily(delivery)).sort(), ['fallthrough', 'review-blocked'], 'the source is named by the fall-through beside the admission\'s decision')
   const [decision, fallthrough] = ['review-blocked', 'fallthrough'].map(family => naming.find(delivery => noticeFamily(delivery) === family))
@@ -636,7 +637,7 @@ const graceBoard = async (t, { legacy = false, running = false } = {}) => {
   /** The families of the decisions naming a task at its epoch, reminders aside. */
   const naming = task => ownerRows(f).filter(delivery => (delivery.subjects ?? []).includes(`${task.id}@${taskOf(f.runtime, task.id).epoch}`) && delivery.notice.trigger !== 'owner-decision-unresolved')
   await ticks(f, 1)
-  assert.equal(f.runtime.reviewNeed(taskOf(f.runtime, source.id)).ripe, false, 'the need is inside its grace')
+  assert.equal(reviewNeed(f.runtime.boardOf(f.mission.id), taskOf(f.runtime, source.id)).ripe, false, 'the need is inside its grace')
   return { f, dead, source, naming, families: task => naming(task).map(delivery => noticeFamily(delivery)) }
 }
 
@@ -683,9 +684,9 @@ test('a review-blocked decision an older build wrote for a submission without an
     await f.runtime.settle(f.mission.id)
     // The decision 29a0268 wrote for this source past its grace, through the same emitter, with its event: the running board's cause.
     const row = taskOf(f.runtime, source.id)
-    f.runtime.notices.notifyReviewBlocked(f.runtime.mission(f.mission.id), row, f.runtime.reviewNeed(row).id, BOARD_RUNNING)
+    f.runtime.notices.notifyReviewBlocked(f.runtime.mission(f.mission.id), row, reviewNeed(f.runtime.boardOf(f.mission.id), row).id, BOARD_RUNNING)
     const [legacy] = ownerRows(f).filter(delivery => noticeFamily(delivery) === 'review-blocked')
-    assert.equal(legacy.notice.dedupKey, `review-blocked:${f.mission.id}:${source.id}:${f.runtime.reviewNeed(row).id}:${BOARD_RUNNING}`, `running=${running}: the older build's key`)
+    assert.equal(legacy.notice.dedupKey, `review-blocked:${f.mission.id}:${source.id}:${reviewNeed(f.runtime.boardOf(f.mission.id), row).id}:${BOARD_RUNNING}`, `running=${running}: the older build's key`)
     // After the upgrade the running work goes on, or the owner withdraws it and the board has nothing else to do.
     if (!running) { f.runtime.cancel(f.owner, f.mission.id, { taskId: unrelated.id, reason: 'Not needed' }); await f.runtime.settle(f.mission.id) }
     await ticks(f, Math.ceil(Math.max(f.runtime.config.tickMs, 1_000) / f.runtime.config.tickMs) + 1)

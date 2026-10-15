@@ -205,9 +205,9 @@ export const CALLER_COMPOSED_MESSAGES = [
   {
     file: 'src/admission.ts',
     code: 'review_path_missing',
-    authoredIn: 'src/runtime.ts',
+    authoredIn: 'src/board.ts',
     probe: 'reviewPathExit',
-    note: 'Each review-blocked reason names its own exit: SwarmRuntime.reviewPathBlocker and the automatic-review admission failure compose it in src/runtime.ts, the transition classifier\'s running-board fallback in src/notices.ts. The probe holds the exits they share (ADMIT_REVIEW, WITHDRAW_SOURCE) to callExitViolations; tests/review-blocked-exits.test.mjs performs every exit a reason names.',
+    note: 'Each review-blocked reason names its own exit: reviewPathBlocker composes it in src/board.ts, the automatic-review admission failure in src/runtime.ts, the transition classifier\'s running-board fallback in src/notices.ts. The probe holds the exits they share (ADMIT_REVIEW, WITHDRAW_SOURCE) to callExitViolations; tests/review-blocked-exits.test.mjs performs every exit a reason names.',
   },
 ]
 

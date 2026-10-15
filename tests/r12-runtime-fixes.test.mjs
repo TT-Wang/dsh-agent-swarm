@@ -1,6 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { eventually, makeRuntime } from './faults/harness.mjs'
+import { reviewNeed } from '../lib/board.js'
 
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms))
 async function fixture(t) {
@@ -122,13 +123,13 @@ test('retired members and late start failures cannot resurrect membership', asyn
 test('submission and missing-review identity survive event-window truncation and cache loss', async t => {
   const f = await fixture(t), task = f.propose({})
   f.runtime.store.transaction(() => f.runtime.store.event(f.mission.id, 'task/submitted', f.a.id, { taskId: task.id }))
-  const need = f.runtime.reviewNeed(task)
+  const need = reviewNeed(f.runtime.boardOf(task.missionId), task)
   assert.ok(need.seq > 0)
   assert.equal(need.recorded, false)
   f.runtime.reportMissingReview(f.mission, task)
   f.runtime.store.transaction(() => { for (let i = 0; i < 5; i++) f.runtime.store.event(f.mission.id, 'noise', 'runtime', {}) })
-  assert.equal(f.runtime.reviewNeed(task).seq, need.seq)
-  assert.equal(f.runtime.reviewNeed(task).recorded, true, 'the missing review stays recorded for this need')
+  assert.equal(reviewNeed(f.runtime.boardOf(task.missionId), task).seq, need.seq)
+  assert.equal(reviewNeed(f.runtime.boardOf(task.missionId), task).recorded, true, 'the missing review stays recorded for this need')
 })
 
 test('owner can settle receipts after stop without queuing work or reactivating the mission', async t => {

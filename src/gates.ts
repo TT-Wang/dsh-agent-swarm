@@ -13,6 +13,7 @@ import { TERMINAL_STATES, currentEvidenceIds, subjectsOfTasks, terminal } from '
 import { excerpt } from './declared-checks.ts'
 import { executionElapsed } from './resource-time.ts'
 import { memberPhaseOf } from './projection.ts'
+import { dispatchable, reviewable } from './board.ts'
 import { noticeFamily, noticeIdentity } from './notices.ts'
 import type { SwarmRuntime } from './runtime.ts'
 import type { Delivery, Member, Mission, Post, Task, UsageBuckets, UsageSnapshotSource } from './types.ts'
@@ -127,17 +128,16 @@ export class RuntimeGates {
   /**
    * The owner-observable board slice F(S) digests (`missionFingerprint`; the
    * kernel caches the digest per store revision, `Kernel.fingerprint`). Its
-   * readiness and review come from Scheduling's predicates (`dispatchable`,
+   * readiness and review are the board's predicates (`dispatchable`,
    * `reviewable`), the ones the scheduler and the completion check use, so the
    * digest cannot disagree with the board; readiness asks the adapter's
    * idleness and the clock (a preparation back-off), not only durable rows.
    */
   fingerprintBoard(missionId: string): MissionFingerprintBoard {
-    const mission = this.rt.mission(missionId)
-    const tasks = this.rt.store.list('tasks', missionId)
-    const members = this.rt.store.list('members', missionId)
-    const ready = new Set(this.rt.dispatchable(tasks, members).map(task => task.id))
-    const unreviewed = new Set(tasks.filter(task => task.status === 'submitted' && !this.rt.reviewable(task, tasks)).map(task => task.id))
+    const board = this.rt.boardOf(missionId)
+    const { mission, tasks, members } = board
+    const ready = new Set(dispatchable(board).map(task => task.id))
+    const unreviewed = new Set(tasks.filter(task => task.status === 'submitted' && !reviewable(board, task)).map(task => task.id))
     return {
       status: mission.status,
       tasks: tasks.map(task => ({ id: task.id, status: task.status,

@@ -24,7 +24,7 @@ import assert from 'node:assert/strict'
 import { join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { setup, makeRuntime, events, taskOf, FakeWorkers, FakeClock, SwarmRuntime, MISSION_ACCEPTANCE } from './faults/harness.mjs'
-import { waitsLegitimately } from '../lib/notices.js'
+import { reviewNeed, stalled } from '../lib/board.js'
 
 /** `count` ticks of the timer a fake-clock runtime does not run, one tick unit of clock time apart. */
 async function ticks(f, count) { for (let n = 0; n < count; n += 1) { f.clock.advance(f.runtime.config.tickMs); await f.runtime.tick() } }
@@ -1114,7 +1114,7 @@ test('manualTick runs no timer while tickMs stays the tick unit: settle() return
     // durable submission, so a submission's review need ripens only past it.
     const claimed = taskOf(f.runtime, task.id)
     await f.runtime.submit(f.actor(f.author), f.mission.id, { taskId: task.id, attemptId: claimed.attempt.id, output: 'candidate' })
-    const ripe = () => f.runtime.reviewNeed(taskOf(f.runtime, task.id)).ripe
+    const ripe = () => reviewNeed(f.runtime.boardOf(f.mission.id), taskOf(f.runtime, task.id)).ripe
     assert.equal(ripe(), false, 'a submission\'s review need is not ripe at its own instant')
     clock.advance(Math.max(tickMs, 1_000) - 1)
     assert.equal(ripe(), false, 'nor one clock millisecond inside the grace')
@@ -1136,9 +1136,9 @@ test('an unreviewed submission is a stall exactly when it stops waiting legitima
       if (blocked) f.runtime.commit(f.mission.id, () => f.runtime.store.put('members', { ...f.runtime.store.get('members', f.reviewer.id), phase: 'stopped' }))
       await f.runtime.submit(f.actor(f.author), f.mission.id, { taskId: task.id, attemptId: claimed.attempt.id, output: 'candidate' })
       const classified = () => {
-        const tasks = f.runtime.store.list('tasks', f.mission.id)
-        const row = tasks.find(candidate => candidate.id === task.id)
-        return { stall: f.runtime.stalled(tasks, f.runtime.store.list('members', f.mission.id)), waits: waitsLegitimately(f.runtime, row, tasks) }
+        const board = f.runtime.boardOf(f.mission.id)
+        const row = board.tasks.find(candidate => candidate.id === task.id)
+        return { stall: stalled(board), waits: f.runtime.notices.waitsLegitimately(board, row) }
       }
       const past = blocked ? { stall: true, waits: false } : { stall: false, waits: true }
       // One scheduler period, at least 1 s.
@@ -1148,7 +1148,7 @@ test('an unreviewed submission is a stall exactly when it stops waiting legitima
       assert.deepEqual(classified(), past, `tickMs ${tickMs}, blocked ${blocked}: past it, a source the admission names a blocker for is a stall, and one it would admit a review for waits for the admission, before the admission has run`)
       await f.runtime.tick()
       await f.runtime.settle(f.mission.id)
-      assert.equal(f.runtime.reviewNeed(taskOf(f.runtime, task.id)).recorded, true, `tickMs ${tickMs}, blocked ${blocked}: the next pass's admission recorded the need`)
+      assert.equal(reviewNeed(f.runtime.boardOf(f.mission.id), taskOf(f.runtime, task.id)).recorded, true, `tickMs ${tickMs}, blocked ${blocked}: the next pass's admission recorded the need`)
       assert.deepEqual(classified(), past, `tickMs ${tickMs}, blocked ${blocked}: and the record changes neither reader`)
       assert.equal(f.runtime.store.list('tasks', f.mission.id).some(row => row.reviewOf === task.id), !blocked, `tickMs ${tickMs}, blocked ${blocked}: the admission admitted a review exactly when it named no blocker`)
     } finally { await f.cleanup() }

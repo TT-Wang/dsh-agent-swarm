@@ -13,6 +13,7 @@ import { arenaView } from '../lib/arena.js'
 import { validatePlan } from '../lib/plans.js'
 import { boardIndex } from '../lib/types/client/projection.js'
 import { FakeClock, MISSION_ACCEPTANCE, setup, taskOf } from './faults/harness.mjs'
+import { capable, ready, reviewNeed, reviewPathBlocker, reviewable, unschedulable } from '../lib/board.js'
 
 const coded = code => error => { assert.equal(error.code, code, error.message); return true }
 
@@ -63,8 +64,8 @@ test('claim (capabilityBlocker): a prior owner cannot claim an open review of it
   const f = await coauthored(t)
   const open = f.review()
   await assert.rejects(f.runtime.claim(f.actor(f.prior), f.mission.id, open.id), /authored review source/)
-  assert.equal(f.runtime.scheduling.capable(taskOf(f.runtime, open.id), f.prior), false, 'the dispatcher and reroute share the refusal')
-  assert.equal(f.runtime.scheduling.capable(taskOf(f.runtime, open.id), f.reviewer), true)
+  assert.equal(capable(f.runtime.boardOf(f.mission.id), taskOf(f.runtime, open.id), f.prior), false, 'the dispatcher and reroute share the refusal')
+  assert.equal(capable(f.runtime.boardOf(f.mission.id), taskOf(f.runtime, open.id), f.reviewer), true)
 })
 
 test('handoff: a review cannot be handed to a prior owner of its source', async t => {
@@ -116,7 +117,7 @@ test('claim and dispatch of an unassigned SOURCE: never to the member its own bo
   await f.runtime.scheduling.dispatch(f.runtime.mission(f.mission.id), f.mission.id)
   const pending = taskOf(f.runtime, source.id)
   assert.deepEqual([pending.status, pending.attempt, pending.priorOwnerIds], ['pending', undefined, []], 'the reviewer never became the source\'s author')
-  assert.equal(f.runtime.ready(pending, f.runtime.store.get('members', f.reviewer.id)), false)
+  assert.equal(ready(f.runtime.boardOf(f.mission.id), pending, f.runtime.store.get('members', f.reviewer.id)), false)
   await assert.rejects(f.runtime.claim(f.actor(f.reviewer), f.mission.id, source.id), error => {
     assert.equal(error.code, 'task_not_ready')
     assert.ok(error.message.includes(`is the assignee of review ${review.id} of this task`), error.message)
@@ -146,8 +147,8 @@ test('reroute of a SOURCE: a failed start never moves it to the member its own b
       assert.notEqual(taskOf(f.runtime, source.id).assigneeId, bound.id)
       assert.deepEqual(moved, shape === 'two members' ? [] : [f.reviewer.id], 'an independent capable member takes it when there is one')
       // With none, the released source is named unschedulable: no live member may take it.
-      const unschedulable = f.runtime.unschedulable(f.runtime.mission(f.mission.id), f.runtime.store.list('tasks', f.mission.id), f.runtime.store.list('members', f.mission.id)).map(task => task.id)
-      assert.equal(unschedulable.includes(source.id), shape === 'two members')
+      const dead = unschedulable(f.runtime.boardOf(f.mission.id)).map(task => task.id)
+      assert.equal(dead.includes(source.id), shape === 'two members')
       assert.equal(taskOf(f.runtime, review.id).assigneeId, bound.id)
       assert.equal(canOwnReview(taskOf(f.runtime, source.id), bound.id), true, 'the review stays ownable by its assignee')
     })
@@ -170,16 +171,16 @@ test('verify: a prior owner holding a review attempt cannot record a verdict', a
 test('reviewable: a pending review only a prior owner could take is not a live review path', async t => {
   const f = await coauthored(t)
   f.review()
-  const reviewable = () => f.runtime.reviewable(taskOf(f.runtime, f.source.id), f.runtime.store.list('tasks', f.mission.id))
-  assert.equal(reviewable(), true, 'an independent live member makes it live')
+  const live = () => reviewable(f.runtime.boardOf(f.mission.id), taskOf(f.runtime, f.source.id))
+  assert.equal(live(), true, 'an independent live member makes it live')
   f.stopReviewer()
-  assert.equal(reviewable(), false)
+  assert.equal(live(), false)
 })
 
 test('waitsLegitimately: a pending review only a prior owner could take waits on nothing', async t => {
   const f = await coauthored(t)
   const open = f.review()
-  const waits = () => f.runtime.notices.waitsLegitimately(taskOf(f.runtime, open.id), f.runtime.store.list('tasks', f.mission.id))
+  const waits = () => f.runtime.notices.waitsLegitimately(f.runtime.boardOf(f.mission.id), taskOf(f.runtime, open.id))
   assert.equal(waits(), true, 'an independent live member makes the review a live wait')
   f.stopReviewer()
   assert.equal(waits(), false, 'with only the source\'s authors live, no path advances the review')
@@ -187,7 +188,7 @@ test('waitsLegitimately: a pending review only a prior owner could take waits on
 
 test('reviewPathBlocker: a prior owner does not count as the independent member an automatic review needs', async t => {
   const f = await coauthored(t)
-  const blocker = () => f.runtime.reviewPathBlocker(taskOf(f.runtime, f.source.id), f.runtime.reviewNeed(taskOf(f.runtime, f.source.id)))
+  const blocker = () => { const board = f.runtime.boardOf(f.mission.id), source = taskOf(f.runtime, f.source.id); return reviewPathBlocker(board, source, reviewNeed(board, source)) }
   assert.equal(blocker(), undefined)
   f.stopReviewer()
   assert.match(blocker(), /no live member other than the author/)
@@ -196,7 +197,7 @@ test('reviewPathBlocker: a prior owner does not count as the independent member 
 test('unschedulable: a pending review whose only live candidates authored its source is dead', async t => {
   const f = await coauthored(t)
   const open = f.review()
-  const dead = () => f.runtime.scheduling.unschedulable(f.runtime.mission(f.mission.id), f.runtime.store.list('tasks', f.mission.id), f.runtime.store.list('members', f.mission.id)).map(task => task.id)
+  const dead = () => unschedulable(f.runtime.boardOf(f.mission.id)).map(task => task.id)
   assert.equal(dead().includes(open.id), false)
   f.stopReviewer()
   assert.equal(dead().includes(open.id), true)

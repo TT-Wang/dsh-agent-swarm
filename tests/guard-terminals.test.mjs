@@ -52,6 +52,7 @@ import { guardTerminal } from '../lib/refusals.js'
 import { dependencyAssumptions, reconcileTaskAdmission } from '../lib/admission.js'
 import { assessText, ownerTools, sessionTools, toolSchemaIndex } from './refusal-inventory.mjs'
 import { setup, eventually, events, FakeClock, budget } from './faults/harness.mjs'
+import { reviewable } from '../lib/board.js'
 
 /** The model-visible code of the R12-F9 admission refusal. */
 const DEPENDENCY_ASSUMPTION_CODE = 'dependency_assumption_missing'
@@ -532,7 +533,7 @@ test('S4r-D4: guardBoard reports review liveness from the same predicate the sch
     f.runtime.cancel(f.owner, f.mission.id, { taskId: review.id, reason: 'S4r: withdraw the review' })
     const board = guardBoard(f.runtime, f.mission.id)
     const source = board.tasks.find(candidate => candidate.id === task.id)
-    const schedulerSays = f.runtime.scheduling.reviewable(f.runtime.store.get('tasks', task.id), f.runtime.store.list('tasks', f.mission.id))
+    const schedulerSays = reviewable(f.runtime.boardOf(f.mission.id), f.runtime.store.get('tasks', task.id))
     assert.equal(schedulerSays, false, 'the scheduler sees no live review')
     assert.equal(source.reviewSourceLive, schedulerSays, 'the board view and the scheduler agree')
     assert.equal(guardActions(board).filter(action => action.kind === 'progress' && action.taskId === task.id).length, 0,

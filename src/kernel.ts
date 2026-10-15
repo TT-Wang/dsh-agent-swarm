@@ -4,7 +4,7 @@
  * through `Kernel`, and stamps a pass body it awaits for without importing the
  * sweep.
  */
-import type { Bounds } from './board.ts'
+import type { AdapterView, Board, Bounds } from './board.ts'
 import type { SwarmStore } from './store.ts'
 import type { Mission, RuntimeConfig, Task, WorkerAdapter } from './types.ts'
 
@@ -13,12 +13,15 @@ import type { Mission, RuntimeConfig, Task, WorkerAdapter } from './types.ts'
  * the store and the transaction funnel over it, the runtime clock, the adapter,
  * the mission queue, the lifecycle flags and the declared bounds. `bounds` is
  * read from the live config on every read, never a snapshot, because a config
- * can change after construction. `fingerprint` is F(S), the board digest the owner
- * instruments and the stall events carry. Its cache is the kernel's: one digest
- * per store revision, never trusted inside an open transaction (`commitDepth`).
- * The slice it digests is not: Gates builds it (`fingerprintBoard`) over
- * Scheduling's readiness and review predicates, and readiness asks the
- * adapter's idleness and the clock, so F(S) still reaches up into those seams.
+ * can change after construction. `boardOf` is one mission's board as the store
+ * holds it now, the value every decision reads where it decides, and `view` the
+ * adapter answers it asks, called through on every ask. `fingerprint` is F(S),
+ * the board digest the owner instruments and the stall events carry. Its cache
+ * is the kernel's: one digest per store revision, never trusted inside an open
+ * transaction (`commitDepth`). The slice it digests is not: Gates builds it
+ * (`fingerprintBoard`) over the board's readiness and review predicates, and
+ * readiness asks the adapter's idleness and the clock, so F(S) still reaches up
+ * into Gates.
  */
 export interface Kernel {
   readonly store: SwarmStore
@@ -32,6 +35,8 @@ export interface Kernel {
   /** This process's identity in durable claims: a claim another instance wrote never gates this one. */
   readonly instanceId: string
   readonly bounds: Bounds
+  readonly view: AdapterView
+  boardOf(missionId: string): Board
   commit<T>(missionId: string, fn: () => T): T
   defer(fn: () => Promise<void>): void
   exclusive<T>(missionId: string, fn: () => Promise<T>): Promise<T>

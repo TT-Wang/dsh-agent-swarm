@@ -13,6 +13,7 @@ import { stopFaultKey } from './notices.ts'
 import { memberPhaseOf } from './projection.ts'
 import { PolicyError } from './policy-error.ts'
 import { awaited, formatSpan, type SchedulingPass } from './kernel.ts'
+import { dependencySatisfied } from './board.ts'
 
 /**
  * The detail a terminal message embeds. A guard's own message may already carry
@@ -218,7 +219,8 @@ export class Attempts {
     const { member } = this.rt.active(actor, missionId)
     const task = this.rt.task(missionId, taskId)
     if (!member || task.status !== 'running' || !task.attempt || task.attempt.id !== attemptId || task.attempt.ownerId !== member.id || task.attempt.leaseUntil < this.rt.now()) throw new PolicyError('task_attempt_stale', 'authorization_error', 'Stale or unauthorized task attempt; stop work and observe the current assignment')
-    if (!task.dependencies.every(dep => this.rt.dependencySatisfied(missionId, dep))) throw new PolicyError('task_prerequisite_revoked', 'tool_error', 'A task prerequisite is no longer accepted; stop work')
+    const board = this.rt.boardOf(missionId)
+    if (!task.dependencies.every(dep => dependencySatisfied(board, dep))) throw new PolicyError('task_prerequisite_revoked', 'tool_error', 'A task prerequisite is no longer accepted; stop work')
     return { task, member }
   }
   /**

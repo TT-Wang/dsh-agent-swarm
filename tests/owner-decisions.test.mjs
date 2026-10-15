@@ -29,8 +29,14 @@ import { HarnessWorkers, strandedInboxDecision } from '../lib/harness-workers.js
 import { sidebarState } from '../lib/types/client/progress.js'
 import { tempDirectory } from './temp-root.mjs'
 import { guardBoard } from './guard-model.mjs'
+import { dependencySatisfied, effectiveDependency, reviewNeed, reviewable } from '../lib/board.js'
+import { taskGraphIndex } from '../lib/task-graph.js'
+import { dispatchQuestion } from '../lib/notices.js'
 import { wakePrecision } from './instruments.mjs'
 import { FakeWorkers, SwarmRuntime, budget as sharedBudget, makeRuntime } from './faults/harness.mjs'
+
+/** The fixture mission's board over the given rows, the way the runtime judges rows it holds. */
+const boardOver = (f, tasks) => ({ ...f.runtime.boardOf(f.mission.id), tasks, graph: taskGraphIndex(tasks) })
 
 const budget = { ...sharedBudget, maxTokens: 100000, maxSteps: 100, maxTasks: 20, maxExperiments: 2 }
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
@@ -230,13 +236,12 @@ test('R15-A4 pair: an open attempt stays silent — the close-out path already n
   const f = await scenario(t, { workers: new Workers({ idle: memberId => !memberId.startsWith('holder-member') }) })
   const builder = await f.addMember('Builder')
   const task = f.propose('Mid-flight', { assigneeId: builder.id })
-  const members = f.runtime.store.list('members', f.mission.id)
   const withoutAttempt = { ...f.runtime.store.get('tasks', task.id) }
-  assert.notEqual(f.runtime.dispatchQuestion(f.mission.id, [withoutAttempt], members, [withoutAttempt]), undefined, 'the question answers for a task with no open attempt')
+  assert.notEqual(dispatchQuestion(boardOver(f, [withoutAttempt]), [withoutAttempt]), undefined, 'the question answers for a task with no open attempt')
   const row = f.runtime.store.get('tasks', task.id)
   row.attempt = { id: 'attempt_open', epoch: row.epoch, ownerId: builder.id, leaseUntil: Date.now() + 60000 }
   f.runtime.store.put('tasks', row)
-  assert.equal(f.runtime.dispatchQuestion(f.mission.id, [f.runtime.store.get('tasks', task.id)], members, [f.runtime.store.get('tasks', task.id)]), undefined, "an open attempt is the close-out path business, not a dispatch question")
+  assert.equal(dispatchQuestion(boardOver(f, [f.runtime.store.get('tasks', task.id)]), [f.runtime.store.get('tasks', task.id)]), undefined, "an open attempt is the close-out path business, not a dispatch question")
   await sleep(250)
   const question = f.notices().find(delivery => typeof delivery.notice?.dedupKey === 'string' && delivery.notice.dedupKey.startsWith('dispatch-question:'))
   assert.equal(question, undefined, 'no owner decision is recorded while an open attempt exists')
@@ -538,8 +543,8 @@ const TERMINAL_STATES = new Set(['accepted', 'cancelled'])
  * two-hop repair chain still covered the original through the seam while the
  * weakened classifier did not).
  */
-function referenceCarried(runtime, missionId, task, tasks) {
-  const tail = runtime.effectiveDependency(missionId, task.id, tasks)
+function referenceCarried(board, task) {
+  const tail = effectiveDependency(board, task.id)
   return tail.id !== task.id && !TERMINAL_STATES.has(tail.status)
 }
 
@@ -551,37 +556,38 @@ function referenceCarried(runtime, missionId, task, tasks) {
  * replacement-coverage helper makes them disagree on the two-hop chain, which is
  * what the mutation proofs exercise.
  */
-function referenceWaiting(runtime, missionId, task, tasks) {
+function referenceWaiting(board, task) {
+  const tasks = board.tasks
   if (TERMINAL_STATES.has(task.status)) return false
-  if (referenceCarried(runtime, missionId, task, tasks)) return true
+  if (referenceCarried(board, task)) return true
   if (task.status === 'running') return task.attempt !== undefined && task.attempt.leaseUntil >= Date.now()
   if (task.status === 'submitted') {
-    const need = runtime.reviewNeed(task)
-    return runtime.reviewable(task, tasks) || !need.ripe || (task.artifact !== undefined && !need.recorded)
+    const need = reviewNeed(board, task)
+    return reviewable(board, task) || !need.ripe || (task.artifact !== undefined && !need.recorded)
   }
   if (task.status === 'blocked' && task.resumeAfterStop?.epoch === task.epoch) {
     const stop = task.resumeAfterStop
-    return stop.at !== undefined && Date.now() - stop.at <= runtime.bounds.stallPassTimeoutMs
+    return stop.at !== undefined && Date.now() - stop.at <= board.bounds.stallPassTimeoutMs
   }
   if (task.status === 'pending' && task.reviewOf !== undefined) {
     const source = tasks.find(candidate => candidate.id === task.reviewOf)
-    return source !== undefined && !TERMINAL_STATES.has(source.status) && runtime.reviewable(source, tasks)
+    return source !== undefined && !TERMINAL_STATES.has(source.status) && reviewable(board, source)
   }
   if (task.status === 'pending' && task.resumeAfterStop?.epoch === task.epoch
-    && task.dependencies.every(id => tasks.some(candidate => candidate.id === id) && runtime.effectiveDependency(missionId, id, tasks).status === 'accepted')) {
+    && task.dependencies.every(id => tasks.some(candidate => candidate.id === id) && effectiveDependency(board, id).status === 'accepted')) {
     const stop = task.resumeAfterStop
-    return stop.at !== undefined && Date.now() - stop.at <= runtime.bounds.stallPassTimeoutMs
+    return stop.at !== undefined && Date.now() - stop.at <= board.bounds.stallPassTimeoutMs
   }
   return task.dependencies.some(id => {
     if (!tasks.some(candidate => candidate.id === id)) return false
-    return !TERMINAL_STATES.has(runtime.effectiveDependency(missionId, id, tasks).status)
+    return !TERMINAL_STATES.has(effectiveDependency(board, id).status)
   })
 }
 
 /** The independent reference for `stallRoots` membership of one blocked task. */
-function referenceStallRoot(runtime, missionId, task, tasks, stallPassTimeoutMs) {
+function referenceStallRoot(board, task, stallPassTimeoutMs) {
   if (task.status !== 'blocked') return false
-  if (referenceCarried(runtime, missionId, task, tasks)) return false
+  if (referenceCarried(board, task)) return false
   if (task.reviewOf !== undefined) return false
   const stop = task.resumeAfterStop?.epoch === task.epoch ? task.resumeAfterStop : undefined
   if (stop === undefined) return true
@@ -593,6 +599,9 @@ test('R16-A1: the waiting classifier is enumerated over every constructed board 
   const owner = { sessionId: 'r16-a1' }
   const mission = f.runtime.create(owner, { title: 'Lineage enumeration', objective: 'Enumerate the classifier', workspace: f.directory, scope: ['src/'], acceptance: ['works'], budget }, { grantRoot: f.directory, source: 'session' })
   const stream = f.runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Main' })
+  // Each constructed board is judged over its own rows; the mission and its members are read once.
+  const base = f.runtime.boardOf(mission.id)
+  const over = tasks => ({ ...base, tasks, graph: taskGraphIndex(tasks) })
   const now = Date.now()
   let seq = 0
   const materialize = (id, status, extra = {}) => {
@@ -615,7 +624,7 @@ test('R16-A1: the waiting classifier is enumerated over every constructed board 
     // The pre-fix rule: raw ids, no lineage, no replacement coverage.
     if (TERMINAL_STATES.has(task.status)) return false
     if (task.status === 'running') return task.attempt !== undefined && task.attempt.leaseUntil >= Date.now()
-    if (task.status === 'submitted') return !f.runtime.reviewNeed(task).ripe
+    if (task.status === 'submitted') return !reviewNeed(over(tasks), task).ripe
     if (task.status === 'blocked' && task.resumeAfterStop?.epoch === task.epoch) {
       const stop = task.resumeAfterStop
       return stop.at !== undefined && Date.now() - stop.at <= f.runtime.bounds.stallPassTimeoutMs
@@ -656,12 +665,12 @@ test('R16-A1: the waiting classifier is enumerated over every constructed board 
               f.runtime.store.put('tasks', subject)
             }
             tasks.push(subject)
-            const got = f.runtime.notices.waitsLegitimately(subject, tasks)
-            const want = referenceWaiting(f.runtime, mission.id, subject, tasks)
+            const got = f.runtime.notices.waitsLegitimately(over(tasks), subject)
+            const want = referenceWaiting(over(tasks), subject)
             if (got !== want) mismatches.push({ depStatus, replacement, subjectStatus, stopShape, reviewShape, got, want })
             const rootTask = { ...subject }
             const gotRoot = f.runtime.notices.stallRoots(tasks).some(root => root.id === subject.id)
-            const wantRoot = referenceStallRoot(f.runtime, mission.id, rootTask, tasks, f.runtime.bounds.stallPassTimeoutMs)
+            const wantRoot = referenceStallRoot(over(tasks), rootTask, f.runtime.bounds.stallPassTimeoutMs)
             if (gotRoot !== wantRoot) mismatches.push({ kind: 'stallRoot', depStatus, replacement, subjectStatus, stopShape, reviewShape, gotRoot, wantRoot })
             if (naiveWaiting(subject, tasks) !== want) naiveDivergences.push({ depStatus, replacement, subjectStatus, stopShape, reviewShape })
             checked += 1
@@ -714,17 +723,17 @@ test('R16-A1: the waiting classifier is enumerated over every constructed board 
       previous = row.id
     }
     tasks.push(...rows, subject)
-    const got = f.runtime.notices.waitsLegitimately(subject, tasks)
-    const want = referenceWaiting(f.runtime, mission.id, subject, tasks)
+    const got = f.runtime.notices.waitsLegitimately(over(tasks), subject)
+    const want = referenceWaiting(over(tasks), subject)
     if (got !== want) mismatches.push({ kind: 'subjectCoverage', shape: shape.name, got, want })
     const gotRoot = f.runtime.notices.stallRoots(tasks).some(root => root.id === subject.id)
-    const wantRoot = referenceStallRoot(f.runtime, mission.id, { ...subject }, tasks, f.runtime.bounds.stallPassTimeoutMs)
+    const wantRoot = referenceStallRoot(over(tasks), { ...subject }, f.runtime.bounds.stallPassTimeoutMs)
     if (gotRoot !== wantRoot) mismatches.push({ kind: 'subjectCoverageRoot', shape: shape.name, gotRoot, wantRoot })
     // The board without the final repair row: when it stops waiting, the coverage
     // predicate is what makes this board live.
     if (want && rows.length > 0) {
       const withoutTail = tasks.filter(row => row.id !== rows.at(-1).id)
-      if (!referenceWaiting(f.runtime, mission.id, subject, withoutTail)) coverageDriven.push(shape.name)
+      if (!referenceWaiting(over(withoutTail), subject)) coverageDriven.push(shape.name)
     }
     coverageChecked += 1
   }
@@ -759,9 +768,9 @@ test("R16-A2: a cancelled predecessor with a live repair leaves its dependent wa
   const fallthroughs = () => f.notices().filter(delivery => typeof delivery.notice?.dedupKey === 'string' && delivery.notice.dedupKey.startsWith('fallthrough:'))
   await sleep(300)
   assert.deepEqual(fallthroughs(), [], `the dependent waits on the running repair instead of being named: ${JSON.stringify(fallthroughs().map(delivery => delivery.content.slice(0, 80)))}`)
-  assert.equal(f.runtime.dependencySatisfied(f.mission.id, original.id), false, 'the dispatcher still cannot start the dependent: its effective dependency is running, not accepted')
+  assert.equal(dependencySatisfied(f.runtime.boardOf(f.mission.id), original.id), false, 'the dispatcher still cannot start the dependent: its effective dependency is running, not accepted')
   const live = f.runtime.store.get('tasks', dependent.id)
-  assert.equal(f.runtime.notices.waitsLegitimately(live, f.runtime.store.list('tasks', f.mission.id)), true, 'the dependent is waiting on the live repair, not dead')
+  assert.equal(f.runtime.notices.waitsLegitimately(f.runtime.boardOf(f.mission.id), live), true, 'the dependent is waiting on the live repair, not dead')
   // Pair: closing the repair's whole lineage makes the same dependent a named
   // decision — the fall-through may appear only when no live path remains.
   const repairRow = f.runtime.store.get('tasks', repair.id)
@@ -796,7 +805,7 @@ test('R16-A1r pair: a blocked subject with a running repair is never named, and 
   const namesSubject = () => f.notices().filter(delivery => Array.isArray(delivery.subjects) && delivery.subjects.some(subject => subject.startsWith(`${source.id}@`)))
   await sleep(300)
   const tasks = f.runtime.store.list('tasks', f.mission.id)
-  assert.equal(f.runtime.notices.waitsLegitimately(f.runtime.store.get('tasks', source.id), tasks), true, 'the blocked subject waits on its running repair')
+  assert.equal(f.runtime.notices.waitsLegitimately(f.runtime.boardOf(f.mission.id), f.runtime.store.get('tasks', source.id)), true, 'the blocked subject waits on its running repair')
   assert.equal(f.runtime.notices.stallRoots(tasks).some(root => root.id === source.id), false, 'a subject carried by a live repair is not a stall root')
   assert.deepEqual(namesSubject(), [], `no owner decision names the covered subject: ${JSON.stringify(f.notices().map(delivery => delivery.notice?.dedupKey))}`)
   // Pair: closing the whole lineage makes the same subject a named decision.
@@ -842,10 +851,10 @@ test('R16-A1r2 pair: a two-hop repair chain through a cancelled repair keeps the
     && Array.isArray(delivery.subjects) && delivery.subjects.some(subject => subject.startsWith(`${original.id}@`)))
   await sleep(300)
   const tasks = f.runtime.store.list('tasks', f.mission.id)
-  const tail = f.runtime.effectiveDependency(f.mission.id, original.id, tasks)
+  const tail = effectiveDependency(f.runtime.boardOf(f.mission.id), original.id)
   assert.equal(tail.id, secondRepair.id, 'the runtime seam resolves the original through the cancelled first repair to the second')
   assert.equal(tail.status, 'running', 'the seam tail is the running second repair')
-  assert.equal(f.runtime.notices.waitsLegitimately(f.runtime.store.get('tasks', original.id), tasks), true, 'the original waits on the running second repair')
+  assert.equal(f.runtime.notices.waitsLegitimately(f.runtime.boardOf(f.mission.id), f.runtime.store.get('tasks', original.id)), true, 'the original waits on the running second repair')
   assert.equal(f.runtime.notices.stallRoots(tasks).some(root => root.id === original.id), false, 'a two-hop covered subject is not a stall root')
   assert.deepEqual(namesOriginal(coveredAt), [], `no owner decision names the covered original after the second repair was admitted: ${JSON.stringify(f.notices().map(delivery => delivery.notice?.dedupKey))}`)
   // Pair: closing the whole chain makes the original a named decision.
@@ -945,7 +954,7 @@ test('R16-A5: the wake-precision projection counts decisions, false wakes and mi
   assert.equal(precision.missedObligations.subjects.includes(`${repair.id}@${repair.epoch}`), false, 'the running repair is live work')
   const board = f.runtime.store.list('tasks', f.mission.id)
   assert.equal(f.runtime.notices.stallRoots(board).some(candidate => candidate.id === covered.id), false, 'the covered blocked task is not a stall root')
-  assert.equal(f.runtime.notices.waitsLegitimately(cover, board), true, 'the live cover is running work, not silence')
+  assert.equal(f.runtime.notices.waitsLegitimately(f.runtime.boardOf(f.mission.id), cover), true, 'the live cover is running work, not silence')
   assert.equal(cover.replaces[0], covered.id)
   // Pair: a fall-through naming a genuinely dead subject is not a false wake, and
   // stops being a missed obligation once a decision names it.
@@ -973,9 +982,9 @@ test('R16-A6 pair: the lineage rule reaches an ordinary dependent but not a revi
   const dependent = put('task_r16a6_dependent', 'pending', { dependencies: [source.id] })
   const review = put('task_r16a6_review', 'pending', { kind: 'verification', reviewOf: source.id, dependencies: [] })
   const tasks = f.runtime.store.list('tasks', f.mission.id)
-  assert.equal(f.runtime.dependencySatisfied(f.mission.id, source.id), false, 'the effective dependency is running, not accepted')
-  assert.equal(f.runtime.notices.waitsLegitimately(dependent, tasks), true, 'an ordinary dependent waits on the live repair')
-  assert.equal(f.runtime.notices.waitsLegitimately(review, tasks), false, 'the review follows its source IDENTITY, which is terminal: a review of a cancelled task has no path even when the obligation is repaired')
+  assert.equal(dependencySatisfied(f.runtime.boardOf(f.mission.id), source.id), false, 'the effective dependency is running, not accepted')
+  assert.equal(f.runtime.notices.waitsLegitimately(f.runtime.boardOf(f.mission.id), dependent), true, 'an ordinary dependent waits on the live repair')
+  assert.equal(f.runtime.notices.waitsLegitimately(f.runtime.boardOf(f.mission.id), review), false, 'the review follows its source IDENTITY, which is terminal: a review of a cancelled task has no path even when the obligation is repaired')
   assert.equal(f.runtime.notices.stallRoots(tasks).some(root => root.id === review.id), false, 'a verdict record is never a stall root')
   assert.equal(f.runtime.notices.stallRoots(tasks).some(root => root.id === dependent.id), false, 'a pending dependent is never a stall root')
   assert.equal(repair.status, 'running')

@@ -1,5 +1,5 @@
 /** Durable collaboration policy. Worker lifecycle and filesystem effects belong to the adapter. */
-import { createHash, randomUUID } from 'node:crypto'
+import { randomUUID } from 'node:crypto'
 import { isAbsolute, join } from 'node:path'
 import { SwarmStore, WriterBusyError, StoreRecoveryError, id, stageRestore, type PendingRestore, type PostFilter, type StoreOptions } from './store.ts'
 import { Attempts } from './attempts.ts'
@@ -7,11 +7,11 @@ import { PolicyError } from './policy-error.ts'
 export { WorkspaceRevokedError } from './authorization.ts'
 import { recordedClaim, type WorkspaceClaim } from './authorization.ts'
 import { WorkspaceAdmission, gitWriteDeniedMessage, TEMP_RENDEZVOUS_WINDOW_MS, type TempMention } from './workspace-admission.ts'
-import { Notices, NOTICE_TEMPLATES, REJECTION_DECISION_TRIGGER, ADMISSION_REFUSED, ADMIT_REVIEW, BOARD_RUNNING, WITHDRAW_SOURCE, newestReviewBlock, renderNotice, unreviewedSources, type NotifyOptions } from './notices.ts'
+import { Notices, NOTICE_TEMPLATES, REJECTION_DECISION_TRIGGER, renderNotice, type NotifyOptions } from './notices.ts'
 import { RefusalRegistry, requireStrings, requireText, sameChecks, unsupportedEffort, validatedBudget } from './refusals.ts'
 import { Scheduling } from './scheduling.ts'
 import { progressed, type Kernel, type SchedulingPass } from './kernel.ts'
-import { bounds, type Bounds } from './board.ts'
+import { ADMISSION_REFUSED, AUTOMATIC_REVIEW_PREFIX, PROVIDER_OUTAGE_WINDOW_MS, bounds, capable, dependencyIdentities, dependencySatisfied, effectiveDependencies, effectiveDependency, lineage, readBoard, readinessBlocker, readMission, ready, rerouteTarget, providerQuiescent, reviewable, reviewNeed, reviewPathBlocker, reviewPathStalled, unreviewedSources, unschedulable, type AdapterView, type Board, type Bounds, type ReviewNeed } from './board.ts'
 // R17-G6/G7: the one derivation of mission derived state and its host projection.
 import { deriveMemberBoard, deriveMemberStatus, memberPhaseOf, memberDeliveryHealth, type MissionBoardMember } from './projection.ts'
 import type { MissionInterpretation } from './notices.ts'
@@ -24,11 +24,11 @@ import { awaitsDelivery } from './arena.ts'
 import { AdmissionRefusedError, classifyProviderOutage, LIMIT_LEVELS, TASK_CLASSES, type AdmissionCandidate, type AdmissionDecision, type AdmissionReason, type AdmissionRecord, type LimitLevel, type LimitRule } from './scheduler.ts'
 import { validScope, scopeSubset } from './scope.ts'
 import { AdmissionError, assertDeclaredOutputs, assertScopeSelectors, citedCovers, dependencyAssumptions, formatDiagnostic, isNoopCheck, loadPackageScripts, normalizeReviewDependencies, normalizeScopeSelectors, normalizeTaskCeilings, reconcileTaskAdmission, requireHostChecks, taskCeilingBlock, taskGraphDefects, TaskGraphAdmissionError, type TaskGraphNode } from './admission.ts'
-import { authorIdsOf, canBorrowTask, canOwnReview, strandedReview } from './assignment.ts'
+import { canBorrowTask, canOwnReview, strandedReview } from './assignment.ts'
 import { executionClock, executionElapsed } from './resource-time.ts'
 import { TERMINAL_STATES, blockCauses, completionExempt, currentEvidenceIds, missionSubject, pendingStopOwner, quiescencePending, selectAcceptedDelivery, stopPending, subjectsOfTasks, taskGraphIndex, taskSubject, terminal, uncoveredCriteria, type BlockCause } from './task-graph.ts'
 import { checkSyntaxDetail, declaredPlanChecks, orderedTasks, pairReviews, planAdvisories, validatePlan } from './plans.ts'
-import { OWNER_ONLY_TOOLS, type Actor, type AutoStart, BoardQuery, Budget, CheckAttribution, CheckEnvelope, CheckEnvironment, CheckResult, CreateMissionInput, CriticalPath, criterionId, Delivery, DraftPlan, Escalation, Evidence, EvidenceStatus, Member, MemberStatus, Mission, nextWorkerName, ObserveQuery, MessageInput, PlanInput, Post, PostInput, PostKind, ProposeTaskInput, ProviderOutage, PublishInput, RecoveryFallback, RequestStartInput, RuntimeConfig, Snapshot, Task, TaskAmendment, TaskRejection, TaskCeiling, ToolRun, UsageBuckets, UsageSnapshotSource, VerificationCleanupFailure, WorkerAdapter, WorkerActivity, Workstream } from './types.ts'
+import { OWNER_ONLY_TOOLS, type Actor, type AutoStart, BoardQuery, Budget, CheckAttribution, CheckEnvelope, CheckEnvironment, CreateMissionInput, CriticalPath, criterionId, Delivery, DraftPlan, Escalation, Evidence, EvidenceStatus, Member, MemberStatus, Mission, nextWorkerName, ObserveQuery, MessageInput, PlanInput, Post, PostInput, PostKind, ProposeTaskInput, ProviderOutage, PublishInput, RecoveryFallback, RequestStartInput, RuntimeConfig, Snapshot, Task, TaskAmendment, TaskRejection, TaskCeiling, ToolRun, UsageBuckets, UsageSnapshotSource, VerificationCleanupFailure, WorkerAdapter, WorkerActivity, Workstream } from './types.ts'
 import { requireArtifactChecks } from './artifact-policy.ts'
 
 /** Release a prelaunch caller even when an adapter ignores cancellation. Its late writes remain fenced. */
@@ -55,8 +55,6 @@ const EVIDENCE_OUTCOMES: readonly string[] = ['supported', 'disproved', 'inconcl
 const BOARD_PAGE_MAX = 100
 const BOARD_PAGE_DEFAULT = 20
 
-/** R11-01: how long a classified provider outage keeps a member's route quiescent. */
-const PROVIDER_OUTAGE_WINDOW_MS = 5 * 60_000
 /** R11-01: bound the durable outage log to one row per member and class per window. */
 const PROVIDER_OUTAGE_EVENT_WINDOW_MS = 30_000
 
@@ -73,18 +71,6 @@ const START_FAILURE_REROUTE_LIMIT = 3
  * consume an unbounded share of the mission budget.
  */
 const AUTO_REVIEW_RECOVERY_ATTEMPTS = 2
-/** Only `admitAutomaticReview` mints a task id with this prefix, followed by the review need's id. */
-const AUTOMATIC_REVIEW_PREFIX = 'task_auto_review_'
-/**
- * F2: one review need of a submitted source (`SwarmRuntime.reviewNeed`).
- * `ripe` is the one review grace: the need is older than one scheduler period,
- * at least 1 s (the author may propose its own review in the turn it
- * submitted; the floor keeps a fast tick from turning a same-turn proposal
- * into a race), or has no dated row to show it is not, which the board's
- * classifiers read (`awaitsReviewAdmission`). `recorded` is the admission's own
- * record: a `task/review-missing` row newer than the row that opened the need.
- */
-interface ReviewNeed { id: string; seq: number; ripe: boolean; recorded: boolean }
 /**
  * Owner re-opens of one rejected task (`maxRework` when the task sets none).
  * Past it the task stays blocked until the owner raises `maxRework` or
@@ -359,11 +345,6 @@ export class SwarmRuntime implements Kernel {
     }
     return [missionSubject({ id: missionId })]
   }
-  /**
-   * R15-A4: the dispatcher's per-(task, assignee) question, forwarded so the
-   * notice path asks exactly the predicate the sweep used.
-   */
-  dispatchQuestion(missionId: string, tasks: Task[], members: Member[], dispatchable: Task[]): ReturnType<Scheduling['dispatchQuestion']> { return this.scheduling.dispatchQuestion(missionId, tasks, members, dispatchable) }
   noticeLedger(actor: Actor, missionId: string, query: { limit?: number } = {}): unknown { return this.notices.noticeLedger(actor, missionId, query) }
   private bounded(text: string): string { return this.notices.bounded(text) }
   private ensureWitness(missionId: string): void { return this.notices.ensureWitness(missionId) }
@@ -379,25 +360,12 @@ export class SwarmRuntime implements Kernel {
   private topicDelivery(missionId: string, from: string, topic: string, content: string): void { return this.notices.topicDelivery(missionId, from, topic, content) }
   async flushOutbox(missionId: string, pass?: SchedulingPass, only?: string): Promise<void> { return this.notices.flushOutbox(missionId, pass, only) }
 
-  /** M1a seam 7/7: scheduling predicates, pass bookkeeping and the dispatch sweep. */
+  /** M1a seam 7/7: pass bookkeeping, the dispatch sweep and the attempt reporting bound; its predicates are the board's. */
   private readonly scheduling = new Scheduling(this)
-  ready(task: Task, member: Member, tasks?: Task[]): boolean { return this.scheduling.ready(task, member, tasks) }
-  eligible(task: Task, member: Member, tasks: Task[]): boolean { return this.scheduling.eligible(task, member, tasks) }
-  dispatchable(tasks: Task[], members: Member[]): Task[] { return this.scheduling.dispatchable(tasks, members) }
-  unschedulable(mission: Mission, tasks: Task[], members: Member[]): Task[] { return this.scheduling.unschedulable(mission, tasks, members) }
-  reviewable(task: Task, tasks: Task[], members?: Member[]): boolean { return this.scheduling.reviewable(task, tasks, members) }
-  stalled(tasks: Task[], members: Member[]): boolean { return this.scheduling.stalled(tasks, members) }
   private deliveryTarget(actor: Actor, missionId: string): { mission: Mission; task: Task } { return this.scheduling.deliveryTarget(actor, missionId) }
   private openPass(missionId: string): SchedulingPass | undefined { return this.scheduling.openPass(missionId) }
   private closePass(missionId: string, pass: SchedulingPass): void { return this.scheduling.closePass(missionId, pass) }
   private checkSchedulingPasses(): void { return this.scheduling.checkSchedulingPasses() }
-  reviewPathStalled(tasks: Task[], members: Member[]): boolean { return this.scheduling.reviewPathStalled(tasks, members) }
-  /** R11-01: a route inside its provider outage window waits for its next probe, so it is re-routed work's last resort. */
-  private rerouteTarget(missionId: string, task: Task, failedId: string): Member | undefined {
-    const target = this.scheduling.rerouteTarget(missionId, task, failedId)
-    if (target === undefined || this.providerQuiescent(target) === undefined) return target
-    return this.scheduling.rerouteCandidates(missionId, task, failedId).find(member => this.providerQuiescent(member) === undefined) ?? target
-  }
 
   /** M1a seam 5/7: the declared-check execution path. */
   private readonly declaredChecks = new DeclaredChecks(this)
@@ -807,12 +775,15 @@ export class SwarmRuntime implements Kernel {
     for (const member of board) status[member.id] = member.status
     return this.store.list('members', missionId).map(member => ({ ...member, status: status[member.id] ?? member.status }))
   }
-  mission(missionId: string): Mission {
-    const mission = this.store.get('missions', missionId)
-    if (!mission) throw new PolicyError('mission_unknown', 'validation_error', 'Unknown mission')
-    if (mission.executionTime !== undefined && !terminal(mission)) executionClock(mission, mission.executionTime.since !== undefined, this.now())
-    return mission
-  }
+  mission(missionId: string): Mission { return readMission(this.store, missionId, this.now) }
+  /**
+   * The adapter's answers a decision asks, called through to the adapter on
+   * every ask and never memoized: asking whether a handle is idle can drain a
+   * stranded inbox item.
+   */
+  readonly view: AdapterView = { startable: memberId => this.workers.isIdle(memberId) }
+  /** One mission's board as the store holds it now: a decision reads it where it decides. */
+  boardOf(missionId: string): Board { return readBoard(this.store, missionId, this.now, this.bounds, this.view) }
   /** One projection per reader. A member reads this wherever the runtime hands it a task, in its assignment, in `swarm_observe` and in the result of its own propose, claim, submit and verify: `acceptance` is its derived checklist, which holds the text of every criterion it cites, never the bare ids. The owner reads the stored row at every exit and resolves its `covers` through the mission's criteria. */
   private memberTask({ covers: _cited, ...task }: Task, mission = this.mission(task.missionId), graph = taskGraphIndex(this.store.list('tasks', task.missionId))): Task { return { ...task, acceptance: graph.checklist(task.id, mission.acceptance) } }
   participant(actor: Actor, missionId: string): { mission: Mission; member?: Member; key: string; owner: boolean } {
@@ -837,26 +808,6 @@ export class SwarmRuntime implements Kernel {
     return task
   }
   /**
-   * Follow repair lineage from a referenced dependency to the task that now
-   * carries its obligations. A blocked or cancelled task replaced by a live
-   * repair resolves to that repair, recursively; the original identity in a
-   * dependent's `dependencies` therefore keeps working after replacement.
-   */
-  private lineage(missionId: string, dependencyId: string, tasks = this.store.list('tasks', missionId), graph = taskGraphIndex(tasks)): Task[] {
-    const chain = graph.lineage(dependencyId)
-    if (!chain.length) throw new PolicyError('task_not_in_mission', 'validation_error', 'Task is not in this mission')
-    return chain
-  }
-  /** Effective prerequisites for workspace preparation; one accepted repair covering several originals is merged once. */
-  effectiveDependencies(missionId: string, task: Task): Task[] {
-    if (!task.dependencies.length) return []
-    const tasks = this.store.list('tasks', missionId), graph = taskGraphIndex(tasks)
-    const seen = new Set<string>()
-    return task.dependencies.map(dep => this.lineage(missionId, dep, tasks, graph).at(-1)!).filter(dependency => !seen.has(dependency.id) && seen.add(dependency.id))
-  }
-  effectiveDependency(missionId: string, dependencyId: string, tasks?: Task[]): Task { return this.lineage(missionId, dependencyId, tasks).at(-1)! }
-  dependencySatisfied(missionId: string, dependencyId: string, tasks?: Task[]): boolean { return this.effectiveDependency(missionId, dependencyId, tasks).status === 'accepted' }
-  /**
    * A repair redirects existing dependencies, so even a fresh task can close a
    * cycle. Validate its prospective effective graph before writing anything.
    * Review edges stay pinned to their exact source, as they do in the scheduler;
@@ -864,7 +815,7 @@ export class SwarmRuntime implements Kernel {
    * Every newly introduced cycle must be reachable from the candidate, so an
    * unrelated legacy defect cannot prevent the owner from admitting a repair.
    */
-  private assertEffectiveTaskGraph(missionId: string, candidate: Task, tasks: Task[]): void {
+  private assertEffectiveTaskGraph(candidate: Task, tasks: Task[]): void {
     const rows = [...tasks, candidate]
     const index = taskGraphIndex(rows)
     const graph: TaskGraphNode[] = []
@@ -877,7 +828,7 @@ export class SwarmRuntime implements Kernel {
       const task = index.byId.get(taskId)
       if (task === undefined) continue // The shared validator reports the dangling edge.
       const waiting = ['pending', 'running', 'submitted'].includes(task.status) || quiescencePending(task)
-      const dependencies = waiting ? task.dependencies.map(dependency => this.lineage(missionId, dependency, rows, index).at(-1)!.id) : []
+      const dependencies = waiting ? task.dependencies.map(dependency => effectiveDependency({ graph: index }, dependency).id) : []
       const reviewOf = waiting ? task.reviewOf : undefined
       graph.push({ id: task.id, dependencies, ...(reviewOf === undefined ? {} : { reviewOf }) })
       pending.push(...dependencies, ...(reviewOf === undefined ? [] : [reviewOf]))
@@ -885,28 +836,6 @@ export class SwarmRuntime implements Kernel {
     const defects = taskGraphDefects(graph)
     if (defects.length) throw new TaskGraphAdmissionError(defects)
   }
-  /**
-   * R16-A: the EFFECTIVE unfinished prerequisites of one task, deduplicated in
-   * reference order. This is the one seam the waking classifier reads, so a notice
-   * and the scheduler resolve a replaced dependency through the same lineage.
-   */
-  unfinishedDependencies(missionId: string, task: Task, tasks?: Task[]): Task[] {
-    if (!task.dependencies.length) return []
-    const rows = tasks ?? this.store.list('tasks', missionId)
-    const graph = taskGraphIndex(rows)
-    const seen = new Set<string>()
-    const unfinished: Task[] = []
-    for (const dependency of task.dependencies) {
-      const effective = graph.effective(dependency)
-      if (effective === undefined || TERMINAL_STATES.has(effective.status)) continue
-      if (seen.has(effective.id)) continue
-      seen.add(effective.id)
-      unfinished.push(effective)
-    }
-    return unfinished
-  }
-  /** Every identity a dependency reference stands for, including the current effective repair. */
-  dependencyIdentities(missionId: string, dependencyId: string, tasks?: Task[]): Set<string> { return new Set(this.lineage(missionId, dependencyId, tasks).map(task => task.id)) }
   // M1a: lease/attempt accounting lives in src/attempts.ts; these forwarders keep
   // the call sites unchanged.
   private ownAttempt(actor: Actor, missionId: string, taskId: string, attemptId: string): { task: Task; member: Member } { return this.attempts.ownAttempt(actor, missionId, taskId, attemptId) }
@@ -1241,7 +1170,7 @@ export class SwarmRuntime implements Kernel {
     }
     const dependencies = [...new Set(normalizeReviewDependencies(input.kind, input.reviewOf, input.dependencies))]
     for (const dependency of dependencies) {
-      const effective = this.effectiveDependency(missionId, dependency, tasks)
+      const effective = effectiveDependency({ graph: taskGraphIndex(tasks) }, dependency)
       if (effective.status === 'cancelled' || effective.status === 'blocked') throw new PolicyError('dependency_not_live', 'tool_error', `Dependency ${dependency} is ${effective.status} and has no live replacement; depend on an accepted or in-progress task, or propose a repair with replaces`)
     }
     // An empty id passed the truthiness check below and bound the task to member
@@ -1316,7 +1245,7 @@ export class SwarmRuntime implements Kernel {
     if (input.assignmentMode !== undefined) task.assignmentMode = input.assignmentMode
     if (input.maxRecoveryAttempts !== undefined) task.maxRecoveryAttempts = input.maxRecoveryAttempts
     if (input.checkTimeoutMs !== undefined) task.checkTimeoutMs = input.checkTimeoutMs
-    this.assertEffectiveTaskGraph(missionId, task, tasks)
+    this.assertEffectiveTaskGraph(task, tasks)
     this.commit(missionId, () => {
       this.store.put('tasks', task)
       this.store.event(missionId, 'task/proposed', key, task)
@@ -1448,16 +1377,16 @@ export class SwarmRuntime implements Kernel {
       if (!member) throw new Error('[owner_cannot_claim] Only a member can claim work: Inspect `taskId` with `swarm_observe`, or decide the mission with `swarm_control` and its `action`.')
       const task = this.task(missionId, taskId)
       if (pendingStopOwner(this.store.list('tasks', missionId), member.id)) throw new Error('Worker is waiting for its previous attempt to stop')
-      const blocker = this.scheduling.readinessBlocker(task, member)
+      const blocker = readinessBlocker(this.boardOf(missionId), task, member)
       if (blocker !== undefined) throw new PolicyError('task_not_ready', 'conflict_error', `Task is not ready for this member: ${blocker}`)
       this.assertAdmission(task, member)
       await this.assertWorkspaceAuthorized(this.mission(missionId))
-      await this.workers.prepareTask(member, { ...task, epoch: task.epoch + 1 }, this.effectiveDependencies(missionId, task), task.reviewOf ? this.task(missionId, task.reviewOf) : undefined)
+      await this.workers.prepareTask(member, { ...task, epoch: task.epoch + 1 }, effectiveDependencies(this.boardOf(missionId), task), task.reviewOf ? this.task(missionId, task.reviewOf) : undefined)
       this.active(actor, missionId)
       const fresh = this.task(missionId, taskId)
       if (fresh.epoch !== task.epoch || fresh.assigneeId !== task.assigneeId
         || fresh.plannedAssigneeId !== task.plannedAssigneeId || fresh.assignmentMode !== task.assignmentMode
-        || !this.ready(fresh, member)) throw new PolicyError('task_changed_during_preparation', 'conflict_error', 'Task changed while preparing its workspace')
+        || !ready(this.boardOf(missionId), fresh, member)) throw new PolicyError('task_changed_during_preparation', 'conflict_error', 'Task changed while preparing its workspace')
       const result = this.assign(fresh, member)
       this.kick(missionId)
       return result
@@ -2093,8 +2022,10 @@ export class SwarmRuntime implements Kernel {
       if (source.status === 'accepted') { source.status = 'submitted'; this.store.put('tasks', source) }
       const invalidated = new Set([source.id])
       const tasks = this.store.list('tasks', missionId)
-      // A dependent naming a replaced original effectively depends on its accepted repair.
-      const dependsOnInvalidated = (dependent: Task) => dependent.dependencies.some(dep => [...this.dependencyIdentities(missionId, dep, tasks)].some(identity => invalidated.has(identity)))
+      // A dependent naming a replaced original effectively depends on its accepted
+      // repair. The loop below fences these rows in place, so each ask reads the
+      // graph over them as they stand.
+      const dependsOnInvalidated = (dependent: Task) => dependent.dependencies.some(dep => [...dependencyIdentities({ graph: taskGraphIndex(tasks) }, dep)].some(identity => invalidated.has(identity)))
       let changed = true
       while (changed) {
         changed = false
@@ -2301,7 +2232,7 @@ export class SwarmRuntime implements Kernel {
    */
   private missingReviewPath(task: Task): string | undefined {
     if (task.artifact === undefined) return undefined
-    if (this.reviewable(task, this.store.list('tasks', task.missionId))) return undefined
+    if (reviewable(this.boardOf(task.missionId), task)) return undefined
     return `no live independent verification task reviews this submitted ${task.kind} artifact; a review (kind verification, reviewOf ${task.id}) must be pending or running and assigned to a member who did not author it`
   }
   /**
@@ -2314,69 +2245,21 @@ export class SwarmRuntime implements Kernel {
    * review the author is proposing in the same turn and keeps the durable log free of redundant events.
    */
   private admitMissingReviews(mission: Mission): void {
-    const tasks = this.store.list('tasks', mission.id)
-    const members = this.store.list('members', mission.id)
-    const stalled = this.reviewPathStalled(tasks, members)
-    for (const source of unreviewedSources(this, tasks)) {
-      const need = this.reviewNeed(source)
+    const found = this.boardOf(mission.id)
+    const stalled = reviewPathStalled(found)
+    for (const source of unreviewedSources(found)) {
+      const need = reviewNeed(this.boardOf(mission.id), source)
       if (!need.ripe) continue
       if (!need.recorded) this.reportMissingReview(mission, source)
-      const blocked = this.reviewPathBlocker(source, need, stalled)
+      const blocked = reviewPathBlocker(this.boardOf(mission.id), source, need, stalled)
       if (blocked !== undefined) this.notifyReviewBlocked(mission, source, need, blocked)
       else this.admitAutomaticReview(mission, source, need)
     }
-  }
-  /**
-   * F2: the review need of one submitted source, the one identity every
-   * missing-review fact is keyed on. The need is the submission (the epoch
-   * fences every resubmission, even of an unchanged commit) and each review of
-   * it a challenge took away (the one that accepted it or one in progress: its
-   * `task/invalidated` row), which re-opens it. `id` keys its automatic review
-   * and its blocker decisions; `seq` is that of the newest row that opened
-   * it, from which its grace (`ripe`, the one grace every reader asks), its
-   * missing-review record (`recorded`) and an owner withdrawal are dated. S5:
-   * derived from the log, so a restart or a lost cache re-derives the same need.
-   */
-  reviewNeed(source: Task): ReviewNeed {
-    const submitted = this.store.latestTaskEvent(source.missionId, source.id, 'task/submitted')
-    const reopened = this.store.list('tasks', source.missionId).filter(review => review.reviewOf === source.id)
-      .flatMap(review => this.store.latestTaskEvent(source.missionId, review.id, 'task/invalidated') ?? []).filter(row => row.seq > (submitted?.seq ?? 0)).sort((a, b) => a.seq - b.seq)
-    const opened = reopened.at(-1) ?? submitted
-    const seq = opened?.seq ?? 0
-    return { id: createHash('sha256').update([source.missionId, source.id, source.epoch, source.artifact?.commit ?? '', ...reopened.map(row => row.seq)].join(':')).digest('hex').slice(0, 32),
-      seq, ripe: opened === undefined || this.now() - opened.createdAt >= Math.max(this.config.tickMs, 1000),
-      recorded: (this.store.latestTaskEvent(source.missionId, source.id, 'task/review-missing')?.seq ?? 0) > seq }
   }
   /** Record the missing review of a need that is not yet recorded (`ReviewNeed.recorded`). */
   private reportMissingReview(mission: Mission, source: Task): void {
     const reason = this.missingReviewPath(source) ?? `no live independent verification task reviews this submitted ${source.kind} artifact`
     this.commit(mission.id, () => this.store.event(mission.id, 'task/review-missing', 'runtime', { taskId: source.id, kind: source.kind, reason }))
-  }
-  /**
-   * Why the host cannot give this unreviewable source a live review under this
-   * need, each cause with the exit that removes it, or undefined when it
-   * admits one now. A review the owner admits needs a task slot and an
-   * independent member, so the host's own review that cannot reach a verdict
-   * is named after those: the one it admitted for this need (it admits one), or
-   * one the owner withdrew, an automatic review (host-minted id) with a durable
-   * `task/cancelled` row newer than the row that opened the need (a verdict, rework or challenge retires a review without cancelling it),
-   * or the one admission refused for this need: the source's newest recorded blocker is newer than that row and states the refusal (`ADMISSION_REFUSED`).
-   * The host's own admission reviews on a board with nothing else to do (`stalled`, as the admission pass judged it).
-   */
-  reviewPathBlocker(source: Task, need: ReviewNeed, stalled?: boolean): string | undefined {
-    const mission = this.mission(source.missionId)
-    const tasks = this.store.list('tasks', mission.id), members = this.store.list('members', mission.id)
-    const deferred = tasks.find(task => task.status === 'blocked' && task.reviewOf === source.id && task.verificationRecovery !== undefined && task.verificationRecovery.commit === source.artifact?.commit)
-    if (deferred !== undefined) return `review ${deferred.id} deferred its verdict on this artifact: ${recoveryExit(this.store.toolRuns(mission.id, { taskId: deferred.id }).filter(run => run.tool === 'swarm.host_verification').map(run => run.result as CheckResult))}`
-    if (tasks.length >= mission.budget.maxTasks) return `the mission task budget is exhausted (${tasks.length}/${mission.budget.maxTasks} admitted tasks), so no verification task can be admitted: raise maxTasks with swarm_budget(budget, reason), or ${WITHDRAW_SOURCE}`
-    const authors = [...authorIdsOf(source)]
-    if (!members.some(member => memberPhaseOf(member) !== 'stopped' && canOwnReview(source, member.id))) return `no live member other than the author (${authors.join(', ') || 'unknown'}) can review this artifact independently: add an independent member with swarm_add_member(role, maxOutputTokens), or ${WITHDRAW_SOURCE}`
-    const automatic = tasks.find(review => review.id === `${AUTOMATIC_REVIEW_PREFIX}${need.id}` || (review.reviewOf === source.id && review.status === 'cancelled'
-      && review.id.startsWith(AUTOMATIC_REVIEW_PREFIX) && (this.store.latestTaskEvent(mission.id, review.id, 'task/cancelled')?.seq ?? 0) > need.seq))
-    if (automatic !== undefined) return `the automatically admitted review ${automatic.id} ${automatic.status === 'cancelled' ? 'was withdrawn' : `is ${automatic.status} and cannot reach a verdict`}: ${ADMIT_REVIEW}, or ${WITHDRAW_SOURCE}`
-    const recorded = newestReviewBlock(this.store, mission.id, source.id)
-    if (recorded !== undefined && recorded.seq > need.seq && recorded.reason?.startsWith(ADMISSION_REFUSED)) return recorded.reason
-    return (stalled ?? this.reviewPathStalled(tasks, members)) ? undefined : BOARD_RUNNING
   }
   /** Admit the bounded independent review of one unreviewable submitted deliverable. Its id is keyed on the review need, and `reviewPathBlocker` names one that exists or was refused, so each need is proposed once. */
   private admitAutomaticReview(mission: Mission, source: Task, need: ReviewNeed): void {
@@ -2455,10 +2338,11 @@ export class SwarmRuntime implements Kernel {
       // live work. They stay pending (and repairable) instead of being treated
       // as dead: the result and the event name them, and the board classifier
       // names each one no live path advances.
-      for (const dependent of this.store.list('tasks', missionId)) {
+      const board = this.boardOf(missionId)
+      for (const dependent of board.tasks) {
         if (dependent.id === task.id || dependent.status !== 'pending') continue
-        const references = dependent.dependencies.some(dependency => this.dependencyIdentities(missionId, dependency).has(task.id))
-        if (references && dependent.dependencies.some(dependency => !this.dependencySatisfied(missionId, dependency))) strandedDependents.push(dependent.id)
+        const references = dependent.dependencies.some(dependency => dependencyIdentities(board, dependency).has(task.id))
+        if (references && dependent.dependencies.some(dependency => !dependencySatisfied(board, dependency))) strandedDependents.push(dependent.id)
       }
       this.store.event(missionId, 'task/cancelled', key, { taskId: task.id, reason: input.reason, previousStatus,
         ...(attempt === undefined ? {} : { attemptId: attempt.id, ownerId: attempt.ownerId }),
@@ -3141,8 +3025,7 @@ export class SwarmRuntime implements Kernel {
     // Worker guidance alone did not prevent detail=full, so the runtime refuses
     // it for worker sessions while the owner path keeps the complete view.
     if (member && query.detail === 'full') throw new ObserveDetailRefusedError()
-    const tasks = this.store.list('tasks', missionId), members = this.projectedMembers(missionId)
-    const graph = taskGraphIndex(tasks)
+    const board = this.boardOf(missionId), { tasks, graph } = board, members = this.projectedMembers(missionId)
     const runRef = (run: ToolRun) => ({ id: run.id, seq: run.seq ?? 0, taskId: run.taskId, attemptId: run.attemptId, memberId: run.memberId, tool: run.tool, isError: run.isError, arguments: excerpt(run.arguments, 240) })
     const evidenceRef = (evidence: Evidence, full = false) => ({ id: evidence.id, taskId: evidence.taskId, authorId: evidence.authorId, claim: full ? evidence.claim : excerpt(evidence.claim, 400), outcome: evidence.outcome, status: evidence.status, toolRunIds: evidence.toolRunIds,
       ...(evidence.challenges.length ? { challenges: full ? evidence.challenges : evidence.challenges.length } : {}), ...(evidence.supersedes.length ? { supersedes: evidence.supersedes } : {}) })
@@ -3178,7 +3061,7 @@ export class SwarmRuntime implements Kernel {
     if (query.taskId !== undefined) {
       const task = this.task(missionId, query.taskId)
       return { task: taskRecord(task, 6000), evidence: evidenceOf(task, true), reviews: tasks.filter(item => item.reviewOf === task.id).map(taskRef),
-        dependencies: task.dependencies.map(dep => this.lineage(missionId, dep, tasks, graph)).map(chain => ({ ...taskRef(chain.at(-1)!), ...(chain.length > 1 ? { replacementOf: chain.slice(0, -1).map(item => item.id) } : {}) })),
+        dependencies: task.dependencies.map(dep => lineage(board, dep)).map(chain => ({ ...taskRef(chain.at(-1)!), ...(chain.length > 1 ? { replacementOf: chain.slice(0, -1).map(item => item.id) } : {}) })),
         ...(task.reviewOf ? { reviewSource: taskRef(this.task(missionId, task.reviewOf)) } : {}), ...runsWindow({ taskId: task.id }, 40, query.afterRun) }
     }
     // A member's delivered position is the default cursor; an explicit
@@ -3223,7 +3106,7 @@ export class SwarmRuntime implements Kernel {
         // unchanged one stays in the cached prefix and is not re-sent.
         ...(delivered.current === currentKey ? {} : { current: current === undefined ? null : {
           task: taskRecord(current!, 2400), attemptId: current!.attempt!.id,
-          dependencies: current!.dependencies.map(dep => this.lineage(missionId, dep, tasks, graph)).map(chain => ({ ...taskRef(chain.at(-1)!), output: excerpt(chain.at(-1)!.output ?? '', 600), ...(chain.length > 1 ? { replacementOf: chain.slice(0, -1).map(item => item.id) } : {}) })),
+          dependencies: current!.dependencies.map(dep => lineage(board, dep)).map(chain => ({ ...taskRef(chain.at(-1)!), output: excerpt(chain.at(-1)!.output ?? '', 600), ...(chain.length > 1 ? { replacementOf: chain.slice(0, -1).map(item => item.id) } : {}) })),
           ...(source ? { reviewSource: { ...taskRecord(source, 2400), evidence: evidenceOf(source) } } : {}),
         } }),
         events, ...eventCursor, ...runs,
@@ -3236,7 +3119,7 @@ export class SwarmRuntime implements Kernel {
         member: { id: member.id, name: member.name, role: member.role, status: member.status },
         current: current ? {
           task: taskRecord(current, 2400), attemptId: current.attempt!.id,
-          dependencies: current.dependencies.map(dep => this.lineage(missionId, dep, tasks, graph)).map(chain => ({ ...taskRef(chain.at(-1)!), output: excerpt(chain.at(-1)!.output ?? '', 600), ...(chain.length > 1 ? { replacementOf: chain.slice(0, -1).map(item => item.id) } : {}) })),
+          dependencies: current.dependencies.map(dep => lineage(board, dep)).map(chain => ({ ...taskRef(chain.at(-1)!), output: excerpt(chain.at(-1)!.output ?? '', 600), ...(chain.length > 1 ? { replacementOf: chain.slice(0, -1).map(item => item.id) } : {}) })),
           ...(source ? { reviewSource: { ...taskRecord(source, 2400), evidence: evidenceOf(source) } } : {}),
         } : null,
         evidence: current ? evidenceOf(current) : [],
@@ -3288,7 +3171,7 @@ export class SwarmRuntime implements Kernel {
     return {
       mission: { id: mission.id, title: mission.title, status: mission.status, ...(mission.reason ? { reason: mission.reason } : {}), ...(ownerCursor ? {} : { criteria: Object.fromEntries(mission.acceptance.map((text, index) => [criterionId(index), text])) }), ...budget, criticalPath: this.criticalPath(missionId), workerUsage: mission.workerUsage ?? emptyUsage(), ownerUsage: mission.ownerUsage ?? emptyUsage() },
       ...rows, ...cursorView,
-      unschedulable: this.unschedulable(mission, tasks, members).map(task => task.id),
+      unschedulable: unschedulable(board).map(task => task.id),
       pendingDeliveries: this.store.list('deliveries', missionId).filter(awaitsDelivery).length,
       posts: { total: this.store.countPosts(missionId), newest: newest.map(post => postView(post, this.now())),
         ...(postAfter === undefined ? {} : { count: postCount }), ...(postCount > newest.length ? { omitted: postCount - newest.length } : {}) },
@@ -3528,7 +3411,7 @@ export class SwarmRuntime implements Kernel {
       if (structural && !next.resumeAfterStop) next.epoch++ // Fence a preparation already awaiting I/O.
       if (resumes && !next.resumeAfterStop && next.status === 'blocked') next.status = 'pending'
     }
-    this.assertEffectiveTaskGraph(missionId, { ...next, status: 'pending' }, this.store.list('tasks', missionId).filter(row => row.id !== taskId))
+    this.assertEffectiveTaskGraph({ ...next, status: 'pending' }, this.store.list('tasks', missionId).filter(row => row.id !== taskId))
     next.handoff = `${next.handoff ?? ''}\nOwner ${action}: ${reason}`.trim()
     // R20: raising a ceiling no longer has a host park to consume. The exhausted
     // handle is refused by the step brake until its stop confirms, and `parked`
@@ -3665,9 +3548,10 @@ export class SwarmRuntime implements Kernel {
     if (mission.status !== 'active' || this.now() >= mission.deadline || mission.usedSteps > mission.budget.maxSteps || mission.usedTokens >= mission.budget.maxTokens) return 'Mission is inactive or out of budget'
     if (mission.budgetPause) return 'Budget pause is waiting for worker quiescence and a fresh resume assignment'
     if (/^(?:subagent|spawn_agent|agent_teams|cordis|plugin|workflow|ralph)(?:$|_)/.test(tool) || ['send_message', 'interrupt_agent', ...OWNER_ONLY_TOOLS].includes(tool)) return 'Use the swarm work board; alternate delegation and runtime modification bypass mission authority'
-    const active = this.store.list('tasks', member.missionId).find(t => t.status === 'running' && t.attempt?.ownerId === memberId)
+    const board = this.boardOf(member.missionId)
+    const active = board.tasks.find(t => t.status === 'running' && t.attempt?.ownerId === memberId)
     // A sandbox Git refusal is diagnostic; reads, edits, and checks remain available.
-    if (active && !active.dependencies.every(dep => this.dependencySatisfied(member.missionId, dep))) return 'A prerequisite was invalidated; stop work and inspect the challenge'
+    if (active && !active.dependencies.every(dep => dependencySatisfied(board, dep))) return 'A prerequisite was invalidated; stop work and inspect the challenge'
     if (active?.reviewOf && this.task(member.missionId, active.reviewOf).status !== 'submitted') return 'The reviewed source is no longer submitted; await a fresh review assignment'
     if (active?.attempt && active.attempt.leaseUntil < this.now()) return 'Task lease expired; await reassignment'
     if (!active && !tool.startsWith('swarm_')) return 'Claim an assigned task before executing workspace tools'
@@ -3845,11 +3729,6 @@ export class SwarmRuntime implements Kernel {
       `${member.name} provider ${outage.class} outage${outage.status === undefined ? '' : ` (HTTP ${outage.status})`}: ${outage.message}. Its attempt is preserved and no recovery credit is spent while the route is quiescent.`,
       open.length ? view.subjectsOf(open) : [missionSubject(view.mission)], { from: member.id, trigger: 'provider/outage', reason: outage.class })
   }
-  /** R11-01: the member's route is quiescent only inside the outage window. */
-  private providerQuiescent(member: Member): Member['providerOutage'] {
-    const outage = member.providerOutage
-    return outage !== undefined && this.now() - outage.at <= PROVIDER_OUTAGE_WINDOW_MS ? outage : undefined
-  }
   /**
    * S5c: a start that leaves the member's session running, an adoption included,
    * ends its counted start failures (`startFailures` mirrors them). R11-01: only
@@ -3983,7 +3862,7 @@ export class SwarmRuntime implements Kernel {
     // provider unavailable) is a quiescent route, not this member's failure:
     // it spends no recovery credit, does not count toward retiring the route,
     // and the work moves to another capable live member when one exists.
-    const outage = classifyProviderOutage(error) ?? this.providerQuiescent(member)
+    const outage = classifyProviderOutage(error) ?? providerQuiescent(member, this.now())
     const reason = outage !== undefined ? `Provider ${outage.class} outage: ${outage.message}` : `Worker could not start: ${String(error)}`
     // S5c: the count is read from the durable member row (the map is the mirror),
     // so losing the map — or restarting the runtime — continues the count instead
@@ -4011,7 +3890,7 @@ export class SwarmRuntime implements Kernel {
         const pinned = task.assigneeId
         delete task.assigneeId
         task.status = 'pending'
-        const target = task.assignmentMode !== 'pinned' && (outage !== undefined || reroute) ? this.rerouteTarget(missionId, task, member.id) : undefined
+        const target = task.assignmentMode !== 'pinned' && (outage !== undefined || reroute) ? rerouteTarget(this.boardOf(missionId), task, member.id) : undefined
         // Re-route wins over the credit limit: the obligation moves to another
         // live route instead of blocking, with its recovery allowance intact.
         if (target !== undefined) task.assigneeId = target.id
@@ -4034,10 +3913,11 @@ export class SwarmRuntime implements Kernel {
       // The retirement is its own fact (never deduplicated into an earlier
       // failure notice). Pending work this route could start and no live route
       // can is named with every retired route: nothing retries it any more.
-      const stranded = this.store.list('tasks', missionId).filter(task => task.status === 'pending' && this.scheduling.capable(task, member)
-        && (task.assignmentMode === 'pinned' ? task.assigneeId === member.id : this.rerouteTarget(missionId, task, member.id) === undefined))
-      const retired = this.store.list('members', missionId).filter(candidate => memberPhaseOf(candidate) === 'stopped'
-        && (candidate.startFailures ?? 0) >= START_FAILURE_REROUTE_LIMIT && stranded.some(task => this.scheduling.capable(task, candidate)))
+      const board = this.boardOf(missionId)
+      const stranded = board.tasks.filter(task => task.status === 'pending' && capable(board, task, member)
+        && (task.assignmentMode === 'pinned' ? task.assigneeId === member.id : rerouteTarget(board, task, member.id) === undefined))
+      const retired = board.members.filter(candidate => memberPhaseOf(candidate) === 'stopped'
+        && (candidate.startFailures ?? 0) >= START_FAILURE_REROUTE_LIMIT && stranded.some(task => capable(board, task, candidate)))
       const options = { trigger: 'member/resume-failed', reason: `${member.id} retired after ${consecutiveFailures} consecutive start failures` }
       if (!stranded.length) {
         this.notify(missionId, `${member.name} could not start after ${consecutiveFailures} consecutive failures; its work remains on the board; capable live routes may claim it, or use swarm_control with taskId and action=amend to choose an assignee.`,
@@ -4183,7 +4063,7 @@ export class SwarmRuntime implements Kernel {
           // Multiple callers of that same opening never spend more credits.
           // R11-01: a route inside its recorded provider outage window gets one
           // probe per window, not one per tick (an owner admission still supersedes).
-          const quiet = failed ? this.providerQuiescent(this.store.get('members', member.id) ?? member) : undefined
+          const quiet = failed ? providerQuiescent(this.store.get('members', member.id) ?? member, this.now()) : undefined
           if (failed) entry.retryAfter = quiet === undefined ? this.now() + this.config.tickMs : quiet.at + PROVIDER_OUTAGE_WINDOW_MS
           else this.workerStarts.delete(member.id)
         }

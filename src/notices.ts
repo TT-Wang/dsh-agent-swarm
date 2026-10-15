@@ -12,8 +12,9 @@ import { guardTerminal, guardTerminalKey, requireText, type GuardChainId, type G
 import { TERMINAL_STATES, blockCauses, missionSubject, stopPending, subjectsOfTasks, taskGraphIndex, taskSubject, terminal } from './task-graph.ts'
 import { PolicyError } from './policy-error.ts'
 import type { SwarmRuntime } from './runtime.ts'
-import { WriterBusyError, id, type SwarmStore } from './store.ts'
+import { WriterBusyError, id } from './store.ts'
 import { awaited, type SchedulingPass } from './kernel.ts'
+import { awaitsReviewAdmission, dispatchable, eligible, newestReviewBlock, reviewable, reviewNeed, reviewPathBlocker, reviewPathStalled, stalled, startBlocker, unfinishedDependencies, unreviewedSources, unschedulable, type Board } from './board.ts'
 import type { Actor, Delivery, Escalation, Member, Mission, NoticeClass, Task, WorkerAdapter } from './types.ts'
 
 /**
@@ -311,15 +312,17 @@ export function noticeTemplateKey(delivery: Pick<Delivery, 'notice'>): keyof typ
 /** R17-G1: the shared interpretation one mission's notice generators consume. */
 export interface MissionInterpretation {
   missionId: string
+  /** The board every field below is read from; its mission, tasks and members are the next three. */
+  board: Board
   mission: Mission
   tasks: Task[]
   members: Member[]
   nonTerminal: Task[]
   stallRoots: Task[]
   replaced: Set<string>
-  /** The dispatcher's eligibility (`Scheduling.eligible`), bound to these rows. */
+  /** The dispatcher's eligibility (`eligible`), over this board. */
   eligible: (task: Task, member: Member) => boolean
-  /** The dispatchable work (`Scheduling.dispatchable`), the dispatcher's question. */
+  /** The dispatchable work (`dispatchable`), the dispatcher's question. */
   dispatchable: Task[]
   /** The review admission's sources (`unreviewedSources`). */
   unreviewed: Task[]
@@ -373,20 +376,6 @@ export function taskFromSubject(subject: string, tasks: readonly Task[]): Task |
 /** The task a subject names while it is unfinished at that epoch: the term a subject-judged notice is deliverable and reminded by. */
 const unfinished = (subject: string, tasks: readonly Task[]): Task | undefined => { const task = taskFromSubject(subject, tasks); return task === undefined || TERMINAL_STATES.has(task.status) ? undefined : task }
 
-/** The exits a review-path blocker may name beside its own cause's (admit the review, naming the recovery limit a launched mission's admission requires and every mission accepts; or withdraw the source), the blocker while the host's own review waits for the board, and the statement a refused host review is recorded with, before its refusal. */
-export const ADMIT_REVIEW = 'admit a review with swarm_propose(kind: "verification", reviewOf, outputs: [], maxRecoveryAttempts)'
-export const WITHDRAW_SOURCE = 'withdraw the source with swarm_cancel(taskId, reason)'
-export const BOARD_RUNNING = `it has no live independent review path and cannot reach a verdict while the rest of the board keeps running: ${ADMIT_REVIEW}, or ${WITHDRAW_SOURCE}`
-export const ADMISSION_REFUSED = `automatic review admission failed: ${ADMIT_REVIEW} correcting what its refusal names, or ${WITHDRAW_SOURCE}. The refusal: `
-/** The source's newest recorded review blocker (its `task/review-blocked` row): the reason last recorded, with the row's sequence. */
-export const newestReviewBlock = (store: Pick<SwarmStore, 'latestTaskEvent'>, missionId: string, sourceId: string): { seq: number; reason: string | undefined } | undefined => {
-  const row = store.latestTaskEvent(missionId, sourceId, 'task/review-blocked')
-  return row && { seq: row.seq, reason: (row.data as { reason?: string }).reason }
-}
-
-/** R17-G9: the runtime slice the lineage rules read, so the classifiers and the delivery-time relevance check consume ONE implementation (a test can supply the same shape). */
-type LineageRuntime = Pick<SwarmRuntime, 'config' | 'bounds' | 'now' | 'reviewNeed' | 'reviewPathBlocker' | 'unfinishedDependencies' | 'reviewable'>
-
 /**
  * R16-A: the ids whose obligation is carried by a live task through `replaces`,
  * transitively. Shared by `stallRoots` (a covered task is not a root) and
@@ -409,10 +398,10 @@ function replacementCoverage(tasks: Task[]): Set<string> {
  * durable rows, so the pass, the timer-driven notice path, the delivery-time
  * relevance check and a test all classify the same board identically.
  */
-function stallRootsFor(rt: Pick<LineageRuntime, 'bounds' | 'now'>, tasks: Task[]): Task[] {
+function stallRootsFor(board: Pick<Board, 'tasks' | 'clock' | 'bounds'>): Task[] {
   // A live replacement marks every id in its transitive lineage as covered.
-  const replaced = replacementCoverage(tasks)
-  return tasks.filter(task => {
+  const replaced = replacementCoverage(board.tasks)
+  return board.tasks.filter(task => {
     if (task.status !== 'blocked' || replaced.has(task.id)) return false
     // A verdict record is not a repairable root: its source carries the repair.
     if (task.reviewOf !== undefined) return false
@@ -423,7 +412,7 @@ function stallRootsFor(rt: Pick<LineageRuntime, 'bounds' | 'now'>, tasks: Task[]
     // absent timestamp is UNBOUNDED — the bound cannot be shown to hold, so the
     // state escalates as a root rather than becoming silence (a pre-upgrade
     // durable row reaches exactly this state).
-    return at === undefined || rt.now() - at > rt.bounds.stallPassTimeoutMs
+    return at === undefined || board.clock() - at > board.bounds.stallPassTimeoutMs
   })
 }
 
@@ -438,7 +427,8 @@ function stallRootsFor(rt: Pick<LineageRuntime, 'bounds' | 'now'>, tasks: Task[]
  * dependents, never re-named here) x the review grace (`reviewable` and the
  * review-blocked emitter) x the wedged-pass classification.
  */
-export function waitsLegitimately(rt: LineageRuntime, task: Task, tasks: Task[]): boolean {
+export function waitsLegitimately(board: Board, task: Task): boolean {
+  const tasks = board.tasks
   if (TERMINAL_STATES.has(task.status)) return false
   // R16-A: a task whose obligation is carried by a live replacement has a live
   // path whatever its own row says — the repair advances it.
@@ -450,21 +440,21 @@ export function waitsLegitimately(rt: LineageRuntime, task: Task, tasks: Task[])
   // Submission remains in this state for the entire independent review: the
   // dispatcher's live-review rule (an admitted or parked review included), or
   // a need the review admission would still serve (`awaitsReviewAdmission`).
-  if (task.status === 'submitted') return rt.reviewable(task, tasks) || awaitsReviewAdmission(rt, task)
+  if (task.status === 'submitted') return reviewable(board, task) || awaitsReviewAdmission(board, task)
   if (task.status === 'blocked') {
     // A blocked verdict record is not outstanding on its own while its source
     // speaks for it: a live replacement carries the repair, or the source is a
     // stall root whose notice lists this record as a dependent. Naming the
     // record again (a W3 reminder, a fall-through) repeats the root's decision.
     if (task.reviewOf !== undefined && (replacementCoverage(tasks).has(task.reviewOf)
-      || stallRootsFor(rt, tasks).some(root => root.id === task.reviewOf))) return true
+      || stallRootsFor(board).some(root => root.id === task.reviewOf))) return true
     const stop = stopPending(task) ? task.resumeAfterStop : undefined
     // R15-A3: an absent `at` is UNBOUNDED, so it is not legitimate waiting. The
     // "cannot judge" case must never be the silent one: `stallRootsFor` classifies
     // the same row as a root, and this classifier refusing it here keeps the two
     // in agreement instead of leaving the state both silent and unnamed.
-    if (stop !== undefined) return stop.at !== undefined && rt.now() - stop.at <= rt.bounds.stallPassTimeoutMs
-    return rt.unfinishedDependencies(task.missionId, task, tasks).length > 0
+    if (stop !== undefined) return stop.at !== undefined && board.clock() - stop.at <= board.bounds.stallPassTimeoutMs
+    return unfinishedDependencies(board, task).length > 0
   }
   if (task.status === 'pending') {
     // Reviews wait on their exact source; no worker stop can repair a missing
@@ -473,11 +463,10 @@ export function waitsLegitimately(rt: LineageRuntime, task: Task, tasks: Task[])
     // keep the shared lineage rule.
     if (task.reviewOf !== undefined) {
       const source = tasks.find(candidate => candidate.id === task.reviewOf)
-      return source !== undefined && !TERMINAL_STATES.has(source.status) && rt.reviewable(source, tasks)
+      return source !== undefined && !TERMINAL_STATES.has(source.status) && reviewable(board, source)
     }
-    if (rt.unfinishedDependencies(task.missionId, task, tasks).length > 0) return true
-    const graph = taskGraphIndex(tasks)
-    if (!task.dependencies.every(dependency => graph.dependencyMet(dependency))) return false
+    if (unfinishedDependencies(board, task).length > 0) return true
+    if (!task.dependencies.every(dependency => board.graph.dependencyMet(dependency))) return false
     // A preparation failure the host will not retry is a block cause the owner
     // repairs (`blockCauses` owns that distinction). One carrying `retryAt` is the
     // host's own bounded back-off: a live wait until one tick past `retryAt`.
@@ -486,7 +475,7 @@ export function waitsLegitimately(rt: LineageRuntime, task: Task, tasks: Task[])
     const failure = task.preparationFailure
     if (failure !== undefined) {
       if (blockCauses(task, () => undefined, Number.POSITIVE_INFINITY).has('preparation-failed')) return false
-      if (failure.retryAt !== undefined && rt.now() <= failure.retryAt + rt.config.tickMs) return true
+      if (failure.retryAt !== undefined && board.clock() <= failure.retryAt + board.bounds.tickMs) return true
     }
     // The same marker that fences dispatch is a live wait only while every
     // matching stop is inside its bound. An unknown owner reserves all members.
@@ -495,22 +484,73 @@ export function waitsLegitimately(rt: LineageRuntime, task: Task, tasks: Task[])
       && (candidate.id === task.id || candidate.resumeAfterStop.memberId === undefined
         || (memberId !== undefined && candidate.resumeAfterStop.memberId === memberId)))
     if (stops.length > 0) return stops.every(candidate => candidate.resumeAfterStop!.at !== undefined
-      && rt.now() - candidate.resumeAfterStop!.at! <= rt.bounds.stallPassTimeoutMs)
+      && board.clock() - candidate.resumeAfterStop!.at! <= board.bounds.stallPassTimeoutMs)
     // Once the stop settles, another live attempt may take the selected member
     // first. Its bounded lease provides the next chance to run this ready work.
     return memberId !== undefined && tasks.some(candidate => candidate.status === 'running'
-      && candidate.attempt?.ownerId === memberId && candidate.attempt.leaseUntil >= rt.now())
+      && candidate.attempt?.ownerId === memberId && candidate.attempt.leaseUntil >= board.clock())
   }
   return false
 }
 
 
-/** The submissions the review admission speaks for: submitted artifacts. A submission an older build left without an artifact is ordinary stuck work. Its sources, the one set its admission, its decisions and the interpretation read, are those no live review can accept (before the grace is applied). */
-const admissionSpeaksFor = (task: Task): boolean => task.status === 'submitted' && task.artifact !== undefined
-export const unreviewedSources = (rt: Pick<LineageRuntime, 'reviewable'>, tasks: Task[]): Task[] => tasks.filter(task => admissionSpeaksFor(task) && !rt.reviewable(task, tasks))
-/** Whether the host can still advance an unreviewable submission, the review admission's own rule, which the stall predicate and the waiting classifier read: inside its review grace (`ReviewNeed.ripe`), or, for a source the admission speaks for, while the admission names no blocker under the board's own stall (`SwarmRuntime.reviewPathBlocker`): the next pass on a stalled board admits its review. */
-export const awaitsReviewAdmission = (rt: Pick<LineageRuntime, 'reviewNeed' | 'reviewPathBlocker'>, task: Task): boolean => { const need = rt.reviewNeed(task); return !need.ripe || (admissionSpeaksFor(task) && rt.reviewPathBlocker(task, need) === undefined) }
-/** A review-blocked decision's identity: one per blocker reason of one review need (`SwarmRuntime.reviewNeed`) of a source. */
+/**
+ * R15-A4: the dispatcher's answer to "why did this ready task not dispatch?",
+ * asked per (task, assignee) after a pass. `holder` is present only when the
+ * blocker is a member handle that still holds an unfinished turn; the mission
+ * admission refusal has no holder. Both carry the task's subject and a dedup key
+ * that belongs to the task and epoch, so an unrelated notice can never consume
+ * this decision.
+ */
+interface DispatchQuestion {
+  task: Task
+  holder?: Member
+  message: string
+  subjects: string[]
+  dedupKey: string
+}
+
+/**
+ * R15-A4: the dispatcher's own question, asked about the first dispatchable
+ * task that did not dispatch and is not yet asked about at its epoch on the
+ * ledger, so successive passes ask about each such task once, and the owner
+ * notice names the real cause and the member whose handle holds the task
+ * instead of claiming an admission refusal that was never recorded. It asks the
+ * dispatcher's own predicates (`eligible`, `startBlocker`), so the owner is
+ * never told a cause the sweep did not test.
+ *
+ * Returns undefined — no owner decision — when no such task remains: every
+ * other one carries an open attempt (the close-out path is already nudging
+ * it; W6 owns that state) or has no eligible member at all (nothing is ready
+ * for a member; the board is someone else's witness, not this notice's).
+ *
+ * Otherwise the notice names a handle holder or an unexplained dispatch gap.
+ * An idle handle alone proves no budget refusal.
+ * - `handle-busy`: every member eligible for the task is working by the
+ *   adapter's contract. The named holder is the task's assignee when the task
+ *   is pinned, else the first eligible member whose handle is busy;
+ */
+export function dispatchQuestion(board: Board, dispatchable: Task[]): DispatchQuestion | undefined {
+  const missionId = board.missionId
+  const deliveries = board.records.list('deliveries', missionId)
+  for (const task of dispatchable) {
+    const subjects = [taskSubject(task)], dedupKey = `dispatch-question:${missionId}:${subjects[0]}`
+    // An open attempt is not a dispatch candidate: the close-out path nudges it
+    // (W6) or the lease path recovers it; a task asked about at its epoch, under
+    // the identity `Notices.tell` writes, is the owner's: a second wake is noise.
+    if (task.attempt !== undefined || hasNotice(deliveries, noticeIdentity(missionId, subjects, { dedupKey }).identity)) continue
+    const candidates = board.members.filter(member => eligible(board, task, member))
+    if (!candidates.length) continue
+    if (candidates.some(member => startBlocker(board.view, member) === undefined)) return { task, subjects, dedupKey,
+      message: `Task ${task.id} (${task.title}, epoch ${task.epoch}) has an eligible idle member but was not dispatched this tick. An idle handle alone does not identify the dispatch blocker. Inspect the task and recorded admission/preparation diagnostics with swarm_observe; repair the reported cause or withdraw the task with swarm_cancel.` }
+    const pinned = task.assigneeId === undefined ? undefined : candidates.find(member => member.id === task.assigneeId)
+    const holder = pinned ?? candidates[0]!
+    return { task, holder, subjects, dedupKey,
+      message: `Task ${task.id} (${task.title}, epoch ${task.epoch}) is ready for member ${holder.name} (${holder.id})${pinned === undefined ? ', one of its eligible members,' : ', the member it is assigned to,'} whose worker handle still holds an unfinished turn, so the dispatcher cannot start it: no admission limit and no budget refusal was recorded for this board. The task is not undispatched for lack of an eligible member. Wait for that turn to end (the close-out path re-pends or completes it), amend this task's assigneeId with swarm_control(taskId: "${task.id}", action: "amend", changes: { assigneeId: "member id" }, reason: "reassign"), or withdraw it with swarm_cancel.` }
+  }
+  return undefined
+}
+/** A review-blocked decision's identity: one per blocker reason of one review need (`reviewNeed`, src/board.ts) of a source. */
 const reviewBlockedKey =(missionId: string, sourceId: string, need: string, reason: string): string => `review-blocked:${missionId}:${sourceId}:${need}:${reason}`
 /** The families of the board's own fact: the W3 stall, or an owner-assembled mission's coverage-complete (R10-14). */
 const BOARD_FAMILIES: readonly string[] = ['board-stall', 'coverage-complete']
@@ -845,22 +885,21 @@ export class Notices {
    * Read-only: it writes nothing and holds no cache.
    */
   interpretation(missionId: string): MissionInterpretation {
-    const mission = this.rt.mission(missionId)
-    const tasks = this.rt.store.list('tasks', missionId)
-    const members = this.rt.store.list('members', missionId)
+    const board = this.rt.boardOf(missionId)
+    const { mission, tasks, members } = board
     return {
-      missionId, mission, tasks, members,
+      missionId, board, mission, tasks, members,
       nonTerminal: tasks.filter(task => !TERMINAL_STATES.has(task.status)),
-      stallRoots: this.stallRoots(tasks),
+      stallRoots: stallRootsFor(board),
       replaced: replacementCoverage(tasks),
-      eligible: (task, member) => this.rt.eligible(task, member, tasks),
+      eligible: (task, member) => eligible(board, task, member),
       // The dispatcher's own question and its own predicates, computed once here
       // so a notice can never describe a board the dispatcher would act on
       // differently (`eligible`, `reviewable`, `unschedulable`, `stalled`).
-      dispatchable: this.rt.dispatchable(tasks, members),
-      unreviewed: unreviewedSources(this.rt, tasks),
-      unschedulable: this.rt.unschedulable(mission, tasks, members),
-      stalled: this.rt.stalled(tasks, members),
+      dispatchable: dispatchable(board),
+      unreviewed: unreviewedSources(board),
+      unschedulable: unschedulable(board),
+      stalled: stalled(board),
       parkedHolders: tasks.filter(task => task.status === 'running' && task.attempt !== undefined
         && members.some(member => member.id === task.attempt?.ownerId && memberPhaseOf(member) === 'parked'))
         .map(task => ({ task, member: members.find(member => member.id === task.attempt?.ownerId)! })),
@@ -954,8 +993,8 @@ export class Notices {
     // A stall-root decision is outstanding exactly while its root still is one;
     // the dependents it lists (a rejecting review) never keep it open.
     const family = noticeFamily(delivery)
-    if (family === 'stall-root') return this.openStallRoot(mission.id, delivery, view.tasks)
-    if (family === 'review-blocked') return this.openReviewBlock(mission.id, delivery, view.tasks)
+    if (family === 'stall-root') return this.openStallRoot(view.board, delivery)
+    if (family === 'review-blocked') return this.openReviewBlock(view.board, delivery)
     if (BOARD_FAMILIES.includes(family) && !this.boardFactOpen(view, delivery)) return []
     // Coverage-complete names its terminal deliverable: the completion it asks for is what stays outstanding.
     if (family === 'coverage-complete') return delivery.subjects ?? []
@@ -966,7 +1005,7 @@ export class Notices {
           || (view.tasks.length > 0 && view.nonTerminal.length === 0)
       }
       const task = unfinished(subject, view.tasks)
-      return task !== undefined && !this.waitsLegitimately(task, view.tasks)
+      return task !== undefined && !this.waitsLegitimately(view.board, task)
     })
   }
 
@@ -1012,12 +1051,12 @@ export class Notices {
     if (BOARD_FAMILIES.includes(family)) return this.boardFactOpen(this.interpretation(mission.id), delivery)
     if (family === 'review-blocked' || family === 'fallthrough' || family === 'stall-root'
       || family === 'dispatch-question' || family === 'parked' || family === 'scheduling-pass') {
-      const tasks = this.rt.store.list('tasks', mission.id)
+      const board = this.rt.boardOf(mission.id), tasks = board.tasks
       const subjects = delivery.subjects ?? fact.subjects ?? []
       // Old unattributed rows cannot be judged from their text alone.
       if (subjects.length === 0) return true
-      if (family === 'stall-root') return this.openStallRoot(mission.id, delivery, tasks).length > 0
-      if (family === 'review-blocked') return this.openReviewBlock(mission.id, delivery, tasks).length === subjects.length
+      if (family === 'stall-root') return this.openStallRoot(board, delivery).length > 0
+      if (family === 'review-blocked') return this.openReviewBlock(board, delivery).length === subjects.length
       // A wedged pass's naming holds for the work it named that is unfinished at that epoch: a body is named once (one on a held fact is left to this row), so no later fact speaks for the rest.
       if (family === 'scheduling-pass') return subjects.some(subject => subject === missionSubject(mission) || unfinished(subject, tasks) !== undefined)
       // A batch asserts the condition for every named subject. If one changes,
@@ -1026,7 +1065,7 @@ export class Notices {
         if (subject === missionSubject(mission)) return true
         const task = unfinished(subject, tasks)
         if (task === undefined) return false
-        if (family === 'fallthrough') return !this.waitsLegitimately(task, tasks)
+        if (family === 'fallthrough') return !this.waitsLegitimately(board, task)
         if (family === 'dispatch-question') return task.status === 'pending'
         return this.interpretation(mission.id).parkedHolders.some(holder => holder.task.id === task.id)
       })
@@ -1043,22 +1082,22 @@ export class Notices {
    * rejected root's reminders alive while its repair ran (the rejecting review is
    * a listed dependent). Returns the root subject while it is still a stall root.
    */
-  private openStallRoot(missionId: string, delivery: Pick<Delivery, 'subjects' | 'notice'>, tasks: Task[]): string[] {
-    const rootPrefix = `stall-root:${missionId}:`
+  private openStallRoot(board: Board, delivery: Pick<Delivery, 'subjects' | 'notice'>): string[] {
+    const rootPrefix = `stall-root:${board.missionId}:`
     const key = delivery.notice?.dedupKey ?? ''
     const root = key.startsWith(rootPrefix) ? key.slice(rootPrefix.length) : (delivery.subjects ?? noticeRow(delivery)?.subjects)?.[0]
-    const task = root === undefined ? undefined : taskFromSubject(root, tasks)
-    return task !== undefined && stallRootsFor(this.rt, tasks).some(candidate => candidate.id === task.id) ? [root!] : []
+    const task = root === undefined ? undefined : taskFromSubject(root, board.tasks)
+    return task !== undefined && stallRootsFor(board).some(candidate => candidate.id === task.id) ? [root!] : []
   }
 
-  /** A review-blocked decision is outstanding while its source is one the review admission speaks for (`unreviewedSources`) and its reason is the blocker the admission derives for that source under the same review need (`SwarmRuntime.reviewPathBlocker`). */
-  private openReviewBlock(missionId: string, delivery: Delivery, tasks: Task[]): string[] {
+  /** A review-blocked decision is outstanding while its source is one the review admission speaks for (`unreviewedSources`) and its reason is the blocker the admission derives for that source under the same review need (`reviewPathBlocker`, src/board.ts). */
+  private openReviewBlock(board: Board, delivery: Delivery): string[] {
     return (delivery.subjects ?? []).filter(subject => {
-      const task = taskFromSubject(subject, unreviewedSources(this.rt, tasks))
+      const task = taskFromSubject(subject, unreviewedSources(board))
       if (task === undefined) return false
-      const need = this.rt.reviewNeed(task)
-      const blocker = this.rt.reviewPathBlocker(task, need)
-      return blocker !== undefined && delivery.notice?.dedupKey === reviewBlockedKey(missionId, task.id, need.id, blocker)
+      const need = reviewNeed(board, task)
+      const blocker = reviewPathBlocker(board, task, need)
+      return blocker !== undefined && delivery.notice?.dedupKey === reviewBlockedKey(board.missionId, task.id, need.id, blocker)
     })
   }
 
@@ -1251,8 +1290,8 @@ export class Notices {
     // rule, only what it does not reach: while a wedged pass keeps it from
     // running, a need it recorded (`ReviewNeed.recorded`).
     if (options.wedged === true) for (const task of view.unreviewed) {
-      const need = this.rt.reviewNeed(task)
-      const blocker = need.recorded ? this.rt.reviewPathBlocker(task, need) : undefined
+      const need = reviewNeed(view.board, task)
+      const blocker = need.recorded ? reviewPathBlocker(view.board, task, need) : undefined
       if (blocker !== undefined) this.notifyReviewBlocked(view.mission, task, need.id, blocker)
     }
     this.judgeBoard(view, options)
@@ -1271,13 +1310,13 @@ export class Notices {
     // The dispatchable work is the dispatcher's own question's to name (R15-A4),
     // one emitter among the board's: it names the member whose handle holds the
     // task, or an unexplained dispatch gap (its co-firing guards are in
-    // `Scheduling.dispatchQuestion`). A handle that is working is not a silent
+    // `dispatchQuestion`). A handle that is working is not a silent
     // board: with no member startable the question is not asked (the T3 rule),
     // except by a wedged pass, which never reached its own question (R15-D1).
     // The dedup key is the task at its epoch, so every judgement re-asks it
     // without repeating the wake.
     if (dispatchable.length && (options.wedged === true || members.some(member => member.status === 'waiting' || (member.status === 'idle' && this.rt.workers.isIdle(member.id))))) {
-      const question = this.rt.dispatchQuestion(missionId, tasks, members, dispatchable)
+      const question = dispatchQuestion(view.board, dispatchable)
       if (question !== undefined) this.tell(missionId, question.message, view.subjectsOf([question.task]), { dedupKey: question.dedupKey })
     }
     // The board's own fact, of which this is the one emitter: coverage-complete
@@ -1285,7 +1324,7 @@ export class Notices {
     // pass instead), the W3 stall once the board is stalled (`boardFact`).
     this.notifyBoard(view)
     // No live work: stuck work is the W3 stall's alone (a stall candidate until the board is stalled).
-    if (this.rt.reviewPathStalled(tasks, members)) return
+    if (reviewPathStalled(view.board)) return
     // R14-F2(c): the unnamed fallback is replaced. While every unfinished task is
     // legitimately waiting (row 3: a running attempt waits on its lease's path),
     // the runtime stays silent; otherwise it escalates UNCONDITIONALLY and names
@@ -1296,7 +1335,7 @@ export class Notices {
     // left to it, asked once a member can start; every other task no live path
     // advances is named here, whatever owner decision also names it.
     const roots = new Set(view.stallRoots.map(task => task.id))
-    const unrecognised = view.nonTerminal.filter(task => !roots.has(task.id) && !dispatchable.includes(task) && !this.waitsLegitimately(task, tasks))
+    const unrecognised = view.nonTerminal.filter(task => !roots.has(task.id) && !dispatchable.includes(task) && !this.waitsLegitimately(view.board, task))
     if (!unrecognised.length) return
     // R17-G3: the fact is the named subjects and the recorded reason (the
     // classifier's verdict), never the board digest.
@@ -1376,7 +1415,7 @@ export class Notices {
    * classify the same board identically.
    */
   stallRoots(tasks: Task[]): Task[] {
-    return stallRootsFor(this.rt, tasks)
+    return stallRootsFor({ tasks, clock: this.rt.now, bounds: this.rt.bounds })
   }
 
   /**
@@ -1411,7 +1450,7 @@ export class Notices {
    * Anything else is unnamed silence and must escalate.
    *
    * R16-A: the predecessor edge is resolved through the dispatcher's own lineage
-   * seam (`rt.unfinishedDependencies`), never the raw id, so a task whose
+   * seam (`unfinishedDependencies`), never the raw id, so a task whose
    * cancelled dependency has a live running repair is waiting, not dead. And a
    * task whose own obligation is carried by a live replacement is waiting too,
    * read from the same coverage `stallRoots` uses, so the fall-through can name a
@@ -1425,8 +1464,8 @@ export class Notices {
    * wedged-pass classification (D1/D2: the wedge changes who generates the
    * decision, never which boards are waiting).
    */
-  waitsLegitimately(task: Task, tasks: Task[]): boolean {
-    return waitsLegitimately(this.rt, task, tasks)
+  waitsLegitimately(board: Board, task: Task): boolean {
+    return waitsLegitimately(board, task)
   }
 
   /**
@@ -1477,7 +1516,7 @@ export class Notices {
       { dedupKey: `integration-gap:${mission.id}:${implementations.length}`, trigger: NOTICE_TEMPLATES['integration-gap'].trigger, reason: diagnostic, statement })
   }
 
-  /** Record an unreviewable submitted deliverable's blocker whenever it changes, and wake the owner once per blocker and review need (`SwarmRuntime.reviewNeed`): its decision is told with its record (`tell`, whose ledger dedup gates the wake across restarts), and a changed blocker whose decision the owner holds is recorded alone. */
+  /** Record an unreviewable submitted deliverable's blocker whenever it changes, and wake the owner once per blocker and review need (`reviewNeed`, src/board.ts): its decision is told with its record (`tell`, whose ledger dedup gates the wake across restarts), and a changed blocker whose decision the owner holds is recorded alone. */
   notifyReviewBlocked(mission: Mission, source: Task, need: string, reason: string): void {
     const view = this.interpretation(mission.id)
     const row = view.tasks.find(candidate => candidate.id === source.id) ?? source

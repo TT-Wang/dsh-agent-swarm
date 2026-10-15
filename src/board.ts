@@ -1,7 +1,26 @@
 /**
  * The board every decision reads, and the declared bounds it is judged against.
+ *
+ * A board is one mission's rows read at one instant (`readBoard`): the mission
+ * with its execution clock applied, its tasks, its members and the task graph
+ * over them. The scheduling, review-admission and task-graph decisions below
+ * are functions of it, so a reader builds the board where it decides and every
+ * predicate it asks sees those rows; none re-reads a row. Three inputs are not
+ * rows and are never snapshotted: the clock (`clock`, read where a decision
+ * needs the time), the adapter (`view`, asked where a decision needs its
+ * answer) and the durable log (`records`: task events, tool runs, the
+ * deliveries ledger and evidence, read where a decision reads it).
  */
-import type { RuntimeConfig } from './types.ts'
+import { createHash } from 'node:crypto'
+import type { SwarmStore } from './store.ts'
+import { PolicyError } from './policy-error.ts'
+import { executionClock } from './resource-time.ts'
+import { assignmentAllows, authorIdsOf, canBorrowTask, canOwnReview, strandedReview } from './assignment.ts'
+import { liveReviewFor } from './admission.ts'
+import { memberPhaseOf } from './projection.ts'
+import { recoveryExit } from './declared-checks.ts'
+import { TERMINAL_STATES, pendingStopOwner, quiescencePending, taskGraphIndex, terminal, type TaskGraphIndex } from './task-graph.ts'
+import type { CheckResult, Member, Mission, RuntimeConfig, Task } from './types.ts'
 
 /**
  * S1: the bound on one scheduling pass before the runtime names it wedged, in
@@ -83,3 +102,366 @@ function declaredBound(value: number | undefined, fallback: number): number {
   if (value === 0) return 0
   return typeof value === 'number' && Number.isFinite(value) && value > 0 ? Math.floor(value) : fallback
 }
+
+/**
+ * The adapter's answers a decision asks. Each call goes straight through to the
+ * adapter at the instant the decision asks it, never memoized: asking whether a
+ * handle is idle can drain a stranded inbox item (`WorkerAdapter.isIdle`, R15-A5).
+ */
+export interface AdapterView {
+  /** Whether the member's worker handle can take an assignment now (`WorkerAdapter.isIdle`). */
+  startable(memberId: string): boolean
+}
+
+/** The durable log a board reads where a decision reads it: task events, tool runs, the deliveries ledger and evidence. */
+export type BoardRecords = Pick<SwarmStore, 'latestTaskEvent' | 'toolRuns' | 'list'>
+
+/** One mission's rows at one instant, with the clock, the bounds, the adapter view and the log every decision over them reads. */
+export interface Board {
+  missionId: string
+  /** The mission row with its execution clock applied (`readMission`). */
+  mission: Mission
+  tasks: Task[]
+  members: Member[]
+  /** The task graph over `tasks`. */
+  graph: TaskGraphIndex
+  clock: () => number
+  bounds: Bounds
+  view: AdapterView
+  records: BoardRecords
+}
+
+/** A mission row as every reader sees it: its execution clock applied while it is not terminal. An unknown id is refused. */
+export function readMission(store: Pick<SwarmStore, 'get'>, missionId: string, clock: () => number): Mission {
+  const mission = store.get('missions', missionId)
+  if (!mission) throw new PolicyError('mission_unknown', 'validation_error', 'Unknown mission')
+  if (mission.executionTime !== undefined && !terminal(mission)) executionClock(mission, mission.executionTime.since !== undefined, clock())
+  return mission
+}
+
+/** The board of one mission as the store holds it now. */
+export function readBoard(store: Pick<SwarmStore, 'get' | 'list' | 'latestTaskEvent' | 'toolRuns'>, missionId: string, clock: () => number, bounds: Bounds, view: AdapterView): Board {
+  const mission = readMission(store, missionId, clock)
+  const tasks = store.list('tasks', missionId)
+  return { missionId, mission, tasks, members: store.list('members', missionId), graph: taskGraphIndex(tasks), clock, bounds, view, records: store }
+}
+
+/** A task of this board, refused like `SwarmRuntime.task` when the id names no task of the mission. */
+function taskOf(board: Pick<Board, 'graph'>, taskId: string): Task {
+  const task = board.graph.byId.get(taskId)
+  if (task === undefined) throw new PolicyError('task_not_in_mission', 'validation_error', 'Task is not in this mission')
+  return task
+}
+
+/* ----------------------------------------------------------------------- *
+ * The task-graph queries: dependency lineage as the dispatcher resolves it.
+ * ----------------------------------------------------------------------- */
+
+/**
+ * Follow repair lineage from a referenced dependency to the task that now
+ * carries its obligations. A blocked or cancelled task replaced by a live
+ * repair resolves to that repair, recursively; the original identity in a
+ * dependent's `dependencies` therefore keeps working after replacement.
+ */
+export function lineage(board: Pick<Board, 'graph'>, dependencyId: string): Task[] {
+  const chain = board.graph.lineage(dependencyId)
+  if (!chain.length) throw new PolicyError('task_not_in_mission', 'validation_error', 'Task is not in this mission')
+  return chain
+}
+export function effectiveDependency(board: Pick<Board, 'graph'>, dependencyId: string): Task { return lineage(board, dependencyId).at(-1)! }
+export function dependencySatisfied(board: Pick<Board, 'graph'>, dependencyId: string): boolean { return effectiveDependency(board, dependencyId).status === 'accepted' }
+/** Effective prerequisites for workspace preparation; one accepted repair covering several originals is merged once. */
+export function effectiveDependencies(board: Pick<Board, 'graph'>, task: Task): Task[] {
+  const seen = new Set<string>()
+  return task.dependencies.map(dependency => effectiveDependency(board, dependency)).filter(dependency => !seen.has(dependency.id) && seen.add(dependency.id))
+}
+/**
+ * R16-A: the EFFECTIVE unfinished prerequisites of one task, deduplicated in
+ * reference order. This is the one seam the waking classifier reads, so a notice
+ * and the scheduler resolve a replaced dependency through the same lineage.
+ */
+export function unfinishedDependencies(board: Pick<Board, 'graph'>, task: Task): Task[] {
+  const seen = new Set<string>()
+  const unfinished: Task[] = []
+  for (const dependency of task.dependencies) {
+    const effective = board.graph.effective(dependency)
+    if (effective === undefined || TERMINAL_STATES.has(effective.status) || seen.has(effective.id)) continue
+    seen.add(effective.id)
+    unfinished.push(effective)
+  }
+  return unfinished
+}
+/** Every identity a dependency reference stands for, including the current effective repair. */
+export function dependencyIdentities(board: Pick<Board, 'graph'>, dependencyId: string): Set<string> { return new Set(lineage(board, dependencyId).map(task => task.id)) }
+
+/* ----------------------------------------------------------------------- *
+ * The scheduling predicates: readiness, capability, the dispatchable work,
+ * the unschedulable work and the stall.
+ * ----------------------------------------------------------------------- */
+
+/**
+ * R15-A4/A5: the dispatcher's startability question for one member, shared by
+ * the sweep and by the explanation the dispatch question gives the owner, so
+ * both answer with the same predicate.
+ *
+ * Guards it can co-fire with:
+ * - the parked-member hatch (`memberPhaseOf(member) === 'parked'`, R10-09/S3): a
+ *   parked member is startable even when the adapter reports a pending inbox item,
+ *   so the hatch wins here exactly as it does in `Scheduling.dispatch`;
+ * - the adapter's `isIdle` precondition (`HarnessWorkers.isIdle`), which drains a
+ *   stranded `nextStep` item instead of stranding the member (R15-A5);
+ * - the W6 open-attempt close-out, which owns a member that already has a
+ *   running attempt: `dispatch` handles that member before it dispatches, and
+ *   the dispatch question refuses to answer for a task with an open attempt.
+ */
+export function startBlocker(view: AdapterView, member: Member): 'handle-busy' | undefined {
+  if (memberPhaseOf(member) === 'parked') return undefined
+  return view.startable(member.id) ? undefined : 'handle-busy'
+}
+
+export function ready(board: Board, task: Task, member: Member): boolean {
+  return readinessBlocker(board, task, member) === undefined
+}
+
+/** The dispatcher's eligibility, which every reader of a dispatchable task asks: a live member that owes no stop, for which the task is ready. */
+export function eligible(board: Board, task: Task, member: Member): boolean { return memberPhaseOf(member) !== 'stopped' && !pendingStopOwner(board.tasks, member.id) && ready(board, task, member) }
+
+/** Spec §2: the dispatchable work, each pending task an idle or waiting member is eligible for; a working member is already busy. */
+export function dispatchable(board: Board): Task[] {
+  const runnable = board.members.filter(member => member.status === 'idle' || member.status === 'waiting')
+  return board.tasks.filter(task => task.status === 'pending' && runnable.some(member => eligible(board, task, member)))
+}
+
+/** The same readiness decision supplies a concrete refusal without another policy model. */
+export function readinessBlocker(board: Board, task: Task, member: Member): string | undefined {
+  if (task.status !== 'pending') return `task ${task.id} is ${task.status}; inspect its current attempt, artifact or recovery condition with swarm_observe(taskId)`
+  if ((task.preparationFailure?.retryAt ?? 0) > board.clock()) return `preparation is backing off until ${task.preparationFailure!.retryAt}: ${task.preparationFailure!.reason}`
+  if (task.assigneeId === member.id) return capabilityBlocker(board, task, member)
+  if (task.assigneeId !== undefined && !canBorrowTask(task)) return `task is bound to member ${task.assigneeId}; the owner can amend assigneeId when reassignment is appropriate`
+  const all = board.tasks
+  if (!assignmentAllows(task, member.id, all)) return `member ${member.id} is the assignee of review ${strandedReview(all, task.id, { assigneeId: member.id })?.id} of this task, so owning this task would make it that review's author; another member can take it, or the owner can amend that review's assigneeId with swarm_control`
+  const incapable = capabilityBlocker(board, task, member)
+  if (incapable !== undefined || task.assigneeId === undefined) return incapable
+  // Keep useful context on the preferred member when it can take this work
+  // now. A busy, stopping, retired or non-independent preference cannot reserve
+  // an untouched task while another member is idle. This adds no reservation.
+  const preferred = board.members.find(candidate => candidate.id === task.assigneeId)
+  const availableForBorrowing = preferred === undefined || !eligible(board, task, preferred)
+    || all.some(candidate => candidate.status === 'running' && candidate.attempt?.ownerId === preferred.id)
+    || startBlocker(board.view, preferred) !== undefined
+  return availableForBorrowing ? undefined : `preferred member ${task.assigneeId} is available for this task; the owner can amend assigneeId to change the preference`
+}
+
+/**
+ * R5-02: whether a member could take this task if it were pending and
+ * unassigned. Same prerequisites and review-independence guard as `ready`,
+ * without the status/assignee pin, so a start-failure re-route can evaluate
+ * candidates before committing the re-pend. The author check matches
+ * admission's definition (`attempt?.ownerId ?? assigneeId`), so a re-route can
+ * never assign a verification to the author of the source it reviews.
+ */
+export function capable(board: Board, task: Task, member: Member): boolean {
+  return capabilityBlocker(board, task, member) === undefined
+}
+
+function capabilityBlocker(board: Board, task: Task, member: Member): string | undefined {
+  const waiting = task.dependencies.find(dependency => !dependencySatisfied(board, dependency))
+  if (waiting !== undefined) {
+    const effective = effectiveDependency(board, waiting)
+    return `dependency ${waiting}${effective.id === waiting ? '' : ` (effective replacement ${effective.id})`} is ${effective.status}, not accepted; inspect it or amend the dependency plan`
+  }
+  if (task.reviewOf) {
+    const source = taskOf(board, task.reviewOf)
+    if (source.status !== 'submitted') return `review source ${source.id} is ${source.status}; review begins only after its artifact is submitted`
+    if (!canOwnReview(source, member.id)) return `member ${member.id} authored review source ${source.id}; assign an independent reviewer`
+  }
+  return undefined
+}
+
+/**
+ * Tasks that cannot be dispatched under the current plan: pending work whose dependency
+ * lineage or review source is dead, reviews assigned to their own author,
+ * pending work no live member may take (`assignmentAllows`: a source only its
+ * own bound reviewer is left to take included), and blocked work. This is a
+ * diagnostic for owner repair, not permission to
+ * cancel obligations or mark the mission complete.
+ */
+export function unschedulable(board: Board): Task[] {
+  const tasks = board.tasks
+  const live = board.members.filter(member => memberPhaseOf(member) !== 'stopped')
+  // W15: a blocked task with a matching stop marker is alive, not dead. Handoff,
+  // worker close-out and lease expiry hold the task at `blocked` +
+  // `resumeAfterStop` only until `workers.stop()` resolves; treating it as
+  // unschedulable lets `control complete` cancel recoverable work.
+  const dead = new Set(tasks.filter(task => task.status === 'blocked' && !quiescencePending(task)).map(task => task.id))
+  // Fixpoint: work waiting on dead prerequisites or an unreachable review source is dead too.
+  for (let changed = true; changed;) {
+    changed = false
+    for (const task of tasks) {
+      if (dead.has(task.id) || task.status !== 'pending') continue
+      const stuck = task.dependencies.some(dependency => { const effective = effectiveDependency(board, dependency); return effective.status === 'cancelled' || dead.has(effective.id) })
+        || (task.reviewOf !== undefined && (() => {
+          const source = taskOf(board, task.reviewOf)
+          return TERMINAL_STATES.has(source.status) || dead.has(source.id)
+            || !live.some(member => assignmentAllows(task, member.id, tasks) && canOwnReview(source, member.id))
+        })())
+        || !live.some(member => assignmentAllows(task, member.id, tasks))
+      if (stuck) { dead.add(task.id); changed = true }
+    }
+  }
+  return tasks.filter(task => dead.has(task.id))
+}
+
+/**
+ * A submitted task is progress only while a live review can still accept it,
+ * under the one live-review rule (`liveReviewFor`). A review that was never
+ * admitted or was retired leaves the submission unreviewable forever;
+ * counting it as progress hid a stalled board from the owner (Round-8 F1).
+ * So does a review no live member may own: counting it silenced the owner's
+ * review-blocked decision. A parked review (blocked with a matching stop
+ * marker) re-pends after the stop acknowledgement, so it still counts.
+ */
+export function reviewable(board: Board, task: Task): boolean {
+  return liveReviewFor(board.tasks, task, new Set(board.members.filter(member => memberPhaseOf(member) !== 'stopped').map(member => member.id))) !== undefined
+}
+
+/**
+ * F2: the board makes no progress except for submitted work. Unlike `stalled`,
+ * a submitted task is not progress: an artifact whose review path is broken
+ * can never reach a verdict by itself.
+ */
+export function reviewPathStalled(board: Board): boolean {
+  if (board.tasks.some(task => task.status === 'running' || quiescencePending(task))) return false
+  const live = board.members.filter(member => memberPhaseOf(member) !== 'stopped')
+  return !board.tasks.some(task => task.status === 'pending' && live.some(member => ready(board, task, member)))
+}
+
+/**
+ * Nothing is running, reviewably submitted or dispatchable, and no submission
+ * with no live review awaits the review admission (`awaitsReviewAdmission`,
+ * the admission's own rule): workers would stay idle forever. An empty board
+ * is a mission the owner has not planned yet.
+ */
+export function stalled(board: Board): boolean {
+  return board.tasks.length > 0 && reviewPathStalled(board)
+    && !board.tasks.some(task => task.status === 'submitted' && !reviewable(board, task) && awaitsReviewAdmission(board, task))
+}
+
+/** R11-01: how long a classified provider outage keeps a member's route quiescent. */
+export const PROVIDER_OUTAGE_WINDOW_MS = 5 * 60_000
+/** R11-01: the member's route is quiescent only inside the outage window. */
+export function providerQuiescent(member: Member, now: number): Member['providerOutage'] {
+  const outage = member.providerOutage
+  return outage !== undefined && now - outage.at <= PROVIDER_OUTAGE_WINDOW_MS ? outage : undefined
+}
+
+/**
+ * R5-02: the live members a failed attempt may be re-routed to, in store
+ * order: capable of the task, and never the member one of its own reviews is
+ * bound to (`strandedReview`), whom a reroute would make that review's author.
+ */
+function rerouteCandidates(board: Board, task: Task, failedId: string): Member[] {
+  return board.members.filter(member => member.id !== failedId && memberPhaseOf(member) !== 'stopped'
+    && capable(board, task, member) && strandedReview(board.tasks, task.id, { assigneeId: member.id }) === undefined)
+}
+
+/**
+ * R5-02: the deterministic next live member for re-routed work: the planned
+ * assignee when it is a candidate, else the first candidate by name. R11-01: a
+ * route inside its provider outage window waits for its next probe, so it is the
+ * last resort: the first candidate outside an outage window, in store order,
+ * takes the work before it.
+ */
+export function rerouteTarget(board: Board, task: Task, failedId: string): Member | undefined {
+  const candidates = rerouteCandidates(board, task, failedId)
+  const planned = task.plannedAssigneeId === undefined ? undefined : candidates.find(member => member.id === task.plannedAssigneeId)
+  const target = planned ?? [...candidates].sort((a, b) => a.name.localeCompare(b.name) || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))[0]
+  if (target === undefined || providerQuiescent(target, board.clock()) === undefined) return target
+  return candidates.find(member => providerQuiescent(member, board.clock()) === undefined) ?? target
+}
+
+/* ----------------------------------------------------------------------- *
+ * F2: the review admission's rule. A submitted artifact no live review can
+ * accept gets a bounded independent review admitted by the host, or its
+ * blocker named to the owner, once per review need.
+ * ----------------------------------------------------------------------- */
+
+/** Only the review admission (`SwarmRuntime.admitAutomaticReview`) mints a task id with this prefix, followed by the review need's id. */
+export const AUTOMATIC_REVIEW_PREFIX = 'task_auto_review_'
+/** The exits a review-path blocker may name beside its own cause's (admit the review, naming the recovery limit a launched mission's admission requires and every mission accepts; or withdraw the source), the blocker while the host's own review waits for the board, and the statement a refused host review is recorded with, before its refusal. */
+export const ADMIT_REVIEW = 'admit a review with swarm_propose(kind: "verification", reviewOf, outputs: [], maxRecoveryAttempts)'
+export const WITHDRAW_SOURCE = 'withdraw the source with swarm_cancel(taskId, reason)'
+export const BOARD_RUNNING = `it has no live independent review path and cannot reach a verdict while the rest of the board keeps running: ${ADMIT_REVIEW}, or ${WITHDRAW_SOURCE}`
+export const ADMISSION_REFUSED = `automatic review admission failed: ${ADMIT_REVIEW} correcting what its refusal names, or ${WITHDRAW_SOURCE}. The refusal: `
+/** The source's newest recorded review blocker (its `task/review-blocked` row): the reason last recorded, with the row's sequence. */
+export const newestReviewBlock = (store: Pick<SwarmStore, 'latestTaskEvent'>, missionId: string, sourceId: string): { seq: number; reason: string | undefined } | undefined => {
+  const row = store.latestTaskEvent(missionId, sourceId, 'task/review-blocked')
+  return row && { seq: row.seq, reason: (row.data as { reason?: string }).reason }
+}
+
+/**
+ * F2: one review need of a submitted source (`reviewNeed`). `ripe` is the one
+ * review grace: the need is older than one scheduler period, at least 1 s (the
+ * author may propose its own review in the turn it submitted; the floor keeps a
+ * fast tick from turning a same-turn proposal into a race), or has no dated row
+ * to show it is not, which the board's classifiers read
+ * (`awaitsReviewAdmission`). `recorded` is the admission's own record: a
+ * `task/review-missing` row newer than the row that opened the need.
+ */
+export interface ReviewNeed { id: string; seq: number; ripe: boolean; recorded: boolean }
+
+/**
+ * F2: the review need of one submitted source, the one identity every
+ * missing-review fact is keyed on. The need is the submission (the epoch
+ * fences every resubmission, even of an unchanged commit) and each review of
+ * it a challenge took away (the one that accepted it or one in progress: its
+ * `task/invalidated` row), which re-opens it. `id` keys its automatic review
+ * and its blocker decisions; `seq` is that of the newest row that opened
+ * it, from which its grace (`ripe`, the one grace every reader asks), its
+ * missing-review record (`recorded`) and an owner withdrawal are dated. S5:
+ * derived from the log, so a restart or a lost cache re-derives the same need.
+ */
+export function reviewNeed(board: Board, source: Task): ReviewNeed {
+  const records = board.records
+  const submitted = records.latestTaskEvent(source.missionId, source.id, 'task/submitted')
+  const reopened = board.tasks.filter(review => review.reviewOf === source.id)
+    .flatMap(review => records.latestTaskEvent(source.missionId, review.id, 'task/invalidated') ?? []).filter(row => row.seq > (submitted?.seq ?? 0)).sort((a, b) => a.seq - b.seq)
+  const opened = reopened.at(-1) ?? submitted
+  const seq = opened?.seq ?? 0
+  return { id: createHash('sha256').update([source.missionId, source.id, source.epoch, source.artifact?.commit ?? '', ...reopened.map(row => row.seq)].join(':')).digest('hex').slice(0, 32),
+    seq, ripe: opened === undefined || board.clock() - opened.createdAt >= Math.max(board.bounds.tickMs, 1000),
+    recorded: (records.latestTaskEvent(source.missionId, source.id, 'task/review-missing')?.seq ?? 0) > seq }
+}
+
+/**
+ * Why the host cannot give this unreviewable source a live review under this
+ * need, each cause with the exit that removes it, or undefined when it
+ * admits one now. A review the owner admits needs a task slot and an
+ * independent member, so the host's own review that cannot reach a verdict
+ * is named after those: the one it admitted for this need (it admits one), or
+ * one the owner withdrew, an automatic review (host-minted id) with a durable
+ * `task/cancelled` row newer than the row that opened the need (a verdict, rework or challenge retires a review without cancelling it),
+ * or the one admission refused for this need: the source's newest recorded blocker is newer than that row and states the refusal (`ADMISSION_REFUSED`).
+ * The host's own admission reviews on a board with nothing else to do (`stalled`, as the admission pass judged it).
+ */
+export function reviewPathBlocker(board: Board, source: Task, need: ReviewNeed, stalled?: boolean): string | undefined {
+  const { mission, tasks, members, records } = board
+  const deferred = tasks.find(task => task.status === 'blocked' && task.reviewOf === source.id && task.verificationRecovery !== undefined && task.verificationRecovery.commit === source.artifact?.commit)
+  if (deferred !== undefined) return `review ${deferred.id} deferred its verdict on this artifact: ${recoveryExit(records.toolRuns(mission.id, { taskId: deferred.id }).filter(run => run.tool === 'swarm.host_verification').map(run => run.result as CheckResult))}`
+  if (tasks.length >= mission.budget.maxTasks) return `the mission task budget is exhausted (${tasks.length}/${mission.budget.maxTasks} admitted tasks), so no verification task can be admitted: raise maxTasks with swarm_budget(budget, reason), or ${WITHDRAW_SOURCE}`
+  const authors = [...authorIdsOf(source)]
+  if (!members.some(member => memberPhaseOf(member) !== 'stopped' && canOwnReview(source, member.id))) return `no live member other than the author (${authors.join(', ') || 'unknown'}) can review this artifact independently: add an independent member with swarm_add_member(role, maxOutputTokens), or ${WITHDRAW_SOURCE}`
+  const automatic = tasks.find(review => review.id === `${AUTOMATIC_REVIEW_PREFIX}${need.id}` || (review.reviewOf === source.id && review.status === 'cancelled'
+    && review.id.startsWith(AUTOMATIC_REVIEW_PREFIX) && (records.latestTaskEvent(mission.id, review.id, 'task/cancelled')?.seq ?? 0) > need.seq))
+  if (automatic !== undefined) return `the automatically admitted review ${automatic.id} ${automatic.status === 'cancelled' ? 'was withdrawn' : `is ${automatic.status} and cannot reach a verdict`}: ${ADMIT_REVIEW}, or ${WITHDRAW_SOURCE}`
+  const recorded = newestReviewBlock(records, mission.id, source.id)
+  if (recorded !== undefined && recorded.seq > need.seq && recorded.reason?.startsWith(ADMISSION_REFUSED)) return recorded.reason
+  return (stalled ?? reviewPathStalled(board)) ? undefined : BOARD_RUNNING
+}
+
+/** The submissions the review admission speaks for: submitted artifacts. A submission an older build left without an artifact is ordinary stuck work. */
+const admissionSpeaksFor = (task: Task): boolean => task.status === 'submitted' && task.artifact !== undefined
+/** The review admission's sources, the one set its admission, its decisions and the interpretation read: the submissions it speaks for that no live review can accept (before the grace is applied). */
+export const unreviewedSources = (board: Board): Task[] => board.tasks.filter(task => admissionSpeaksFor(task) && !reviewable(board, task))
+/** Whether the host can still advance an unreviewable submission, the review admission's own rule, which the stall predicate and the waiting classifier read: inside its review grace (`ReviewNeed.ripe`), or, for a source the admission speaks for, while the admission names no blocker under the board's own stall (`reviewPathBlocker`): the next pass on a stalled board admits its review. */
+export const awaitsReviewAdmission = (board: Board, task: Task): boolean => { const need = reviewNeed(board, task); return !need.ripe || (admissionSpeaksFor(task) && reviewPathBlocker(board, task, need) === undefined) }

@@ -32,7 +32,7 @@ import { ATTEMPT_FENCING_EVENTS } from '../lib/types.js'
  */
 export function wakePrecision(runtime, missionId) {
   const notices = runtime.notices
-  const tasks = runtime.store.list('tasks', missionId)
+  const board = runtime.boardOf(missionId), tasks = board.tasks
   // A covered fact (`coveredBy`) is never sent: the delivery covering it is the wake.
   const deliveries = runtime.store.list('deliveries', missionId).filter(delivery => delivery.to === 'owner' && delivery.notice?.coveredBy === undefined
     && (delivery.notice?.class === 'decision' || delivery.notice?.class === 'escalation' || delivery.kind === 'escalation'))
@@ -51,7 +51,7 @@ export function wakePrecision(runtime, missionId) {
       if (task === undefined) continue
       const falseWake = family === 'stall-root'
         ? task.status === 'blocked' && !roots.has(subject)
-        : notices.waitsLegitimately(task, tasks)
+        : notices.waitsLegitimately(board, task)
       if (!falseWake) continue
       falseByFamily[family] = (falseByFamily[family] ?? 0) + 1
       falseSubjects.push(subject)
@@ -60,7 +60,7 @@ export function wakePrecision(runtime, missionId) {
   const missed = []
   for (const task of tasks) {
     if (TERMINAL_STATES.has(task.status)) continue
-    if (notices.waitsLegitimately(task, tasks)) continue
+    if (notices.waitsLegitimately(board, task)) continue
     const subject = taskSubject(task)
     if (named.has(subject)) continue
     missed.push(subject)

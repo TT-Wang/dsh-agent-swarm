@@ -45,6 +45,7 @@ import { registerTools } from '../lib/tools.js'
 import { selectAcceptedDelivery, taskGraphIndex } from '../lib/task-graph.js'
 import { SWARM_SCRATCH_DIRNAME } from '../lib/workspaces.js'
 import { FakeWorkers, SwarmRuntime, budget, eventually, git, makeRepo, makeRuntime, makeWorkspaces } from './faults/harness.mjs'
+import { startBlocker } from '../lib/board.js'
 
 const BUDGET = { ...budget, maxTokens: 1000000, maxSteps: 5000, maxWorkers: 6, maxDurationMs: 3600000, maxTasks: 60 }
 
@@ -297,7 +298,7 @@ test('R18-4: a stop barrier never lifts a member\'s own park, and a ceiling-fenc
   assert.equal(current(f, bound).ceiling?.code, 'task_ceiling_exhausted', 'the task stays blocked at its own ceiling')
   assert.equal(f.runtime.store.get('members', f.second.id).phase, 'active', 'the host never parks the member itself')
   assert.equal(memberStatus(f, f.second.id), 'idle')
-  assert.equal(f.runtime.scheduling.startBlocker(f.runtime.store.get('members', f.second.id)), undefined,
+  assert.equal(startBlocker(f.runtime.view, f.runtime.store.get('members', f.second.id)), undefined,
     'and the stopped handle is dispatchable for other work')
 })
 
