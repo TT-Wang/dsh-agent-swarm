@@ -24,6 +24,7 @@ import assert from 'node:assert/strict'
 import { join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { setup, makeRuntime, events, taskOf, FakeWorkers, FakeClock, SwarmRuntime, MISSION_ACCEPTANCE } from './faults/harness.mjs'
+import { ownerTools } from './refusal-inventory.mjs'
 import { reviewNeed, stallRoots, stalled, waitsLegitimately } from '../lib/board.js'
 
 /** `count` ticks of the timer a fake-clock runtime does not run, one tick unit of clock time apart. */
@@ -290,6 +291,58 @@ test('R15-D2: the naming of a wedged body states a blocked task\'s stop only pas
     wedge?.release.reject(new Error('Worker startup timed out (released by the test)'))
     await f.runtime.settle(f.mission.id)
     await f.cleanup()
+  }
+})
+
+test('S1: the exits a wedge naming names work through the owner\'s registered tools: swarm_cancel retires the work it named, and swarm_propose admits a repair the next pass dispatches', async () => {
+  // A body wedges in the start of the member its task is assigned to, and the
+  // watchdog names that task. The owner performs one named exit while the body
+  // is still wedged; the body then settles at its start bound and the next pass
+  // acts on the board the exit left.
+  for (const exit of ['swarm_cancel', 'swarm_propose']) {
+    const clock = new FakeClock()
+    const workers = new WedgeStartWorkers({ clock })
+    const f = await setup({ workers, clock, config: { workerStartTimeoutMs: 3_600_000 } })
+    let wedge
+    try {
+      const builder = await f.runtime.addMember(f.owner, f.mission.id, { name: 'Builder', role: 'implementation', maxOutputTokens: 5_000 })
+      workers.idle.add(builder.id)
+      const stuck = f.propose({ title: 'Blocked behind the hung start' })
+      await f.runtime.settle(f.mission.id)
+      wedge = workers.arm()
+      f.runtime.kick(f.mission.id)
+      await wedge.entered.promise
+      clock.advance(f.runtime.config.stallPassTimeoutMs)
+      await f.runtime.tick()
+      const [event] = wedgeEvents(f)
+      assert.ok(event !== undefined, 'the watchdog names the body')
+      const naming = f.runtime.store.list('deliveries', f.mission.id).find(delivery => delivery.notice?.dedupKey === event.data.noticeKey)
+      assert.deepEqual(naming.subjects, [`${stuck.id}@${stuck.epoch}`], 'the naming names the work the body never reached')
+      assert.match(naming.content, /Decide: inspect the named tasks, admit a repair with swarm_propose, or withdraw the blocking work with swarm_cancel\.$/)
+      const tool = await ownerTools(f)
+      const repair = exit === 'swarm_cancel'
+        ? (await tool('swarm_cancel', { taskId: stuck.id, reason: 'Withdraw the work the wedged pass holds' }), undefined)
+        : await tool('swarm_propose', { workstreamId: f.stream.id, title: 'Repair on a member that can start', objective: 'Do the held work on a member whose start returns', kind: 'implementation', scope: ['**'], covers: ['c1'], outputs: [], checks: ['test -d .'], assigneeId: builder.id })
+      wedge.release.reject(new Error('Worker startup timed out (released by the test)'))
+      wedge = undefined
+      await f.runtime.settle(f.mission.id)
+      await f.runtime.tick()
+      const mission = f.runtime.mission(f.mission.id)
+      if (exit === 'swarm_cancel') {
+        assert.equal(taskOf(f.runtime, stuck.id).status, 'cancelled', 'the withdrawn work stays withdrawn')
+        assert.equal(f.runtime.store.list('deliveries', f.mission.id).some(delivery => delivery.kind === 'assignment' && delivery.taskId === stuck.id), false, 'no pass dispatches it')
+        assert.equal(f.runtime.ownerDeliveryRelevant(mission, f.runtime.store.get('deliveries', naming.id)), false, 'the exit retires the naming')
+      } else {
+        const dispatched = taskOf(f.runtime, repair.id)
+        assert.deepEqual([dispatched.status, dispatched.attempt?.ownerId], ['running', builder.id], 'the next pass dispatches the repair to its member')
+        assert.ok(f.runtime.store.list('deliveries', f.mission.id).some(delivery => delivery.kind === 'assignment' && delivery.taskId === repair.id && delivery.deliveredAt !== undefined), 'and its assignment is delivered')
+        assert.equal(f.runtime.ownerDeliveryRelevant(mission, f.runtime.store.get('deliveries', naming.id)), true, 'the work the naming named is still unfinished, so the naming holds')
+      }
+    } finally {
+      wedge?.release.reject(new Error('Worker startup timed out (released by the test)'))
+      await f.runtime.settle(f.mission.id)
+      await f.cleanup()
+    }
   }
 })
 
