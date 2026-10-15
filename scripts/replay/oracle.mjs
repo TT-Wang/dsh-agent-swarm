@@ -15,9 +15,11 @@
  * re-records with `--write`.
  *
  * Scenarios: the replay scenario (scripts/replay/scenario.mjs) and the clocked
- * variants of the fault scenarios the runtime slices cite: F2, F5, F13, F18
- * and F19 run unchanged on the oracle clock; F21 has its own clocked variant
- * (scripts/replay/f21-clocked.mjs), because its wedge ends at a real timer.
+ * variants of the fault scenarios the runtime slices cite: F2, F5, F12, F13,
+ * F18 and F19 run unchanged on the oracle clock; F21 has its own clocked
+ * variant (scripts/replay/f21-clocked.mjs), because its wedge ends at a real
+ * timer; `paths` (scripts/replay/paths-clocked.mjs) reaches what none of them
+ * does: stop fences, an isolation violation, the silence bounds, completion.
  *
  * Usage: node scripts/replay/oracle.mjs [--only replay,F19] [--runs n] [--stress] [--write] [--out dir]
  *   --runs n   run the whole set n times; every run must produce the same logs
@@ -38,10 +40,12 @@ const SCENARIOS = [
   { id: 'replay', script: 'scripts/replay/oracle.mjs', args: ['--child-replay'] },
   { id: 'F2', script: 'tests/faults/f02-lease-expiry.mjs' },
   { id: 'F5', script: 'tests/faults/f05-duplicate-replacement.mjs' },
+  { id: 'F12', script: 'tests/faults/f12-terminal-immutability.mjs' },
   { id: 'F13', script: 'tests/faults/f13-worker-closeout.mjs' },
   { id: 'F18', script: 'tests/faults/f18-start-failure.mjs' },
   { id: 'F19', script: 'tests/faults/f19-no-silent-state.mjs' },
   { id: 'F21', script: 'scripts/replay/f21-clocked.mjs' },
+  { id: 'paths', script: 'scripts/replay/paths-clocked.mjs' },
 ]
 
 const args = process.argv.slice(2)
