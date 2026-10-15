@@ -399,7 +399,7 @@ export class Scheduling {
           : `${task.id} is blocked and its stop has been awaited for ${Math.max(0, now - stop.at)}ms, past its declared bound`
       })
     const stopText = stopFacts.length ? ` Stop state: ${stopFacts.join('; ')}.` : ''
-    this.rt.notices.tell(missionId, `Scheduling pass ${pass.id} (run ${pass.operationId}) for mission ${missionId} did not return within ${bound}ms and produced no durable state change (fingerprint ${fingerprint.slice(0, 12)}). This pass keeps the mission's scheduling until the call it awaits returns at its own bound; the next pass then resumes from lease recovery. Unschedulable: ${stuck.join(', ') || 'none'}.${heldText} Work the pass never reached: ${unreachedText}.${stopText} Decide: inspect the named tasks, admit a repair with swarm_propose, or withdraw the blocking work with swarm_cancel.`, subjects,
+    this.rt.notices.escalate(missionId, `Scheduling pass ${pass.id} (run ${pass.operationId}) for mission ${missionId} did not return within ${bound}ms and produced no durable state change (fingerprint ${fingerprint.slice(0, 12)}). This pass keeps the mission's scheduling until the call it awaits returns at its own bound; the next pass then resumes from lease recovery. Unschedulable: ${stuck.join(', ') || 'none'}.${heldText} Work the pass never reached: ${unreachedText}.${stopText} Decide: inspect the named tasks, admit a repair with swarm_propose, or withdraw the blocking work with swarm_cancel.`, subjects,
       { dedupKey: noticeKey, reason }, () => {
       // Reuse the registered board-stall event rather than inventing a new type:
       // `cause: 'scheduling-pass'` and `wedged` make the pass-level escalation
@@ -447,10 +447,10 @@ export class Scheduling {
    * S1/S2: the wedge detector. Runs from the tick timer, outside every mission
    * queue and outside the pass it watches. A body still queued or running past
    * the declared bound is named: the durable stall event is committed, the owner
-   * notice is delivered by the tick's queue-external outbox pump, never by the
-   * wedged mission queue, and the mission publishes as wedged until the body
-   * settles. The queue keeps the body as the physical owner; each await it can
-   * be in carries its own bound.
+   * notice is an escalation (`Notices.escalate`) delivered by the queue-external
+   * pump its telling requests, never by the wedged mission queue, and the mission
+   * publishes as wedged until the body settles. The queue keeps the body as the
+   * physical owner; each await it can be in carries its own bound.
    *
    * R16-D: the naming is bounded even when the mission still has live work. A
    * live lease or an in-flight quiescence may be progress, so the body is not

@@ -561,9 +561,7 @@ export class SwarmRuntime implements Kernel {
     // S2: the outbox pump is driven from the tick timer, never from a mission
     // queue. A durable owner notice is delivered even when the mission's pass
     // is wedged in an adapter call or the lock is otherwise held, because the
-    // pump reads only durable rows and never takes `exclusive`. Its flush runs
-    // after this tick body, so it delivers what the later guards commit in the
-    // same tick too: the watchdog's naming of a wedged pass.
+    // pump reads only durable rows and never takes `exclusive`.
     this.tickGuard('outbox', () => this.notices.pumpOutbox())
     this.tickGuard('starts', () => this.sweepStarts())
     this.tickGuard('passes', () => this.checkSchedulingPasses())

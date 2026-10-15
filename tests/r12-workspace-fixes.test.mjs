@@ -44,15 +44,15 @@ async function fixture(t) {
 }
 
 test('M2-1: a repeated pass-timeout naming is recorded once, through the ledger', () => {
-  const mission = { id: 'mission', status: 'active' }, records = [], deliveries = []
+  const mission = { id: 'mission', status: 'active' }, records = [], deliveries = [], pumps = []
   // The stub store writes only ledger rows: a naming that wrote the mission row would throw.
   const rt = makeRuntimeStub({ store: { get: () => structuredClone(mission), list: table => table === 'deliveries' ? deliveries : [], event: (_m, _t, _a, data) => records.push(data), revision: () => 0,
     put: (table, row) => { assert.equal(table, 'deliveries'); deliveries.push(row) } },
-    bounds: { stallPassTimeoutMs: 1000 }, fingerprint: () => 'same', commit: (_id, fn) => fn(),
+    bounds: { stallPassTimeoutMs: 1000 }, fingerprint: () => 'same', commit: (_id, fn) => fn(), defer: flush => pumps.push(flush),
     boardOf: missionId => ({ missionId, mission, tasks: [], members: [], graph: taskGraphIndex([]) }) })
-  // The runtime's own telling, over this store; the publication is outside this test.
+  // The runtime's own escalation, over this store; the publication and the flush of the pump it requests are outside this test.
   const notices = new Notices(rt, new RefusalRegistry(rt))
-  rt.notices = { tell: notices.tell.bind(notices), expectWedgedRelease() {}, transition() {} }
+  rt.notices = { escalate: notices.escalate.bind(notices), expectWedgedRelease() {}, transition() {} }
   const scheduling = new Scheduling(rt)
   // Two bodies wedge in turn on one naming fact. The first naming's row is the
   // record: the second body is marked named and writes neither row nor event.
@@ -66,6 +66,7 @@ test('M2-1: a repeated pass-timeout naming is recorded once, through the ledger'
   }
   assert.deepEqual(records.map(row => [row.runId, row.wedged, row.noticeKey]), [['one', true, deliveries[0].notice.dedupKey]])
   assert.deepEqual({ rows: deliveries.length, named }, { rows: 1, named: [true, true] })
+  assert.equal(pumps.length, 1, 'the naming that wrote its row requested the pump; the one whose fact the ledger held told nothing and requested none')
 })
 
 test('M2-2: submission grace survives newer unrelated events without aging a new submission', async t => {

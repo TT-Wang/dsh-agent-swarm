@@ -165,6 +165,48 @@ test('S1: a wedged body is not followed by refused successor passes, so the owne
   } finally { await f.cleanup() }
 })
 
+test('S2: the naming of a wedged body is delivered in its own tick, by a pump its telling starts once the pump the tick joined is past its bound', async () => {
+  // An earlier pump is still in flight on a hung owner delivery when the tick
+  // runs. The tick's outbox guard joins it, one millisecond inside its bound;
+  // the guards after it take that millisecond (the starts guard stands in for
+  // synchronous adapter work), so the watchdog names the body at the bound,
+  // when that pump no longer suppresses a new one. The pump the tick joined
+  // listed its deliveries before the naming existed, so only a pump requested
+  // by the naming itself delivers it while the body is wedged.
+  const clock = new FakeClock()
+  const workers = new WedgeStartWorkers({ clock })
+  const held = hold()
+  const deliver = workers.deliver.bind(workers)
+  workers.deliver = async (member, delivery) => {
+    if (member.id === 'owner' && delivery.content === 'A notice whose delivery hangs') { held.entered.resolve(); await held.release.promise }
+    return await deliver(member, delivery)
+  }
+  const f = await setup({ workers, clock, config: { workerStartTimeoutMs: 3_600_000 } })
+  const wedge = workers.arm()
+  try {
+    const bound = f.runtime.bounds.stallPassTimeoutMs
+    await f.runtime.settle(f.mission.id)
+    f.runtime.commit(f.mission.id, () => f.runtime.notify(f.mission.id, 'A notice whose delivery hangs', [`mission:${f.mission.id}`], { trigger: 'test/held', reason: 'held' }))
+    f.runtime.notices.pumpOutbox()
+    await held.entered.promise
+    f.runtime.kick(f.mission.id)
+    await wedge.entered.promise
+    clock.advance(bound - 1)
+    const sweepStarts = f.runtime.sweepStarts.bind(f.runtime)
+    f.runtime.sweepStarts = () => { sweepStarts(); clock.advance(1) }
+    await f.runtime.tick()
+    const [event] = wedgeEvents(f)
+    assert.ok(event !== undefined, 'the watchdog names the body at its bound')
+    const naming = f.runtime.store.list('deliveries', f.mission.id).find(delivery => delivery.notice?.dedupKey === event.data.noticeKey)
+    assert.ok(naming?.deliveredAt !== undefined, 'the naming is delivered in the tick that told it, while the body is wedged')
+  } finally {
+    wedge.release.reject(new Error('Worker startup timed out (released by the test)'))
+    held.release.resolve()
+    await f.runtime.settle(f.mission.id)
+    await f.cleanup()
+  }
+})
+
 test('S1: every body that wedges is named once, also when an earlier named body left the board unchanged', async () => {
   // Before, a naming was keyed by the board fingerprint, on the mission row.
   // H's every start hangs to its bound, and the second hung body changes
