@@ -24,7 +24,7 @@ import assert from 'node:assert/strict'
 import { join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { setup, makeRuntime, events, taskOf, FakeWorkers, FakeClock, SwarmRuntime, MISSION_ACCEPTANCE } from './faults/harness.mjs'
-import { reviewNeed, stalled, waitsLegitimately } from '../lib/board.js'
+import { reviewNeed, stallRoots, stalled, waitsLegitimately } from '../lib/board.js'
 
 /** `count` ticks of the timer a fake-clock runtime does not run, one tick unit of clock time apart. */
 async function ticks(f, count) { for (let n = 0; n < count; n += 1) { f.clock.advance(f.runtime.config.tickMs); await f.runtime.tick() } }
@@ -248,6 +248,46 @@ test('S2: every row a tick\'s guards tell is delivered by that tick\'s pump once
   } finally {
     wedge?.release.reject(new Error('Worker startup timed out (released by the test)'))
     held.release.resolve()
+    await f.runtime.settle(f.mission.id)
+    await f.cleanup()
+  }
+})
+
+test('R15-D2: the naming of a wedged body states a blocked task\'s stop only past its declared bound, in the words of the stall root it is', async () => {
+  // A body wedges in start. Past the live-work bound, three tasks are parked
+  // behind a stop at their own epoch: one awaited 10ms of the 1000ms bound, one
+  // awaited three bounds, one with no recorded start. They are the live work
+  // that held the naming, and the naming states the stops past their bound.
+  const clock = new FakeClock()
+  const workers = new WedgeStartWorkers({ clock })
+  const f = await setup({ workers, clock, config: { workerStartTimeoutMs: 3_600_000, stallPassTimeoutMs: 1_000, stallPassLiveGraceMs: 1_000 } })
+  let wedge
+  try {
+    const bound = f.runtime.config.stallPassTimeoutMs
+    const tasks = ['inside', 'past', 'unstarted'].map(title => f.propose({ title }))
+    await f.runtime.settle(f.mission.id)
+    wedge = workers.arm()
+    f.runtime.kick(f.mission.id)
+    await wedge.entered.promise
+    clock.advance(3 * bound)
+    const stoppedAt = { inside: clock.now() - 10, past: clock.now() - 3 * bound, unstarted: undefined }
+    for (const task of tasks) {
+      const row = taskOf(f.runtime, task.id)
+      const at = stoppedAt[row.title]
+      f.runtime.store.put('tasks', { ...row, status: 'blocked', resumeAfterStop: { epoch: row.epoch, memberId: f.author.id, ...(at === undefined ? {} : { at }) } })
+    }
+    await f.runtime.tick()
+    const [event] = wedgeEvents(f)
+    assert.ok(event !== undefined, 'the watchdog names the body past its live-work bound')
+    const naming = f.runtime.store.list('deliveries', f.mission.id).find(delivery => delivery.notice?.dedupKey === event.data.noticeKey)
+    const [past, unstarted] = tasks.slice(1).map(task => task.id)
+    assert.equal(naming.content.match(/ Stop state: (.*?)\. Decide:/)?.[1], [
+      `${past} is blocked and its stop has been awaited for ${3 * bound}ms, past the declared bound (${bound}ms)`,
+      `${unstarted} is blocked and its stop carries no recorded start, so the declared bound (${bound}ms) cannot be shown to hold`,
+    ].join('; '), 'a stop inside its bound is never stated as past it')
+    assert.deepEqual(stallRoots(f.runtime.boardOf(f.mission.id)).map(task => task.id), [past, unstarted], 'the stops it states are the stall roots\' stops')
+  } finally {
+    wedge?.release.reject(new Error('Worker startup timed out (released by the test)'))
     await f.runtime.settle(f.mission.id)
     await f.cleanup()
   }

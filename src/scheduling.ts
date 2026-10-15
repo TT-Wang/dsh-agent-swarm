@@ -6,8 +6,8 @@
  * board where it decides, after each of its awaits.
  */
 import { id } from './store.ts'
-import { TERMINAL_STATES, pendingStopOwner, quiescencePending, selectAcceptedDelivery, stopPending, subjectsOfTasks, taskSubject, terminal } from './task-graph.ts'
-import { eligible, noticeSubjectsFor, ready, startBlocker, unschedulable } from './board.ts'
+import { TERMINAL_STATES, pendingStopOwner, quiescencePending, selectAcceptedDelivery, subjectsOfTasks, taskSubject, terminal } from './task-graph.ts'
+import { eligible, noticeSubjectsFor, overdueStop, ready, startBlocker, unschedulable } from './board.ts'
 import { factKey } from './notices.ts'
 import { AdmissionRefusedError } from './scheduler.ts'
 import { awaited, formatSpan, progressed, type SchedulingPass } from './kernel.ts'
@@ -391,13 +391,7 @@ export class Scheduling {
     // past its declared bound (or carries no recorded start), the escalation
     // states that row-supported fact — the wedged pass is exactly what makes
     // the stop unbounded.
-    const stopFacts = unreached.filter(task => task.status === 'blocked' && stopPending(task))
-      .map(task => {
-        const stop = task.resumeAfterStop
-        return stop?.at === undefined
-          ? `${task.id} is blocked and its stop carries no recorded start, so the declared bound (${bound}ms) cannot be shown to hold`
-          : `${task.id} is blocked and its stop has been awaited for ${Math.max(0, now - stop.at)}ms, past its declared bound`
-      })
+    const stopFacts = unreached.flatMap(task => { const fact = overdueStop(board, task); return fact === undefined ? [] : [`${task.id} is blocked and ${fact}`] })
     const stopText = stopFacts.length ? ` Stop state: ${stopFacts.join('; ')}.` : ''
     this.rt.notices.tell(missionId, `Scheduling pass ${pass.id} (run ${pass.operationId}) for mission ${missionId} did not return within ${bound}ms and produced no durable state change (fingerprint ${fingerprint.slice(0, 12)}). This pass keeps the mission's scheduling until the call it awaits returns at its own bound; the next pass then resumes from lease recovery. Unschedulable: ${stuck.join(', ') || 'none'}.${heldText} Work the pass never reached: ${unreachedText}.${stopText} Decide: inspect the named tasks, admit a repair with swarm_propose, or withdraw the blocking work with swarm_cancel.`, subjects,
       { dedupKey: noticeKey, reason }, () => {

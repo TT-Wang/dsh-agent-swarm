@@ -14,7 +14,7 @@ import { PolicyError } from './policy-error.ts'
 import type { SwarmRuntime } from './runtime.ts'
 import { WriterBusyError, id } from './store.ts'
 import { awaited, type SchedulingPass } from './kernel.ts'
-import { completionError, dependentsOf, eligible, interpret, newestReviewBlock, noticeSubjectsFor, reviewNeed, reviewPathBlocker, reviewPathStalled, stallRoots, startBlocker, unreviewedSources, waitsLegitimately, type Board, type Interpretation } from './board.ts'
+import { completionError, dependentsOf, eligible, interpret, newestReviewBlock, noticeSubjectsFor, overdueStop, reviewNeed, reviewPathBlocker, reviewPathStalled, stallRoots, startBlocker, unreviewedSources, waitsLegitimately, type Board, type Interpretation } from './board.ts'
 import type { Actor, Delivery, Escalation, Member, Mission, NoticeClass, Task, WorkerAdapter } from './types.ts'
 
 /**
@@ -1182,12 +1182,7 @@ export class Notices {
       const subject = taskSubject(root)
       const key = `stall-root:${mission.id}:${subject}`
       const dependents = dependentsOf(view, root)
-      const stop = stopPending(root) ? root.resumeAfterStop : undefined
-      const cause = stop !== undefined
-        ? (stop.at === undefined
-          ? `its stop carries no recorded start, so the declared bound (${this.rt.bounds.stallPassTimeoutMs}ms) cannot be shown to hold`
-          : `its stop has been awaited for ${Math.max(0, this.rt.now() - stop.at)}ms, past the declared bound (${this.rt.bounds.stallPassTimeoutMs}ms)`)
-        : 'no live replacement exists anywhere in its lineage'
+      const cause = overdueStop(view, root) ?? 'no live replacement exists anywhere in its lineage'
       const { content: body, statement } = renderNotice('stall-root', { rootId: root.id, title: root.title, epoch: root.epoch, cause,
         dependents: dependents.map(task => task.id), ...(root.output === undefined ? {} : { recordedReason: root.output }) })
       // A root the verify site already put in front of the owner (its rejection

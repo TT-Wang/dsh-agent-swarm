@@ -514,6 +514,20 @@ function stopInBound(board: Pick<Board, 'clock' | 'bounds'>, marker: Pick<NonNul
 }
 
 /**
+ * The owner-facing fact of a blocked task whose pending stop is not inside its
+ * declared bound (`stopInBound`): how long the stop has been awaited, or that
+ * it carries no recorded start. Undefined for any other task, so no notice can
+ * state a stop inside its bound as past it.
+ */
+export function overdueStop(board: Pick<Board, 'clock' | 'bounds'>, task: Task): string | undefined {
+  if (!quiescencePending(task) || stopInBound(board, task.resumeAfterStop)) return undefined
+  const bound = board.bounds.stallPassTimeoutMs, at = task.resumeAfterStop.at
+  return at === undefined
+    ? `its stop carries no recorded start, so the declared bound (${bound}ms) cannot be shown to hold`
+    : `its stop has been awaited for ${Math.max(0, board.clock() - at)}ms, past the declared bound (${bound}ms)`
+}
+
+/**
  * R14-F2(b): the stall roots of one board, in board order. Purely a function of
  * durable rows, so the pass, the timer-driven notice path, the delivery-time
  * relevance check and a test all classify the same board identically.

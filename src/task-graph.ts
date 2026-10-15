@@ -287,7 +287,7 @@ export function stopPending<T extends Pick<Task, 'epoch' | 'resumeAfterStop'>>(t
  * old worker handle acknowledges the stop, then it re-pends. Every scheduler
  * and completion decision treats it as live work.
  */
-export function quiescencePending(task: Task): boolean { return task.status === 'blocked' && stopPending(task) }
+export function quiescencePending<T extends Pick<Task, 'status' | 'epoch' | 'resumeAfterStop'>>(task: T): task is T & { resumeAfterStop: NonNullable<T['resumeAfterStop']> } { return task.status === 'blocked' && stopPending(task) }
 
 /** A fenced handle must finish stopping before that member can own new work. */
 export function pendingStopOwner(tasks: readonly Task[], memberId: string): boolean {
