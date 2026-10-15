@@ -9,9 +9,10 @@ Current **0.7.0** working-tree checks and the historical **0.6.0** baseline are 
 
 ## Round-30 simplification batch 11: one notice ledger (2026-10-14)
 
-**Head**: `b982c30` and this record (documentation only), branch `batch11/ledger` on `29a0268`, 119 commits.
-`src` net against `29a0268`: −662 lines (+735/−1397). Every design step shrinks it; the integrator rounds and their
-repairs shrink it by 79 (B1 and its repairs are withdrawn, net 0; the final round is −21 and the closing round −29).
+**Head**: `5209de7` and this record (documentation only), branch `batch11/ledger` on `29a0268`, 124 commits.
+`src` net against `29a0268`: −683 lines (+752/−1435). Every design step shrinks it; the integrator rounds and their
+repairs shrink it by 100 (B1 and its repairs are withdrawn, net 0; the final round is −21, the closing round −29 and
+its second round −21).
 
 **One record that the owner was told** (review M-1; design step 7, with the owner's amendment of the no-silent-state
 spec §2, §4 and §6 and of the F19 contract). Wrong model: beside the deliveries ledger row, "told" was a mission-row
@@ -33,7 +34,7 @@ only completes (`b36bd09`), the no-progress watchdog and `stallPasses` are delet
 terminal is the one emitter of an isolation refusal, a cancellation's stranded dependent is named by the board
 classifier (`f6b9c34`) whether or not dispatchable work stands beside it (`c259487`), and an unreviewable submission
 holds the board only while the review admission's own rule would still admit its review (`b2d4157`, which deleted
-`d451784`'s board-wide gates; `9e0847e`).
+`d451784`'s board-wide gates; `9e0847e`), whose refusal of the host's review is a blocker it derives (`55b1209`).
 
 **The design at the head, step by step.** An item's `src` net counts its own commits and every later repair of it, so
 the items sum to the branch total.
@@ -54,6 +55,7 @@ the items sum to the branch total.
 | Step 10: comments and documentation | `4b2604b` | −2 |
 | Final integrator round: D1's gates, the dispatch question's isolation skip and an unreachable cover term deleted | `b2d4157`, `ec2a892`, `59fcb19` | −21 |
 | Closing integrator round: the dispatch question's returns, the admission's record as its rule, a hand-built identity | `c259487`, `9e0847e`, `b982c30` | −29 |
+| Closing round 2: the refused admission derived, the row-3 return and the hand-built identities deleted | `55b1209`, `1cbb3f7`, `5209de7` (`e6d28d9` is a test) | −21 |
 
 **Step 4 at the head.** A wedged pass's naming is one ledger row per naming fact, under the key shape older builds
 wrote: the mission's unfinished work at its epochs and each member's counted start failures
@@ -552,6 +554,81 @@ and one weak predicate (E7).
 | `scripts/smoke-web.mjs` / `scripts/smoke-command-web.mjs` | passed, 13 checks / passed, 10 checks | not run |
 | Test files the round touched (2), three rounds of two concurrent copies | 12/12 runs passed (474 tests) | the 2 files and 2 dispatch-question files, once: 120/120 tests |
 | Test files reading the changed rules, notices or docs (53), once; the 15 that read the docs again with this record | 737/737 tests; 257/257 tests | not run |
+
+**Integrator closing round 2: the review admission has two outcomes, a blocker or an admitted review** (`55b1209` to
+`5209de7`, and this record). `src` net against `29a0268` is now −683 lines (+752/−1435); the round is −21: E9 +1,
+E11 −22 (the row-3 return −8, the ledger identities −14); E10 is a test. The three lenses of the closing round's
+verification found one hole in E7 (E9).
+- `55b1209` (fix, E9, +1). E7 made `awaitsReviewAdmission` read `reviewPathBlocker` as the admission's whole rule, but
+  the admission had a third outcome that rule did not derive: the host review's proposal refused (`automatic review
+  admission failed`, known only to `admitAutomaticReview`'s catch). On a quiet board the refused source awaited the
+  admission on every pass, the board never stalled, `judgeBoard` returned at the review path's stall before the
+  fall-through, and a dependent of the source, or one a cancellation stranded anywhere on that board, was named by no
+  row (a regression against `93db631` and `29a0268`). Each pass also proposed the refused review again (four proposals
+  in four passes on `f63fa0b`), beside running work `BOARD_RUNNING` displaced the refusal, and a refusal written in the
+  pass that admitted another source's review was withheld (the residual known-limitations recorded).
+  `reviewPathBlocker` now derives the refusal for the current need as it derives a withdrawn host review: the source's
+  newest `task/review-blocked` row is newer than the row that opened the need and states `ADMISSION_REFUSED`, the
+  statement's prefix, one constant beside the other review-path statements, read by `admitAutomaticReview` and by the
+  derivation. It is named after the task slot and the independent member its exit needs. The refusal is a cause like
+  the others: the board stalls, the W3 stall is told beside the decision, and the host proposes its review once per
+  need; the owner's exits stay. Deleted: `openReviewBlock`'s `?? recordedBlocker(...)` fallback and
+  `Notices.recordedBlocker`, whose one remaining reader, `notifyReviewBlocked`'s check that records the blocker whenever
+  it changes, reads the newest recorded reason itself; and the known-limitations residual. The +1 is the derivation (2
+  lines), the constant (1) and the cause in `reviewPathBlocker`'s contract (1), against the fallback and
+  `recordedBlocker` (−3). One corner, measured by a probe and now in known-limitations: a cause named before the
+  refusal (the task budget, an independent member, a deferred verdict) that is recorded after it displaces it, and
+  once the owner removes that cause the host proposes its review once more; refused for the same reason, it is recorded
+  again with no second decision. Regressions in `tests/review-blocked-exits.test.mjs`, whose `refusedAdmission` recipe
+  gains a hook that changes the board after the submission: REFUSED-DEP and REFUSED-D1 (on a quiet board one
+  outstanding W3 stall names the source's dependent, and a dependent a cancellation stranded elsewhere, beside the
+  outstanding refusal), REFUSED-PAIR (the refusal written in the pass that admitted another source's review is
+  outstanding and delivered) and the refused-then-running-then-stall test, rewritten (the refusal stays the one
+  recorded cause and the outstanding decision beside running work and after it, and the host proposes its review
+  once). All fail on `f63fa0b` (there no row names either dependent) and on `29a0268` (there REFUSED-DEP and REFUSED-D1
+  fail only on the W3 stall's family: that build's W3 stall, under its older `mission/stalled:` key, names the
+  dependents, and its cancel site names the stranded one). E7's liveness pin in `tests/notice-ledger.test.mjs` gains
+  the refused admission: the W3 stall is told beside the refusal (fails on `f63fa0b` at that board, and on `29a0268`
+  at its first board, as before).
+- `e6d28d9` (test, E10). E7's `BOARD_RUNNING` half: beside work running under its lease, past its grace, a source the
+  host's review would serve is named by the fall-through alone, outstanding, beside the outstanding `BOARD_RUNNING`
+  decision. It passes on `f63fa0b` and here; mutant M9 (`awaitsReviewAdmission` reading `reviewPathBlocker(task, need,
+  true)`, a forced stall) fails it on both (the fall-through names nothing). On `29a0268` it fails at its precondition
+  (that build's review need has no `ripe` grace).
+- `1cbb3f7` (refactor, E11, −8). `judgeBoard`'s row-3 return is deleted. Every board it exempted (each non-terminal
+  task running under a live lease) is exempted by the classifiers after it: completion is refused while a task runs
+  (only a blocked task is exempt from it), the stall predicate is false beside running work, so the board's fact tells
+  nothing, and the fall-through counts a running task with an attempt as waiting. The fall-through's comment now states
+  row 3 and the T3 case: while no member is startable no question is asked, and the dispatchable task is still left to
+  the question. F19 (row 3 exempt with no notice) and the 10 files that read the classifier, the lease or T3 pass as
+  before (215/215 tests).
+- `5209de7` (refactor, E11, −14). The three readers that built a ledger identity by hand ask `noticeIdentity`, so its
+  comment is true. `notifyReviewBlocked` tells its decision through `tell`, with its record as the companion write, and
+  records a changed blocker alone when the owner holds its decision; the budget warnings ask it for the threshold
+  identities they read and the batch constituents they write (their subjects are `subjectsOfTasks` of the warning's
+  task, else the mission root: what `noticeSubjectsFor` returned, without its second read of the task table); the
+  workspace fence asks it for its revocation request's identity, and `guardTerminalHeld`, that fence's one helper, is
+  deleted. No reader's identity differs: each holds an explicit key. The 29 files that read these identities or the
+  notice sites in source pass as before (498/498 tests).
+- Docs: known-limitations no longer says coverage-complete is told beside a dispatchable experiment; its
+  review-admission paragraph counts the refused admission among the causes, states the outstanding rule without the
+  fallback, drops the withheld-refusal residual and records the displaced-refusal corner; design.md counts the refusal
+  among the blockers. README.md and README.zh-CN.md state nothing E9 changes (their "while nothing blocks one" is now
+  exact) and are unchanged.
+- Correction: the closing round's E6 record says a board on which completion is allowed beside a dispatchable
+  experiment is now told its coverage-complete. No such board exists: a dispatchable task is pending, and completion is
+  refused while any task is pending.
+- Unchanged: the replay digest, `tests/fixtures/model-visible.expected.json` and F19.
+
+| Check at `5209de7` | 0.1.5-rc.3 (`a4c74a91e0`) | 0.1.7-rc.1 (`46a7f68b09`) |
+| --- | --- | --- |
+| `npm run typecheck` / `npm run build` | passed / passed | passed / passed |
+| `npm run test:harness` | passed; `UPDATE_SMOKE_SNAPSHOT=1` leaves `tests/fixtures/model-visible.expected.json` unchanged | passed |
+| `npm run test:replay` | passed, digest `sha256:61a921e64088b78b957cd6aeaa563d5436d4a6eae4b0130725d1f3c74c6f971e` unchanged | not run |
+| `node scripts/faults/run.mjs` | 24/24 | 24/24 |
+| `scripts/smoke-web.mjs` / `scripts/smoke-command-web.mjs` | passed, 13 checks / passed, 10 checks | not run |
+| Test files the round touched (2), three rounds of two concurrent copies | 12/12 runs passed (702 tests) | the 2 files, once: 117/117 tests |
+| Test files reading the changed rules, identities or docs (45), once, with this record | 691/691 tests | not run |
 
 ## Round-29 simplification batch 9: one authorization rule, one exit table, a derived progress clock (2026-09-25)
 
