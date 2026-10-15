@@ -348,6 +348,39 @@ test('a rejected root that strands a dependent names it in a delivered notice, n
   assert.deepEqual(f.notices().filter(delivery => delivery.notice?.dedupKey?.startsWith('obligation-followup:')), [], 'no reminder was needed')
 })
 
+test('the rejection cover matches its subject@epoch only: a task the rejection named, blocked again at the next epoch beside running work, is named there by an uncovered stall root in a delivered notice', async t => {
+  // The verify site's rejection decision covers the stall root at the epoch it names. At the next epoch no decision
+  // states the block, so the root is its own wake while other work runs. The clock and the ticks are driven by hand.
+  const f = await fixture(t, { clock: new FakeClock(), tickMs: 10 })
+  f.runtime.notices.obligationFollowupMs = 1e9
+  const reviewer = await f.runtime.addMember(f.owner, f.mission.id, { name: 'Reviewer', role: 'verification' })
+  const other = await f.runtime.addMember(f.owner, f.mission.id, { name: 'Other', role: 'implementation' })
+  await f.runtime.settle(f.mission.id)
+  const source = f.propose('Rejected implementation')
+  const claimed = await f.runtime.claim(f.actor, f.mission.id, source.id)
+  await f.runtime.submit(f.actor, f.mission.id, { taskId: source.id, attemptId: claimed.attempt.id, output: 'candidate' })
+  const review = f.runtime.propose(f.owner, f.mission.id, { outputs: [], workstreamId: f.runtime.store.get('tasks', source.id).workstreamId,
+    title: 'Review', objective: 'Independent review', kind: 'verification', reviewOf: source.id, scope: ['src/'], acceptance: ['works'], assigneeId: reviewer.id })
+  const reviewing = await f.runtime.claim({ sessionId: reviewer.sessionId }, f.mission.id, review.id)
+  await f.runtime.settle(f.mission.id)
+  const sibling = f.propose('Healthy sibling', { kind: 'research', checks: undefined, assigneeId: other.id })
+  await f.runtime.claim({ sessionId: other.sessionId }, f.mission.id, sibling.id)
+  await f.runtime.verify({ sessionId: reviewer.sessionId }, f.mission.id, { taskId: review.id, attemptId: reviewing.attempt.id, verdict: 'reject', reason: 'The candidate does not work' })
+  await f.runtime.settle(f.mission.id)
+  const rootAt = epoch => f.stallRoots().find(delivery => delivery.notice.dedupKey === `stall-root:${f.mission.id}:${source.id}@${epoch}`)
+  const rejected = f.runtime.store.get('tasks', source.id).epoch
+  const covered = await ticksUntil(f, () => rootAt(rejected), 'the rejected root is recorded', 200)
+  assert.equal(f.runtime.store.get('deliveries', covered.notice.coveredBy)?.notice?.trigger, 'task/rejected', 'at the rejected epoch the root is recorded against the rejection decision')
+  // The task moves to the next epoch and is blocked there by a cause no decision states.
+  f.runtime.commit(f.mission.id, () => f.block(source))
+  await f.runtime.settle(f.mission.id)
+  const next = rejected + 1
+  const naming = await ticksUntil(f, () => f.notices().find(delivery => delivery.deliveredAt !== undefined && (delivery.subjects ?? []).includes(`${source.id}@${next}`)), 'a delivered notice names the task at the next epoch', 200)
+  assert.equal(f.runtime.store.get('tasks', sibling.id).status, 'running', 'while other work runs')
+  const root = rootAt(next)
+  assert.deepEqual([root?.id, root?.notice.coveredBy], [naming.id, undefined], 'the delivered notice is the stall root at the next epoch, which no rejection decision covers')
+})
+
 test('a rejected root whose decision was summarized is its own fact, and is named again when its repair is withdrawn', async t => {
   // 82d9ec8: a stall root was recorded against a rejection decision that was a
   // wake-budget summary constituent, so it had no reminders of its own and

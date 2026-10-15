@@ -48,18 +48,26 @@ async function allRoutesFail() {
     assert.equal(current.status, 'pending', 'a start failure never blocks the task')
     assert.equal(current.recoveryCount ?? 0, 0, 'I18: no start failure spends task execution credit')
     assert.equal(events(f.runtime, f.mission.id, 'task/blocked').length, 0)
-    // Its own row, or recorded in full in the wake-budget summary that carries it: the dispatch question about the task
-    // spends a slot of the window beside the start failures (two wordings, the open item R20).
-    const named = ownerNotices(f).flatMap(delivery => delivery.notice?.facts ?? [delivery.content]).filter(text => /No live member can start/.test(text))
-    assert.equal(named.length, 1, 'I18: exactly one owner notice names the stranded task')
-    const content = named[0]
-    assert.ok(content.includes(task.id), 'the notice names the task')
+    // What the owner is woken with: the start failures and the dispatch question about the task spend the owner's wake
+    // window (two wordings, the open item R20), so the retirement rides the window's summary, which names the task and
+    // points to swarm_observe with its deliveryId.
+    const retirement = delivery => (delivery.notice?.aggregatedFacts ?? []).find(part => /No live member can start/.test(delivery.notice.facts.slice(part.factStart, part.factStart + part.factCount).join('\n')))
+    const summaries = ownerNotices(f).filter(delivery => retirement(delivery) !== undefined)
+    assert.equal(summaries.length, 1, 'I18: exactly one owner notice carries the stranded task')
+    const [summary] = summaries
+    assert.ok(summary.deliveredAt !== undefined && summary.content.includes(task.id), 'the owner is woken with the summary, which names the task')
+    assert.ok(summary.content.includes(`swarm_observe({ missionId: "${f.mission.id}", deliveryId: "${summary.id}" })`), 'and points to swarm_observe with its deliveryId')
+    // The exits are reached through that call: the durable fact it returns names each retired route and the exits.
+    const { delivery } = f.runtime.observe(f.owner, f.mission.id, { deliveryId: summary.id })
+    const part = retirement(delivery)
+    const content = delivery.notice.facts.slice(part.factStart, part.factStart + part.factCount).join('\n')
+    assert.ok(content.includes(task.id), 'the durable fact names the task')
     for (const member of [f.author, f.reviewer]) {
       assert.ok(content.includes(`${member.name} (${member.id}): ${K} consecutive start failures, last error: Error: injected bootstrap failure for ${member.name}`),
-        `the notice names ${member.name}, its consecutive start failures and its last error`)
+        `the durable fact names ${member.name}, its consecutive start failures and its last error`)
     }
-    assert.match(content, /swarm_add_member/, 'the notice names the add-member exit')
-    assert.match(content, /swarm_control\(taskId, action: "amend"/, 'the notice names the reassign exit')
+    assert.match(content, /swarm_add_member/, 'the durable fact carries the add-member exit')
+    assert.match(content, /swarm_control\(taskId, action: "amend"/, 'and the reassign exit')
     return { starts: Object.values(starts), notice: content.slice(0, 80) }
   } finally { await f.cleanup() }
 }

@@ -197,24 +197,31 @@ test('R5-02: when every route fails to start, starts stop at k per route and the
   assert.equal(stranded.assigneeId, undefined, 'the work is released to any route the owner admits')
   assert.equal(stranded.recoveryCount ?? 0, 0, 'a start failure spends no task execution credit')
   assert.equal(f.events('task/blocked').length, 0)
-  // The named, undeduplicated owner fact: its own row, or recorded in full in the wake-budget summary that carries it
-  // (the dispatch question about the task spends a slot of the window beside the start failures, the open item R20).
-  const facts = f.ownerNotices().flatMap(delivery => delivery.notice.aggregatedFacts?.map(part => ({ ...part, text: delivery.notice.facts.slice(part.factStart, part.factStart + part.factCount).join('\n') }))
-    ?? [{ dedupKey: delivery.notice.dedupKey, subjects: delivery.subjects, text: delivery.content }])
-  const named = facts.filter(fact => /No live member can start/.test(fact.text))
-  assert.equal(named.length, 1, 'exactly one owner notice names the stranded task')
-  const [{ text: notice, subjects }] = named
-  assert.ok(notice.includes(proposed.id), 'the notice names the task')
+  // What the owner is woken with: the start failures and the dispatch question about the task spend the owner's wake
+  // window (the open item R20 in docs/known-limitations.md), so the retirement rides the window's summary. That
+  // summary names the task and points to swarm_observe with its deliveryId.
+  const retirement = delivery => (delivery.notice.aggregatedFacts ?? []).find(part => /No live member can start/.test(delivery.notice.facts.slice(part.factStart, part.factStart + part.factCount).join('\n')))
+  const [summary, ...others] = f.ownerNotices().filter(delivery => retirement(delivery) !== undefined)
+  assert.deepEqual([others, f.ownerNotices().filter(delivery => /No live member can start/.test(delivery.content) && delivery.notice.aggregatedFacts === undefined)], [[], []], 'exactly one delivery carries the stranded task\'s retirement: the window\'s summary')
+  assert.ok(summary.deliveredAt !== undefined, 'the owner is woken with that summary')
+  assert.ok(summary.content.includes(proposed.id), 'it names the task')
+  assert.ok(summary.content.includes(`swarm_observe({ missionId: "${f.mission.id}", deliveryId: "${summary.id}" })`), 'and points to swarm_observe with its deliveryId')
+  // The exits are reached through that call: the durable fact it returns names each retired route and the exits.
+  const { delivery } = f.runtime.observe(f.owner, f.mission.id, { deliveryId: summary.id })
+  const part = retirement(delivery)
+  const notice = delivery.notice.facts.slice(part.factStart, part.factStart + part.factCount).join('\n')
+  assert.ok(notice.includes(proposed.id), 'the durable fact names the task')
   for (const retired of [f.alpha, f.beta]) {
     assert.ok(notice.includes(`${retired.name} (${retired.id}): ${K} consecutive start failures, last error: Error: worker bootstrap failed for ${retired.name}`),
-      `the notice names ${retired.name} with its consecutive start failures and last error`)
+      `the durable fact names ${retired.name} with its consecutive start failures and last error`)
   }
-  assert.match(notice, /swarm_add_member/, 'the notice names the add-member exit')
-  assert.match(notice, /swarm_control\(taskId, action: "amend"/, 'the notice names the reassign exit')
-  assert.ok((subjects ?? []).some(subject => subject.startsWith(`${proposed.id}@`)), 'the notice is attributed to the task')
+  assert.match(notice, /swarm_add_member/, 'the durable fact carries the add-member exit')
+  assert.match(notice, /swarm_control\(taskId, action: "amend"/, 'and the reassign exit')
+  assert.ok((part.subjects ?? []).some(subject => subject.startsWith(`${proposed.id}@`)), 'the fact is attributed to the task')
   // No stuck task is without a notice: the dispatch question and the W3 stall name the work too, each once, beside the
   // start and retirement notices (wordings of one condition, the open item R20 in docs/known-limitations.md).
-  const families = facts.filter(fact => (fact.subjects ?? []).includes(`${proposed.id}@${stranded.epoch}`)).map(fact => fact.dedupKey.split(':')[0])
+  const families = f.ownerNotices().flatMap(row => row.notice.aggregatedFacts ?? [{ dedupKey: row.notice.dedupKey, subjects: row.subjects }])
+    .filter(fact => (fact.subjects ?? []).includes(`${proposed.id}@${stranded.epoch}`)).map(fact => fact.dedupKey.split(':')[0])
   assert.deepEqual([...new Set(families)].sort(), ['board-stall', 'dispatch-question', 'member/resume-failed'], `the stranded task is named by its notices, the dispatch question and the W3 stall: ${families}`)
   assert.deepEqual(['board-stall', 'dispatch-question'].map(family => families.filter(named => named === family).length), [1, 1], 'the W3 stall and the dispatch question name it once each')
   // The exit works: a route the owner admits claims the released work.

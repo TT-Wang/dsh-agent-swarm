@@ -14,6 +14,7 @@ import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
 import { FakeClock, FakeWorkers, MISSION_ACCEPTANCE, acceptThroughReview, blockThroughReview, eventually, events, setup, taskOf } from './faults/harness.mjs'
 import { ownerTools } from './refusal-inventory.mjs'
+import { emitGuardTerminal } from '../lib/refusals.js'
 import { BOARD_RUNNING, NOTICE_TEMPLATES, factKey, noticeFamily, noticeTemplateKey } from '../lib/notices.js'
 
 const ownerRows = f => f.runtime.store.list('deliveries', f.mission.id).filter(delivery => delivery.to === 'owner' && delivery.notice !== undefined)
@@ -1612,6 +1613,51 @@ test('work admitted after the isolation request, unassigned or given to a member
     const namings = ownerRows(f).filter(delivery => (delivery.subjects ?? []).includes(subjectOf(f, later)) && delivery.notice.trigger !== 'owner-decision-unresolved')
     assert.deepEqual(namings.map(delivery => noticeFamily(delivery)), ['dispatch-question'], `assigned=${assigned}: the dispatch question names it, once`)
     assert.deepEqual([relevant(f, namings[0]), relevant(f, request), terminalRows(f, 'workspace').length, request.subjects.includes(subjectOf(f, later))], [true, true, 1, false], `assigned=${assigned}: outstanding, beside the one open request, which does not name it`)
+  }
+})
+
+test('the fall-through names stuck work at its epoch, once, beside an open request raised for that task and beside the retirement that names it: no decision stands in for the board\'s naming', async t => {
+  // Running work keeps each board from stalling, so the fall-through is the board's namer.
+  const boards = {
+    'an open request raised for the task': async () => {
+      const f = await setup({ clock: new FakeClock(), budget: LONG })
+      t.after(f.cleanup)
+      await f.runtime.claim(f.actor(f.author), f.mission.id, f.propose({ title: 'Running work', kind: 'research', checks: [] }).id)
+      // Work only the reviewer may take, dead once the reviewer is gone, with a request raised for it.
+      const stuck = f.propose({ title: 'Reviewer-only work', kind: 'research', checks: [], assigneeId: f.reviewer.id })
+      f.runtime.commit(f.mission.id, () => f.runtime.store.put('members', { ...f.runtime.store.get('members', f.reviewer.id), phase: 'stopped' }))
+      emitGuardTerminal(f.runtime, f.mission.id, 'attempt_lease', { taskId: stuck.id, localKey: 'closeout-abandoned:attempt_abandoned', detail: 'idle close-out abandoned attempt attempt_abandoned and re-pended the task' })
+      await quiet(f)
+      // The board digest moves: work queued behind the author's live lease.
+      f.propose({ title: 'Queued work', kind: 'research', checks: [] })
+      await quiet(f)
+      const [decision] = terminalRows(f, 'attempt_lease')
+      return { f, stuck, decision }
+    },
+    'the retirement of the route it is pinned to': async () => {
+      const f = await setup({ clock: new FakeClock(), workers: new FakeWorkers({ autoIdle: true }), budget: LONG })
+      t.after(f.cleanup)
+      await f.runtime.claim(f.actor(f.reviewer), f.mission.id, f.propose({ title: 'Unrelated work', kind: 'research', checks: [], assigneeId: f.reviewer.id }).id)
+      const start = f.workers.start.bind(f.workers)
+      f.workers.start = async spec => { if (spec.member.id === f.author.id) throw Object.assign(new Error('worker start failed'), { code: 'EMFILE' }); return start(spec) }
+      const stuck = f.propose({ title: 'Pinned to the author', kind: 'research', checks: [], assigneeId: f.author.id, assignmentMode: 'pinned' })
+      await f.runtime.settle(f.mission.id)
+      await ticks(f, 20)
+      await f.runtime.settle(f.mission.id)
+      assert.equal(f.runtime.store.get('members', f.author.id).phase, 'stopped', 'the author was retired after its start failures')
+      const decision = ownerRows(f).find(delivery => (delivery.subjects ?? []).includes(subjectOf(f, stuck)) && /could not start after 3 consecutive failures|No live member can start/.test(delivery.content))
+      return { f, stuck, decision }
+    },
+  }
+  for (const [board, build] of Object.entries(boards)) {
+    const { f, stuck, decision } = await build()
+    await ticks(f, 20)
+    const subject = subjectOf(f, stuck)
+    assert.deepEqual([taskOf(f.runtime, stuck.id).status, decision?.subjects.includes(subject)], ['pending', true], `${board}: the decision names the pending task at its epoch`)
+    if (board === 'an open request raised for the task') assert.equal(relevant(f, decision), true, `${board}: and is open`)
+    const fallthroughs = ownerRows(f).filter(delivery => noticeFamily(delivery) === 'fallthrough' && delivery.subjects.includes(subject))
+    assert.equal(fallthroughs.length, 1, `${board}: the fall-through names it at that epoch, once`)
+    assert.equal(relevant(f, fallthroughs[0]), true, `${board}: and that naming is outstanding`)
   }
 })
 
