@@ -238,6 +238,13 @@ export function stopPending<T extends Pick<Task, 'epoch' | 'resumeAfterStop'>>(t
   return task.resumeAfterStop?.epoch === task.epoch
 }
 
+/**
+ * A durable stop transition is in flight: the task is blocked only until the
+ * old worker handle acknowledges the stop, then it re-pends. Every scheduler
+ * and completion decision treats it as live work.
+ */
+export function quiescencePending(task: Task): boolean { return task.status === 'blocked' && stopPending(task) }
+
 /** A fenced handle must finish stopping before that member can own new work. */
 export function pendingStopOwner(tasks: readonly Task[], memberId: string): boolean {
   return tasks.some(task => {

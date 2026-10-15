@@ -8,7 +8,7 @@
  * member loop used to be.
  */
 import { id } from './store.ts'
-import { TERMINAL_STATES, pendingStopOwner, selectAcceptedDelivery, stopPending, subjectsOfTasks, taskSubject, terminal } from './task-graph.ts'
+import { TERMINAL_STATES, pendingStopOwner, quiescencePending, selectAcceptedDelivery, stopPending, subjectsOfTasks, taskSubject, terminal } from './task-graph.ts'
 import { assignmentAllows, canBorrowTask, canOwnReview, strandedReview } from './assignment.ts'
 import { liveReviewFor } from './admission.ts'
 import { hasNotice } from './arena.ts'
@@ -361,7 +361,7 @@ export class Scheduling {
     // worker close-out and lease expiry hold the task at `blocked` +
     // `resumeAfterStop` only until `workers.stop()` resolves; treating it as
     // unschedulable lets `control complete` cancel recoverable work.
-    const dead = new Set(tasks.filter(task => task.status === 'blocked' && !this.quiescencePending(task)).map(task => task.id))
+    const dead = new Set(tasks.filter(task => task.status === 'blocked' && !quiescencePending(task)).map(task => task.id))
     // Fixpoint: work waiting on dead prerequisites or an unreachable review source is dead too.
     for (let changed = true; changed;) {
       changed = false
@@ -404,18 +404,6 @@ export class Scheduling {
       && !tasks.some(task => task.status === 'submitted' && !this.reviewable(task, tasks, members) && awaitsReviewAdmission(this.rt, task))
   }
 
-  /**
-   * A durable stop transition is in flight: the task is blocked only until the
-   * old worker handle acknowledges the stop, then it re-pends. Every scheduler
-   * and completion decision treats it as live work.
-   */
-  quiescencePending(task: Task): boolean { return task.status === 'blocked' && stopPending(task) }
-
-  /** The runtime's unique deliverable among accepted artifacts; throws when none is unique. */
-  selectDeliveryTarget(_missionId: string, tasks: Task[]): Task {
-    return selectAcceptedDelivery(tasks)
-  }
-
   /** One completion policy is shared by manual controls and automatic requests. */
   deliveryTarget(actor: Actor, missionId: string): { mission: Mission; task: Task } {
     actor.signal?.throwIfAborted()
@@ -424,7 +412,7 @@ export class Scheduling {
     if (mission.ownerSessionId !== actor.sessionId || this.rt.isWorkerSession(actor.sessionId)) throw new PolicyError('delivery_owner_required', 'authorization_error', 'Only the mission owner can access deliverables')
     if (mission.status !== 'completed') throw new PolicyError('delivery_acceptance_required', 'tool_error', 'Complete independent acceptance before applying results')
     if (!mission.baseline) throw new PolicyError('delivery_baseline_missing', 'tool_error', 'This historical mission has no saved delivery baseline; inspect its retained artifact')
-    return { mission, task: this.selectDeliveryTarget(missionId, this.rt.store.list('tasks', missionId)) }
+    return { mission, task: selectAcceptedDelivery(this.rt.store.list('tasks', missionId)) }
   }
 
   /** The mission's stable pass name, carried by the stall event (`passId`) and the owner notice. */
@@ -464,7 +452,7 @@ export class Scheduling {
     const now = this.rt.now()
     const holders: Array<{ subject: string; memberId?: string }> = []
     for (const task of this.rt.store.list('tasks', missionId)) {
-      const live = this.quiescencePending(task) || (task.status === 'running' && task.attempt !== undefined && task.attempt.leaseUntil >= now)
+      const live = quiescencePending(task) || (task.status === 'running' && task.attempt !== undefined && task.attempt.leaseUntil >= now)
       if (!live) continue
       const memberId = task.attempt?.ownerId ?? task.assigneeId
       holders.push({ subject: taskSubject(task), ...(memberId === undefined ? {} : { memberId }) })
@@ -707,7 +695,7 @@ export class Scheduling {
   hasLiveWork(missionId: string): boolean {
     const now = this.rt.now()
     return this.rt.store.list('tasks', missionId).some(task =>
-      this.quiescencePending(task)
+      quiescencePending(task)
       || (task.status === 'running' && task.attempt !== undefined && task.attempt.leaseUntil >= now))
   }
 
@@ -850,7 +838,7 @@ export class Scheduling {
    * can never reach a verdict by itself.
    */
   reviewPathStalled(tasks: Task[], members: Member[]): boolean {
-    if (tasks.some(task => task.status === 'running' || this.quiescencePending(task))) return false
+    if (tasks.some(task => task.status === 'running' || quiescencePending(task))) return false
     const live = members.filter(member => memberPhaseOf(member) !== 'stopped')
     return !tasks.some(task => task.status === 'pending' && live.some(member => this.ready(task, member, tasks)))
   }

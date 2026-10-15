@@ -43,6 +43,12 @@ const RECOVERY_EXITS: Record<NonNullable<CheckResult['failureKind']>, (check: Ch
   },
 }
 
+/** A deferred review's exit: its last classified failure's (a pass stops at its first failing check), or resuming when no row has a kind. */
+export function recoveryExit(checks: ReadonlyArray<CheckResult>): string {
+  const failure = checks.findLast(check => check.failureKind !== undefined)
+  return failure?.failureKind === undefined ? RESUME : RECOVERY_EXITS[failure.failureKind](failure)
+}
+
 export class DeclaredChecks {
   /**
    * S15: the attempts of the verification in flight. The key is
@@ -178,12 +184,6 @@ export class DeclaredChecks {
   recoveryRequired(checks: ReadonlyArray<CheckResult>): boolean {
     const failures = checks.filter(check => check.exitCode !== 0)
     return failures.length > 0 && failures.every(check => check.failureKind !== undefined)
-  }
-
-  /** A deferred review's exit: its last classified failure's (a pass stops at its first failing check), or resuming when no row has a kind. */
-  recoveryExit(checks: ReadonlyArray<CheckResult>): string {
-    const failure = checks.findLast(check => check.failureKind !== undefined)
-    return failure?.failureKind === undefined ? RESUME : RECOVERY_EXITS[failure.failureKind](failure)
   }
 
   /**

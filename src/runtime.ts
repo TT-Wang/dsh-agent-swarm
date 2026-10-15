@@ -17,7 +17,7 @@ import { deriveMemberBoard, deriveMemberStatus, memberPhaseOf, memberDeliveryHea
 import type { MissionInterpretation } from './notices.ts'
 export { emptyUsage, addUsage, missionFingerprint, type MissionFingerprintBoard } from './gates.ts'
 import { RuntimeGates, emptyUsage, addUsage, BOARD_DELTA_POSTS, missionFingerprint, postView, type MissionFingerprintBoard } from './gates.ts'
-import { DeclaredChecks, MAX_REPORTED_CHECK_FAILURES, excerpt } from './declared-checks.ts'
+import { DeclaredChecks, MAX_REPORTED_CHECK_FAILURES, excerpt, recoveryExit } from './declared-checks.ts'
 import { verdictRows } from './trace.ts'
 export { TEMP_RENDEZVOUS_WINDOW_MS, sharedTempPaths, tempRendezvousDecision, type TempMention } from './workspace-admission.ts'
 import { awaitsDelivery } from './arena.ts'
@@ -26,7 +26,7 @@ import { validScope, scopeSubset } from './scope.ts'
 import { AdmissionError, assertDeclaredOutputs, assertScopeSelectors, citedCovers, dependencyAssumptions, formatDiagnostic, isNoopCheck, loadPackageScripts, normalizeReviewDependencies, normalizeScopeSelectors, normalizeTaskCeilings, reconcileTaskAdmission, requireHostChecks, taskCeilingBlock, taskGraphDefects, TaskGraphAdmissionError, type TaskGraphNode } from './admission.ts'
 import { authorIdsOf, canBorrowTask, canOwnReview, strandedReview } from './assignment.ts'
 import { executionClock, executionElapsed } from './resource-time.ts'
-import { TERMINAL_STATES, blockCauses, completionExempt, currentEvidenceIds, missionSubject, pendingStopOwner, stopPending, subjectsOfTasks, taskGraphIndex, taskSubject, terminal, uncoveredCriteria, type BlockCause } from './task-graph.ts'
+import { TERMINAL_STATES, blockCauses, completionExempt, currentEvidenceIds, missionSubject, pendingStopOwner, quiescencePending, selectAcceptedDelivery, stopPending, subjectsOfTasks, taskGraphIndex, taskSubject, terminal, uncoveredCriteria, type BlockCause } from './task-graph.ts'
 import { checkSyntaxDetail, declaredPlanChecks, orderedTasks, pairReviews, planAdvisories, validatePlan } from './plans.ts'
 import { OWNER_ONLY_TOOLS, type Actor, type AutoStart, BoardQuery, Budget, CheckAttribution, CheckEnvelope, CheckEnvironment, CheckResult, CreateMissionInput, CriticalPath, criterionId, Delivery, DraftPlan, Escalation, Evidence, EvidenceStatus, Member, MemberStatus, Mission, nextWorkerName, ObserveQuery, MessageInput, PlanInput, Post, PostInput, PostKind, ProposeTaskInput, ProviderOutage, PublishInput, RecoveryFallback, RequestStartInput, RuntimeConfig, Snapshot, Task, TaskAmendment, TaskRejection, TaskCeiling, ToolRun, UsageBuckets, UsageSnapshotSource, VerificationCleanupFailure, WorkerAdapter, WorkerActivity, Workstream } from './types.ts'
 import { requireArtifactChecks } from './artifact-policy.ts'
@@ -387,8 +387,6 @@ export class SwarmRuntime implements Kernel {
   unschedulable(mission: Mission, tasks: Task[], members: Member[]): Task[] { return this.scheduling.unschedulable(mission, tasks, members) }
   reviewable(task: Task, tasks: Task[], members?: Member[]): boolean { return this.scheduling.reviewable(task, tasks, members) }
   stalled(tasks: Task[], members: Member[]): boolean { return this.scheduling.stalled(tasks, members) }
-  private quiescencePending(task: Task): boolean { return this.scheduling.quiescencePending(task) }
-  private selectDeliveryTarget(missionId: string, tasks: Task[]): Task { return this.scheduling.selectDeliveryTarget(missionId, tasks) }
   private deliveryTarget(actor: Actor, missionId: string): { mission: Mission; task: Task } { return this.scheduling.deliveryTarget(actor, missionId) }
   private openPass(missionId: string): SchedulingPass | undefined { return this.scheduling.openPass(missionId) }
   private closePass(missionId: string, pass: SchedulingPass): void { return this.scheduling.closePass(missionId, pass) }
@@ -878,7 +876,7 @@ export class SwarmRuntime implements Kernel {
       seen.add(taskId)
       const task = index.byId.get(taskId)
       if (task === undefined) continue // The shared validator reports the dangling edge.
-      const waiting = ['pending', 'running', 'submitted'].includes(task.status) || this.quiescencePending(task)
+      const waiting = ['pending', 'running', 'submitted'].includes(task.status) || quiescencePending(task)
       const dependencies = waiting ? task.dependencies.map(dependency => this.lineage(missionId, dependency, rows, index).at(-1)!.id) : []
       const reviewOf = waiting ? task.reviewOf : undefined
       graph.push({ id: task.id, dependencies, ...(reviewOf === undefined ? {} : { reviewOf }) })
@@ -1638,7 +1636,7 @@ export class SwarmRuntime implements Kernel {
       // prose. A judgement rejection with no failing check keeps the prose.
       const rejection = passed ? input.reason : this.declaredChecks.rejectionReason(input.reason, checks)
       if (this.declaredChecks.recoveryRequired(checks)) {
-        const deferral = `\nReview ${task.id} deferred its verdict on the immutable source ${source.id} at ${artifact.commit}, which remains submitted: ${this.declaredChecks.recoveryExit(checks)}.`
+        const deferral = `\nReview ${task.id} deferred its verdict on the immutable source ${source.id} at ${artifact.commit}, which remains submitted: ${recoveryExit(checks)}.`
         const reason = `${excerpt(rejection, Math.max(0, this.config.maxMessageChars - deferral.length - 32))}${deferral}`
         this.commit(missionId, () => {
           const runIds = this.declaredChecks.recordRuns(missionId, { memberId: member.id, taskId: task.id, attemptId: input.attemptId, commit: artifact.commit }, checks)
@@ -2162,7 +2160,7 @@ export class SwarmRuntime implements Kernel {
       // that source is closed (accepted, withdrawn, retired by a replacement) or
       // a rework re-opens it (`blocked`), its blocked reviews are closed too, a
       // deferred or fenced one included; keep their verdict, output and evidence.
-      const moot = review.status === 'pending' || review.status === 'running' || this.quiescencePending(review)
+      const moot = review.status === 'pending' || review.status === 'running' || quiescencePending(review)
         || (closeBlocked && review.status === 'blocked')
       if (!moot) continue
       const { previousStatus, attempt } = this.attempts.fenceForStop(review, { status: 'cancelled', cause: 'review-retired' })
@@ -2369,7 +2367,7 @@ export class SwarmRuntime implements Kernel {
     const mission = this.mission(source.missionId)
     const tasks = this.store.list('tasks', mission.id), members = this.store.list('members', mission.id)
     const deferred = tasks.find(task => task.status === 'blocked' && task.reviewOf === source.id && task.verificationRecovery !== undefined && task.verificationRecovery.commit === source.artifact?.commit)
-    if (deferred !== undefined) return `review ${deferred.id} deferred its verdict on this artifact: ${this.declaredChecks.recoveryExit(this.store.toolRuns(mission.id, { taskId: deferred.id }).filter(run => run.tool === 'swarm.host_verification').map(run => run.result as CheckResult))}`
+    if (deferred !== undefined) return `review ${deferred.id} deferred its verdict on this artifact: ${recoveryExit(this.store.toolRuns(mission.id, { taskId: deferred.id }).filter(run => run.tool === 'swarm.host_verification').map(run => run.result as CheckResult))}`
     if (tasks.length >= mission.budget.maxTasks) return `the mission task budget is exhausted (${tasks.length}/${mission.budget.maxTasks} admitted tasks), so no verification task can be admitted: raise maxTasks with swarm_budget(budget, reason), or ${WITHDRAW_SOURCE}`
     const authors = [...authorIdsOf(source)]
     if (!members.some(member => memberPhaseOf(member) !== 'stopped' && canOwnReview(source, member.id))) return `no live member other than the author (${authors.join(', ') || 'unknown'}) can review this artifact independently: add an independent member with swarm_add_member(role, maxOutputTokens), or ${WITHDRAW_SOURCE}`
@@ -3107,7 +3105,7 @@ export class SwarmRuntime implements Kernel {
     const tasks = this.store.list('tasks', missionId)
     let deliveryTarget: { taskId: string; commit: string } | undefined
     try {
-      const target = this.selectDeliveryTarget(missionId, tasks)
+      const target = selectAcceptedDelivery(tasks)
       if (target.artifact) deliveryTarget = { taskId: target.id, commit: target.artifact.commit }
     } catch { deliveryTarget = undefined }
     const completionReason = this.completionError(mission)
@@ -3350,7 +3348,7 @@ export class SwarmRuntime implements Kernel {
     const uncovered = uncoveredCriteria(mission.acceptance, new Set(deliverables.flatMap(task => [...graph.criteriaOf(task.id)])))
     if (uncovered.length) return `Accepted tasks do not cover every mission acceptance criterion: ${uncovered.join(', ')}. Propose a deliverable that names them in \`covers\` with \`swarm_propose\`; an accepted task cannot gain covers`
     if (tasks.some(task => ['implementation', 'integration'].includes(task.kind) && task.status !== 'cancelled')) {
-      try { this.selectDeliveryTarget(mission.id, tasks) }
+      try { selectAcceptedDelivery(tasks) }
       catch (error) { return error instanceof Error ? error.message : String(error) }
     }
     // Evidence of explicitly cancelled work no longer supports an accepted result,
