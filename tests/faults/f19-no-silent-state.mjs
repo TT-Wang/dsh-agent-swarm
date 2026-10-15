@@ -495,7 +495,8 @@ await runScenario({
         const notice = await eventually(() => ownerNotices(f).find(delivery => /challenged/.test(delivery.content)), 'row 12: the challenge must wake the owner')
         assert.equal(f.runtime.store.get('evidence', evidence.id).status, 'challenged')
         assert.equal(f.runtime.snapshot(f.owner, f.mission.id).completion.eligible, false, 'row 12: an open challenge blocks completion')
-        assert.throws(() => f.runtime.control(f.owner, f.mission.id, 'complete', 'too early'), /unfinished or blocked required work|Unresolved evidence challenges/)
+        // The challenge re-opens the accepted source, so completion is refused as unfinished work naming it.
+        assert.throws(() => f.runtime.control(f.owner, f.mission.id, 'complete', 'too early'), new RegExp(`Mission still has unfinished or blocked required work: (.+, )?${task.id} \\(submitted\\)`))
         assertWitness(f, notice, noticeFamily(notice), since, 'row 12')
         rows.row12 = { witness: 'W2', evidenceId: evidence.id }
       } finally { await f.cleanup() }
