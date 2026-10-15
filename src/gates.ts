@@ -417,7 +417,7 @@ export class RuntimeGates {
     const pause = mission.budgetPause
     if (pause === undefined || pause.id !== pauseId || pause.quiesced) return
     const claim = pause.stopping
-    if (claim !== undefined && claim.instanceId === this.rt.instanceId && this.rt.now() - claim.at < this.rt.stallPassTimeoutMs) return
+    if (claim !== undefined && claim.instanceId === this.rt.instanceId && this.rt.now() - claim.at < this.rt.bounds.stallPassTimeoutMs) return
     // The durable claim lands BEFORE the first await, so it is the gate for any
     // later caller.
     pause.stopping = { instanceId: this.rt.instanceId, at: this.rt.now() }

@@ -11,6 +11,7 @@ import { Notices, NOTICE_TEMPLATES, REJECTION_DECISION_TRIGGER, ADMISSION_REFUSE
 import { RefusalRegistry, requireStrings, requireText, sameChecks, unsupportedEffort, validatedBudget } from './refusals.ts'
 import { Scheduling } from './scheduling.ts'
 import { progressed, type Kernel, type SchedulingPass } from './kernel.ts'
+import { bounds, type Bounds } from './board.ts'
 // R17-G6/G7: the one derivation of mission derived state and its host projection.
 import { deriveMemberBoard, deriveMemberStatus, memberPhaseOf, memberDeliveryHealth, type MissionBoardMember } from './projection.ts'
 import type { MissionInterpretation } from './notices.ts'
@@ -59,33 +60,6 @@ const PROVIDER_OUTAGE_WINDOW_MS = 5 * 60_000
 /** R11-01: bound the durable outage log to one row per member and class per window. */
 const PROVIDER_OUTAGE_EVENT_WINDOW_MS = 30_000
 
-/**
- * S1: the bound on one scheduling pass before the runtime names it wedged, in
- * `tickMs` (RuntimeConfig.`stallPassTimeoutMs`), never a constant a wedged pass
- * can be trapped behind.
- */
-const DEFAULT_STALL_PASS_TIMEOUT_TICKS = 30
-/**
- * R16-D: the declared bound on how long a live attempt may record no durable
- * progress before the runtime escalates it by name (`attempt-silent:`). The
- * default matches the longest wait this host itself treats as bounded (F1's
- * `operationBoundMs` / the harness's 600 s `maxWaitTimeoutMs`): an attempt that
- * has recorded nothing at all for that long is past the point where a live lease
- * can still be read as progress. Configuration, never a constant the runtime is
- * trapped behind: `attemptSilenceBoundMs` on the runtime config, `0` disables
- * the guard, an invalid value keeps this default.
- */
-const DEFAULT_ATTEMPT_SILENCE_BOUND_MS = 10 * 60_000
-/**
- * R16-D: the additional declared window a wedged scheduling pass stays live
- * (unnamed) while the mission still has live work. The default is the pass
- * bound itself (so a wedge is named after at most 2 × `stallPassTimeoutMs`),
- * and it is configuration: `stallPassLiveGraceMs` on the runtime config, `0`
- * meaning "name it at the first bound". Without it the naming was unbounded — a
- * wedged pass waited for every unrelated lease to lapse, exactly the silent
- * blocking round 16 removes.
- */
-const DEFAULT_STALL_PASS_LIVE_GRACE_TICKS = 1
 /**
  * R5-02: consecutive `workers.start` failures for one member before its work is
  * re-routed to another capable live member. A transient start failure self-heals
@@ -761,7 +735,7 @@ export class SwarmRuntime implements Kernel {
       await Promise.race([
         previous.catch(() => {}),
         new Promise<never>((_resolve, reject) => {
-          timer = setTimeout(() => reject(new Error('[mission_operation_pending] A previous mission operation is still in flight; this request made no changes. Inspect the pending operation with swarm_observe and retry after it returns. Other missions and owner controls remain available.')), this.stallPassTimeoutMs)
+          timer = setTimeout(() => reject(new Error('[mission_operation_pending] A previous mission operation is still in flight; this request made no changes. Inspect the pending operation with swarm_observe and retry after it returns. Other missions and owner controls remain available.')), this.bounds.stallPassTimeoutMs)
           timer.unref()
         }),
       ])
@@ -4084,46 +4058,8 @@ export class SwarmRuntime implements Kernel {
     void operation.catch(error => { if (!this.closed) process.stderr.write(`[agent-swarm] ${String(error)}\n`) }).finally(() => this.operations.delete(operation))
   }
 
-  /**
-   * S1: the declared bound on one scheduling pass (default 30 × `tickMs`). A
-   * pass still queued or running past this bound has produced no durable change
-   * for the whole window; the watchdog names it and the mission publishes as
-   * wedged until the body settles.
-   */
-  get stallPassTimeoutMs(): number {
-    const value = Math.trunc(this.config.stallPassTimeoutMs ?? this.config.tickMs * DEFAULT_STALL_PASS_TIMEOUT_TICKS)
-    return Number.isSafeInteger(value) && value >= this.config.tickMs ? value : this.config.tickMs
-  }
-  /**
-   * R16-D: the declared window a wedged pass stays live (unnamed) while the
-   * mission has live work (default: the pass bound itself, read as
-   * `stallPassTimeoutMs`; `stallPassLiveGraceMs: 0` names it at the first bound).
-   * Structural read: `RuntimeConfig` (src/types.ts) and the plugin `Config`
-   * schema (src/index.ts) are outside this task's write scope, so the two schema
-   * lines are a recorded hand-off — a runtime handed `stallPassLiveGraceMs` uses
-   * it, one without it uses the default.
-   */
-  get stallPassLiveGraceMs(): number {
-    const raw = (this.config as { stallPassLiveGraceMs?: unknown }).stallPassLiveGraceMs
-    if (typeof raw === 'number' && Number.isFinite(raw) && raw >= 0) return Math.floor(raw)
-    return this.stallPassTimeoutMs * DEFAULT_STALL_PASS_LIVE_GRACE_TICKS
-  }
-  /**
-   * R16-D: the total bound a wedged pass is measured against once it has live
-   * work to progress. Past it the pass is named even though the live work
-   * remains — the work is preserved and named, generation is not held hostage.
-   */
-  get stallPassReleaseBoundMs(): number { return this.stallPassTimeoutMs + this.stallPassLiveGraceMs }
-  /**
-   * R16-D: the declared bound on an attempt's durable progress (see
-   * `DEFAULT_ATTEMPT_SILENCE_BOUND_MS`). Structural read with the same hand-off
-   * as `stallPassLiveGraceMs`.
-   */
-  get attemptSilenceBoundMs(): number {
-    const raw = (this.config as { attemptSilenceBoundMs?: unknown }).attemptSilenceBoundMs
-    if (raw === 0) return 0
-    return typeof raw === 'number' && Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : DEFAULT_ATTEMPT_SILENCE_BOUND_MS
-  }
+  /** The declared bounds of the live config, read again on every read: a test or the host may change the config after construction. */
+  get bounds(): Bounds { return bounds(this.config) }
   /**
    * R16-D: the durable reporting bound verdict for the live attempt on one task
    * (`taskId@epoch` + member), or undefined when the attempt is inside its bound
@@ -4318,7 +4254,7 @@ export class SwarmRuntime implements Kernel {
       const drain = Promise.allSettled([...this.operations, ...this.queues.values()])
       let bound: ReturnType<typeof setTimeout> | undefined
       try {
-        await Promise.race([drain, new Promise<void>(resolve => { bound = setTimeout(resolve, this.stallPassTimeoutMs) })])
+        await Promise.race([drain, new Promise<void>(resolve => { bound = setTimeout(resolve, this.bounds.stallPassTimeoutMs) })])
       } finally { if (bound !== undefined) clearTimeout(bound) }
     }
     finally {

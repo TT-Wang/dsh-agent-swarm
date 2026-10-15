@@ -38,7 +38,7 @@ await runScenario({
     const workers = new WedgeStartWorkers()
     const f = await setup({ workers, config: { workerStartTimeoutMs: 3_600_000 } })
     try {
-      const bound = f.runtime.stallPassTimeoutMs
+      const bound = f.runtime.bounds.stallPassTimeoutMs
       // The proposal kicks a body; it is open on the current board before it
       // runs, so the wedge armed now hangs its first start.
       const task = f.propose()

@@ -385,7 +385,7 @@ export const newestReviewBlock = (store: Pick<SwarmStore, 'latestTaskEvent'>, mi
 }
 
 /** R17-G9: the runtime slice the lineage rules read, so the classifiers and the delivery-time relevance check consume ONE implementation (a test can supply the same shape). */
-type LineageRuntime = Pick<SwarmRuntime, 'config' | 'stallPassTimeoutMs' | 'now' | 'reviewNeed' | 'reviewPathBlocker' | 'unfinishedDependencies' | 'reviewable'>
+type LineageRuntime = Pick<SwarmRuntime, 'config' | 'bounds' | 'now' | 'reviewNeed' | 'reviewPathBlocker' | 'unfinishedDependencies' | 'reviewable'>
 
 /**
  * R16-A: the ids whose obligation is carried by a live task through `replaces`,
@@ -409,7 +409,7 @@ function replacementCoverage(tasks: Task[]): Set<string> {
  * durable rows, so the pass, the timer-driven notice path, the delivery-time
  * relevance check and a test all classify the same board identically.
  */
-function stallRootsFor(rt: Pick<LineageRuntime, 'stallPassTimeoutMs' | 'now'>, tasks: Task[]): Task[] {
+function stallRootsFor(rt: Pick<LineageRuntime, 'bounds' | 'now'>, tasks: Task[]): Task[] {
   // A live replacement marks every id in its transitive lineage as covered.
   const replaced = replacementCoverage(tasks)
   return tasks.filter(task => {
@@ -423,7 +423,7 @@ function stallRootsFor(rt: Pick<LineageRuntime, 'stallPassTimeoutMs' | 'now'>, t
     // absent timestamp is UNBOUNDED — the bound cannot be shown to hold, so the
     // state escalates as a root rather than becoming silence (a pre-upgrade
     // durable row reaches exactly this state).
-    return at === undefined || rt.now() - at > rt.stallPassTimeoutMs
+    return at === undefined || rt.now() - at > rt.bounds.stallPassTimeoutMs
   })
 }
 
@@ -463,7 +463,7 @@ export function waitsLegitimately(rt: LineageRuntime, task: Task, tasks: Task[])
     // "cannot judge" case must never be the silent one: `stallRootsFor` classifies
     // the same row as a root, and this classifier refusing it here keeps the two
     // in agreement instead of leaving the state both silent and unnamed.
-    if (stop !== undefined) return stop.at !== undefined && rt.now() - stop.at <= rt.stallPassTimeoutMs
+    if (stop !== undefined) return stop.at !== undefined && rt.now() - stop.at <= rt.bounds.stallPassTimeoutMs
     return rt.unfinishedDependencies(task.missionId, task, tasks).length > 0
   }
   if (task.status === 'pending') {
@@ -495,7 +495,7 @@ export function waitsLegitimately(rt: LineageRuntime, task: Task, tasks: Task[])
       && (candidate.id === task.id || candidate.resumeAfterStop.memberId === undefined
         || (memberId !== undefined && candidate.resumeAfterStop.memberId === memberId)))
     if (stops.length > 0) return stops.every(candidate => candidate.resumeAfterStop!.at !== undefined
-      && rt.now() - candidate.resumeAfterStop!.at! <= rt.stallPassTimeoutMs)
+      && rt.now() - candidate.resumeAfterStop!.at! <= rt.bounds.stallPassTimeoutMs)
     // Once the stop settles, another live attempt may take the selected member
     // first. Its bounded lease provides the next chance to run this ready work.
     return memberId !== undefined && tasks.some(candidate => candidate.status === 'running'
@@ -1324,8 +1324,8 @@ export class Notices {
       const stop = stopPending(root) ? root.resumeAfterStop : undefined
       const cause = stop !== undefined
         ? (stop.at === undefined
-          ? `its stop carries no recorded start, so the declared bound (${this.rt.stallPassTimeoutMs}ms) cannot be shown to hold`
-          : `its stop has been awaited for ${Math.max(0, this.rt.now() - stop.at)}ms, past the declared bound (${this.rt.stallPassTimeoutMs}ms)`)
+          ? `its stop carries no recorded start, so the declared bound (${this.rt.bounds.stallPassTimeoutMs}ms) cannot be shown to hold`
+          : `its stop has been awaited for ${Math.max(0, this.rt.now() - stop.at)}ms, past the declared bound (${this.rt.bounds.stallPassTimeoutMs}ms)`)
         : 'no live replacement exists anywhere in its lineage'
       const { content: body, statement } = renderNotice('stall-root', { rootId: root.id, title: root.title, epoch: root.epoch, cause,
         dependents: dependents.map(task => task.id), ...(root.output === undefined ? {} : { recordedReason: root.output }) })
@@ -1345,7 +1345,7 @@ export class Notices {
         statement, ...(cover === undefined ? {} : { coveredBy: cover.id }) }, () => {
         this.rt.store.event(mission.id, 'mission/stalled', 'runtime', {
           cause: 'stall-root', taskId: root.id, epoch: root.epoch, reason: root.output ?? null, noticeKey: key,
-          dependents: dependents.map(task => task.id), boundMs: this.rt.stallPassTimeoutMs,
+          dependents: dependents.map(task => task.id), boundMs: this.rt.bounds.stallPassTimeoutMs,
           // R14-F2v D1: the W3 stall event carries `unschedulable` and readers
           // (fault F19 row 7) take it from the LATEST mission/stalled event; a
           // stall-root event without it broke that reader. The root plus the
@@ -1577,7 +1577,7 @@ export class Notices {
       try {
         const settled = await awaited(pass, Promise.race([
           this.rt.workers.deliver(member, delivery).then(() => true),
-          new Promise<boolean>(resolve => { bound = setTimeout(() => resolve(false), this.rt.stallPassTimeoutMs) }),
+          new Promise<boolean>(resolve => { bound = setTimeout(() => resolve(false), this.rt.bounds.stallPassTimeoutMs) }),
         ]), this.rt.now)
         if (!settled) { this.recordOutboxStarvation(missionId, delivery); continue }
         // R17-G8: delivery is the transport fact. It is never relabelled as
@@ -1648,7 +1648,7 @@ export class Notices {
     // suppresses the next one — the flag ages out instead of starving the
     // outbox (the reviewer's D2).
     const now = this.rt.now()
-    if (this.pumpingSince !== undefined && now - this.pumpingSince < this.rt.stallPassTimeoutMs) return
+    if (this.pumpingSince !== undefined && now - this.pumpingSince < this.rt.bounds.stallPassTimeoutMs) return
     this.pumpingSince = now
     this.rt.defer(async () => {
       try {

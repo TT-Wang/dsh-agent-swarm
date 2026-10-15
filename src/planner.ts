@@ -138,7 +138,7 @@ export function registerAutomaticStart(ctx: Context, runtime: SwarmRuntime): voi
       timeout.abort(new Error('Planning notification delivery timed out'))
     }
     if (kind === 'planning') expire()
-    else { timer = setTimeout(expire, runtime.stallPassTimeoutMs); timer.unref() }
+    else { timer = setTimeout(expire, runtime.bounds.stallPassTimeoutMs); timer.unref() }
     let aborted: () => void = () => {}
     try {
       await Promise.race([deliver(request, kind, signal), new Promise<never>((_resolve, reject) => {

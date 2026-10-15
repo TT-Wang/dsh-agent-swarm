@@ -47,32 +47,6 @@ export function stopOutcome(causes: ReadonlySet<BlockCause>, reason: StopReason)
 const DEFAULT_IDLE_CLOSEOUTS = 2
 /** Renewal allowance per model output token, so a long model call keeps its lease. */
 const LEASE_MS_PER_OUTPUT_TOKEN = 20
-/**
- * F1: the declared bound on how long one in-flight operation may hold an
- * attempt without recording anything. Inside the bound an operation is
- * plausibly bounded (a long build, a declared check, one generation) and the
- * lease-renewal rule is right; past it "bounded" stops being plausible, so the
- * operation stops counting as liveness and the owner is told exactly which
- * member, task and tool went silent. Configuration, never a constant the
- * runtime is trapped behind: `operationBoundMs` on the runtime config, `0`
- * disables the guard, an invalid value keeps this default. The default matches
- * the longest wait this host itself treats as bounded (the harness's
- * `maxWaitTimeoutMs` of 600 s): one operation silently held past it is past the
- * point where "bounded" is still plausible, while an operation that declares a
- * longer bound of its own is judged by that bound instead.
- */
-const DEFAULT_OPERATION_BOUND_MS = 10 * 60_000
-/** Read the declared bound; invalid configuration keeps the default rather than reverting to 0. */
-function declaredOperationBoundMs(config: { operationBoundMs?: unknown }): number {
-  // The bound arrives on the runtime config. `RuntimeConfig` (src/types.ts) and
-  // the plugin `Config` schema (src/index.ts) live outside this task's write
-  // scope, so the read is structural and the two schema lines are recorded in
-  // the submission as a hand-off: a runtime handed `operationBoundMs` uses it,
-  // one without it uses the default above.
-  const value = config.operationBoundMs
-  if (value === 0) return 0
-  return typeof value === 'number' && Number.isFinite(value) && value > 0 ? Math.floor(value) : DEFAULT_OPERATION_BOUND_MS
-}
 /** F1: one in-flight operation that has produced nothing beyond the declared bound. */
 interface SilentOperation {
   attemptId: string
@@ -372,7 +346,7 @@ export class Attempts {
     // One operation belongs to the attempt it started under; an operation
     // recorded under a different attempt is not this task's stuck call.
     if (activity.attemptId !== undefined && activity.attemptId !== attempt.id) return undefined
-    const boundMs = this.operationBound(activity, declaredOperationBoundMs(this.rt.config as { operationBoundMs?: unknown }))
+    const boundMs = this.operationBound(activity, this.rt.bounds.operationBoundMs)
     if (boundMs === undefined) return undefined
     const lastRecordedAt = this.rt.store.toolRuns(mission.id, { attemptId: attempt.id }).reduce((latest, run) => Math.max(latest, run.createdAt), 0)
     const silentSince = Math.max(activity.startedAt, lastRecordedAt)

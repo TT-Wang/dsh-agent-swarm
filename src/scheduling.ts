@@ -104,7 +104,7 @@ export class Scheduling {
         let memberSince = this.rt.now()
         for (const [index, member] of order.entries()) {
           if (this.rt.shuttingDown || this.rt.mission(missionId).status !== 'active') return false
-          if (pass !== undefined && index > 0 && this.rt.now() - memberSince >= this.rt.stallPassTimeoutMs) {
+          if (pass !== undefined && index > 0 && this.rt.now() - memberSince >= this.rt.bounds.stallPassTimeoutMs) {
             pass.stoppedBefore = member.id
             // A chain whose start member is gone restarts from this body's first one.
             pass.chainFrom = end > 0 ? pass.chainFrom : order[0]!.id
@@ -450,7 +450,7 @@ export class Scheduling {
     if (!this.pastBound(pass, now)) return pass
     // Past the declared pass bound the body is live only while the mission has
     // live work to progress AND the bounded live-work hold has not elapsed.
-    if (now - pass.startedAt < this.rt.stallPassReleaseBoundMs && this.hasLiveWork(missionId)) return pass
+    if (now - pass.startedAt < this.rt.bounds.stallPassReleaseBoundMs && this.hasLiveWork(missionId)) return pass
     return undefined
   }
 
@@ -501,7 +501,7 @@ export class Scheduling {
    * and another does not yet.
    */
   pastBound(pass: SchedulingPass, now = this.rt.now()): boolean {
-    return now - pass.startedAt >= this.rt.stallPassTimeoutMs
+    return now - pass.startedAt >= this.rt.bounds.stallPassTimeoutMs
   }
 
   /**
@@ -519,7 +519,7 @@ export class Scheduling {
    */
   passState(missionId: string): { passLive: boolean; wedged: boolean } {
     const pass = this.passes.get(missionId)
-    const bound = this.rt.stallPassTimeoutMs
+    const bound = this.rt.bounds.stallPassTimeoutMs
     if (pass?.progressAt !== undefined && this.pastBound(pass, pass.progressAt) && this.rt.now() - pass.progressAt <= bound) return { passLive: true, wedged: false }
     return { passLive: this.livePass(missionId) !== undefined, wedged: this.passWedged(missionId) }
   }
@@ -587,8 +587,8 @@ export class Scheduling {
     const noticeKey = factKey(missionId, { trigger: 'scheduling-pass', reason, subjects })
     const fingerprint = this.rt.fingerprint(missionId)
     const revision = this.rt.store.revision()
-    const bound = this.rt.stallPassTimeoutMs
-    const releaseBoundMs = heldByLiveWork ? this.rt.stallPassReleaseBoundMs : bound
+    const bound = this.rt.bounds.stallPassTimeoutMs
+    const releaseBoundMs = heldByLiveWork ? this.rt.bounds.stallPassReleaseBoundMs : bound
     const unschedulable = this.unschedulable(mission, tasks, members).map(task => `${task.id} (${task.status})`)
     const heldText = heldByLiveWork && holders.length
       ? ` The naming was held to its ${releaseBoundMs}ms live-work bound by work that is preserved untouched: ${holders.map(holder => holder.memberId === undefined ? holder.subject : `${holder.subject} held by ${holder.memberId}`).join(', ')}.`
@@ -685,7 +685,7 @@ export class Scheduling {
       // Inside the second bound live work keeps the body live: a pass that may
       // legitimately be inside a long adapter await for that work is not named.
       // Past it the window is over, and the notice names the subject that held it.
-      if (held && now - pass.startedAt < this.rt.stallPassReleaseBoundMs) continue
+      if (held && now - pass.startedAt < this.rt.bounds.stallPassReleaseBoundMs) continue
       this.escalateWedge(mission, pass, held, held ? this.liveWorkHolders(missionId) : [])
       // The body counts as named once its naming fact is durable: written just
       // now, or held by the owner already. R17-G5: naming it is a transition
@@ -755,7 +755,7 @@ export class Scheduling {
   silentAttempt(task: Task, mission: Mission, now = this.rt.now()): SilentAttempt | undefined {
     const attempt = task.attempt
     if (attempt === undefined || task.status !== 'running') return undefined
-    const boundMs = this.rt.attemptSilenceBoundMs
+    const boundMs = this.rt.bounds.attemptSilenceBoundMs
     if (boundMs <= 0) return undefined
     if (!Number.isSafeInteger(attempt.leaseUntil)) return undefined
     // The W6 idle close-out owns an attempt whose turn ended: it nudges, then
@@ -807,7 +807,7 @@ export class Scheduling {
     // would otherwise have named the attempt.
     const pass = this.passes.get(mission.id)
     const passState = pass !== undefined && this.passWedged(mission.id)
-      ? ` The mission's scheduling pass ${pass.operationId} is wedged past its ${this.rt.stallPassTimeoutMs}ms bound, so the in-pass recovery sweep cannot run either.`
+      ? ` The mission's scheduling pass ${pass.operationId} is wedged past its ${this.rt.bounds.stallPassTimeoutMs}ms bound, so the in-pass recovery sweep cannot run either.`
       : ''
     const message = `${name} has held task ${task.id} "${task.title}" at epoch ${task.epoch} (attempt ${silent.attemptId}) for ${formatSpan(silent.silentMs)} (${silent.silentMs}ms) with no durable report past its declared bound of ${formatSpan(silent.boundMs)} (${silent.boundMs}ms): no durable event, no task state transition and no recorded tool run names this attempt since ${since}; no operation is in flight and the idle close-out is not handling it.${passState} Nothing was stopped or re-pended by this notice: the attempt may still be working. Owner actions: inspect it with swarm_observe (taskId ${task.id}), send it input or finish it with swarm_handoff, raise attemptSilenceBoundMs if this silence is healthy, or withdraw the work with swarm_cancel. [witness: attempt-silent, subject ${silent.subject}, attempt ${silent.attemptId}, member ${silent.ownerId}, lastDurableAt ${silent.lastDurableAt}, silentMs ${silent.silentMs}, boundMs ${silent.boundMs}]`
     return this.rt.notices.tell(mission.id, message, [taskSubject(task)], { noticeClass: 'stall', dedupKey: `${ATTEMPT_SILENCE_PREFIX}${silent.attemptId}:${silent.lastDurableAt}` })

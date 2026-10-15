@@ -169,7 +169,7 @@ test('a wedged pass\'s naming handed to a busy owner is read once the body has s
   const rt = f.rt, mid = f.mission.id, scheduling = rt.scheduling
   /** A scheduling body past its bound, as the tick watchdog finds and names it. */
   const wedge = operationId => {
-    const pass = { id: scheduling.passKey(mid), operationId, missionId: mid, startedAt: rt.now() - rt.stallPassTimeoutMs - 1, revisionBefore: rt.store.revision(), fingerprintBefore: rt.fingerprint(mid) }
+    const pass = { id: scheduling.passKey(mid), operationId, missionId: mid, startedAt: rt.now() - rt.bounds.stallPassTimeoutMs - 1, revisionBefore: rt.store.revision(), fingerprintBefore: rt.fingerprint(mid) }
     scheduling.passes.set(mid, pass)
     t.after(() => scheduling.closePass(mid, pass))
     scheduling.checkSchedulingPasses()

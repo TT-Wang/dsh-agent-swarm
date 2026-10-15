@@ -561,7 +561,7 @@ function referenceWaiting(runtime, missionId, task, tasks) {
   }
   if (task.status === 'blocked' && task.resumeAfterStop?.epoch === task.epoch) {
     const stop = task.resumeAfterStop
-    return stop.at !== undefined && Date.now() - stop.at <= runtime.stallPassTimeoutMs
+    return stop.at !== undefined && Date.now() - stop.at <= runtime.bounds.stallPassTimeoutMs
   }
   if (task.status === 'pending' && task.reviewOf !== undefined) {
     const source = tasks.find(candidate => candidate.id === task.reviewOf)
@@ -570,7 +570,7 @@ function referenceWaiting(runtime, missionId, task, tasks) {
   if (task.status === 'pending' && task.resumeAfterStop?.epoch === task.epoch
     && task.dependencies.every(id => tasks.some(candidate => candidate.id === id) && runtime.effectiveDependency(missionId, id, tasks).status === 'accepted')) {
     const stop = task.resumeAfterStop
-    return stop.at !== undefined && Date.now() - stop.at <= runtime.stallPassTimeoutMs
+    return stop.at !== undefined && Date.now() - stop.at <= runtime.bounds.stallPassTimeoutMs
   }
   return task.dependencies.some(id => {
     if (!tasks.some(candidate => candidate.id === id)) return false
@@ -618,7 +618,7 @@ test('R16-A1: the waiting classifier is enumerated over every constructed board 
     if (task.status === 'submitted') return !f.runtime.reviewNeed(task).ripe
     if (task.status === 'blocked' && task.resumeAfterStop?.epoch === task.epoch) {
       const stop = task.resumeAfterStop
-      return stop.at !== undefined && Date.now() - stop.at <= f.runtime.stallPassTimeoutMs
+      return stop.at !== undefined && Date.now() - stop.at <= f.runtime.bounds.stallPassTimeoutMs
     }
     if (task.status === 'pending' && task.reviewOf !== undefined) {
       const source = tasks.find(candidate => candidate.id === task.reviewOf)
@@ -661,7 +661,7 @@ test('R16-A1: the waiting classifier is enumerated over every constructed board 
             if (got !== want) mismatches.push({ depStatus, replacement, subjectStatus, stopShape, reviewShape, got, want })
             const rootTask = { ...subject }
             const gotRoot = f.runtime.notices.stallRoots(tasks).some(root => root.id === subject.id)
-            const wantRoot = referenceStallRoot(f.runtime, mission.id, rootTask, tasks, f.runtime.stallPassTimeoutMs)
+            const wantRoot = referenceStallRoot(f.runtime, mission.id, rootTask, tasks, f.runtime.bounds.stallPassTimeoutMs)
             if (gotRoot !== wantRoot) mismatches.push({ kind: 'stallRoot', depStatus, replacement, subjectStatus, stopShape, reviewShape, gotRoot, wantRoot })
             if (naiveWaiting(subject, tasks) !== want) naiveDivergences.push({ depStatus, replacement, subjectStatus, stopShape, reviewShape })
             checked += 1
@@ -718,7 +718,7 @@ test('R16-A1: the waiting classifier is enumerated over every constructed board 
     const want = referenceWaiting(f.runtime, mission.id, subject, tasks)
     if (got !== want) mismatches.push({ kind: 'subjectCoverage', shape: shape.name, got, want })
     const gotRoot = f.runtime.notices.stallRoots(tasks).some(root => root.id === subject.id)
-    const wantRoot = referenceStallRoot(f.runtime, mission.id, { ...subject }, tasks, f.runtime.stallPassTimeoutMs)
+    const wantRoot = referenceStallRoot(f.runtime, mission.id, { ...subject }, tasks, f.runtime.bounds.stallPassTimeoutMs)
     if (gotRoot !== wantRoot) mismatches.push({ kind: 'subjectCoverageRoot', shape: shape.name, gotRoot, wantRoot })
     // The board without the final repair row: when it stops waiting, the coverage
     // predicate is what makes this board live.

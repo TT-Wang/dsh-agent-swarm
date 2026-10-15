@@ -4,15 +4,16 @@
  * through `Kernel`, and stamps a pass body it awaits for without importing the
  * sweep.
  */
+import type { Bounds } from './board.ts'
 import type { SwarmStore } from './store.ts'
 import type { Mission, RuntimeConfig, Task, WorkerAdapter } from './types.ts'
 
 /**
  * The infrastructure `SwarmRuntime` implements and hands each seam as itself:
  * the store and the transaction funnel over it, the runtime clock, the adapter,
- * the mission queue, the lifecycle flags and the declared bounds. A bound is a
- * getter over the live config, never a snapshot, because a config can change
- * after construction. `fingerprint` is F(S), the board digest the owner
+ * the mission queue, the lifecycle flags and the declared bounds. `bounds` is
+ * read from the live config on every read, never a snapshot, because a config
+ * can change after construction. `fingerprint` is F(S), the board digest the owner
  * instruments and the stall events carry. Its cache is the kernel's: one digest
  * per store revision, never trusted inside an open transaction (`commitDepth`).
  * The slice it digests is not: Gates builds it (`fingerprintBoard`) over
@@ -30,10 +31,7 @@ export interface Kernel {
   readonly commitDepth: number
   /** This process's identity in durable claims: a claim another instance wrote never gates this one. */
   readonly instanceId: string
-  readonly stallPassTimeoutMs: number
-  readonly stallPassLiveGraceMs: number
-  readonly stallPassReleaseBoundMs: number
-  readonly attemptSilenceBoundMs: number
+  readonly bounds: Bounds
   commit<T>(missionId: string, fn: () => T): T
   defer(fn: () => Promise<void>): void
   exclusive<T>(missionId: string, fn: () => Promise<T>): Promise<T>

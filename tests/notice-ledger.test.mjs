@@ -108,7 +108,7 @@ test('queued board decisions are withheld once the mission completes: coverage-c
   assert.ok(duplicate, 'the duplicate carrier told the owner')
   // A body past its bound on this board, past the live-work bound the running original holds it to, is named.
   const scheduling = f.runtime.scheduling
-  const pass = { id: scheduling.passKey(f.mission.id), operationId: 'operation_ledger_completed', missionId: f.mission.id, startedAt: clock.now() - f.runtime.stallPassReleaseBoundMs,
+  const pass = { id: scheduling.passKey(f.mission.id), operationId: 'operation_ledger_completed', missionId: f.mission.id, startedAt: clock.now() - f.runtime.bounds.stallPassReleaseBoundMs,
     revisionBefore: f.runtime.store.revision(), fingerprintBefore: f.runtime.fingerprint(f.mission.id) }
   scheduling.passes.set(f.mission.id, pass)
   scheduling.checkSchedulingPasses()
@@ -1457,7 +1457,7 @@ test('naming a body is the transition its wedged publication belongs to, whether
   await Promise.resolve()
   assert.equal(stallRow(f), undefined, 'a live pass leaves the board to its end')
   // The body never returns. Past its bound the watchdog names it by the row the owner holds.
-  f.clock.advance(f.runtime.stallPassTimeoutMs)
+  f.clock.advance(f.runtime.bounds.stallPassTimeoutMs)
   scheduling.checkSchedulingPasses()
   assert.deepEqual([body.escalatedAt !== undefined, wedgeRows(f).length, wedgeEvents(f).length], [true, 1, 1], 'the body is named, and the naming writes neither a row nor an event')
   await Promise.resolve()
@@ -1784,7 +1784,7 @@ test('P1d: a member\'s blocked task is named by its stall root beside an open me
       f.runtime.handoff(f.actor(f.reviewer), f.mission.id, { taskId: handed.id, attemptId: claimed.attempt.id, to: f.author.id, summary: 'Hand to the author' })
       f.propose({ title: 'Work for the author', kind: 'research', checks: [] })
       await ticks(f, 3)
-      f.clock.advance(f.runtime.stallPassTimeoutMs + 1)
+      f.clock.advance(f.runtime.bounds.stallPassTimeoutMs + 1)
       await ticks(f, 6)
       return { f, stuck: handed, chain: 'attempt_lease' }
     },

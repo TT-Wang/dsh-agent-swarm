@@ -120,7 +120,7 @@ test('a pending task whose only eligible member still owes a stop past its bound
     if (wedged) {
       // The commit's publication judged the stop inside its bound; past it, a wedged judgement is the first to judge the board.
       await Promise.resolve()
-      f.clock.advance(f.runtime.stallPassTimeoutMs + f.runtime.config.tickMs)
+      f.clock.advance(f.runtime.bounds.stallPassTimeoutMs + f.runtime.config.tickMs)
       f.runtime.notices.ensureWitness(f.mission.id, { wedged: true })
     } else await ticks(f, 6)
     const epochOf = task => f.runtime.store.get('tasks', task.id).epoch
@@ -203,7 +203,7 @@ test('R14-F2v D2: a stop with no recorded start is a root, never silence', async
 
 test('pending stop waits remain bounded and use the same owner scope as dispatch fencing', t => {
   const now = Date.now()
-  const rt = { stallPassTimeoutMs: 100, config: { tickMs: 25 }, unfinishedDependencies: () => [], now: () => now }
+  const rt = { bounds: { stallPassTimeoutMs: 100 }, config: { tickMs: 25 }, unfinishedDependencies: () => [], now: () => now }
   const pending = { id: 'next', missionId: 'mission', epoch: 0, status: 'pending', assigneeId: 'owner', dependencies: [] }
   const stop = (id, memberId, at, epoch = 1) => ({ id, missionId: 'mission', status: 'cancelled', epoch: 1,
     resumeAfterStop: { epoch, memberId, reason: 'handoff', ...(at === undefined ? {} : { at }) } })

@@ -110,7 +110,7 @@ const isAttemptCloser = type => ATTEMPT_FENCING_EVENTS.some(kind => kind === typ
 export function silenceReport(runtime, missionId) {
   const scheduling = runtime.scheduling
   const now = Date.now()
-  const bounds = { passMs: runtime.stallPassTimeoutMs, passReleaseMs: runtime.stallPassReleaseBoundMs, attemptMs: runtime.attemptSilenceBoundMs }
+  const bounds = { passMs: runtime.bounds.stallPassTimeoutMs, passReleaseMs: runtime.bounds.stallPassReleaseBoundMs, attemptMs: runtime.bounds.attemptSilenceBoundMs }
   const events = runtime.store.events(missionId, runtime.config.maxEvents)
   const deliveries = runtime.store.list('deliveries', missionId)
   const current = new Map(runtime.store.list('tasks', missionId).map(task => [task.id, task]))
