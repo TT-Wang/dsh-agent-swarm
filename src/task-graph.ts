@@ -1,5 +1,5 @@
-/** Pure functions of task, mission and member rows, shared by the runtime seams and the read-only projections. */
-import { criterionId, type EvidenceStatus, type Member, type Mission, type Task } from './types.ts'
+/** Pure functions of task and mission rows, shared by the runtime seams and the read-only projections. */
+import { criterionId, type EvidenceStatus, type Mission, type Task } from './types.ts'
 
 const oldest = (tasks: readonly Task[]): Task | undefined => [...tasks].sort((a, b) => a.createdAt - b.createdAt || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))[0]
 
@@ -292,38 +292,4 @@ export function blockCauses(
   if (currentEvidenceIds(task).some(evidenceId => evidenceStatusOf(evidenceId) === 'refuted')) causes.add('refuted')
   if ((task.recoveryCount ?? 0) >= (task.maxRecoveryAttempts ?? defaultMaxRecoveryAttempts)) causes.add('recovery-exhausted')
   return causes
-}
-
-interface IsolationIssue { memberIds: string[]; message: string }
-
-/** Identity-bearing evidence shared by admission and its read-only explanation. */
-export function isolationIssues(allMembers: readonly Member[], tasks: readonly Task[], overlaps: (left: string[], right: string[]) => boolean): IsolationIssue[] {
-    const violations: IsolationIssue[] = []
-    const members = allMembers.filter(member => member.status !== 'stopped')
-    const byWorkspace = new Map<string, Member[]>()
-    for (const member of members) {
-      if (!member.workspace) { violations.push({ memberIds: [member.id], message: `member ${member.id} (${member.name}) has no provisioned isolated worktree` }); continue }
-      byWorkspace.set(member.workspace, [...(byWorkspace.get(member.workspace) ?? []), member])
-    }
-    for (const [workspace, group] of byWorkspace) {
-      if (group.length > 1) violations.push({ memberIds: group.map(member => member.id), message: `live workers ${group.map(member => member.id).join(', ')} share one provisioned worktree (${workspace}); live workers must never exceed provisioned worktrees` })
-    }
-    const running = tasks.filter(task => task.status === 'running' && task.attempt !== undefined)
-    const byTaskWorkspace = new Map<string, Task[]>()
-    for (const task of running) {
-      const owner = allMembers.find(member => member.id === task.attempt!.ownerId)
-      if (owner === undefined || owner.status === 'stopped') { violations.push({ memberIds: [task.attempt!.ownerId], message: `running task ${task.id} has no live owner (${task.attempt!.ownerId})` }); continue }
-      byTaskWorkspace.set(owner.workspace, [...(byTaskWorkspace.get(owner.workspace) ?? []), task])
-    }
-    for (const [workspace, group] of byTaskWorkspace) {
-      if (group.length > 1) violations.push({ memberIds: group.map(task => task.attempt!.ownerId), message: `concurrently running tasks ${group.map(task => task.id).join(', ')} share worktree ${workspace}` })
-      for (let left = 0; left < group.length; left++) {
-        for (let right = left + 1; right < group.length; right++) {
-          if (overlaps(group[left]!.scope, group[right]!.scope)) {
-            violations.push({ memberIds: [group[left]!.attempt!.ownerId, group[right]!.attempt!.ownerId], message: `concurrently running tasks ${group[left]!.id} and ${group[right]!.id} declare overlapping scope in worktree ${workspace}` })
-          }
-        }
-      }
-    }
-    return violations
 }

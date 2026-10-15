@@ -14,8 +14,7 @@ const moduleOf = name => import(new URL(`../${sourceMode ? 'src' : 'lib'}/${name
 const { Scheduling } = await moduleOf('scheduling')
 const { Notices } = await moduleOf('notices')
 const { Workspaces, runProcess } = await moduleOf('workspaces')
-const { WorkspaceAdmission } = await moduleOf('workspace-admission')
-const { isolationIssues } = await moduleOf('task-graph')
+const { WorkspaceAdmission, isolationIssues } = await moduleOf('workspace-admission')
 const { SwarmStore } = await moduleOf('store')
 const { SwarmRuntime } = await moduleOf('runtime')
 const { captureGitSnapshot } = await moduleOf('git-snapshot')
@@ -276,7 +275,7 @@ test('M2-11: isolation uses explicit member IDs including task workspace conflic
   assert.equal(admission.isolationAllows('m', members[1]), true)
   assert.equal(admission.isolationAllows('m', members[0]), false)
   const tasks = ['a', 'b'].map(id => ({ id, status: 'running', scope: ['**'], attempt: { ownerId: 'victim' } }))
-  const issues = isolationIssues(members, tasks, () => true)
+  const issues = isolationIssues(members, tasks)
   assert.ok(issues.some(issue => issue.memberIds.includes('victim') && issue.message.includes('concurrently running tasks')))
 })
 

@@ -8,8 +8,8 @@
  * so no call site changed; the pure helpers are imported by name.
  */
 import { tmpdir } from 'node:os'
-import { isolationIssues, stopPending, subjectsOfTasks, terminal } from './task-graph.ts'
-import { scopesOverlap } from './scheduler.ts'
+import { stopPending, subjectsOfTasks, terminal } from './task-graph.ts'
+import { scopeKeysOverlap } from './scheduler.ts'
 import { claimFor, isContained, reauthorizeWorkspace, WorkspaceRevokedError, WORKSPACE_AUTHORIZATION_CODE, type WorkspaceClaim } from './authorization.ts'
 import { hasNotice } from './arena.ts'
 import { isolationOpener, noticeIdentity } from './notices.ts'
@@ -17,7 +17,7 @@ import { emitGuardTerminal, guardTerminalKey } from './refusals.ts'
 import type { SwarmRuntime } from './runtime.ts'
 import { progressed, type SchedulingPass } from './kernel.ts'
 import { absoluteCheckPaths, shellSegments } from './admission.ts'
-import type { Member, Mission } from './types.ts'
+import type { Member, Mission, Task } from './types.ts'
 
 /**
  * R11-15: the shared temp roots every workspace-write execution may write
@@ -530,7 +530,41 @@ export class WorkspaceAdmission {
     return this.isolationIssues(missionId).map(issue => issue.message)
   }
 
-  private isolationIssues(missionId: string): ReturnType<typeof isolationIssues> {
-    return isolationIssues(this.rt.store.list('members', missionId), this.rt.store.list('tasks', missionId), scopesOverlap)
+  private isolationIssues(missionId: string): IsolationIssue[] {
+    return isolationIssues(this.rt.store.list('members', missionId), this.rt.store.list('tasks', missionId))
   }
+}
+
+interface IsolationIssue { memberIds: string[]; message: string }
+
+/** Identity-bearing evidence shared by admission and its read-only explanation. */
+export function isolationIssues(allMembers: readonly Member[], tasks: readonly Task[]): IsolationIssue[] {
+    const violations: IsolationIssue[] = []
+    const members = allMembers.filter(member => member.status !== 'stopped')
+    const byWorkspace = new Map<string, Member[]>()
+    for (const member of members) {
+      if (!member.workspace) { violations.push({ memberIds: [member.id], message: `member ${member.id} (${member.name}) has no provisioned isolated worktree` }); continue }
+      byWorkspace.set(member.workspace, [...(byWorkspace.get(member.workspace) ?? []), member])
+    }
+    for (const [workspace, group] of byWorkspace) {
+      if (group.length > 1) violations.push({ memberIds: group.map(member => member.id), message: `live workers ${group.map(member => member.id).join(', ')} share one provisioned worktree (${workspace}); live workers must never exceed provisioned worktrees` })
+    }
+    const running = tasks.filter(task => task.status === 'running' && task.attempt !== undefined)
+    const byTaskWorkspace = new Map<string, Task[]>()
+    for (const task of running) {
+      const owner = allMembers.find(member => member.id === task.attempt!.ownerId)
+      if (owner === undefined || owner.status === 'stopped') { violations.push({ memberIds: [task.attempt!.ownerId], message: `running task ${task.id} has no live owner (${task.attempt!.ownerId})` }); continue }
+      byTaskWorkspace.set(owner.workspace, [...(byTaskWorkspace.get(owner.workspace) ?? []), task])
+    }
+    for (const [workspace, group] of byTaskWorkspace) {
+      if (group.length > 1) violations.push({ memberIds: group.map(task => task.attempt!.ownerId), message: `concurrently running tasks ${group.map(task => task.id).join(', ')} share worktree ${workspace}` })
+      for (let left = 0; left < group.length; left++) {
+        for (let right = left + 1; right < group.length; right++) {
+          if (group[left]!.scope.some(a => group[right]!.scope.some(b => scopeKeysOverlap(a, b)))) {
+            violations.push({ memberIds: [group[left]!.attempt!.ownerId, group[right]!.attempt!.ownerId], message: `concurrently running tasks ${group[left]!.id} and ${group[right]!.id} declare overlapping scope in worktree ${workspace}` })
+          }
+        }
+      }
+    }
+    return violations
 }
