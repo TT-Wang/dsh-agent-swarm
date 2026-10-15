@@ -1,11 +1,12 @@
 /**
- * The kernel every seam stands on, and the scheduling pass record with its
- * stamps: a seam reads the store, the clock and the bounds, commits and queues
- * through `Kernel`, and stamps a pass body it awaits for without importing the
- * sweep.
+ * The kernel every seam stands on, F(S) with it, and the scheduling pass record
+ * with its stamps: a seam reads the store, the clock, the bounds and F(S),
+ * commits and queues through `Kernel`, and stamps a pass body it awaits for
+ * without importing the sweep.
  */
+import { createHash } from 'node:crypto'
 import type { SwarmStore } from './store.ts'
-import type { Mission, RuntimeConfig, Task, WorkerAdapter } from './types.ts'
+import type { Member, Mission, RuntimeConfig, Task, WorkerAdapter } from './types.ts'
 
 /**
  * The infrastructure `SwarmRuntime` implements and hands each seam as itself:
@@ -13,9 +14,10 @@ import type { Mission, RuntimeConfig, Task, WorkerAdapter } from './types.ts'
  * the mission queue, the lifecycle flags and the declared bounds. A bound is a
  * getter over the live config, never a snapshot, because a config can change
  * after construction. `fingerprint` is F(S), the board digest the owner
- * instruments and the stall events carry, cached per store revision and never
- * trusted inside an open transaction (`commitDepth`), so the cache has one owner
- * below every seam that reads it.
+ * instruments and the stall events carry: the kernel builds the slice it digests
+ * (`MissionFingerprintBoard`), digests it (`missionFingerprint`) and caches the
+ * digest per store revision, never trusting the cache inside an open transaction
+ * (`commitDepth`). Every part of F(S) is the kernel's; a seam only reads it.
  */
 export interface Kernel {
   readonly store: SwarmStore
@@ -40,6 +42,59 @@ export interface Kernel {
   task(missionId: string, taskId: string): Task
   isWorkerSession(sessionId: string): boolean
   fingerprint(missionId: string): string
+}
+
+/** The owner-observable board slice `missionFingerprint` digests (spec §4). */
+export interface MissionFingerprintBoard {
+  status: Mission['status']
+  tasks: readonly MissionFingerprintTask[]
+  members: ReadonlyArray<{ id: string; status: Member['status'] }>
+  /** Undelivered worker outbox rows whose recipient can no longer receive them. */
+  pendingDeliveries: number
+  challengedEvidence: number
+  /** Ceilings already hit: the budget pause id and each task's exhausted dimension. */
+  ceilings: readonly string[]
+}
+
+/**
+ * One task's owner-observable slice of the no-silent-state board. `ready` and
+ * `unreviewed` are derived by the runtime from durable state (`ready()` and the
+ * live review path); they are never supplied by a caller's claim.
+ */
+interface MissionFingerprintTask {
+  id: string
+  status: Task['status']
+  /** The attempt owner only; a planned assignee is not an observed owner. */
+  attemptOwner?: string
+  /** A pending task at least one idle or waiting member can run right now. */
+  ready: boolean
+  /** A submitted task no live independent review can accept. */
+  unreviewed: boolean
+}
+
+/**
+ * Stable digest `F(S)` of the owner-observable board (docs/no-silent-state-spec.md
+ * §4). Every field is durable state; wall-clock fields are excluded by
+ * construction, so an idle tick never changes the fingerprint. It is an owner
+ * instrument and an audit field, never a notice's identity. Pure so a test can
+ * recompute it from the board.
+ */
+export function missionFingerprint(board: MissionFingerprintBoard): string {
+  const order = (a: { id: string }, b: { id: string }) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0)
+  const tasks = [...board.tasks].sort(order).map(task => [task.id, task.status, task.attemptOwner ?? null, task.ready ? 1 : 0, task.unreviewed ? 1 : 0])
+  const members = [...board.members].sort(order).map(member => [member.id, member.status])
+  const canonical = JSON.stringify({
+    status: board.status,
+    tasks,
+    ready: board.tasks.filter(task => task.ready).length,
+    notReady: board.tasks.filter(task => task.status === 'pending' && !task.ready).length,
+    unreviewed: board.tasks.filter(task => task.unreviewed).length,
+    members,
+    pendingDeliveries: board.pendingDeliveries,
+    challengedEvidence: board.challengedEvidence,
+    ceilings: [...board.ceilings].sort(),
+  })
+  return createHash('sha256').update(canonical).digest('hex').slice(0, 32)
 }
 
 /**
