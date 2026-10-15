@@ -2764,3 +2764,37 @@ trace 144 ["isIdle","member#4",{"returned":true}]
 trace 145 ["deliver","member#4","msg#3"]
 trace 146 ["isIdle","member#3",{"returned":true}]
 trace 147 ["isIdle","member#4",{"returned":true}]
+# runtime 6
+event 0 {"actor":"owner","data":{"acceptance":["fault recovery is proven from durable state"],"budget":{"maxDurationMs":600000,"maxExperiments":0,"maxSteps":500,"maxTasks":30,"maxTokens":500000,"maxWorkers":3},"createdAt":"t+133410","deadline":"t+733410","executionTime":{"usedMs":0},"id":"mission#1","objective":"Prove the injected fault fired and recovery holds","ownerSessionId":"fault-owner","scope":["**"],"status":"active","title":"Fault injection","updatedAt":"t+133410","usedSteps":0,"usedTokens":0,"workspace":"<dir>","workspaceAuthorizationSource":"session","workspaceGrantRoot":"<dir>"},"missionId":"mission#1","type":"mission/created"}
+event 1 {"actor":"owner","data":{"grantRoot":"<dir>","source":"session","workspace":"<dir>"},"missionId":"mission#1","type":"mission/workspace-bound"}
+event 2 {"actor":"owner","data":{"id":"stream#1","missionId":"mission#1","objective":"Exercise the fault path","title":"Faults"},"missionId":"mission#1","type":"workstream/created"}
+event 3 {"actor":"owner","data":{"id":"member#1","maxOutputTokens":5000,"missionId":"mission#1","name":"Author","phase":"active","role":"implementation","sessionId":"swarm-session#1","subscriptions":[],"workspace":"/isolated/member#1"},"missionId":"mission#1","type":"member/added"}
+event 4 {"actor":"owner","data":{"id":"member#2","maxOutputTokens":5000,"missionId":"mission#1","name":"Reviewer","phase":"active","role":"verification","sessionId":"swarm-session#2","subscriptions":[],"workspace":"/isolated/member#2"},"missionId":"mission#1","type":"member/added"}
+event 5 {"actor":"runtime","data":{"boundMs":60000,"cause":"scheduling-pass","liveSubjects":[],"missionFingerprint":"d8772e106153059d4f5174ae10f45e04","noticeKey":"scheduling-pass:mission#1:mission:mission#1:4c73f63580172f84","passId":"pass_mission#1","passStartedAt":"t+133410","reason":"scheduling pass did not return within its 60000ms bound and advanced no durable state","releaseBoundMs":60000,"releaseGapMs":60000,"releasedAt":"t+193410","releasedWhileLive":false,"revisionAtStall":6,"revisionBefore":6,"runId":"operation#1","stateUnchanged":true,"unschedulable":[],"wedged":true},"missionId":"mission#1","type":"mission/stalled"}
+event 6 {"actor":"runtime","data":{"consecutiveFailures":1,"error":"Error: Worker startup timed out (released by the scenario)","memberId":"member#1","rerouted":false},"missionId":"mission#1","type":"member/resume-failed"}
+missions 0 {"acceptance":["fault recovery is proven from durable state"],"budget":{"maxDurationMs":600000,"maxExperiments":0,"maxSteps":500,"maxTasks":30,"maxTokens":500000,"maxWorkers":3},"createdAt":"t+133410","deadline":"t+733410","executionTime":{"usedMs":0},"id":"mission#1","objective":"Prove the injected fault fired and recovery holds","ownerSessionId":"fault-owner","scope":["**"],"status":"active","title":"Fault injection","updatedAt":"t+133410","usedSteps":0,"usedTokens":0,"workspace":"<dir>","workspaceAuthorizationSource":"session","workspaceGrantRoot":"<dir>"}
+members 0 {"id":"member#1","maxOutputTokens":5000,"missionId":"mission#1","name":"Author","phase":"active","role":"implementation","sessionId":"swarm-session#1","startError":"Error: Worker startup timed out (released by the scenario)","startFailures":1,"status":"idle","subscriptions":[],"workspace":"/isolated/member#1"}
+members 1 {"id":"member#2","maxOutputTokens":5000,"missionId":"mission#1","name":"Reviewer","phase":"active","role":"verification","sessionId":"swarm-session#2","status":"idle","subscriptions":[],"workspace":"/isolated/member#2"}
+workstreams 0 {"id":"stream#1","missionId":"mission#1","objective":"Exercise the fault path","title":"Faults"}
+deliveries 0 {"content":"An owner notice whose delivery hangs","createdAt":"t+133410","deliveredAt":"t+193410","from":"runtime","id":"msg#1","kind":"control","missionId":"mission#1","notice":{"class":"decision","dedupKey":"test/held:mission#1:mission:mission#1:c20dea4d876b5b8f","handoffAt":"t+133410","queuedAt":"t+133410","reason":"held","sentAt":"t+133410","subjects":["mission:mission#1"],"trigger":"test/held"},"subjects":["mission:mission#1"],"to":"owner"}
+deliveries 1 {"content":"Scheduling pass pass_mission#1 (run operation#1) for mission mission#1 did not return within 60000ms and produced no durable state change (fingerprint d8772e106153). This pass keeps the mission's scheduling until the call it awaits returns at its own bound; the next pass then resumes from lease recovery. Unschedulable: none. Work the pass never reached: none. Decide: inspect the named tasks, admit a repair with swarm_propose, or withdraw the blocking work with swarm_cancel.","createdAt":"t+193410","deliveredAt":"t+193410","from":"runtime","id":"msg#2","kind":"control","missionId":"mission#1","notice":{"class":"decision","dedupKey":"scheduling-pass:mission#1:mission:mission#1:4c73f63580172f84","handoffAt":"t+193410","queuedAt":"t+193410","reason":"pass-timeout","sentAt":"t+193410","subjects":["mission:mission#1"],"trigger":"scheduling-pass"},"subjects":["mission:mission#1"],"to":"owner"}
+deliveries 2 {"content":"Author could not start (failure 1 of 3); its queued work and task recovery allowance are preserved.","createdAt":"t+193410","deliveredAt":"t+193410","from":"runtime","id":"msg#3","kind":"control","missionId":"mission#1","notice":{"class":"decision","dedupKey":"member/resume-failed:mission#1:mission:mission#1:e4fcd6b0c515d300","handoffAt":"t+193410","queuedAt":"t+193410","reason":"member#1 start failure 7","sentAt":"t+193410","subjects":["mission:mission#1"],"trigger":"member/resume-failed"},"subjects":["mission:mission#1"],"to":"owner"}
+trace 0 ["bind",{"activity":"<fn>","admitDelivery":"<fn>","beforeStep":"<fn>","failure":"<fn>","guard":"<fn>","idle":"<fn>","ownerUsage":"<fn>","providerOutage":"<fn>","recoveryFallback":"<fn>","toolRun":"<fn>","usage":"<fn>","usageSnapshot":"<fn>","verificationCleanupFailure":"<fn>"}]
+trace 1 ["prepareWorkspace","mission#1","member#1"]
+trace 2 ["start",{"member":"member#1","mission":"mission#1","ownerSessionId":"fault-owner"},"<signal>"]
+trace 3 ["prepareWorkspace","mission#1","member#2"]
+trace 4 ["start",{"member":"member#2","mission":"mission#1","ownerSessionId":"fault-owner"},"<signal>"]
+trace 5 ["start",{"member":"member#1","mission":"mission#1","ownerSessionId":"fault-owner"},"<signal>"]
+trace 6 ["isIdle","member#1",{"returned":false}]
+trace 7 ["start",{"member":"member#2","mission":"mission#1","ownerSessionId":"fault-owner"},"<signal>"]
+trace 8 ["isIdle","member#2",{"returned":false}]
+trace 9 ["deliver","owner","msg#1"]
+trace 10 ["start",{"member":"member#1","mission":"mission#1","ownerSessionId":"fault-owner"},"<signal>"]
+trace 11 ["currentActivity","member#1",{}]
+trace 12 ["currentActivity","member#2",{}]
+trace 13 ["currentActivity","member#1",{}]
+trace 14 ["currentActivity","member#2",{}]
+trace 15 ["deliver","owner","msg#2"]
+trace 16 ["start",{"member":"member#2","mission":"mission#1","ownerSessionId":"fault-owner"},"<signal>"]
+trace 17 ["isIdle","member#2",{"returned":false}]
+trace 18 ["deliver","owner","msg#3"]

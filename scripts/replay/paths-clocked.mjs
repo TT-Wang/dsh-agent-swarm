@@ -21,6 +21,12 @@
  *     dispatchable work and again for the stall, so the order in which the
  *     interpretation evaluates its sets is in the trace. Once every handle can
  *     start, each preferred member takes its own task.
+ *  6. A pump that ages out mid-tick. An owner notice's delivery hangs, so the
+ *     pump that started it stays in flight; a body wedges in its start. The
+ *     tick's outbox guard joins that pump one millisecond inside its bound, the
+ *     guards after it take that millisecond, and the watchdog names the body at
+ *     the bound. The naming is delivered in its own tick, while the body is
+ *     wedged.
  *
  * Durable state is injected only where no runtime path produces it (a marker
  * without an owner or at an older epoch, a missing owner, a shared worktree),
@@ -178,7 +184,60 @@ async function preference() {
   } finally { await f.cleanup() }
 }
 
+const HELD_NOTICE = 'An owner notice whose delivery hangs'
+
+/** The next `start` hangs until the scenario releases it, and the owner delivery of HELD_NOTICE hangs until it ends `held`. */
+class AgeOutWorkers extends FakeWorkers {
+  wedgeNext = false
+  wedged = Promise.withResolvers()
+  release
+  delivering = Promise.withResolvers()
+  held = Promise.withResolvers()
+  async start(spec, signal) {
+    this.started.push(spec.member.id)
+    if (!this.wedgeNext) return
+    this.wedgeNext = false
+    this.wedged.resolve()
+    await new Promise((_resolve, reject) => {
+      this.release = () => reject(new Error('Worker startup timed out (released by the scenario)'))
+      signal?.addEventListener('abort', () => reject(signal.reason), { once: true })
+    })
+  }
+  async deliver(member, delivery) {
+    if (member.id === 'owner' && delivery.content === HELD_NOTICE) { this.delivering.resolve(); await this.held.promise }
+    return await super.deliver(member, delivery)
+  }
+}
+
+async function pumpAgeOut() {
+  const workers = new AgeOutWorkers()
+  const f = await setup({ workers, config: { workerStartTimeoutMs: 3_600_000 } })
+  try {
+    const bound = f.runtime.config.stallPassTimeoutMs
+    await f.runtime.settle(f.mission.id)
+    f.runtime.commit(f.mission.id, () => f.runtime.notify(f.mission.id, HELD_NOTICE, [`mission:${f.mission.id}`], { trigger: 'test/held', reason: 'held' }))
+    f.runtime.notices.pumpOutbox()
+    await workers.delivering.promise
+    workers.wedgeNext = true
+    f.runtime.kick(f.mission.id)
+    await workers.wedged.promise
+    f.clock.advance(bound - 1)
+    const sweepStarts = f.runtime.sweepStarts.bind(f.runtime)
+    f.runtime.sweepStarts = () => { sweepStarts(); f.clock.advance(1) }
+    await f.runtime.tick()
+    f.runtime.sweepStarts = sweepStarts
+    const named = f.runtime.store.events(f.mission.id, 5_000).filter(event => event.type === 'mission/stalled' && event.data.cause === 'scheduling-pass')
+    assert.equal(named.length, 1, 'the watchdog names the body at its bound')
+    const naming = f.runtime.store.list('deliveries', f.mission.id).find(delivery => delivery.notice?.dedupKey === named[0].data.noticeKey)
+    assert.ok(naming?.deliveredAt !== undefined, 'the naming is delivered in its own tick, while the body is wedged')
+    workers.release()
+    workers.held.resolve()
+    await f.runtime.settle(f.mission.id)
+    return { named: named.length }
+  } finally { await f.cleanup() }
+}
+
 await runScenario({
-  id: 'paths', title: 'Clocked: stop fences, isolation, silence bounds, completion and preference', invariants: [],
-  body: async () => ({ fences: await stopFences(), isolation: await isolation(), silence: await silence(), completion: await completion(), preference: await preference() }),
+  id: 'paths', title: 'Clocked: stop fences, isolation, silence bounds, completion, preference and a pump that ages out mid-tick', invariants: [],
+  body: async () => ({ fences: await stopFences(), isolation: await isolation(), silence: await silence(), completion: await completion(), preference: await preference(), pumpAgeOut: await pumpAgeOut() }),
 })
