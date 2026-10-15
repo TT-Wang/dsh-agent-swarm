@@ -21,7 +21,7 @@ import { liveReviewFor } from './admission.ts'
 import { memberPhaseOf } from './projection.ts'
 import { recoveryExit } from './declared-checks.ts'
 import { TERMINAL_STATES, completionExempt, missionSubject, pendingStopOwner, quiescencePending, selectAcceptedDelivery, subjectsOfTasks, taskGraphIndex, taskSubject, terminal, uncoveredCriteria, type TaskGraphIndex } from './task-graph.ts'
-import type { CheckResult, Member, Mission, RuntimeConfig, Task } from './types.ts'
+import type { CheckResult, Delivery, Evidence, Member, Mission, RuntimeConfig, Task } from './types.ts'
 
 /**
  * S1: the bound on one scheduling pass before the runtime names it wedged, in
@@ -114,8 +114,16 @@ export interface AdapterView {
   startable(memberId: string): boolean
 }
 
-/** The durable log a board reads where a decision reads it: task events, tool runs, the deliveries ledger and evidence. */
-export type BoardRecords = Pick<SwarmStore, 'latestTaskEvent' | 'toolRuns' | 'list'>
+/**
+ * The durable log a board reads where a decision reads it: task events, tool
+ * runs, the deliveries ledger and evidence. It lists those two tables only: the
+ * board's own rows (its mission, tasks and members) are its fields, so no
+ * predicate can read one again through the log.
+ */
+export interface BoardRecords extends Pick<SwarmStore, 'latestTaskEvent' | 'toolRuns'> {
+  list(table: 'deliveries', missionId: string): Delivery[]
+  list(table: 'evidence', missionId: string): Evidence[]
+}
 
 /** One mission's rows at one instant, with the clock, the bounds, the adapter view and the log every decision over them reads. */
 export interface Board {
