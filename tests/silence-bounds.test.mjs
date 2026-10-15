@@ -47,6 +47,7 @@ import assert from 'node:assert/strict'
 import { silenceReport } from './instruments.mjs'
 import { FakeWorkers, eventually, makeRuntime } from './faults/harness.mjs'
 import { noticeFamily } from '../lib/notices.js'
+import { formatSpan } from '../lib/kernel.js'
 
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
 
@@ -390,4 +391,9 @@ test('R16-D8: the silence projection reads both gaps, the wedge record and the u
   assert.ok(report.attemptsEnded >= 1)
   assert.equal(report.passReleases.count, 1, 'the wedge count comes from the durable stall events')
   assert.equal(report.passReleases.worst.runId, wedged.operationId)
+})
+
+test('both silence notices render a span as seconds, minutes and seconds, or hours and minutes', () => {
+  for (const [ms, text] of [[-1_500, '0s'], [59_499, '59s'], [59_500, '1m 0s'], [60_000, '1m 0s'], [3_599_000, '59m 59s'],
+    [3_599_500, '1h 0m'], [3_600_000, '1h 0m'], [3_661_000, '1h 1m'], [90_061_000, '25h 1m']]) assert.equal(formatSpan(ms), text, `${ms}ms`)
 })
