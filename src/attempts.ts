@@ -104,8 +104,8 @@ export class Attempts {
 
   /** Stop outside the pass queue; only confirmed quiescence can re-pend this epoch. */
   resumeStoppedAttempt(missionId: string, task: Task, options: { force?: boolean } = {}): void {
+    if (!stopPending(task)) return
     const marker = task.resumeAfterStop
-    if (marker?.epoch !== task.epoch) return
     if (options.force && !this.stopRetries.get(task.id)?.inFlight) {
       delete marker.failure
       this.stopRetries.delete(task.id)

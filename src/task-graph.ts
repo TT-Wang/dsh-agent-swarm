@@ -234,7 +234,7 @@ export function subjectsOfTasks(tasks: readonly Pick<Task, 'id' | 'epoch'>[], mi
  * the notices; naming it is what lets a reader see that they all ask the same
  * question rather than four similar ones.
  */
-export function stopPending(task: Pick<Task, 'epoch' | 'resumeAfterStop'>): boolean {
+export function stopPending<T extends Pick<Task, 'epoch' | 'resumeAfterStop'>>(task: T): task is T & { resumeAfterStop: NonNullable<T['resumeAfterStop']> } {
   return task.resumeAfterStop?.epoch === task.epoch
 }
 
@@ -242,7 +242,7 @@ export function stopPending(task: Pick<Task, 'epoch' | 'resumeAfterStop'>): bool
 export function pendingStopOwner(tasks: readonly Task[], memberId: string): boolean {
   return tasks.some(task => {
     if (!stopPending(task)) return false
-    const marker = task.resumeAfterStop!
+    const marker = task.resumeAfterStop
     if (marker.memberId !== undefined) return marker.memberId === memberId
     // An unresolved legacy owner is a conservative stop of every mission
     // handle; reserve every member until the complete scan confirms quiescence.

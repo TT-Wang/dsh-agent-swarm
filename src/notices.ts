@@ -492,8 +492,8 @@ export function waitsLegitimately(rt: LineageRuntime, task: Task, tasks: Task[])
     // matching stop is inside its bound. An unknown owner reserves all members.
     const memberId = task.assigneeId ?? task.plannedAssigneeId
     const stops = tasks.filter(candidate => stopPending(candidate)
-      && (candidate.id === task.id || candidate.resumeAfterStop!.memberId === undefined
-        || (memberId !== undefined && candidate.resumeAfterStop!.memberId === memberId)))
+      && (candidate.id === task.id || candidate.resumeAfterStop.memberId === undefined
+        || (memberId !== undefined && candidate.resumeAfterStop.memberId === memberId)))
     if (stops.length > 0) return stops.every(candidate => candidate.resumeAfterStop!.at !== undefined
       && rt.now() - candidate.resumeAfterStop!.at! <= rt.stallPassTimeoutMs)
     // Once the stop settles, another live attempt may take the selected member
@@ -1062,9 +1062,8 @@ export class Notices {
     const tasks = this.rt.store.list('tasks', mission.id)
     return (delivery.subjects ?? []).filter(subject => {
       const task = taskFromSubject(subject, tasks)
-      const marker = task?.resumeAfterStop
-      if (task === undefined || marker?.epoch !== task.epoch || marker.failure === undefined) return false
-      return key === guardTerminalKey('attempt_lease', { localKey: stopFaultKey(task.id, marker, marker.failure.message) })
+      if (task === undefined || !stopPending(task) || task.resumeAfterStop.failure === undefined) return false
+      return key === guardTerminalKey('attempt_lease', { localKey: stopFaultKey(task.id, task.resumeAfterStop, task.resumeAfterStop.failure.message) })
     })
   }
 

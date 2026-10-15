@@ -1,6 +1,6 @@
 import { EVENT_PANEL_LABELS, type EventKind } from '../events.ts'
 import type { Evidence, Member, Snapshot, Task, WorkerActivity } from '../types.ts'
-import { TERMINAL_STATES, completionExempt, missionSubject, taskSubject } from '../task-graph.ts'
+import { TERMINAL_STATES, completionExempt, missionSubject, stopPending, taskSubject } from '../task-graph.ts'
 import type { LiveWorkRow } from './live-work.ts'
 
 export type ConnectionState = 'connecting' | 'connected' | 'reconnecting' | 'paused'
@@ -319,7 +319,7 @@ export function sidebarState(snapshot: Snapshot, connection: ConnectionState = '
   const reviewed: Record<string, true> = {}
   for (const task of tasks) {
     if (task.kind === 'verification' && task.reviewOf !== undefined
-      && (task.status === 'pending' || task.status === 'running' || (task.status === 'blocked' && task.resumeAfterStop?.epoch === task.epoch))) reviewed[task.reviewOf] = true
+      && (task.status === 'pending' || task.status === 'running' || (task.status === 'blocked' && stopPending(task)))) reviewed[task.reviewOf] = true
   }
   let stopping: Task | undefined
   let blocked: Task | undefined
@@ -330,7 +330,7 @@ export function sidebarState(snapshot: Snapshot, connection: ConnectionState = '
   let pendingCount = 0
   for (const task of tasks) {
     if (task.status === 'blocked') {
-      if (task.resumeAfterStop?.epoch === task.epoch) { if (stopping === undefined) stopping = task }
+      if (stopPending(task)) { if (stopping === undefined) stopping = task }
       else if (blocked === undefined) blocked = task
     } else if (task.status === 'submitted') {
       if (unreviewed === undefined && reviewed[task.id] !== true) unreviewed = task
