@@ -494,12 +494,11 @@ export function completionError(board: Board): string | undefined {
  * Co-fires with: the lineage-resolved dependency rule (both read the same durable
  * `replaces` edges the dispatcher's `effectiveDependency` walks) and the
  * fall-through, which may name a subject only when this set does not contain it.
- * The walk is the task graph's `replacedLineage`.
+ * The walk is the board graph's `replacedLineage`.
  */
-function replacementCoverage(tasks: Task[]): Set<string> {
-  const graph = taskGraphIndex(tasks)
+function replacementCoverage(board: Pick<Board, 'tasks' | 'graph'>): Set<string> {
   const replaced = new Set<string>()
-  for (const task of tasks) if (!TERMINAL_STATES.has(task.status)) for (const origin of graph.replacedLineage(task.id).slice(1)) replaced.add(origin.id)
+  for (const task of board.tasks) if (!TERMINAL_STATES.has(task.status)) for (const origin of board.graph.replacedLineage(task.id).slice(1)) replaced.add(origin.id)
   return replaced
 }
 
@@ -508,9 +507,9 @@ function replacementCoverage(tasks: Task[]): Set<string> {
  * durable rows, so the pass, the timer-driven notice path, the delivery-time
  * relevance check and a test all classify the same board identically.
  */
-export function stallRoots(board: Pick<Board, 'tasks' | 'clock' | 'bounds'>): Task[] {
+export function stallRoots(board: Pick<Board, 'tasks' | 'graph' | 'clock' | 'bounds'>): Task[] {
   // A live replacement marks every id in its transitive lineage as covered.
-  const replaced = replacementCoverage(board.tasks)
+  const replaced = replacementCoverage(board)
   return board.tasks.filter(task => {
     if (task.status !== 'blocked' || replaced.has(task.id)) return false
     // A verdict record is not a repairable root: its source carries the repair.
@@ -578,7 +577,8 @@ export function waitsLegitimately(board: Board, task: Task): boolean {
   if (TERMINAL_STATES.has(task.status)) return false
   // R16-A: a task whose obligation is carried by a live replacement has a live
   // path whatever its own row says — the repair advances it.
-  if (replacementCoverage(tasks).has(task.id)) return true
+  const covered = replacementCoverage(board)
+  if (covered.has(task.id)) return true
   // R17-G3: a running task with a live attempt row is NOT dead — the lease path
   // owns its expiry (fence, re-pend, re-route). Only a running row with no
   // attempt at all is unrecognised.
@@ -592,7 +592,7 @@ export function waitsLegitimately(board: Board, task: Task): boolean {
     // speaks for it: a live replacement carries the repair, or the source is a
     // stall root whose notice lists this record as a dependent. Naming the
     // record again (a W3 reminder, a fall-through) repeats the root's decision.
-    if (task.reviewOf !== undefined && (replacementCoverage(tasks).has(task.reviewOf)
+    if (task.reviewOf !== undefined && (covered.has(task.reviewOf)
       || stallRoots(board).some(root => root.id === task.reviewOf))) return true
     const stop = stopPending(task) ? task.resumeAfterStop : undefined
     // R15-A3: an absent `at` is UNBOUNDED, so it is not legitimate waiting. The
