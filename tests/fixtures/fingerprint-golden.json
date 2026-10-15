@@ -431,5 +431,57 @@
       ]
     },
     "digest": "912e061c49739735eeb3c50e39cab971"
+  },
+  {
+    "name": "a submission without an artifact and no live review",
+    "cacheIsLive": true,
+    "board": {
+      "status": "active",
+      "tasks": [
+        {
+          "id": "task_1",
+          "status": "submitted",
+          "attemptOwner": "member_1",
+          "ready": false,
+          "unreviewed": true
+        },
+        {
+          "id": "task_2",
+          "status": "pending",
+          "ready": false,
+          "unreviewed": false
+        },
+        {
+          "id": "task_3",
+          "status": "pending",
+          "ready": false,
+          "unreviewed": false
+        },
+        {
+          "id": "task_4",
+          "status": "running",
+          "attemptOwner": "member_1",
+          "ready": false,
+          "unreviewed": false
+        }
+      ],
+      "members": [
+        {
+          "id": "member_1",
+          "status": "waiting"
+        },
+        {
+          "id": "member_2",
+          "status": "stopped"
+        }
+      ],
+      "pendingDeliveries": 1,
+      "challengedEvidence": 1,
+      "ceilings": [
+        "budget:pause_1",
+        "task:task_2:maxSteps"
+      ]
+    },
+    "digest": "912e061c49739735eeb3c50e39cab971"
   }
 ]

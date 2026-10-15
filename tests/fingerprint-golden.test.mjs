@@ -7,8 +7,10 @@
  * One mission walks through the board states F(S) reads: readiness (an idle,
  * a busy and a parked member, an unmet dependency), an attempt owner, a
  * submission with and without a live independent reviewer, a stopped member,
- * a task ceiling, a challenged claim, an undeliverable worker message and a
- * budget pause. At each state the test records the runtime's `fingerprint`
+ * a task ceiling, a challenged claim, an undeliverable worker message, a
+ * budget pause and a submission an older build left without an artifact (the
+ * review admission never speaks for it, yet F(S) counts it unreviewed). At
+ * each state the test records the runtime's `fingerprint`
  * (revision-cached) and the digest of its board recomputed now; the board is
  * recorded with ids relabeled by first appearance, so the golden pins what F(S)
  * derives and digests, not the random ids of one run.
@@ -85,6 +87,15 @@ test('F(S) over the fixture boards equals the recorded golden', async t => {
   put('missions', { ...f.runtime.mission(f.mission.id), budgetPause: { id: 'pause_golden', quiesced: true } })
   await step()
   record('a budget pause')
+  // F(S)'s unreviewed work is every submission no live review can accept, not
+  // only the review admission's sources: one an older build left without an
+  // artifact stays unreviewed.
+  const bare = f.runtime.store.get('tasks', first.id)
+  assert.equal(bare.status, 'submitted')
+  delete bare.artifact
+  put('tasks', bare)
+  await step()
+  record('a submission without an artifact and no live review')
 
   if (process.env.UPDATE_FINGERPRINT_GOLDEN === '1') await writeFile(GOLDEN, `${JSON.stringify(states, null, 2)}\n`)
   assert.deepEqual(states, JSON.parse(await readFile(GOLDEN, 'utf8')))
