@@ -19,6 +19,7 @@
  * owner-assembled mission returned silently.
  */
 import assert from 'node:assert/strict'
+import { completionError } from '../../lib/board.js'
 import { acceptThroughReview, blockThroughReview, clone, eventually, events, makeRuntime, now, runScenario, setup, taskOf, wait } from './harness.mjs'
 import { noticeFamily } from '../../lib/notices.js'
 
@@ -428,7 +429,7 @@ await runScenario({
         // The delivery predicate's wording since 69211b9; the row's claim is that
         // the stall carries exactly what completion reports.
         assert.match(stall.data.reason, /A unique independently accepted implementation artifact is required/)
-        assert.equal(stall.data.reason, f.runtime.completionError(f.runtime.store.get('missions', f.mission.id)))
+        assert.equal(stall.data.reason, completionError(f.runtime.boardOf(f.mission.id)))
         assertWitness(f, ownerNotices(f).find(delivery => delivery.notice.dedupKey === stall.data.noticeKey), 'board-stall', since, 'row 9b')
         rows.row9b = { witness: 'W3', reason: stall.data.reason }
       } finally { await f.cleanup() }

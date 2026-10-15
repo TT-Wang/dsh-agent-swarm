@@ -5,6 +5,7 @@ import type { SessionEvent } from '@deepseek-ai/dsh-session'
 import { ENTRY_PROMPT, HISTORICAL_OWNER_PROMPT, hiddenToolsFor, OWNER_PROMPT, type SwarmRole } from './tools.ts'
 import type { SwarmRuntime } from './runtime.ts'
 import { terminal } from './task-graph.ts'
+import { openAsks } from './arena.ts'
 
 interface Applied { role: SwarmRole; dispose: () => void }
 /** Presentation history only: a completed turn does not settle task or notice obligations. */
@@ -50,7 +51,7 @@ export class RoleScoper {
     const handled = handling?.handled
     if (starts.some(start => start.status === 'failed' && (start.recoveryNoticePending
       || (handling?.admitted.has(recoveryKey(start.id, start.planningEpoch)) && !handled?.has(recoveryKey(start.id, start.planningEpoch)))))) return 'owner'
-    if (missions.some(mission => (mission.status !== 'stopped' && this.runtime.openAsks(mission.id, 'owner').length > 0)
+    if (missions.some(mission => (mission.status !== 'stopped' && openAsks(this.runtime.store.list('deliveries', mission.id), 'owner').length > 0)
       // Keep final facts (including legacy completion decisions) until handled;
       // a stale action the outbox will not send cannot pin the large protocol.
       || (mission.status === 'completed' && this.runtime.store.list('deliveries', mission.id)

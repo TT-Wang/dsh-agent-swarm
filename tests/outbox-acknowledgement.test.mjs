@@ -2,6 +2,7 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { join } from 'node:path'
 import { FakeWorkers, makeRuntime } from './faults/harness.mjs'
+import { openAsks } from '../lib/arena.js'
 
 /** Records a clone of every delivery the outbox sends and lets a test intercept the transport. */
 class OutboxWorkers extends FakeWorkers {
@@ -125,7 +126,7 @@ for (const dismiss of [false, true]) {
     assert.ok(current.deliveredAt)
     assert.equal(current.state, dismiss ? 'dismissed' : 'answered')
     assert.equal(current.answeredBy, 'owner')
-    assert.equal(f.runtime.openAsks(f.mission.id, 'owner').length, 0)
+    assert.equal(openAsks(f.runtime.store.list('deliveries', f.mission.id), 'owner').length, 0)
   })
 }
 

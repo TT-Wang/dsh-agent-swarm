@@ -2,6 +2,8 @@ import type { Context } from '@deepseek-ai/cordis'
 import type { SwarmRuntime } from './runtime.ts'
 import type { Delivery, Mission } from './types.ts'
 import { terminal } from './task-graph.ts'
+import { openAsks } from './arena.ts'
+import { noticeSubjectsFor } from './board.ts'
 
 /** One question booked at turn start, with everything the nudge must name. */
 interface Booking {
@@ -102,7 +104,7 @@ export class OwnerReplyGuard {
     // the question booked by the preceding relay.
     const booked = this.bookings.get(sessionId) ?? new Map<string, Booking>()
     for (const mission of this.ownerMissions(sessionId)) {
-      for (const delivery of this.rt.openAsks(mission.id, 'owner')) {
+      for (const delivery of openAsks(this.rt.store.list('deliveries', mission.id), 'owner')) {
         const consumedNow = delivery.id === consumedId
         if (consumedNow && delivery.consumedAt === undefined) {
           this.rt.commit(mission.id, () => {
@@ -171,7 +173,7 @@ export class OwnerReplyGuard {
       // Each recovery turn needs its own wake. Persist its ordinal and outbox
       // row together so restart cannot spend a nudge without retaining it.
       this.rt.notices.notify(booking.missionId, ownerReplyNudge(booking.missionId, delivery, booking, spent + 1, this.options.maxNudges),
-        this.rt.noticeSubjectsFor(booking.missionId, { ...(booking.taskId === undefined ? {} : { taskId: booking.taskId }), memberId: booking.from }),
+        noticeSubjectsFor(this.rt.boardOf(booking.missionId), { ...(booking.taskId === undefined ? {} : { taskId: booking.taskId }), memberId: booking.from }),
         { dedupKey: `owner-reply-missing:${deliveryId}:${spent + 1}`, questionId: deliveryId })
     })
   }

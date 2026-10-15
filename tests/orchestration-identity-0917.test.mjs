@@ -7,6 +7,7 @@ import { canBorrowTask } from '../lib/assignment.js'
 import { taskGraphIndex } from '../lib/task-graph.js'
 import { FakeWorkers, SwarmRuntime, eventually, makeRuntime } from './faults/harness.mjs'
 import { dependencySatisfied, effectiveDependency } from '../lib/board.js'
+import { openAsks } from '../lib/arena.js'
 
 class Workers extends FakeWorkers {
   checks = [{ command: 'npm test', exitCode: 0, output: 'ok' }]
@@ -146,7 +147,7 @@ for (const paused of [false, true]) test(`C06: a ${paused ? 'paused' : 'live'} o
   const f = await fixture(t)
   f.runtime.message(f.actor(f.author), f.mission.id, { to: 'owner', kind: 'question', content: 'Which result should I produce?' })
   await f.runtime.flushOutbox(f.mission.id)
-  const question = f.runtime.openAsks(f.mission.id, 'owner')[0]
+  const question = openAsks(f.runtime.store.list('deliveries', f.mission.id), 'owner')[0]
   if (paused) f.runtime.control(f.owner, f.mission.id, 'pause', 'Pause while considering the answer')
   const before = f.runtime.store.list('deliveries', f.mission.id)
   assert.throws(() => f.runtime.message(f.owner, f.mission.id, { to: f.reviewer.id, kind: 'question', content: 'Wrong destination', replyTo: question.id }), error => error.code === 'reply_recipient_mismatch')
@@ -162,7 +163,7 @@ for (const paused of [false, true]) test(`C06: a ${paused ? 'paused' : 'live'} o
 test('C06: member replies use the same recipient check; dismiss still closes without sending', async t => {
   const f = await fixture(t)
   f.runtime.message(f.actor(f.author), f.mission.id, { to: f.reviewer.id, kind: 'question', content: 'Can you clarify the acceptance?' })
-  const question = f.runtime.openAsks(f.mission.id, f.reviewer.id)[0]
+  const question = openAsks(f.runtime.store.list('deliveries', f.mission.id), f.reviewer.id)[0]
   assert.throws(() => f.runtime.message(f.actor(f.reviewer), f.mission.id, { to: 'owner', kind: 'question', content: 'Misrouted answer', replyTo: question.id }), error => error.code === 'reply_recipient_mismatch')
   assert.equal(f.runtime.store.get('deliveries', question.id).state, 'open')
   const result = f.runtime.message(f.actor(f.reviewer), f.mission.id, { to: 'owner', kind: 'question', content: 'This question is no longer needed', replyTo: question.id, dismiss: true })

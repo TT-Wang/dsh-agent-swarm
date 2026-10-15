@@ -11,7 +11,7 @@ import { Notices, NOTICE_TEMPLATES, REJECTION_DECISION_TRIGGER, renderNotice, ty
 import { RefusalRegistry, requireStrings, requireText, sameChecks, unsupportedEffort, validatedBudget } from './refusals.ts'
 import { Scheduling } from './scheduling.ts'
 import { progressed, type Kernel, type SchedulingPass } from './kernel.ts'
-import { ADMISSION_REFUSED, AUTOMATIC_REVIEW_PREFIX, PROVIDER_OUTAGE_WINDOW_MS, bounds, capable, dependencyIdentities, dependencySatisfied, effectiveDependencies, effectiveDependency, lineage, readBoard, readinessBlocker, readMission, ready, rerouteTarget, providerQuiescent, reviewable, reviewNeed, reviewPathBlocker, reviewPathStalled, unreviewedSources, unschedulable, type AdapterView, type Board, type Bounds, type ReviewNeed } from './board.ts'
+import { ADMISSION_REFUSED, AUTOMATIC_REVIEW_PREFIX, PROVIDER_OUTAGE_WINDOW_MS, bounds, capable, completionError, dependencyIdentities, dependencySatisfied, effectiveDependencies, effectiveDependency, lineage, noticeSubjectsFor, readBoard, readinessBlocker, readMission, ready, rerouteTarget, providerQuiescent, reviewable, reviewNeed, reviewPathBlocker, reviewPathStalled, unreviewedSources, unschedulable, type AdapterView, type Board, type Bounds, type ReviewNeed } from './board.ts'
 // R17-G6/G7: the one derivation of mission derived state and its host projection.
 import { deriveMemberBoard, deriveMemberStatus, memberPhaseOf, memberDeliveryHealth, type MissionBoardMember } from './projection.ts'
 import type { MissionInterpretation } from './notices.ts'
@@ -26,7 +26,7 @@ import { validScope, scopeSubset } from './scope.ts'
 import { AdmissionError, assertDeclaredOutputs, assertScopeSelectors, citedCovers, dependencyAssumptions, formatDiagnostic, isNoopCheck, loadPackageScripts, normalizeReviewDependencies, normalizeScopeSelectors, normalizeTaskCeilings, reconcileTaskAdmission, requireHostChecks, taskCeilingBlock, taskGraphDefects, TaskGraphAdmissionError, type TaskGraphNode } from './admission.ts'
 import { canBorrowTask, canOwnReview, strandedReview } from './assignment.ts'
 import { executionClock, executionElapsed } from './resource-time.ts'
-import { TERMINAL_STATES, blockCauses, completionExempt, currentEvidenceIds, missionSubject, pendingStopOwner, quiescencePending, selectAcceptedDelivery, stopPending, subjectsOfTasks, taskGraphIndex, taskSubject, terminal, uncoveredCriteria, type BlockCause } from './task-graph.ts'
+import { TERMINAL_STATES, blockCauses, currentEvidenceIds, missionSubject, pendingStopOwner, quiescencePending, selectAcceptedDelivery, stopPending, taskGraphIndex, taskSubject, terminal, uncoveredCriteria, type BlockCause } from './task-graph.ts'
 import { checkSyntaxDetail, declaredPlanChecks, orderedTasks, pairReviews, planAdvisories, validatePlan } from './plans.ts'
 import { OWNER_ONLY_TOOLS, type Actor, type AutoStart, BoardQuery, Budget, CheckAttribution, CheckEnvelope, CheckEnvironment, CreateMissionInput, CriticalPath, criterionId, Delivery, DraftPlan, Escalation, Evidence, EvidenceStatus, Member, MemberStatus, Mission, nextWorkerName, ObserveQuery, MessageInput, PlanInput, Post, PostInput, PostKind, ProposeTaskInput, ProviderOutage, PublishInput, RecoveryFallback, RequestStartInput, RuntimeConfig, Snapshot, Task, TaskAmendment, TaskRejection, TaskCeiling, ToolRun, UsageBuckets, UsageSnapshotSource, VerificationCleanupFailure, WorkerAdapter, WorkerActivity, Workstream } from './types.ts'
 import { requireArtifactChecks } from './artifact-policy.ts'
@@ -324,27 +324,6 @@ export class SwarmRuntime implements Kernel {
    * resolved stay three facts.
    */
   recordConsumption(deliveryId: string, options: { at?: number; source?: string } = {}): boolean { return this.notices.recordConsumption(deliveryId, options) }
-  /**
-   * R15-A1: the subjects of a notice that is scoped to a task, a member or the
-   * mission itself. A task-scoped notice names that task at its epoch; a
-   * member-scoped notice names the member's unfinished work; the mission root is
-   * the fallback only when neither exists, so a notice is never anonymous.
-   * Guard pair: member-scoped notice x task-scoped notice — a member's notice
-   * never borrows another task's subject, which is what keeps one subject's clock
-   * independent of a healthy sibling (R15-A4).
-   */
-  noticeSubjectsFor(missionId: string, scope: { taskId?: string; memberId?: string } = {}): string[] {
-    const tasks = this.store.list('tasks', missionId)
-    if (scope.taskId !== undefined) {
-      const task = tasks.find(candidate => candidate.id === scope.taskId)
-      if (task !== undefined) return [taskSubject(task)]
-    }
-    if (scope.memberId !== undefined) {
-      const owned = tasks.filter(task => (task.attempt?.ownerId === scope.memberId || task.assigneeId === scope.memberId) && !TERMINAL_STATES.has(task.status))
-      if (owned.length) return subjectsOfTasks(owned, { id: missionId })
-    }
-    return [missionSubject({ id: missionId })]
-  }
   noticeLedger(actor: Actor, missionId: string, query: { limit?: number } = {}): unknown { return this.notices.noticeLedger(actor, missionId, query) }
   private bounded(text: string): string { return this.notices.bounded(text) }
   private ensureWitness(missionId: string): void { return this.notices.ensureWitness(missionId) }
@@ -1757,16 +1736,6 @@ export class SwarmRuntime implements Kernel {
     return { queued: true, ...(question === undefined ? {} : { answered: question.id }) }
   }
 
-  /**
-   * L0: questions that were delivered and still carry no answer, optionally
-   * restricted to one recipient. The receipt is the durable link `replyTo`
-   * writes; a delivery written before this field existed is never retro-open.
-   */
-  openAsks(missionId: string, to?: string): Delivery[] {
-    return this.store.list('deliveries', missionId)
-      .filter(delivery => delivery.replyExpected === true && delivery.answeredBy === undefined && (to === undefined || delivery.to === to))
-  }
-
   /** Resolve a `replyTo` target, refusing anything this caller cannot answer. */
   private answerableQuestion(missionId: string, key: string, deliveryId: string): Delivery {
     const target = this.store.get('deliveries', deliveryId)
@@ -1839,7 +1808,7 @@ export class SwarmRuntime implements Kernel {
       // R15-A1: its fact names the task or attempt it is about and carries its record. Its
       // delivery is the one that carries the fact: its own row, or over the wake budget the summary.
       const { id: deliveryId } = this.notices.enqueueOwnerNotice(missionId, body, { class: 'escalation', dedupKey, from: member.id },
-        { subjects: this.noticeSubjectsFor(missionId, { taskId, memberId: member.id }), trigger: 'escalation/raised', reason: '', escalation })
+        { subjects: noticeSubjectsFor(this.boardOf(missionId), { taskId, memberId: member.id }), trigger: 'escalation/raised', reason: '', escalation })
       this.store.event(missionId, 'escalation/raised', member.id, {
         escalationId: escalation.id, memberId: member.id, deliveryId,
         ...(taskId === undefined ? {} : { taskId }), ...(attemptId === undefined ? {} : { attemptId }),
@@ -2986,13 +2955,13 @@ export class SwarmRuntime implements Kernel {
   /** Snapshot access is checked against durable membership. */
   snapshot(actor: Actor, missionId: string): Snapshot {
     const { mission } = this.participant(actor, missionId)
-    const tasks = this.store.list('tasks', missionId)
+    const board = this.boardOf(missionId), tasks = board.tasks
     let deliveryTarget: { taskId: string; commit: string } | undefined
     try {
       const target = selectAcceptedDelivery(tasks)
       if (target.artifact) deliveryTarget = { taskId: target.id, commit: target.artifact.commit }
     } catch { deliveryTarget = undefined }
-    const completionReason = this.completionError(mission)
+    const completionReason = completionError(board)
     // R17-G6: the client's read face takes member statuses from the derived board
     // (the registered projection when published), not from a second derivation.
     return { mission, members: this.projectedMembers(missionId), workstreams: this.store.list('workstreams', missionId), tasks, evidence: this.store.list('evidence', missionId), events: this.store.events(missionId, this.config.maxEvents), pendingDeliveries: this.store.list('deliveries', missionId).filter(awaitsDelivery).length,
@@ -3220,29 +3189,6 @@ export class SwarmRuntime implements Kernel {
     })
   }
 
-  completionError(mission: Mission): string | undefined {
-    const tasks = this.store.list('tasks', mission.id)
-    if (!tasks.length) return 'Mission still has unfinished or blocked required work'
-    const unfinished = tasks.filter(task => !TERMINAL_STATES.has(task.status) && !completionExempt(task, tasks))
-    if (unfinished.length) return `Mission still has unfinished or blocked required work: ${unfinished.map(task => `${task.id} (${task.status})`).join(', ')}`
-    // Only accepted deliverable work covers a mission criterion, by the ids its
-    // replacement lineage cites; code deliverables need an artifact.
-    const graph = taskGraphIndex(tasks), deliverables = tasks.filter(task => task.status === 'accepted' && task.kind !== 'verification' && (task.kind === 'research' || task.artifact !== undefined))
-    const uncovered = uncoveredCriteria(mission.acceptance, new Set(deliverables.flatMap(task => [...graph.criteriaOf(task.id)])))
-    if (uncovered.length) return `Accepted tasks do not cover every mission acceptance criterion: ${uncovered.join(', ')}. Propose a deliverable that names them in \`covers\` with \`swarm_propose\`; an accepted task cannot gain covers`
-    if (tasks.some(task => ['implementation', 'integration'].includes(task.kind) && task.status !== 'cancelled')) {
-      try { selectAcceptedDelivery(tasks) }
-      catch (error) { return error instanceof Error ? error.message : String(error) }
-    }
-    // Evidence of explicitly cancelled work no longer supports an accepted result,
-    // and a claim a rework archived is history of a rejected commit that no
-    // verdict judges again; live disputes still block.
-    const dead = new Set(tasks.filter(task => task.status === 'cancelled').map(task => task.id))
-    const archived = new Set(tasks.flatMap(task => task.rejections?.flatMap(rejection => rejection.evidenceIds) ?? []))
-    const disputed = this.store.list('evidence', mission.id).filter(evidence => evidence.status === 'challenged' && !dead.has(evidence.taskId) && !archived.has(evidence.id))
-    if (disputed.length) return `Unresolved evidence challenges prevent completion: ${disputed.map(evidence => evidence.id).join(', ')}`
-    return undefined
-  }
   /** Automatic completion consumes accepted obligations; it never withdraws unfinished work.
    * Owner-assembled missions retain explicit completion (R10-14: an owner-assembled
    * mission may still be extending its plan); the board classifier tells the owner
@@ -3250,7 +3196,7 @@ export class SwarmRuntime implements Kernel {
    */
   private completeAutomatic(missionId: string): boolean {
     const mission = this.mission(missionId)
-    if (mission.status !== 'active' || this.completionError(mission) !== undefined || this.store.list('starts', missionId).length === 0) return false
+    if (mission.status !== 'active' || completionError(this.boardOf(missionId)) !== undefined || this.store.list('starts', missionId).length === 0) return false
     this.control({ sessionId: mission.ownerSessionId }, missionId, 'complete', 'Automatically completed after independent verification satisfied all mission acceptance criteria')
     this.commit(missionId, () => {
       this.store.event(missionId, 'automatic/completed', 'runtime', {})
@@ -3486,7 +3432,7 @@ export class SwarmRuntime implements Kernel {
       mission.coordinatorId = coordinatorId
     } else if (action === 'complete') {
       // The owner decides; verified coverage and the deliverable are still required.
-      const error = this.completionError(mission)
+      const error = completionError(this.boardOf(missionId))
       if (error) throw new PolicyError('mission_completion_pending', 'validation_error', error)
       mission.status = 'completed'
     } else if (action === 'resume') {
@@ -3770,7 +3716,7 @@ export class SwarmRuntime implements Kernel {
       this.store.event(member.missionId, 'member/failure', memberId, { error })
       // R15-A1: it names the member's unfinished work, else the mission root. The fact
       // is the member on that work; the provider's text (per-request data) is the body.
-      this.notify(member.missionId, message, this.noticeSubjectsFor(member.missionId, { memberId: member.id }), { trigger: 'member/failure', reason: member.id })
+      this.notify(member.missionId, message, noticeSubjectsFor(this.boardOf(member.missionId), { memberId: member.id }), { trigger: 'member/failure', reason: member.id })
     })
   }
   /**
@@ -3810,7 +3756,7 @@ export class SwarmRuntime implements Kernel {
       this.store.put('tasks', task)
       this.store.event(info.missionId, 'task/recovery-fallback', 'runtime', { taskId: info.taskId, epoch: info.epoch, from: info.previousOwnerId, to: info.memberId, commit: info.commit, preserved: info.preserved, reason: info.reason })
       // A carried snapshot asks nothing of the owner; a left-behind worktree may.
-      this.notify(info.missionId, content, this.noticeSubjectsFor(info.missionId, { taskId: info.taskId }), { noticeClass: info.preserved ? 'progress' : 'decision', trigger: 'task/recovery-fallback', reason: info.reason })
+      this.notify(info.missionId, content, noticeSubjectsFor(this.boardOf(info.missionId), { taskId: info.taskId }), { noticeClass: info.preserved ? 'progress' : 'decision', trigger: 'task/recovery-fallback', reason: info.reason })
     })
   }
   /**
@@ -3831,7 +3777,7 @@ export class SwarmRuntime implements Kernel {
     const content = `Verification checkout ${info.checkout} for ${info.taskId} could not be removed cleanly after its checks ran (${info.reason}). The check results and the verdict stand. The mission's next verification reclaims what is left of the checkout and its worktree registration, so no repository-wide prune is needed.`
     this.commit(info.missionId, () => {
       this.store.event(info.missionId, 'task/verification-cleanup-failed', 'runtime', { taskId: info.taskId, memberId: info.memberId, checkout: info.checkout, reason: info.reason })
-      this.notify(info.missionId, content, this.noticeSubjectsFor(info.missionId, { taskId: info.taskId }), { noticeClass: 'progress', trigger: 'task/verification-cleanup-failed', reason: info.reason })
+      this.notify(info.missionId, content, noticeSubjectsFor(this.boardOf(info.missionId), { taskId: info.taskId }), { noticeClass: 'progress', trigger: 'task/verification-cleanup-failed', reason: info.reason })
     })
   }
   /**
@@ -3907,7 +3853,7 @@ export class SwarmRuntime implements Kernel {
       if (outage !== undefined) return
       if (!reroute) {
         this.notify(missionId, `${member.name} could not start (failure ${consecutiveFailures} of ${START_FAILURE_REROUTE_LIMIT}); its queued work and task recovery allowance are preserved.`,
-          this.noticeSubjectsFor(missionId, { memberId: member.id }), { trigger: 'member/resume-failed', reason: `${member.id} start failure ${failure}` })
+          noticeSubjectsFor(this.boardOf(missionId), { memberId: member.id }), { trigger: 'member/resume-failed', reason: `${member.id} start failure ${failure}` })
         return
       }
       // The retirement is its own fact (never deduplicated into an earlier
@@ -3921,7 +3867,7 @@ export class SwarmRuntime implements Kernel {
       const options = { trigger: 'member/resume-failed', reason: `${member.id} retired after ${consecutiveFailures} consecutive start failures` }
       if (!stranded.length) {
         this.notify(missionId, `${member.name} could not start after ${consecutiveFailures} consecutive failures; its work remains on the board; capable live routes may claim it, or use swarm_control with taskId and action=amend to choose an assignee.`,
-          this.noticeSubjectsFor(missionId, { memberId: member.id }), options)
+          noticeSubjectsFor(this.boardOf(missionId), { memberId: member.id }), options)
         return
       }
       const routes = retired.map(candidate => `${candidate.name} (${candidate.id}): ${candidate.startFailures} consecutive start failures, last error: ${candidate.startError ?? 'not recorded'}`)

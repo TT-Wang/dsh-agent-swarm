@@ -21,6 +21,7 @@ import { join } from 'node:path'
 import { PolicyError } from '../lib/policy-error.js'
 import { assessText, toolSchemaIndex } from './refusal-inventory.mjs'
 import { FakeClock, FakeWorkers, MISSION_ACCEPTANCE, WorkspaceWorkers, eventually, git, makeRepo, makeRuntime, makeWorkspaces, setup } from './faults/harness.mjs'
+import { completionError } from '../lib/board.js'
 
 /** Every attempt captures its own commit, so a reworked artifact is a new commit. */
 class ReworkWorkers extends FakeWorkers {
@@ -218,7 +219,7 @@ test('a dispute of an archived claim recorded before the refusal blocks neither 
   assert.equal(f.evidence(archived.id).status, 'challenged', 'the archived claim is not judged by the rework verdict')
   assert.equal(f.events('evidence/verified').filter(event => event.data.evidenceId === archived.id).length, 0, 'it is never verified')
   assert.notEqual(f.evidence(archived.id).artifact.commit, f.current(source).artifact.commit, 'nor re-stamped with the reworked artifact')
-  assert.equal(f.runtime.completionError(f.runtime.mission(f.mission.id)), undefined, 'history of a rejected commit is not an open dispute')
+  assert.equal(completionError(f.runtime.boardOf(f.mission.id)), undefined, 'history of a rejected commit is not an open dispute')
   assert.equal(f.runtime.control(f.owner, f.mission.id, 'complete', 'Accepted rework covers the mission').status, 'completed')
 })
 

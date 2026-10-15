@@ -19,7 +19,7 @@ import { assignmentAllows, authorIdsOf, canBorrowTask, canOwnReview, strandedRev
 import { liveReviewFor } from './admission.ts'
 import { memberPhaseOf } from './projection.ts'
 import { recoveryExit } from './declared-checks.ts'
-import { TERMINAL_STATES, pendingStopOwner, quiescencePending, taskGraphIndex, terminal, type TaskGraphIndex } from './task-graph.ts'
+import { TERMINAL_STATES, completionExempt, missionSubject, pendingStopOwner, quiescencePending, selectAcceptedDelivery, subjectsOfTasks, taskGraphIndex, taskSubject, terminal, uncoveredCriteria, type TaskGraphIndex } from './task-graph.ts'
 import type { CheckResult, Member, Mission, RuntimeConfig, Task } from './types.ts'
 
 /**
@@ -465,3 +465,54 @@ const admissionSpeaksFor = (task: Task): boolean => task.status === 'submitted' 
 export const unreviewedSources = (board: Board): Task[] => board.tasks.filter(task => admissionSpeaksFor(task) && !reviewable(board, task))
 /** Whether the host can still advance an unreviewable submission, the review admission's own rule, which the stall predicate and the waiting classifier read: inside its review grace (`ReviewNeed.ripe`), or, for a source the admission speaks for, while the admission names no blocker under the board's own stall (`reviewPathBlocker`): the next pass on a stalled board admits its review. */
 export const awaitsReviewAdmission = (board: Board, task: Task): boolean => { const need = reviewNeed(board, task); return !need.ripe || (admissionSpeaksFor(task) && reviewPathBlocker(board, task, need) === undefined) }
+
+/* ----------------------------------------------------------------------- *
+ * What a notice names and whether the mission may complete.
+ * ----------------------------------------------------------------------- */
+
+/**
+ * R15-A1: the subjects of a notice that is scoped to a task, a member or the
+ * mission itself. A task-scoped notice names that task at its epoch; a
+ * member-scoped notice names the member's unfinished work; the mission root is
+ * the fallback only when neither exists, so a notice is never anonymous.
+ * Guard pair: member-scoped notice x task-scoped notice — a member's notice
+ * never borrows another task's subject, which is what keeps one subject's clock
+ * independent of a healthy sibling (R15-A4).
+ */
+export function noticeSubjectsFor(board: Pick<Board, 'missionId' | 'tasks'>, scope: { taskId?: string; memberId?: string } = {}): string[] {
+  const tasks = board.tasks
+  if (scope.taskId !== undefined) {
+    const task = tasks.find(candidate => candidate.id === scope.taskId)
+    if (task !== undefined) return [taskSubject(task)]
+  }
+  if (scope.memberId !== undefined) {
+    const owned = tasks.filter(task => (task.attempt?.ownerId === scope.memberId || task.assigneeId === scope.memberId) && !TERMINAL_STATES.has(task.status))
+    if (owned.length) return subjectsOfTasks(owned, { id: board.missionId })
+  }
+  return [missionSubject({ id: board.missionId })]
+}
+
+/** Why the mission may not complete yet, or undefined when every obligation is accepted, covered and undisputed. */
+export function completionError(board: Board): string | undefined {
+  const { mission, tasks, graph } = board
+  if (!tasks.length) return 'Mission still has unfinished or blocked required work'
+  const unfinished = tasks.filter(task => !TERMINAL_STATES.has(task.status) && !completionExempt(task, tasks))
+  if (unfinished.length) return `Mission still has unfinished or blocked required work: ${unfinished.map(task => `${task.id} (${task.status})`).join(', ')}`
+  // Only accepted deliverable work covers a mission criterion, by the ids its
+  // replacement lineage cites; code deliverables need an artifact.
+  const deliverables = tasks.filter(task => task.status === 'accepted' && task.kind !== 'verification' && (task.kind === 'research' || task.artifact !== undefined))
+  const uncovered = uncoveredCriteria(mission.acceptance, new Set(deliverables.flatMap(task => [...graph.criteriaOf(task.id)])))
+  if (uncovered.length) return `Accepted tasks do not cover every mission acceptance criterion: ${uncovered.join(', ')}. Propose a deliverable that names them in \`covers\` with \`swarm_propose\`; an accepted task cannot gain covers`
+  if (tasks.some(task => ['implementation', 'integration'].includes(task.kind) && task.status !== 'cancelled')) {
+    try { selectAcceptedDelivery(tasks) }
+    catch (error) { return error instanceof Error ? error.message : String(error) }
+  }
+  // Evidence of explicitly cancelled work no longer supports an accepted result,
+  // and a claim a rework archived is history of a rejected commit that no
+  // verdict judges again; live disputes still block.
+  const dead = new Set(tasks.filter(task => task.status === 'cancelled').map(task => task.id))
+  const archived = new Set(tasks.flatMap(task => task.rejections?.flatMap(rejection => rejection.evidenceIds) ?? []))
+  const disputed = board.records.list('evidence', mission.id).filter(evidence => evidence.status === 'challenged' && !dead.has(evidence.taskId) && !archived.has(evidence.id))
+  if (disputed.length) return `Unresolved evidence challenges prevent completion: ${disputed.map(evidence => evidence.id).join(', ')}`
+  return undefined
+}

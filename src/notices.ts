@@ -14,7 +14,7 @@ import { PolicyError } from './policy-error.ts'
 import type { SwarmRuntime } from './runtime.ts'
 import { WriterBusyError, id } from './store.ts'
 import { awaited, type SchedulingPass } from './kernel.ts'
-import { awaitsReviewAdmission, dispatchable, eligible, newestReviewBlock, reviewable, reviewNeed, reviewPathBlocker, reviewPathStalled, stalled, startBlocker, unfinishedDependencies, unreviewedSources, unschedulable, type Board } from './board.ts'
+import { awaitsReviewAdmission, completionError, dispatchable, eligible, newestReviewBlock, noticeSubjectsFor, reviewable, reviewNeed, reviewPathBlocker, reviewPathStalled, stalled, startBlocker, unfinishedDependencies, unreviewedSources, unschedulable, type Board } from './board.ts'
 import type { Actor, Delivery, Escalation, Member, Mission, NoticeClass, Task, WorkerAdapter } from './types.ts'
 
 /**
@@ -653,7 +653,7 @@ export class Notices {
     if (mission === undefined || terminal(mission)) return undefined
     const request = guardTerminal(chain, context)
     const key = guardTerminalKey(chain, context)
-    const subjects = context.subjects ?? this.rt.noticeSubjectsFor(missionId, { taskId: context.taskId, memberId: context.memberId })
+    const subjects = context.subjects ?? noticeSubjectsFor(this.rt.boardOf(missionId), { taskId: context.taskId, memberId: context.memberId })
     try {
       // The board-stall event type is reused with `cause: 'guard-terminal'`, so the
       // durable log names the chain and the code without inventing an unregistered
@@ -1112,7 +1112,7 @@ export class Notices {
   private boardFact(view: MissionInterpretation): { key: string; subjects: string[]; reason: string; content: string; statement: NoticeStatement } | undefined {
     const fact = (body: { content: string; statement: NoticeStatement }, subjects: string[], reason: string) =>
       ({ ...body, subjects, reason, key: factKey(view.missionId, { trigger: NOTICE_TEMPLATES[body.statement.family].trigger, reason, subjects, statement: body.statement }) })
-    const refusal = this.rt.completionError(view.mission)
+    const refusal = completionError(view.board)
     if (refusal === undefined) return this.rt.store.list('starts', view.missionId).length > 0 ? undefined
       : fact(renderNotice('coverage-complete', { missionTitle: view.mission.title }), view.subjectsOf(view.tasks.filter(task => TERMINAL_STATES.has(task.status))), 'every acceptance criterion is independently covered')
     if (!view.stalled) return undefined
@@ -1551,7 +1551,7 @@ export class Notices {
           && row.deliveredAt === undefined && row.deliveryFailure?.reason === reason)
           .sort((a, b) => a.deliveryFailure!.at - b.deliveryFailure!.at)[0]!
         this.notify(missionId, `Messages to ${member?.name ?? delivery.to} (${delivery.to}) are queued but cannot be delivered: ${reason}. Inspect that member's current task and stop/recovery state; repair or reassign its work to an available member. Increasing the task budget will not repair this transport failure.`,
-          this.rt.noticeSubjectsFor(missionId, { memberId: delivery.to }), {
+          noticeSubjectsFor(this.rt.boardOf(missionId), { memberId: delivery.to }), {
             noticeClass: 'blocker', trigger: 'worker-delivery-failed', reason,
             dedupKey: `worker-delivery-failed:${anchor.id}:${reasonDigest(reason)}`, deliveryFailureId: anchor.id,
           })

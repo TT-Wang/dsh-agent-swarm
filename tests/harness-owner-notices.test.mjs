@@ -22,6 +22,7 @@ import { runProcess } from '../lib/workspaces.js'
 import { subprocessSeam, SubprocessLocal } from './subprocess-seam.mjs'
 import { tempDirectory } from './temp-root.mjs'
 import { budget } from './faults/harness.mjs'
+import { openAsks } from '../lib/arena.js'
 
 const deferred = () => { let resolve; const promise = new Promise(done => { resolve = done }); return { promise, resolve } }
 const text = value => ({ kind: 'text', text: value })
@@ -99,7 +100,7 @@ test('full plugin books first consumed question before the transport flush ackno
   })
   f.rt.message({ sessionId: member.sessionId }, f.mission.id, { to: 'owner', kind: 'question', content: 'Which API?' })
   await f.rt.flushOutbox(f.mission.id); await f.agent.whenIdle()
-  const question = f.rt.openAsks(f.mission.id, 'owner')[0]
+  const question = openAsks(f.rt.store.list('deliveries', f.mission.id), 'owner')[0]
   assert.ok(question?.consumedAt)
   assert.equal(ackAtConsumption, undefined, 'fixture reaches consumption before flush ack')
   assert.equal(question.state, 'open')

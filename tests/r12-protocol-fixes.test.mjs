@@ -11,6 +11,7 @@ import { Attempts } from '../lib/attempts.js'
 import { pendingStopOwner } from '../lib/task-graph.js'
 import { wakePrecision } from './instruments.mjs'
 import { FakeClock, FakeWorkers, MISSION_ACCEPTANCE, makeRuntime, makeRuntimeStub, setup } from './faults/harness.mjs'
+import { openAsks } from '../lib/arena.js'
 
 /** A stub `Notices.tell`: the record that exists only with the fact, in the stubs' pass-through transaction (the ledger is not modelled). */
 function tell(_missionId, _content, _subjects, _options, then) { then?.(); return true }
@@ -19,9 +20,8 @@ function guardFixture() {
   const mission = { id: 'm', ownerSessionId: 'owner', status: 'active' }
   const question = { id: 'q', missionId: 'm', from: 'worker', to: 'owner', content: 'Choose an API', replyExpected: true, deliveredAt: 1 }
   const rt = makeRuntimeStub({
-    store: { list: () => [mission], get: table => table === 'missions' ? mission : question, put() {}, event() {} },
-    openAsks: () => [question],
-    commit: (_id, fn) => fn(), notices: { notify() {} }, noticeSubjectsFor: () => [],
+    store: { list: table => table === 'deliveries' ? [question] : [mission], get: table => table === 'missions' ? mission : question, put() {}, event() {} },
+    commit: (_id, fn) => fn(), notices: { notify() {} }, boardOf: missionId => ({ missionId, tasks: [] }),
   })
   return { mission, question, rt, guard: new OwnerReplyGuard({ on: () => () => {} }, rt, { maxNudges: 2 }) }
 }
@@ -45,7 +45,7 @@ test('R12: muted stopped questions do not retain the full owner role; completed 
   const scoper = Object.assign(Object.create(RoleScoper.prototype), {
     runtime: {
       isWorkerSession: () => false, starts: () => [], list: () => [mission],
-      openAsks: () => [{ id: 'question' }], store: { list: () => [] },
+      store: { list: table => table === 'deliveries' ? [{ id: 'question', to: 'owner', replyExpected: true }] : [] },
     }, handling: new Map(), applied: new Map(),
   })
   const owner = { id: 'owner', status: 'idle', session: { header: {} } }
@@ -74,7 +74,7 @@ test('R12: owner can settle a receipt in paused, blocked and terminal missions w
     })
     const result = rt.message(owner, mission.id, { to: 'retired-member', kind: 'question', replyTo: questionId, dismiss: true, content: 'No further work needed' })
     assert.equal(result.dismissed, questionId)
-    assert.equal(rt.openAsks(mission.id, 'owner').length, 0)
+    assert.equal(openAsks(rt.store.list('deliveries', mission.id), 'owner').length, 0)
     assert.equal(rt.mission(mission.id).status, status)
     assert.equal(rt.store.list('deliveries', mission.id).filter(row => row.to === 'retired-member').length, 0)
     assert.throws(() => rt.message(owner, mission.id, { to: 'retired-member', kind: 'question', content: 'New work' }))
@@ -91,7 +91,7 @@ function refusalFixture() {
       get: (table, id) => table === 'missions' ? { id, status: 'active' } : admissions.get(id), list: () => [],
       recordAdmission: row => admissions.set(row.id, structuredClone(row)),
       event: (missionId, type, actor, data) => events.push({ missionId, type, actor, data }),
-    }, noticeSubjectsFor: missionId => [`mission:${missionId}`],
+    }, boardOf: missionId => ({ missionId, tasks: [] }),
   })
   const registry = new RefusalRegistry(kernel)
   return { registry, notices: new Notices(kernel, registry), admissions, events, release: () => { busy = false } }

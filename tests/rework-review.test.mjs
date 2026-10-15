@@ -18,7 +18,7 @@ import { rm, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { assessText, toolSchemaIndex } from './refusal-inventory.mjs'
 import { FakeClock, FakeWorkers, WorkspaceWorkers, makeRepo, makeRuntime, makeWorkspaces, setup } from './faults/harness.mjs'
-import { reviewNeed, reviewPathBlocker, stalled } from '../lib/board.js'
+import { completionError, reviewNeed, reviewPathBlocker, stalled } from '../lib/board.js'
 
 /** Every attempt captures its own commit unless `fixedCommit` pins one (an unchanged resubmission). */
 class ReworkWorkers extends FakeWorkers {
@@ -146,7 +146,7 @@ test('a deferred review of the rejected commit is retired with the rework, so th
   assert.deepEqual(f.live(source).map(task => task.id), [rejecting.id], 'exactly one live review of the resubmission')
   await f.verify(reviewer, rejecting, 'accept', 'The rework meets the criterion')
   assert.equal(f.current(source).status, 'accepted')
-  assert.equal(f.runtime.completionError(f.runtime.mission(f.mission.id)), undefined)
+  assert.equal(completionError(f.runtime.boardOf(f.mission.id)), undefined)
 })
 
 test('a re-opened review re-reviews with a fresh review\'s step allowance; the rejecting round\'s steps are history', async t => {
@@ -484,7 +484,7 @@ test('the rejecting reviewer\'s claims are archived with its verdict: disputing 
   })
   assert.deepEqual([f.current(source).status, f.current(review).status], ['accepted', 'accepted'], 'the accepting review is not reverted')
   assert.equal(f.runtime.store.get('evidence', finding.id).challenges.length, 0, 'no dispute was recorded')
-  assert.equal(f.runtime.completionError(f.runtime.mission(f.mission.id)), undefined)
+  assert.equal(completionError(f.runtime.boardOf(f.mission.id)), undefined)
 })
 
 test('a resubmission of a rejected commit with no new claim is refused; with new claims it is re-reviewed and marked as a repeat', async t => {
@@ -548,7 +548,7 @@ test('a released rework is never taken by the reviewer its re-opened review is b
       assert.deepEqual(f.events('task/review-admitted'), [])
       await f.verify(reviewer, review, 'accept', 'The rework meets the criterion')
       assert.equal(f.current(source).status, 'accepted')
-      assert.equal(f.runtime.completionError(f.runtime.mission(f.mission.id)), undefined)
+      assert.equal(completionError(f.runtime.boardOf(f.mission.id)), undefined)
     })
   }
 })

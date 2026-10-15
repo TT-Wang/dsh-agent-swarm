@@ -40,6 +40,7 @@ import { SwarmRuntime } from '../lib/runtime.js'
 import { NOTICE_TEMPLATES, noticeTemplateKey } from '../lib/notices.js'
 import { tempDirectory } from './temp-root.mjs'
 import { FakeClock, FakeWorkers, NO_GRANTS } from './faults/harness.mjs'
+import { completionError } from '../lib/board.js'
 
 const ROOT = dirname(dirname(fileURLToPath(import.meta.url)))
 const budget = { maxTokens: 100000, maxSteps: 100, maxWorkers: 3, maxDurationMs: 600000, maxTasks: 20, maxExperiments: 2 }
@@ -309,7 +310,7 @@ test('R17-G2b: the W3 stall body replays from the unschedulable rows alone', asy
   const stall = () => {
     const view = f.runtime.interpretation(f.mission.id)
     f.runtime.notices.notifyBoard(view)
-    return { view, reason: f.runtime.completionError(view.mission), notice: f.ownerNotices().filter(delivery => delivery.notice.dedupKey.startsWith('board-stall:')).at(-1) }
+    return { view, reason: completionError(view.board), notice: f.ownerNotices().filter(delivery => delivery.notice.dedupKey.startsWith('board-stall:')).at(-1) }
   }
   // First nothing is unschedulable: two pending rows wait on each other, so the
   // body names every non-terminal row; then a blocked row and its dependent

@@ -13,6 +13,7 @@ import { scopeKeysOverlap } from './scheduler.ts'
 import { claimFor, isContained, reauthorizeWorkspace, WorkspaceRevokedError, WORKSPACE_AUTHORIZATION_CODE, type WorkspaceClaim } from './authorization.ts'
 import { hasNotice } from './arena.ts'
 import { isolationOpener, noticeIdentity } from './notices.ts'
+import { noticeSubjectsFor } from './board.ts'
 import { guardTerminalKey } from './refusals.ts'
 import type { SwarmRuntime } from './runtime.ts'
 import { progressed, type SchedulingPass } from './kernel.ts'
@@ -509,7 +510,8 @@ export class WorkspaceAdmission {
   isolationAllows(missionId: string, member: Member): boolean {
     const violation = this.isolationIssues(missionId).find(entry => entry.memberIds.includes(member.id))
     if (violation === undefined) return true
-    this.rt.notices.emitGuardTerminal(missionId, 'workspace', { subjects: violation.memberIds.flatMap(id => this.rt.noticeSubjectsFor(missionId, { memberId: id })), localKey: isolationOpener(violation.message),
+    const board = this.rt.boardOf(missionId)
+    this.rt.notices.emitGuardTerminal(missionId, 'workspace', { subjects: violation.memberIds.flatMap(id => noticeSubjectsFor(board, { memberId: id })), localKey: isolationOpener(violation.message),
       detail: `the isolation invariant refuses dispatch: ${violation.message}` })
     return false
   }

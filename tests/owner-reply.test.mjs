@@ -20,6 +20,7 @@ import assert from 'node:assert/strict'
 import { join } from 'node:path'
 import { OwnerReplyGuard } from '../lib/owner-reply.js'
 import { FakeClock, FakeWorkers, makeRuntime } from './faults/harness.mjs'
+import { openAsks } from '../lib/arena.js'
 
 /** A context stub: the guard only reads `on` (events) and `agents` (block mode). */
 const fakeContext = () => ({ on: () => () => {}, agents: { get: () => undefined }, get: () => undefined })
@@ -56,7 +57,7 @@ test('L0/L1: a question stays open until its recipient binds an answer, once', a
   const ask = await f.ask()
   assert.equal(ask.replyExpected, true, 'a question is a receipt')
   assert.equal(ask.state, 'open')
-  assert.equal(f.runtime.openAsks(f.mission.id, 'owner').map(d => d.id).join(), ask.id)
+  assert.equal(openAsks(f.runtime.store.list('deliveries', f.mission.id), 'owner').map(d => d.id).join(), ask.id)
   assert.match(ask.content, /\[swarm receipt required\]/, 'L3: the envelope carries the receipt requirement')
   assert.match(ask.content, new RegExp(`replyTo: "${ask.id}"`), 'and the exact call that answers it')
   assert.match(ask.content, /Text in this conversation is NOT delivered to the member/)
@@ -68,7 +69,7 @@ test('L0/L1: a question stays open until its recipient binds an answer, once', a
   assert.equal(receipt.answeredBy, 'owner')
   const answer = f.deliveries().find(item => item.inReplyTo === ask.id)
   assert.ok(answer, 'the answer names the question it settles')
-  assert.equal(f.runtime.openAsks(f.mission.id).length, 0, 'the receipt is settled')
+  assert.equal(openAsks(f.runtime.store.list('deliveries', f.mission.id)).length, 0, 'the receipt is settled')
   assert.equal(f.events('message/answered').length, 1)
   // Idempotent: a repeated answer is delivered, but settles and records nothing twice.
   f.runtime.message(f.owner, f.mission.id, { to: f.member.id, kind: 'question', content: 'target v2 again', replyTo: ask.id })
@@ -82,7 +83,7 @@ test('L0/L1: a question stays open until its recipient binds an answer, once', a
   assert.equal(dismissed.dismissed, second.id)
   assert.equal(f.runtime.store.get('deliveries', second.id).state, 'dismissed')
   assert.equal(f.events('message/dismissed').length, 1)
-  assert.equal(f.runtime.openAsks(f.mission.id).length, 0)
+  assert.equal(openAsks(f.runtime.store.list('deliveries', f.mission.id)).length, 0)
 })
 
 test('L1: a receipt can only be settled by its recipient, on a question, by a real id', async t => {
@@ -106,7 +107,7 @@ test('L1: a receipt can only be settled by its recipient, on a question, by a re
   const answered = f.runtime.message(f.owner, f.mission.id, { to: f.member.id, kind: 'question', content: 'v2', replyTo: ask.id })
   assert.equal(answered.answered, ask.id)
   assert.equal(f.deliveries().filter(item => item.replyExpected === true).length, 1, 'the answer opened no second receipt')
-  assert.equal(f.runtime.openAsks(f.mission.id).length, 0, 'every refused call left the receipt untouched, and the answer settled it')
+  assert.equal(openAsks(f.runtime.store.list('deliveries', f.mission.id)).length, 0, 'every refused call left the receipt untouched, and the answer settled it')
 })
 
 test('L1: a board post may settle a receipt, and a post reply still means a post', async t => {
@@ -114,7 +115,7 @@ test('L1: a board post may settle a receipt, and a post reply still means a post
   const ask = await f.ask()
   const post = f.runtime.post(f.owner, f.mission.id, { kind: 'ANSWER', body: 'target v2', replyTo: ask.id })
   assert.equal(f.runtime.store.get('deliveries', ask.id).answeredBy, 'owner')
-  assert.equal(f.runtime.openAsks(f.mission.id).length, 0)
+  assert.equal(openAsks(f.runtime.store.list('deliveries', f.mission.id)).length, 0)
   assert.equal(post.replyTo, ask.id, 'the post keeps the link to the question it answered')
   const parent = f.runtime.post(f.owner, f.mission.id, { kind: 'IDEA', body: 'parent' })
   const child = f.runtime.post(f.owner, f.mission.id, { kind: 'ANSWER', body: 'child', replyTo: parent.id })
@@ -140,7 +141,7 @@ test('L2/L3: an owner turn that leaves a question open is recorded, nudged with 
   assert.match(nudge[0].content, /\[owner_reply_missing\]/)
   assert.match(nudge[0].content, new RegExp(`replyTo: "${ask.id}"`), 'the nudge carries the exact call')
   assert.match(nudge[0].content, /only that call writes the receipt/)
-  assert.equal(f.runtime.openAsks(f.mission.id, 'owner').length, 1, 'the receipt is still open')
+  assert.equal(openAsks(f.runtime.store.list('deliveries', f.mission.id), 'owner').length, 1, 'the receipt is still open')
   await f.runtime.flushOutbox(f.mission.id)
   assert.ok(f.runtime.store.get('deliveries', nudge[0].id).deliveredAt, 'the first nudge reached transport')
 
@@ -176,7 +177,7 @@ test('L2/L3: an owner turn that leaves a question open is recorded, nudged with 
   guard.observe(f.owner.sessionId, 'user/message', { createdAt: Date.now() + 4000 })
   guard.observe(f.owner.sessionId, 'turn/end', { reason: { kind: 'completed' } })
   assert.equal(f.events('owner/reply-missing').length, 2, 'a settled receipt is never reported again')
-  assert.equal(f.runtime.openAsks(f.mission.id).length, 0)
+  assert.equal(openAsks(f.runtime.store.list('deliveries', f.mission.id)).length, 0)
 
   // L3: the owner observe view names the receipt and how to close it.
   const view = f.runtime.observe(f.owner, f.mission.id, {})
@@ -277,7 +278,7 @@ test('L2/L3: a stopped asker does not hide the open receipt the owner still owes
   const row = f.runtime.store.get('members', f.member.id)
   row.status = 'stopped'
   f.runtime.store.put('members', row)
-  assert.equal(f.runtime.openAsks(f.mission.id, 'owner').length, 1, 'a stopped asker leaves the receipt open')
+  assert.equal(openAsks(f.runtime.store.list('deliveries', f.mission.id), 'owner').length, 1, 'a stopped asker leaves the receipt open')
   const view = f.runtime.observe(f.owner, f.mission.id, {})
   assert.equal(view.openAsks.count, 1)
   assert.equal(view.openAsks.asks[0].deliveryId, ask.id)

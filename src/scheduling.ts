@@ -7,7 +7,7 @@
  */
 import { id } from './store.ts'
 import { TERMINAL_STATES, pendingStopOwner, quiescencePending, selectAcceptedDelivery, stopPending, subjectsOfTasks, taskSubject, terminal } from './task-graph.ts'
-import { effectiveDependencies, ready, startBlocker, unschedulable } from './board.ts'
+import { effectiveDependencies, noticeSubjectsFor, ready, startBlocker, unschedulable } from './board.ts'
 import { factKey } from './notices.ts'
 import { AdmissionRefusedError } from './scheduler.ts'
 import { awaited, formatSpan, progressed, type SchedulingPass } from './kernel.ts'
@@ -202,7 +202,7 @@ export class Scheduling {
             // The terminal of this member's chain, opened by this failure of the work
             // its request names: the same throw over that work on a later pass is the
             // request the owner already holds; other work or another failure is another.
-            const detail = String(error), subjects = this.rt.noticeSubjectsFor(missionId, { memberId: member.id })
+            const detail = String(error), subjects = noticeSubjectsFor(this.rt.boardOf(missionId), { memberId: member.id })
             this.rt.notices.emitGuardTerminal(missionId, 'attempt_lease', { memberId: member.id, detail, subjects, localKey: factKey(missionId, { trigger: `dispatch-failed:${member.id}`, reason: detail, subjects }) })
             continue
           }

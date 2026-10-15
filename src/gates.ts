@@ -8,7 +8,7 @@
  */
 import { createHash } from 'node:crypto'
 import { id } from './store.ts'
-import { arenaView as projectArenaView, hasNotice } from './arena.ts'
+import { arenaView as projectArenaView, hasNotice, openAsks } from './arena.ts'
 import { TERMINAL_STATES, currentEvidenceIds, subjectsOfTasks, terminal } from './task-graph.ts'
 import { excerpt } from './declared-checks.ts'
 import { executionElapsed } from './resource-time.ts'
@@ -188,7 +188,8 @@ export class RuntimeGates {
 
   /** L3: open receipts as the owner reads them, bounded and answerable by id. */
   private openAsks(missionId: string): { count: number; asks: Array<Record<string, unknown>>; note: string } {
-    const asks = this.rt.openAsks(missionId)
+    const open = openAsks(this.rt.store.list('deliveries', missionId))
+    const asks = [...open]
       .sort((a, b) => (a.deliveredAt ?? a.createdAt) - (b.deliveredAt ?? b.createdAt))
       .slice(0, 10)
       .map(delivery => ({
@@ -201,7 +202,7 @@ export class RuntimeGates {
         question: delivery.content.replace(/\s+/g, ' ').slice(0, 200),
       }))
     return {
-      count: this.rt.openAsks(missionId).length,
+      count: open.length,
       asks,
       note: 'Questions with no receipt. Answer one with swarm_message and its deliveryId in replyTo, or close it with dismiss: true; an owner question answered only in chat is still open here.',
     }

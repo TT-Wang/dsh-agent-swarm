@@ -6,7 +6,7 @@ import { OwnerReplyGuard } from '../lib/owner-reply.js'
 import { RoleScoper } from '../lib/roles.js'
 import { HarnessWorkers } from '../lib/harness-workers.js'
 import { registerAutomaticStart } from '../lib/planner.js'
-import { hasNotice } from '../lib/arena.js'
+import { hasNotice, openAsks } from '../lib/arena.js'
 import { FakeWorkers, SwarmRuntime, makeRuntime, makeRuntimeStub } from './faults/harness.mjs'
 import { reviewNeed, reviewPathBlocker, reviewable } from '../lib/board.js'
 
@@ -52,7 +52,7 @@ for (const status of ['paused', 'blocked', 'budget-quiescing']) test(`R02: full 
   await f.runtime.flushOutbox(row.id)
   assert.equal(f.rows().filter(item => item.inReplyTo === question.id).length, 1)
   assert.equal(f.workers.deliveries.filter(item => item.inReplyTo === question.id).length, 0)
-  assert.equal(f.runtime.openAsks(row.id, 'owner').length, 0)
+  assert.equal(openAsks(f.runtime.store.list('deliveries', row.id), 'owner').length, 0)
   await f.reload()
   f.runtime.message(f.owner, row.id, input)
   const restored = f.rows().find(item => item.inReplyTo === question.id)
@@ -85,7 +85,7 @@ test('R01: the reply guard leaves owner tool execution available to answer', asy
   guard.observe('owner', 'turn/end', { reason: { kind: 'completed' } })
   assert.equal(f.runtime.store.get('deliveries', question.id).replyNudges, 1)
   f.runtime.message(f.owner, f.mission.id, { to: f.member.id, kind: 'question', replyTo: question.id, content: 'Now answered' })
-  assert.equal(f.runtime.openAsks(f.mission.id).length, 0)
+  assert.equal(openAsks(f.runtime.store.list('deliveries', f.mission.id)).length, 0)
 })
 
 test('R03: a host append rejection is never an acknowledgement, even one naming this package', async t => {

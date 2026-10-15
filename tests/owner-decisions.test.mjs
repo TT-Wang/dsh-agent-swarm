@@ -29,7 +29,7 @@ import { HarnessWorkers, strandedInboxDecision } from '../lib/harness-workers.js
 import { sidebarState } from '../lib/types/client/progress.js'
 import { tempDirectory } from './temp-root.mjs'
 import { guardBoard } from './guard-model.mjs'
-import { dependencySatisfied, effectiveDependency, reviewNeed, reviewable } from '../lib/board.js'
+import { dependencySatisfied, effectiveDependency, noticeSubjectsFor, reviewNeed, reviewable } from '../lib/board.js'
 import { taskGraphIndex } from '../lib/task-graph.js'
 import { dispatchQuestion } from '../lib/notices.js'
 import { wakePrecision } from './instruments.mjs'
@@ -114,9 +114,9 @@ test('R15-A1: the guard-terminal owner notice behind the task-ceiling path carri
   assert.ok(Array.isArray(reloaded.subjects) && reloaded.subjects.length > 0, `the durable row carries subjects: ${JSON.stringify(reloaded.subjects)}`)
   assert.ok(reloaded.subjects.every(subject => /^task:|^mission:/.test(subject) || subject.includes('@')), `subjects are taskId@epoch or the lineage root: ${JSON.stringify(reloaded.subjects)}`)
   // The task-scoped variant of the same entry (the measured defect) names the task.
-  assert.deepEqual(f.runtime.noticeSubjectsFor(f.mission.id, { taskId: 'task_example', memberId: member.id }), [`mission:${f.mission.id}`], 'an unknown task falls back to the mission root rather than to nothing')
+  assert.deepEqual(noticeSubjectsFor(f.runtime.boardOf(f.mission.id), { taskId: 'task_example', memberId: member.id }), [`mission:${f.mission.id}`], 'an unknown task falls back to the mission root rather than to nothing')
   const rootProposal = f.propose('Rooted')
-  assert.deepEqual(f.runtime.noticeSubjectsFor(f.mission.id, { taskId: rootProposal.id }), [`${rootProposal.id}@${rootProposal.epoch}`], 'a task-scoped guard terminal names that task at its epoch')
+  assert.deepEqual(noticeSubjectsFor(f.runtime.boardOf(f.mission.id), { taskId: rootProposal.id }), [`${rootProposal.id}@${rootProposal.epoch}`], 'a task-scoped guard terminal names that task at its epoch')
 })
 
 test('R15-A1: the W3 stall notice names an unschedulable subject, and an escalation names its own', async t => {

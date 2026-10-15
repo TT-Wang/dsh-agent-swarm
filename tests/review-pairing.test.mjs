@@ -17,7 +17,7 @@ import { registerTools } from '../lib/tools.js'
 import { DraftEditor, removeTask } from '../lib/types/client/DraftEditor.js'
 import { completionBlocker } from '../lib/types/client/projection.js'
 import { FakeClock, FakeWorkers, makeRuntime, makeRuntimeStub, taskOf } from './faults/harness.mjs'
-import { reviewable } from '../lib/board.js'
+import { completionError, reviewable } from '../lib/board.js'
 
 class PairingWorkers extends FakeWorkers {
   checks = [{ command: 'node check.cjs', exitCode: 0, output: 'ok' }]
@@ -196,7 +196,7 @@ test('the added review of an optional experiment inherits its exemption: a rejec
   assert.equal(task('exp-review').status, 'blocked', 'the rejecting review is the experiment\'s verdict record')
   assert.equal(task('exp-review').experiment, false, 'the host-added review is not itself an experiment')
   await deliver('impl', 'accept')
-  assert.equal(runtime.completionError(runtime.mission(missionId)), undefined, 'neither the rejected experiment nor its review holds completion open')
+  assert.equal(completionError(runtime.boardOf(missionId)), undefined, 'neither the rejected experiment nor its review holds completion open')
   assert.equal(completionBlocker({ ...runtime.snapshot(owner, missionId), completion: undefined }), undefined, 'the client\'s legacy completion rule agrees')
 })
 

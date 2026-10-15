@@ -45,7 +45,7 @@ import { registerTools } from '../lib/tools.js'
 import { selectAcceptedDelivery, taskGraphIndex } from '../lib/task-graph.js'
 import { SWARM_SCRATCH_DIRNAME } from '../lib/workspaces.js'
 import { FakeWorkers, SwarmRuntime, budget, eventually, git, makeRepo, makeRuntime, makeWorkspaces } from './faults/harness.mjs'
-import { startBlocker } from '../lib/board.js'
+import { completionError, startBlocker } from '../lib/board.js'
 
 const BUDGET = { ...budget, maxTokens: 1000000, maxSteps: 5000, maxWorkers: 6, maxDurationMs: 3600000, maxTasks: 60 }
 
@@ -166,7 +166,7 @@ test('R18-1b: a mission behind a repaired middle task cannot complete with the p
   await accept(f.second, replacement)
   await accept(f.second, integration)
   assert.equal(current(f, integration).status, 'accepted')
-  assert.match(String(f.runtime.completionError(f.runtime.mission(f.mission.id))), /unique accepted integration/,
+  assert.match(String(completionError(f.runtime.boardOf(f.mission.id))), /unique accepted integration/,
     'the accepted integration does not carry A, so completion is refused rather than delivering an incomplete artifact')
 })
 

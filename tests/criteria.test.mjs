@@ -16,6 +16,7 @@ import { validatePlan } from '../lib/plans.js'
 import { SwarmStore } from '../lib/store.js'
 import { OWNER_PROMPT, registerTools } from '../lib/tools.js'
 import { FakeClock, FakeWorkers, SwarmRuntime, acceptThroughReview, blockThroughReview, budget, makeRuntime, makeRuntimeStub, setup } from './faults/harness.mjs'
+import { completionError } from '../lib/board.js'
 
 const criteria = ['value is two', 'docs mention two', 'no other file changes']
 const row = (id, extra = {}) => ({ id, missionId: 'm', workstreamId: 's', title: id, objective: id, kind: 'implementation', status: 'pending', dependencies: [], scope: ['src/'], acceptance: [], checks: [], priority: 50, experiment: false, epoch: 0, evidenceIds: [], createdAt: 1, ...extra })
@@ -198,7 +199,7 @@ test('propose stores a deliverable\'s ids as given and refuses unknown ids and a
   assert.throws(() => f.propose({ kind: 'verification', reviewOf: source.id, checks: [], covers: ['c1'] }), refused)
   assert.equal(f.runtime.store.list('tasks', f.mission.id).length, 2, 'nothing was admitted')
   await f.runtime.verify(f.actor(f.reviewer), f.mission.id, { taskId: review.id, attemptId: reviewing.attempt.id, verdict: 'accept', reason: 'Independent host checks pass' })
-  assert.match(f.runtime.completionError(f.runtime.mission(f.mission.id)), /: c1 "works"\. Propose a deliverable/, 'the review\'s text never covered c1')
+  assert.match(completionError(f.runtime.boardOf(f.mission.id)), /: c1 "works"\. Propose a deliverable/, 'the review\'s text never covered c1')
 })
 
 test('the completion reason\'s exit, performed as it names it through the registered swarm_propose, makes the mission completable', async t => {
@@ -206,7 +207,7 @@ test('the completion reason\'s exit, performed as it names it through the regist
   t.after(f.cleanup)
   const first = f.propose({ acceptance: [], covers: ['c1'] })
   await acceptThroughReview(f, first)
-  assert.equal(f.runtime.completionError(f.runtime.mission(f.mission.id)), 'Accepted tasks do not cover every mission acceptance criterion: c2 "is documented". Propose a deliverable that names them in `covers` with `swarm_propose`; an accepted task cannot gain covers')
+  assert.equal(completionError(f.runtime.boardOf(f.mission.id)), 'Accepted tasks do not cover every mission acceptance criterion: c2 "is documented". Propose a deliverable that names them in `covers` with `swarm_propose`; an accepted task cannot gain covers')
   const definitions = new Map()
   registerTools({ tools: { register: definition => definitions.set(definition.name, definition) } }, f.runtime, f.mission.budget)
   const propose = async args => (await definitions.get('swarm_propose').execute({ missionId: f.mission.id, workstreamId: f.stream.id, scope: ['**'], outputs: [], ...args }, { signal: new AbortController().signal, agent: { id: f.owner.sessionId } })).result
@@ -215,7 +216,7 @@ test('the completion reason\'s exit, performed as it names it through the regist
   const named = await propose({ title: 'Document it', objective: 'Document the change', kind: 'integration', dependencies: [first.id], covers: ['c2'], checks: ['test -d .'] })
   assert.deepEqual([named.acceptance, named.covers], [[], ['c2']], 'the exit needs no criterion text')
   await acceptThroughReview(f, named)
-  assert.equal(f.runtime.completionError(f.runtime.mission(f.mission.id)), undefined)
+  assert.equal(completionError(f.runtime.boardOf(f.mission.id)), undefined)
 })
 
 test('each exit the bare-deliverable and covers refusals name is performed through the registered swarm_propose', async t => {
@@ -247,7 +248,7 @@ test('each exit the bare-deliverable and covers refusals name is performed throu
   assert.deepEqual([citing.covers, checklist(citing)], [['c2'], ['is documented', 'keeps the API']])
   await acceptThroughReview(f, inheriting); await acceptThroughReview(f, citing)
   await acceptThroughReview(f, await propose({ title: 'Integrate', kind: 'integration', dependencies: [inheriting.id, citing.id], acceptance: ['merges both repairs'], outputs: [] }))
-  assert.equal(f.runtime.completionError(f.runtime.mission(f.mission.id)), undefined, 'both criteria are covered by accepted repairs')
+  assert.equal(completionError(f.runtime.boardOf(f.mission.id)), undefined, 'both criteria are covered by accepted repairs')
 })
 
 test('a repair answers for the ids its lineage cites, and a withdrawn deliverable\'s ids count for nothing', async t => {
@@ -259,13 +260,13 @@ test('a repair answers for the ids its lineage cites, and a withdrawn deliverabl
   assert.equal(repair.covers, undefined, 'the repair cites nothing itself')
   await acceptThroughReview(f, repair)
   assert.equal(f.runtime.store.get('tasks', original.id).status, 'cancelled')
-  assert.equal(f.runtime.completionError(f.runtime.mission(f.mission.id)), undefined)
+  assert.equal(completionError(f.runtime.boardOf(f.mission.id)), undefined)
   const g = await setup({ clock: new FakeClock(), acceptance: ['works', 'is documented'] })
   t.after(g.cleanup)
   await acceptThroughReview(g, g.propose({ covers: ['c1'] }))
   // Research needs no artifact, so nothing but its status keeps the withdrawn task from covering c2.
   g.runtime.cancel(g.owner, g.mission.id, { taskId: g.propose({ kind: 'research', checks: [], covers: ['c2'] }).id, reason: 'Withdrawn' })
-  assert.match(g.runtime.completionError(g.runtime.mission(g.mission.id)), /criterion: c2 "is documented"\. /)
+  assert.match(completionError(g.runtime.boardOf(g.mission.id)), /criterion: c2 "is documented"\. /)
 })
 
 test('workers see criterion text, never bare ids; the owner reads the stored row with its covers, and a fresh overview maps each id to its criterion', async t => {
@@ -582,7 +583,7 @@ test('a v3 store cites the criteria its deliverables copied, once at open, and k
   assert.equal(opened.store.get('tasks', 't1').revision, undefined, 'the upgrade is not a task write')
   assert.deepEqual(opened.store.get('drafts', 'draft').input.tasks.map(task => [task.key, task.covers, task.acceptance]), [['code', ['c2'], ['own']], ['review', undefined, ['x1']], ['docs', ['c1'], ['docs own']]],
     'both draft deliverables cite what they copied and keep only their own text; the review keeps only its review-only text')
-  const reason = id => opened.completionError(opened.store.get('missions', id))
+  const reason = id => completionError(opened.boardOf(id))
   assert.equal(reason('done'), undefined, 'covered before, covered after')
   assert.match(reason('stalled'), /criterion: c2 "b2"\. /, 'uncovered before, uncovered after; a review\'s text still covers nothing')
   // The one change: a repair admitted before inheritance answers for what it replaced.
