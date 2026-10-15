@@ -5,7 +5,7 @@
  * production classifiers it measures (they stay in src/ because the live
  * notice paths use them) and writes nothing.
  */
-import { NO_LIVE_PATH_FAMILIES, noticeFamily, taskFromSubject } from '../lib/notices.js'
+import { NO_LIVE_PATH_FAMILIES, noticeFamily, stallRoots, taskFromSubject } from '../lib/notices.js'
 import { TERMINAL_STATES, taskSubject } from '../lib/task-graph.js'
 import { ATTEMPT_FENCING_EVENTS } from '../lib/types.js'
 
@@ -36,7 +36,7 @@ export function wakePrecision(runtime, missionId) {
   // A covered fact (`coveredBy`) is never sent: the delivery covering it is the wake.
   const deliveries = runtime.store.list('deliveries', missionId).filter(delivery => delivery.to === 'owner' && delivery.notice?.coveredBy === undefined
     && (delivery.notice?.class === 'decision' || delivery.notice?.class === 'escalation' || delivery.kind === 'escalation'))
-  const roots = new Set(notices.stallRoots(board).map(task => taskSubject(task)))
+  const roots = new Set(stallRoots(board).map(task => taskSubject(task)))
   const byFamily = {}
   const falseByFamily = {}
   const falseSubjects = []

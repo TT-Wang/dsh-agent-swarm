@@ -390,7 +390,7 @@ function replacementCoverage(tasks: Task[]): Set<string> {
  * durable rows, so the pass, the timer-driven notice path, the delivery-time
  * relevance check and a test all classify the same board identically.
  */
-function stallRootsFor(board: Pick<Board, 'tasks' | 'clock' | 'bounds'>): Task[] {
+export function stallRoots(board: Pick<Board, 'tasks' | 'clock' | 'bounds'>): Task[] {
   // A live replacement marks every id in its transitive lineage as covered.
   const replaced = replacementCoverage(board.tasks)
   return board.tasks.filter(task => {
@@ -439,10 +439,10 @@ export function waitsLegitimately(board: Board, task: Task): boolean {
     // stall root whose notice lists this record as a dependent. Naming the
     // record again (a W3 reminder, a fall-through) repeats the root's decision.
     if (task.reviewOf !== undefined && (replacementCoverage(tasks).has(task.reviewOf)
-      || stallRootsFor(board).some(root => root.id === task.reviewOf))) return true
+      || stallRoots(board).some(root => root.id === task.reviewOf))) return true
     const stop = stopPending(task) ? task.resumeAfterStop : undefined
     // R15-A3: an absent `at` is UNBOUNDED, so it is not legitimate waiting. The
-    // "cannot judge" case must never be the silent one: `stallRootsFor` classifies
+    // "cannot judge" case must never be the silent one: `stallRoots` classifies
     // the same row as a root, and this classifier refusing it here keeps the two
     // in agreement instead of leaving the state both silent and unnamed.
     if (stop !== undefined) return stop.at !== undefined && board.clock() - stop.at <= board.bounds.stallPassTimeoutMs
@@ -882,7 +882,7 @@ export class Notices {
     return {
       ...board,
       nonTerminal: tasks.filter(task => !TERMINAL_STATES.has(task.status)),
-      stallRoots: this.stallRoots(board),
+      stallRoots: stallRoots(board),
       replaced: replacementCoverage(tasks),
       // The dispatcher's own question and its own predicates, computed once here
       // so a notice can never describe a board the dispatcher would act on
@@ -1078,7 +1078,7 @@ export class Notices {
     const key = delivery.notice?.dedupKey ?? ''
     const root = key.startsWith(rootPrefix) ? key.slice(rootPrefix.length) : (delivery.subjects ?? noticeRow(delivery)?.subjects)?.[0]
     const task = root === undefined ? undefined : taskFromSubject(root, board.tasks)
-    return task !== undefined && stallRootsFor(board).some(candidate => candidate.id === task.id) ? [root!] : []
+    return task !== undefined && stallRoots(board).some(candidate => candidate.id === task.id) ? [root!] : []
   }
 
   /** A review-blocked decision is outstanding while its source is one the review admission speaks for (`unreviewedSources`) and its reason is the blocker the admission derives for that source under the same review need (`reviewPathBlocker`, src/board.ts). */
@@ -1398,15 +1398,6 @@ export class Notices {
       const row = delivery.to === 'owner' ? noticeRow(delivery) : undefined
       return row?.trigger === REJECTION_DECISION_TRIGGER && (delivery.subjects ?? row.subjects ?? []).includes(subject)
     })
-  }
-
-  /**
-   * R14-F2(b): the stall roots of one board, in board order. Purely a function
-   * of durable rows, so the pass, the timer-driven notice path and a test all
-   * classify the same board identically.
-   */
-  stallRoots(board: Board): Task[] {
-    return stallRootsFor(board)
   }
 
   /**

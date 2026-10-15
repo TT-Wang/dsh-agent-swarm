@@ -5,7 +5,7 @@
  */
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { factKey, waitsLegitimately } from '../lib/notices.js'
+import { factKey, stallRoots, waitsLegitimately } from '../lib/notices.js'
 import { taskGraphIndex } from '../lib/task-graph.js'
 import { wakePrecision } from './instruments.mjs'
 import { FakeClock, FakeWorkers, eventually, makeRuntime } from './faults/harness.mjs'
@@ -457,7 +457,7 @@ test('a rejected root whose decision was summarized is its own fact, and is name
   assert.equal(rt.store.get('tasks', repair.id).status, 'running', 'the repair ran past two reminder intervals')
   const withdrawnAt = Date.now()
   rt.cancel(f.owner, f.mission.id, { taskId: repair.id, reason: 'withdraw the repair' })
-  assert.ok(rt.notices.stallRoots(rt.boardOf(f.mission.id)).some(task => task.id === source.id), 'the root is a stall root again')
+  assert.ok(stallRoots(rt.boardOf(f.mission.id)).some(task => task.id === source.id), 'the root is a stall root again')
   const naming = await eventually(() => facts().find(fact => fact.createdAt >= withdrawnAt && fact.subjects.includes(rootSubject)), 'a fact names the root after the withdrawal', 8000)
   assert.ok(naming.dedupKey.startsWith('obligation-followup:'), `a reminder names the root: ${naming.dedupKey}`)
 })
