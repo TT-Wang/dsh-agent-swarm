@@ -1,7 +1,8 @@
 /**
- * Gates: the board slice the mission fingerprint digests (its revision-keyed
- * cache is the kernel's, `Kernel.fingerprint`), the owner/board instruments,
- * and the usage accounting that gates a budget stop. M1a seam 2/7.
+ * Gates: the owner/board instruments and the usage accounting that gates a
+ * budget stop. M1a seam 2/7. F(S), the fingerprint the instruments show, is a
+ * function of the board (`fingerprintBoard`, src/board.ts) the kernel caches
+ * (`Kernel.fingerprint`).
  *
  * Behaviour-identical to the code moved from src/runtime.ts; the runtime keeps
  * thin forwarding methods and re-exports the symbols its public surface had.
@@ -13,10 +14,10 @@ import { TERMINAL_STATES, currentEvidenceIds, subjectsOfTasks, terminal } from '
 import { excerpt } from './declared-checks.ts'
 import { executionElapsed } from './resource-time.ts'
 import { memberPhaseOf } from './projection.ts'
-import { dispatchable, reviewable } from './board.ts'
+import { dispatchable } from './board.ts'
 import { noticeFamily, noticeIdentity } from './notices.ts'
 import type { SwarmRuntime } from './runtime.ts'
-import type { Delivery, Member, Mission, Post, Task, UsageBuckets, UsageSnapshotSource } from './types.ts'
+import type { Delivery, Mission, Post, Task, UsageBuckets, UsageSnapshotSource } from './types.ts'
 
 const USAGE_KEYS = ['uncachedInputTokens', 'cacheReadTokens', 'cacheWriteTokens', 'outputTokens', 'reasoningTokens', 'requests'] as const
 
@@ -37,58 +38,6 @@ function usageDelta(next: UsageBuckets, previous: UsageBuckets | undefined): Usa
 
 function validUsage(value: unknown): value is UsageBuckets {
   return value !== null && typeof value === 'object' && USAGE_KEYS.every(key => Number.isSafeInteger((value as Record<string, unknown>)[key]) && Number((value as Record<string, unknown>)[key]) >= 0)
-}
-
-/** The owner-observable board slice `missionFingerprint` digests (spec §4). */
-export interface MissionFingerprintBoard {
-  status: Mission['status']
-  tasks: readonly MissionFingerprintTask[]
-  members: ReadonlyArray<{ id: string; status: Member['status'] }>
-  /** Undelivered worker outbox rows whose recipient can no longer receive them. */
-  pendingDeliveries: number
-  challengedEvidence: number
-  /** Ceilings already hit: the budget pause id and each task's exhausted dimension. */
-  ceilings: readonly string[]
-}
-
-/**
- * One task's owner-observable slice of the no-silent-state board. `ready` and
- * `unreviewed` are derived by the runtime (`dispatchable` and the live review
- * path); they are never supplied by a caller's claim.
- */
-interface MissionFingerprintTask {
-  id: string
-  status: Task['status']
-  /** The attempt owner only; a planned assignee is not an observed owner. */
-  attemptOwner?: string
-  /** A pending task at least one idle or waiting member can run right now. */
-  ready: boolean
-  /** A submitted task no live independent review can accept. */
-  unreviewed: boolean
-}
-
-/**
- * Stable digest `F(S)` of the owner-observable board (docs/no-silent-state-spec.md
- * §4). No field is a wall-clock time, so the digest moves only when a field
- * does. It is an owner instrument and an audit field, never a notice's
- * identity. Pure so a test can recompute it from the board.
- */
-export function missionFingerprint(board: MissionFingerprintBoard): string {
-  const order = (a: { id: string }, b: { id: string }) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0)
-  const tasks = [...board.tasks].sort(order).map(task => [task.id, task.status, task.attemptOwner ?? null, task.ready ? 1 : 0, task.unreviewed ? 1 : 0])
-  const members = [...board.members].sort(order).map(member => [member.id, member.status])
-  const canonical = JSON.stringify({
-    status: board.status,
-    tasks,
-    ready: board.tasks.filter(task => task.ready).length,
-    notReady: board.tasks.filter(task => task.status === 'pending' && !task.ready).length,
-    unreviewed: board.tasks.filter(task => task.unreviewed).length,
-    members,
-    pendingDeliveries: board.pendingDeliveries,
-    challengedEvidence: board.challengedEvidence,
-    ceilings: [...board.ceilings].sort(),
-  })
-  return createHash('sha256').update(canonical).digest('hex').slice(0, 32)
 }
 
 /** Observe shows only the newest few new posts; the board tool pages the rest. */
@@ -126,40 +75,6 @@ export class RuntimeGates {
   constructor(private readonly rt: SwarmRuntime) {}
 
   /**
-   * The owner-observable board slice F(S) digests (`missionFingerprint`; the
-   * kernel caches the digest per store revision, `Kernel.fingerprint`). Its
-   * readiness and review are the board's predicates (`dispatchable`,
-   * `reviewable`), the ones the scheduler and the completion check use, so the
-   * digest cannot disagree with the board; readiness asks the adapter's
-   * idleness and the clock (a preparation back-off), not only durable rows.
-   */
-  fingerprintBoard(missionId: string): MissionFingerprintBoard {
-    const board = this.rt.boardOf(missionId)
-    const { mission, tasks, members } = board
-    const ready = new Set(dispatchable(board).map(task => task.id))
-    const unreviewed = new Set(tasks.filter(task => task.status === 'submitted' && !reviewable(board, task)).map(task => task.id))
-    return {
-      status: mission.status,
-      tasks: tasks.map(task => ({ id: task.id, status: task.status,
-        ...(task.attempt?.ownerId === undefined ? {} : { attemptOwner: task.attempt.ownerId }),
-        ready: ready.has(task.id), unreviewed: unreviewed.has(task.id) })),
-      members: members.map(member => ({ id: member.id, status: member.status })),
-      // Owner-observable outbox backlog only: a delivery to a live member is the
-      // wake channel and is flushed in the same scheduling pass, and an owner
-      // notice is the ledger's record of a fact told about this board, not
-      // board state, so telling one never moves the digest.
-      pendingDeliveries: this.rt.store.list('deliveries', missionId).filter(delivery => delivery.deliveredAt === undefined
-        && delivery.to !== 'owner'
-        && !members.some(member => member.id === delivery.to && member.status !== 'stopped')).length,
-      challengedEvidence: this.rt.store.list('evidence', missionId).filter(evidence => evidence.status === 'challenged').length,
-      ceilings: [
-        ...(mission.budgetPause === undefined ? [] : [`budget:${mission.budgetPause.id}`]),
-        ...tasks.filter(task => task.ceiling !== undefined).map(task => `task:${task.id}:${task.ceiling!.dimension}`),
-      ],
-    }
-  }
-
-  /**
    * Read-only owner instruments (docs/no-silent-state-spec.md §6): the current
    * board digest `F(S)`, the last witness (the newest ledger row) with its family and time, the
    * pending-dispatchable count, the notice-delivery ledger and durable
@@ -174,7 +89,7 @@ export class RuntimeGates {
     return {
       // T3d: the owner-visible fingerprint is the board digest F(S); no notice is keyed by it.
       fingerprint: this.rt.fingerprint(missionId),
-      pendingDispatchable: this.fingerprintBoard(missionId).tasks.filter(task => task.ready).length,
+      pendingDispatchable: dispatchable(this.rt.boardOf(missionId)).length,
       ...(view.lastNotice === undefined ? {} : { lastWitness: { ...view.lastNotice, family: noticeFamily(records.deliveries.find(delivery => delivery.id === view.notices[0]!.deliveryId)!) } }),
       notices: counts,
       // L3: the receipts nobody has settled yet. A question with no answer is a

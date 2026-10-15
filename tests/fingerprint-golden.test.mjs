@@ -18,6 +18,7 @@ import assert from 'node:assert/strict'
 import { readFile, writeFile } from 'node:fs/promises'
 import { FakeClock, setup } from './faults/harness.mjs'
 import { ORACLE_EPOCH } from './faults/oracle.mjs'
+import { fingerprintBoard } from '../lib/board.js'
 
 const { missionFingerprint } = await import('../lib/runtime.js')
 const GOLDEN = new URL('./fixtures/fingerprint-golden.json', import.meta.url)
@@ -41,7 +42,7 @@ test('F(S) over the fixture boards equals the recorded golden', async t => {
   // The runtime's F(S) is the digest of the board it reads now, unless its
   // revision cache still holds the answer of an unchanged revision.
   const record = name => {
-    const board = f.runtime.fingerprintBoard(f.mission.id)
+    const board = fingerprintBoard(f.runtime.boardOf(f.mission.id))
     states.push({ name, cacheIsLive: f.runtime.fingerprint(f.mission.id) === missionFingerprint(board), ...relabeled(board) })
   }
   const put = (table, row) => f.runtime.store.transaction(() => f.runtime.store.put(table, row))

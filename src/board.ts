@@ -422,8 +422,10 @@ export function reviewPathBlocker(board: Board, source: Task, need: ReviewNeed, 
 
 /** The submissions the review admission speaks for: submitted artifacts. A submission an older build left without an artifact is ordinary stuck work. */
 const admissionSpeaksFor = (task: Task): boolean => task.status === 'submitted' && task.artifact !== undefined
-/** The review admission's sources, the one set its admission, its decisions and the interpretation read: the submissions it speaks for that no live review can accept (before the grace is applied). */
-export const unreviewedSources = (board: Board): Task[] => board.tasks.filter(task => admissionSpeaksFor(task) && !reviewable(board, task))
+/** The submissions no live review can accept (`reviewable`): F(S)'s unreviewed work (`fingerprintBoard`), whose artifacts are the review admission's sources. */
+const unreviewable = (board: Board): Task[] => board.tasks.filter(task => task.status === 'submitted' && !reviewable(board, task))
+/** The review admission's sources, the one set its admission, its decisions and the interpretation read: the unreviewable submissions it speaks for (before the grace is applied). */
+export const unreviewedSources = (board: Board): Task[] => unreviewable(board).filter(admissionSpeaksFor)
 /** Whether the host can still advance an unreviewable submission, the review admission's own rule, which the stall predicate and the waiting classifier read: inside its review grace (`ReviewNeed.ripe`), or, for a source the admission speaks for, while the admission names no blocker under the board's own stall (`reviewPathBlocker`): the next pass on a stalled board admits its review. */
 export const awaitsReviewAdmission = (board: Board, task: Task): boolean => { const need = reviewNeed(board, task); return !need.ripe || (admissionSpeaksFor(task) && reviewPathBlocker(board, task, need) === undefined) }
 
@@ -476,4 +478,95 @@ export function completionError(board: Board): string | undefined {
   const disputed = board.records.list('evidence', mission.id).filter(evidence => evidence.status === 'challenged' && !dead.has(evidence.taskId) && !archived.has(evidence.id))
   if (disputed.length) return `Unresolved evidence challenges prevent completion: ${disputed.map(evidence => evidence.id).join(', ')}`
   return undefined
+}
+
+/* ----------------------------------------------------------------------- *
+ * F(S): the stable digest of the owner-observable board
+ * (docs/no-silent-state-spec.md §4), the owner instruments' fingerprint and an
+ * audit field of the stall events. The kernel caches it per store revision
+ * (`Kernel.fingerprint`).
+ * ----------------------------------------------------------------------- */
+
+/** The owner-observable board slice `missionFingerprint` digests (spec §4). */
+export interface MissionFingerprintBoard {
+  status: Mission['status']
+  tasks: readonly MissionFingerprintTask[]
+  members: ReadonlyArray<{ id: string; status: Member['status'] }>
+  /** Undelivered worker outbox rows whose recipient can no longer receive them. */
+  pendingDeliveries: number
+  challengedEvidence: number
+  /** Ceilings already hit: the budget pause id and each task's exhausted dimension. */
+  ceilings: readonly string[]
+}
+
+/**
+ * One task's owner-observable slice of the no-silent-state board. `ready` and
+ * `unreviewed` are derived by the runtime (`dispatchable` and the live review
+ * path); they are never supplied by a caller's claim.
+ */
+interface MissionFingerprintTask {
+  id: string
+  status: Task['status']
+  /** The attempt owner only; a planned assignee is not an observed owner. */
+  attemptOwner?: string
+  /** A pending task at least one idle or waiting member can run right now. */
+  ready: boolean
+  /** A submitted task no live independent review can accept. */
+  unreviewed: boolean
+}
+
+/**
+ * Stable digest `F(S)` of the owner-observable board. No field is a wall-clock
+ * time, so the digest moves only when a field does. It is an owner instrument
+ * and an audit field, never a notice's identity. Pure so a test can recompute
+ * it from the board.
+ */
+export function missionFingerprint(board: MissionFingerprintBoard): string {
+  const order = (a: { id: string }, b: { id: string }) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0)
+  const tasks = [...board.tasks].sort(order).map(task => [task.id, task.status, task.attemptOwner ?? null, task.ready ? 1 : 0, task.unreviewed ? 1 : 0])
+  const members = [...board.members].sort(order).map(member => [member.id, member.status])
+  const canonical = JSON.stringify({
+    status: board.status,
+    tasks,
+    ready: board.tasks.filter(task => task.ready).length,
+    notReady: board.tasks.filter(task => task.status === 'pending' && !task.ready).length,
+    unreviewed: board.tasks.filter(task => task.unreviewed).length,
+    members,
+    pendingDeliveries: board.pendingDeliveries,
+    challengedEvidence: board.challengedEvidence,
+    ceilings: [...board.ceilings].sort(),
+  })
+  return createHash('sha256').update(canonical).digest('hex').slice(0, 32)
+}
+
+/**
+ * The slice F(S) digests of one board. Its readiness and review are the board's
+ * own sets (`dispatchable`, `unreviewable`), the definitions the interpretation
+ * and the scheduler read, so the digest cannot disagree with the board; it
+ * builds no interpretation. Readiness asks the adapter's idleness and the clock
+ * (a preparation back-off), not only durable rows.
+ */
+export function fingerprintBoard(board: Board): MissionFingerprintBoard {
+  const { missionId, mission, tasks, members } = board
+  const ready = new Set(dispatchable(board).map(task => task.id))
+  const unreviewed = new Set(unreviewable(board).map(task => task.id))
+  return {
+    status: mission.status,
+    tasks: tasks.map(task => ({ id: task.id, status: task.status,
+      ...(task.attempt?.ownerId === undefined ? {} : { attemptOwner: task.attempt.ownerId }),
+      ready: ready.has(task.id), unreviewed: unreviewed.has(task.id) })),
+    members: members.map(member => ({ id: member.id, status: member.status })),
+    // Owner-observable outbox backlog only: a delivery to a live member is the
+    // wake channel and is flushed in the same scheduling pass, and an owner
+    // notice is the ledger's record of a fact told about this board, not
+    // board state, so telling one never moves the digest.
+    pendingDeliveries: board.records.list('deliveries', missionId).filter(delivery => delivery.deliveredAt === undefined
+      && delivery.to !== 'owner'
+      && !members.some(member => member.id === delivery.to && member.status !== 'stopped')).length,
+    challengedEvidence: board.records.list('evidence', missionId).filter(evidence => evidence.status === 'challenged').length,
+    ceilings: [
+      ...(mission.budgetPause === undefined ? [] : [`budget:${mission.budgetPause.id}`]),
+      ...tasks.filter(task => task.ceiling !== undefined).map(task => `task:${task.id}:${task.ceiling!.dimension}`),
+    ],
+  }
 }

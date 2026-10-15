@@ -12,6 +12,7 @@ import { pendingStopOwner } from '../lib/task-graph.js'
 import { wakePrecision } from './instruments.mjs'
 import { FakeClock, FakeWorkers, MISSION_ACCEPTANCE, makeRuntime, makeRuntimeStub, setup } from './faults/harness.mjs'
 import { openAsks } from '../lib/arena.js'
+import { dispatchable as dispatchableOf } from '../lib/board.js'
 
 /** A stub `Notices.tell`: the record that exists only with the fact, in the stubs' pass-through transaction (the ledger is not modelled). */
 function tell(_missionId, _content, _subjects, _options, then) { then?.(); return true }
@@ -177,8 +178,8 @@ test('R12: a pending review is dispatchable only once its source is submitted, t
   const source = f.propose({ title: 'Source' })
   const review = f.runtime.propose(f.owner, f.mission.id, { outputs: [], workstreamId: f.stream.id, title: 'Review', objective: 'Independent review',
     kind: 'verification', reviewOf: source.id, scope: ['**'], acceptance: MISSION_ACCEPTANCE })
-  // The owner instruments' dispatchable set: the dispatcher's eligibility over idle or waiting members.
-  const dispatchable = () => f.runtime.fingerprintBoard(f.mission.id).tasks.filter(task => task.ready).map(task => task.id)
+  // The dispatchable set the owner instruments count and F(S) digests: the dispatcher's eligibility over idle or waiting members.
+  const dispatchable = () => dispatchableOf(f.runtime.boardOf(f.mission.id)).map(task => task.id)
   assert.deepEqual(dispatchable(), [source.id], 'only the source can run')
   const claimed = await f.runtime.claim(f.actor(f.author), f.mission.id, source.id)
   await f.runtime.submit(f.actor(f.author), f.mission.id, { taskId: source.id, attemptId: claimed.attempt.id, output: 'candidate' })

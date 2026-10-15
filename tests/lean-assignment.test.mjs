@@ -4,7 +4,7 @@ import assert from 'node:assert/strict'
 import { join } from 'node:path'
 import { assignmentAllows, authorIdsOf, canBorrowTask } from '../lib/assignment.js'
 import { FakeWorkers, SwarmRuntime, makeRuntime } from './faults/harness.mjs'
-import { ready, reviewable, unschedulable } from '../lib/board.js'
+import { dispatchable, ready, reviewable, unschedulable } from '../lib/board.js'
 
 class Workers extends FakeWorkers {
   busy = new Set()
@@ -147,7 +147,7 @@ test('a retired preference does not make untouched work dead or undispatchable',
   const preferred = f.runtime.store.get('members', f.preferred.id); preferred.phase = 'stopped'
   f.runtime.commit(f.mission.id, () => f.runtime.store.put('members', preferred))
   assert.deepEqual(unschedulable(f.runtime.boardOf(f.mission.id)), [])
-  assert.deepEqual(f.runtime.fingerprintBoard(f.mission.id).tasks.filter(row => row.ready).map(row => row.id), [task.id])
+  assert.deepEqual(dispatchable(f.runtime.boardOf(f.mission.id)).map(row => row.id), [task.id])
   const claimed = await f.runtime.claim(f.actor(f.spare), f.mission.id, task.id)
   assert.equal(claimed.assigneeId, f.spare.id)
 })

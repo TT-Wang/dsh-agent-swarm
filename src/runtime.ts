@@ -11,12 +11,13 @@ import { Notices, NOTICE_TEMPLATES, REJECTION_DECISION_TRIGGER, renderNotice, ty
 import { RefusalRegistry, requireStrings, requireText, sameChecks, unsupportedEffort, validatedBudget } from './refusals.ts'
 import { Scheduling } from './scheduling.ts'
 import { progressed, type Kernel, type SchedulingPass } from './kernel.ts'
-import { ADMISSION_REFUSED, AUTOMATIC_REVIEW_PREFIX, PROVIDER_OUTAGE_WINDOW_MS, bounds, capable, completionError, noticeSubjectsFor, readBoard, readinessBlocker, readMission, ready, rerouteTarget, providerQuiescent, reviewable, reviewNeed, reviewPathBlocker, reviewPathStalled, unreviewedSources, unschedulable, type AdapterView, type Board, type Bounds, type ReviewNeed } from './board.ts'
+import { ADMISSION_REFUSED, AUTOMATIC_REVIEW_PREFIX, PROVIDER_OUTAGE_WINDOW_MS, bounds, capable, completionError, fingerprintBoard, missionFingerprint, noticeSubjectsFor, readBoard, readinessBlocker, readMission, ready, rerouteTarget, providerQuiescent, reviewable, reviewNeed, reviewPathBlocker, reviewPathStalled, unreviewedSources, unschedulable, type AdapterView, type Board, type Bounds, type ReviewNeed } from './board.ts'
 // R17-G6/G7: the one derivation of mission derived state and its host projection.
 import { deriveMemberBoard, deriveMemberStatus, memberPhaseOf, memberDeliveryHealth, type MissionBoardMember } from './projection.ts'
 import type { MissionInterpretation } from './notices.ts'
-export { emptyUsage, addUsage, missionFingerprint, type MissionFingerprintBoard } from './gates.ts'
-import { RuntimeGates, emptyUsage, addUsage, BOARD_DELTA_POSTS, missionFingerprint, postView, type MissionFingerprintBoard } from './gates.ts'
+export { emptyUsage, addUsage } from './gates.ts'
+export { missionFingerprint, type MissionFingerprintBoard } from './board.ts'
+import { RuntimeGates, emptyUsage, addUsage, BOARD_DELTA_POSTS, postView } from './gates.ts'
 import { DeclaredChecks, MAX_REPORTED_CHECK_FAILURES, excerpt, recoveryExit } from './declared-checks.ts'
 import { verdictRows } from './trace.ts'
 export { TEMP_RENDEZVOUS_WINDOW_MS, sharedTempPaths, tempRendezvousDecision, type TempMention } from './workspace-admission.ts'
@@ -350,7 +351,6 @@ export class SwarmRuntime implements Kernel {
   private readonly declaredChecks = new DeclaredChecks(this)
   /** M1a seam 2/7: derived fingerprints, usage accounting and the budget gate. */
   private readonly gates = new RuntimeGates(this)
-  fingerprintBoard(missionId: string): MissionFingerprintBoard { return this.gates.fingerprintBoard(missionId) }
   private ownerInstruments(missionId: string, full: boolean): Record<string, unknown> { return this.gates.ownerInstruments(missionId, full) }
   private boardWindow(missionId: string, memberId: string, afterSeq: number): Record<string, unknown> { return this.gates.boardWindow(missionId, memberId, afterSeq) }
   private async usage(memberId: string, tokens: number): Promise<void> { return this.gates.usage(memberId, tokens) }
@@ -719,11 +719,11 @@ export class SwarmRuntime implements Kernel {
     // digest first computed at it, even if the adapter's idleness or the clock
     // has since changed readiness. Never trust the cache inside an open
     // transaction: the revision has not advanced yet while the board is mutating.
-    if (this.commitDepth > 0) return missionFingerprint(this.gates.fingerprintBoard(missionId))
+    if (this.commitDepth > 0) return missionFingerprint(fingerprintBoard(this.boardOf(missionId)))
     const revision = this.store.revision()
     const cached = this.fingerprintCache.get(missionId)
     if (cached !== undefined && cached.revision === revision) return cached.fingerprint
-    const fingerprint = missionFingerprint(this.gates.fingerprintBoard(missionId))
+    const fingerprint = missionFingerprint(fingerprintBoard(this.boardOf(missionId)))
     this.fingerprintCache.set(missionId, { revision, fingerprint })
     return fingerprint
   }

@@ -16,12 +16,11 @@ import type { Mission, RuntimeConfig, Task, WorkerAdapter } from './types.ts'
  * can change after construction. `boardOf` is one mission's board as the store
  * holds it now, the value every decision reads where it decides, and `view` the
  * adapter answers it asks, called through on every ask. `fingerprint` is F(S),
- * the board digest the owner instruments and the stall events carry. Its cache
- * is the kernel's: one digest per store revision, never trusted inside an open
- * transaction (`commitDepth`). The slice it digests is not: Gates builds it
- * (`fingerprintBoard`) over the board's readiness and review predicates, and
- * readiness asks the adapter's idleness and the clock, so F(S) still reaches up
- * into Gates.
+ * the board digest the owner instruments and the stall events carry: the digest
+ * of `boardOf`'s board (`fingerprintBoard`, a board function), cached by the
+ * kernel at one digest per store revision and never trusted inside an open
+ * transaction (`commitDepth`). Readiness asks the adapter's idleness and the
+ * clock, so a cached digest answers for the instant its revision was first read.
  */
 export interface Kernel {
   readonly store: SwarmStore

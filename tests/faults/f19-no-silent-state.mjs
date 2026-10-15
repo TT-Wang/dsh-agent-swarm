@@ -19,7 +19,7 @@
  * owner-assembled mission returned silently.
  */
 import assert from 'node:assert/strict'
-import { completionError } from '../../lib/board.js'
+import { completionError, fingerprintBoard } from '../../lib/board.js'
 import { acceptThroughReview, blockThroughReview, clone, eventually, events, makeRuntime, now, runScenario, setup, taskOf, wait } from './harness.mjs'
 import { noticeFamily } from '../../lib/notices.js'
 
@@ -578,7 +578,7 @@ await runScenario({
       const f = await setup()
       try {
         const task = f.propose()
-        const base = clone(f.runtime.fingerprintBoard(f.mission.id))
+        const base = clone(fingerprintBoard(f.runtime.boardOf(f.mission.id)))
         assert.equal(f.runtime.fingerprint(f.mission.id), missionFingerprint(base))
         const shuffled = { ...base, tasks: [...base.tasks].reverse(), members: [...base.members].reverse() }
         assert.equal(f.runtime.fingerprint(f.mission.id), missionFingerprint(shuffled), 'F(S) is order-independent')
