@@ -433,3 +433,13 @@ test('a cancelled task is as finished as an accepted one in every client reading
   assert.equal(completionBlocker(snapshot), 'Mission still has unfinished or blocked required work')
   assert.match(render(SwarmBoard, { snapshot, initialView: 'board', onCancelTask() {} }), /data-action="cancel-task"/)
 })
+
+test('a stop marker left at an older epoch fences nothing: the blocked task waits for the owner until a marker at its own epoch makes it a recovery', () => {
+  const snapshot = uiSnapshot()
+  const at = snapshot.mission.updatedAt
+  snapshot.tasks = [snapshot.tasks[0], { ...snapshot.tasks[4], status: 'blocked', epoch: 3, resumeAfterStop: { epoch: 2, reason: 'lease-expired', at: at - 1_000 } }]
+  const reading = () => { const { phase, label, evidence } = sidebarState(snapshot, 'connected', at); return { phase, label, evidence } }
+  assert.deepEqual(reading(), { phase: 'waiting-for-owner', label: 'Waiting for your decision', evidence: 'task t5 status=blocked epoch 3' }, 'the stale marker owes no stop')
+  snapshot.tasks[1] = { ...snapshot.tasks[1], resumeAfterStop: { ...snapshot.tasks[1].resumeAfterStop, epoch: 3 } }
+  assert.deepEqual(reading(), { phase: 'recovering', label: 'Recovering', evidence: 'task t5 resumeAfterStop@3' }, 'a marker at the task\'s epoch is the stop it awaits')
+})
