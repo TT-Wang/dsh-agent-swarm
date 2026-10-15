@@ -6,7 +6,7 @@ import { uiSnapshot } from './fixtures/ui-snapshot.mjs'
 import { currentProgress, recentProgress, acceptanceSummary, activityDuration, sidebarState } from '../lib/types/client/progress.js'
 import { MissionOverview } from '../lib/types/client/LiveWorkPanel.js'
 import { SwarmBoard } from '../lib/types/client/SwarmBoard.js'
-import { activityGroups } from '../lib/types/client/projection.js'
+import { activityGroups, completionBlocker } from '../lib/types/client/projection.js'
 import { ActivityPanel } from '../lib/types/client/ActivityPanel.js'
 import { DeliveryPanel } from '../lib/types/client/DeliveryPanel.js'
 import { LiveWorkOverview } from '../lib/types/client/LiveWorkPanel.js'
@@ -419,4 +419,17 @@ test('the shared live overview animates only fresh native work; reconnects and h
   const revoked = render(LiveWorkOverview, { ...props, snapshot: unbound })
   assert.doesNotMatch(revoked, /data-moving="true"|class="sw-agent-avatar-ring"|Running a tool/)
   assert.match(revoked, /Waiting for activity confirmation/, 'revoked activity cannot make the current task look busy')
+})
+
+test('a cancelled task is as finished as an accepted one in every client reading of terminal work', () => {
+  const snapshot = uiSnapshot()
+  snapshot.tasks = [snapshot.tasks[0], { ...snapshot.tasks[4], status: 'cancelled' }]
+  assert.equal(snapshot.tasks[1].experiment, false, 'not an experiment, so completionExempt does not cover it')
+  assert.equal(currentProgress(snapshot).label, 'Preparing the final result')
+  assert.equal(completionBlocker(snapshot), undefined)
+  assert.doesNotMatch(render(SwarmBoard, { snapshot, initialView: 'board', onCancelTask() {} }), /data-action="cancel-task"/)
+  snapshot.tasks[1] = { ...snapshot.tasks[1], status: 'pending' }
+  assert.equal(currentProgress(snapshot).label, 'Waiting for worker activity')
+  assert.equal(completionBlocker(snapshot), 'Mission still has unfinished or blocked required work')
+  assert.match(render(SwarmBoard, { snapshot, initialView: 'board', onCancelTask() {} }), /data-action="cancel-task"/)
 })
