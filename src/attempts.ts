@@ -393,16 +393,18 @@ export class Attempts {
    * operation, but it is no longer plausible liveness, so the lease stops being
    * renewed and the existing expiry path — not a new kill switch — frees the
    * attempt. Inside the bound the rule is unchanged. `read` and `attemptId` are
-   * the row and the attempt the lease-expiry sweep read.
+   * the row and the attempt the lease-expiry sweep read. Returns the row as it
+   * now stands, renewed or not, while it still holds that attempt; undefined
+   * once a fencing transition took it.
    */
-  private renewActiveOperation(read: Task, attemptId: string, mission: Mission, silent: boolean): void {
+  private renewActiveOperation(read: Task, attemptId: string, mission: Mission, silent: boolean): HeldTask | undefined {
     // S1 (P0): fence the renewal itself. The caller may hold a row read before
     // an earlier iteration's await; re-read and never extend a lease, clear a
     // warning or write a whole record over a row that moved epoch, status or
     // attempt (cancel, handoff, challenge, beforeStep, recordToolRun).
     const task = this.k.store.get('tasks', read.id)
-    if (!holdsAttempt(task, mission.id, read.epoch, attemptId)) return
-    if (task.attempt.leaseUntil >= this.k.now() + this.k.config.leaseMs / 2) return
+    if (!holdsAttempt(task, mission.id, read.epoch, attemptId)) return undefined
+    if (task.attempt.leaseUntil >= this.k.now() + this.k.config.leaseMs / 2) return task
     // A live operation is liveness for its full duration: match by member and
     // activity id, never by the attempt the operation happens to be stored under.
     // The adapter must confirm the operation is live; a durable activity alone never renews.
@@ -415,15 +417,16 @@ export class Attempts {
           this.k.store.event(mission.id, 'task/lease-expiring', 'runtime', { taskId: task.id, ownerId: task.attempt.ownerId, leaseUntil: task.attempt.leaseUntil })
         })
       }
-      return
+      return task
     }
-    if (silent) return
+    if (silent) return task
     const member = this.k.store.get('members', task.attempt.ownerId)
     const modelAllowance = activity.kind === 'model' ? (member?.maxOutputTokens ?? 0) : 0
     task.attempt.leaseUntil = Math.min(mission.deadline, this.k.now() + this.k.config.leaseMs + Math.ceil(modelAllowance * LEASE_MS_PER_OUTPUT_TOKEN))
     delete task.leaseWarned
     // A lease extension is liveness bookkeeping, not a new progress timestamp or milestone.
     this.k.commit(mission.id, () => this.k.store.put('tasks', task))
+    return task
   }
   onIdle(memberId: string): void {
     if (this.k.closed || this.k.shuttingDown) return
@@ -555,14 +558,8 @@ export class Attempts {
           // lease so the existing expiry path can free the attempt.
           const silent = this.silentOperation(task, mission)
           if (silent !== undefined) this.escalateSilentOperation(mission, task, silent)
-          this.renewActiveOperation(task, attemptId, mission, silent !== undefined)
-          // S1r: the renewal commits a re-read row, so the caller's snapshot can
-          // still look expired after a successful renewal. Re-read again and use the
-          // current row for every later comparison, or a live operation is renewed
-          // and then expired in the same pass (the documented "a live operation is
-          // liveness for its full duration" invariant).
-          const renewed = this.k.store.get('tasks', task.id)
-          if (!holdsAttempt(renewed, missionId, task.epoch, attemptId) || renewed.attempt.leaseUntil >= this.k.now()) continue
+          const renewed = this.renewActiveOperation(task, attemptId, mission, silent !== undefined)
+          if (renewed === undefined || renewed.attempt.leaseUntil >= this.k.now()) continue
           task = renewed
           // W6: capture a durable checkpoint before any reassignment when the old
           // owner is quiescent, so the next attempt resumes committed work instead
