@@ -275,11 +275,11 @@ test('M2-10: inline # remains word data, while actual shell comments remain igno
 
 test('M2-11: isolation uses explicit member IDs including task workspace conflicts', () => {
   const members = [{ id: 'bad', name: 'victim', workspace: '', status: 'idle' }, { id: 'victim', name: 'Safe', workspace: '/safe', status: 'idle' }]
-  const admission = new WorkspaceAdmission(makeRuntimeStub({ store: { list: table => table === 'members' ? members : [], get: () => undefined }, boardOf: missionId => ({ missionId, tasks: [] }), notices: { emitGuardTerminal() {} } }))
+  const admission = new WorkspaceAdmission(makeRuntimeStub({ boardOf: missionId => ({ missionId, members, tasks: [] }), notices: { emitGuardTerminal() {} } }))
   assert.equal(admission.isolationAllows('m', members[1]), true)
   assert.equal(admission.isolationAllows('m', members[0]), false)
   const tasks = ['a', 'b'].map(id => ({ id, status: 'running', scope: ['**'], attempt: { ownerId: 'victim' } }))
-  const issues = isolationIssues(members, tasks)
+  const issues = isolationIssues({ members, tasks })
   assert.ok(issues.some(issue => issue.memberIds.includes('victim') && issue.message.includes('concurrently running tasks')))
 })
 

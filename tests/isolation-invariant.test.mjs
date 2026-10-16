@@ -27,7 +27,7 @@ const SCOPES = ['src/', 'docs/', 'scripts/faults/', 'tests/', '**', 'src/runtime
 const rng = seed => { let state = seed >>> 0; return () => { state = (state * 1664525 + 1013904223) >>> 0; return state / 0x1_0000_0000 } }
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
 /** The breaches the invariant lists on one fixture's board, by their text. */
-const violationsOf = f => { const { members, tasks } = f.runtime.boardOf(f.mission.id); return isolationIssues(members, tasks).map(issue => issue.message) }
+const violationsOf = f => isolationIssues(f.runtime.boardOf(f.mission.id)).map(issue => issue.message)
 
 test('S7: generated member/task sets keep live workers within provisioned worktrees and concurrent scopes disjoint per worktree', async () => {
   for (const seed of [1, 2, 3, 4, 5]) {
@@ -138,7 +138,7 @@ test('S7: a shared worktree is refused durably, never dispatched into, and its d
 test('S7: two running tasks in one worktree add an overlap violation exactly when their declared scopes overlap', () => {
   const members = [{ id: 'member_a', name: 'A', status: 'working', workspace: '/isolated/a' }]
   const running = (id, scope) => ({ id, status: 'running', scope, attempt: { ownerId: 'member_a' } })
-  const messages = (left, right) => isolationIssues(members, [running('task_one', left), running('task_two', right)]).map(issue => issue.message)
+  const messages = (left, right) => isolationIssues({ members, tasks: [running('task_one', left), running('task_two', right)] }).map(issue => issue.message)
   const shared = 'concurrently running tasks task_one, task_two share worktree /isolated/a'
   const overlap = 'concurrently running tasks task_one and task_two declare overlapping scope in worktree /isolated/a'
   assert.deepEqual(messages(['src/'], ['src/runtime.ts']), [shared, overlap], 'a directory selector overlaps a file under it')

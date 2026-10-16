@@ -1620,7 +1620,7 @@ test('every exit a failed dispatch\'s request names, performed through the owner
 })
 
 /** The breaches the isolation invariant lists on one fixture's board, by their text. */
-const violationsOf = f => { const { members, tasks } = f.runtime.boardOf(f.mission.id); return isolationIssues(members, tasks).map(issue => issue.message) }
+const violationsOf = f => isolationIssues(f.runtime.boardOf(f.mission.id)).map(issue => issue.message)
 
 test('the isolation request is its violation\'s: keyed by the violation\'s text and naming the unfinished work of every member it lists, told once however often it refuses them; a changed violation is a second request, and only the violation the invariant lists is outstanding and reminded', async t => {
   const f = await setup({ clock: new FakeClock(), workers: new FakeWorkers({ autoIdle: true }), budget: LONG })

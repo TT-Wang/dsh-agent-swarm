@@ -508,9 +508,9 @@ export class WorkspaceAdmission {
    * (`Notices.openGuardTerminal`), and a changed violation is a new one.
    */
   isolationAllows(missionId: string, member: Member): boolean {
-    const violation = isolationIssues(this.rt.store.list('members', missionId), this.rt.store.list('tasks', missionId)).find(entry => entry.memberIds.includes(member.id))
-    if (violation === undefined) return true
     const board = this.rt.boardOf(missionId)
+    const violation = isolationIssues(board).find(entry => entry.memberIds.includes(member.id))
+    if (violation === undefined) return true
     this.rt.notices.emitGuardTerminal(missionId, 'workspace', { subjects: violation.memberIds.flatMap(id => noticeSubjectsFor(board, { memberId: id })), localKey: isolationOpener(violation.message),
       detail: `the isolation invariant refuses dispatch: ${violation.message}` })
     return false

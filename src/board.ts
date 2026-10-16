@@ -357,7 +357,7 @@ export function rerouteTarget(board: Board, task: Task, failedId: string): Membe
 export interface IsolationIssue { memberIds: string[]; message: string }
 
 /**
- * S7: the isolation invariant over one mission's members and tasks, decided
+ * S7: the isolation invariant over one board's members and tasks, decided
  * from durable state only, each breach with the members it lists:
  *  - live workers ≤ provisioned isolated worktrees: every non-stopped member
  *    owns a provisioned workspace and no two live members share one, so the
@@ -372,21 +372,21 @@ export interface IsolationIssue { memberIds: string[]; message: string }
  * the workspace terminal a breach raised is outstanding while the invariant
  * still lists it (`Notices.openGuardTerminal`).
  */
-export function isolationIssues(allMembers: readonly Member[], tasks: readonly Task[]): IsolationIssue[] {
+export function isolationIssues(board: Pick<Board, 'members' | 'tasks'>): IsolationIssue[] {
   const violations: IsolationIssue[] = []
-  const members = allMembers.filter(member => member.status !== 'stopped')
+  const live = board.members.filter(member => member.status !== 'stopped')
   const byWorkspace = new Map<string, Member[]>()
-  for (const member of members) {
+  for (const member of live) {
     if (!member.workspace) { violations.push({ memberIds: [member.id], message: `member ${member.id} (${member.name}) has no provisioned isolated worktree` }); continue }
     byWorkspace.set(member.workspace, [...(byWorkspace.get(member.workspace) ?? []), member])
   }
   for (const [workspace, group] of byWorkspace) {
     if (group.length > 1) violations.push({ memberIds: group.map(member => member.id), message: `live workers ${group.map(member => member.id).join(', ')} share one provisioned worktree (${workspace}); live workers must never exceed provisioned worktrees` })
   }
-  const running = tasks.filter(task => task.status === 'running' && task.attempt !== undefined)
+  const running = board.tasks.filter(task => task.status === 'running' && task.attempt !== undefined)
   const byTaskWorkspace = new Map<string, Task[]>()
   for (const task of running) {
-    const owner = allMembers.find(member => member.id === task.attempt!.ownerId)
+    const owner = board.members.find(member => member.id === task.attempt!.ownerId)
     if (owner === undefined || owner.status === 'stopped') { violations.push({ memberIds: [task.attempt!.ownerId], message: `running task ${task.id} has no live owner (${task.attempt!.ownerId})` }); continue }
     byTaskWorkspace.set(owner.workspace, [...(byTaskWorkspace.get(owner.workspace) ?? []), task])
   }

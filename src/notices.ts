@@ -921,7 +921,7 @@ export class Notices {
       return [`task-budget:${mission.budget.maxTasks}`, `experiment-budget:${mission.budget.maxExperiments}`].some(localKey => key === guardTerminalKey('task_ceiling', { localKey })) ? undefined : []
     }
     if (key?.startsWith(guardTerminalKey('workspace', { localKey: 'isolation:' }))) {
-      return isolationIssues(this.k.store.list('members', mission.id), this.k.store.list('tasks', mission.id)).some(issue => key === guardTerminalKey('workspace', { localKey: isolationOpener(issue.message) })) ? delivery.subjects ?? [] : []
+      return isolationIssues(this.k.boardOf(mission.id)).some(issue => key === guardTerminalKey('workspace', { localKey: isolationOpener(issue.message) })) ? delivery.subjects ?? [] : []
     }
     if (!key?.startsWith(guardTerminalKey('attempt_lease', { localKey: 'stop:' }))) return undefined
     const tasks = this.k.store.list('tasks', mission.id)
