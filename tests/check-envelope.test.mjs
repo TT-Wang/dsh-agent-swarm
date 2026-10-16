@@ -35,7 +35,7 @@ import { compareCheckEnvironments } from '../lib/declared-checks.js'
 import { checkTempEnvironment, runProcess } from '../lib/workspaces.js'
 import { tempDirectory } from './temp-root.mjs'
 import { subprocessSeam } from './subprocess-seam.mjs'
-import { FakeClock, FakeWorkers, makeRepo, makeRuntime, makeWorkspaces, setup } from './faults/harness.mjs'
+import { FakeClock, FakeWorkers, events, makeRepo, makeRuntime, makeWorkspaces, setup } from './faults/harness.mjs'
 
 const FIXTURE_TEST = 'tests/fixture-failing.test.mjs'
 const DEFAULT_DEPENDENCY_DIRS = ['node_modules', '.venv', 'venv', 'vendor', '.tox']
@@ -419,14 +419,16 @@ test('ENV: the supporting host checks are the environment the envelope is compar
   assert.equal(review.status, 'accepted', 'the review is decided by its supporting host checks')
 })
 
+/** A check environment rooted at `home`, as an adapter reports one. */
+const environmentAt = home => ({ home, userCacheDir: `${home}/.cache`, huggingfaceCacheDir: `${home}/.cache/huggingface`,
+  userCacheDirExists: false, huggingfaceCacheDirExists: false, xdgCacheHome: '/check/.cache',
+  sandboxPolicy: { mode: 'workspace-write', enforcement: 'full', workspaceRoot: '/check' },
+  dependencyLinks: { mode: 'copy', dirs: [] }, checkCacheRoot: '/check/.cache', checkCacheRoots: {} })
+
 test('ENV: a verdict compares the envelope delivered with its own attempt, not an earlier attempt\'s or the one the adapter reports when it verifies', async t => {
   const f = await setup({ clock: new FakeClock() })
   t.after(() => f.cleanup())
-  const environment = home => ({ home, userCacheDir: `${home}/.cache`, huggingfaceCacheDir: `${home}/.cache/huggingface`,
-    userCacheDirExists: false, huggingfaceCacheDirExists: false, xdgCacheHome: '/check/.cache',
-    sandboxPolicy: { mode: 'workspace-write', enforcement: 'full', workspaceRoot: '/check' },
-    dependencyLinks: { mode: 'copy', dirs: [] }, checkCacheRoot: '/check/.cache', checkCacheRoots: {} })
-  const earlier = environment('/earlier'), delivered = environment('/delivered'), current = environment('/current')
+  const earlier = environmentAt('/earlier'), delivered = environmentAt('/delivered'), current = environmentAt('/current')
   const reports = env => () => ({ environment: env, selfRunEnvironment: env })
   const assignedHome = attemptId => JSON.parse(f.runtime.store.list('deliveries', f.mission.id)
     .find(delivery => delivery.kind === 'assignment' && delivery.attemptId === attemptId).content).checkEnvironment.environment.home
@@ -469,6 +471,43 @@ test('ENV: the environment report is best-effort: an adapter whose report throws
   assert.equal(content.task.id, task.id, 'the assignment names its task')
   assert.equal(Object.hasOwn(content, 'checkEnvironment'), false, 'a report that throws delivers no envelope instead of breaking the delivery')
   assert.equal(f.runtime.store.get('tasks', task.id).status, 'running', 'the claim holds its attempt')
+})
+
+/** A submitted source and its review, the review claimed by the reviewer while the adapter reports no envelope. */
+async function claimedReview(f) {
+  const source = f.propose()
+  const sourceClaim = await f.runtime.claim(f.actor(f.author), f.mission.id, source.id)
+  await f.runtime.submit(f.actor(f.author), f.mission.id, { taskId: source.id, attemptId: sourceClaim.attempt.id, output: 'ready for review' })
+  const review = f.propose({ title: 'Review', kind: 'verification', reviewOf: source.id, assigneeId: f.reviewer.id })
+  const { attempt } = await f.runtime.claim(f.actor(f.reviewer), f.mission.id, review.id)
+  const assignment = f.runtime.store.list('deliveries', f.mission.id).find(delivery => delivery.kind === 'assignment' && delivery.attemptId === attempt.id)
+  assert.equal(Object.hasOwn(JSON.parse(assignment.content), 'checkEnvironment'), false, 'the review attempt was delivered no envelope')
+  return { review, verify: () => f.runtime.verify(f.actor(f.reviewer), f.mission.id, { taskId: review.id, attemptId: attempt.id, verdict: 'accept', reason: 'Independent review' }) }
+}
+
+test('ENV: the environment report is best-effort at a verdict too: a report that throws when the review verifies leaves the verdict to its host checks and records no envelope', async t => {
+  const f = await setup({ clock: new FakeClock() })
+  t.after(() => f.cleanup())
+  const { verify } = await claimedReview(f)
+  f.workers.checkEnvelope = () => { throw new Error('probe: the environment report failed') }
+  f.workers.checks = [{ command: 'test -d .', exitCode: 0, output: 'ok', environment: environmentAt('/checked') }]
+  assert.equal((await verify()).status, 'accepted', 'a report that throws breaks no verdict: the host checks decide it')
+  assert.deepEqual(events(f.runtime, f.mission.id, 'task/check-envelope'), [], 'and the verdict records no envelope')
+})
+
+test('ENV: a verdict reads the adapter\'s report once, so an attempt delivered no envelope is compared with the envelope the verdict recorded', async t => {
+  const f = await setup({ clock: new FakeClock() })
+  t.after(() => f.cleanup())
+  const { verify } = await claimedReview(f)
+  // The adapter reports one envelope on its first ask and another on any later one.
+  const recorded = environmentAt('/recorded'), later = environmentAt('/later')
+  let asks = 0
+  f.workers.checkEnvelope = () => { const environment = asks++ === 0 ? recorded : later; return { environment, selfRunEnvironment: environment } }
+  f.workers.checks = [{ command: 'test -d .', exitCode: 0, output: 'ok', environment: recorded }]
+  assert.equal((await verify()).status, 'accepted', 'host checks under the envelope the verdict recorded reproduce it')
+  assert.equal(asks, 1, 'the verdict asked the adapter once')
+  assert.deepEqual(events(f.runtime, f.mission.id, 'task/check-envelope').map(event => event.data.environment.home), ['/recorded'],
+    'and its one record is the envelope it compared with')
 })
 
 test('ENV: a cold user cache is recorded as advisory and never refuses an acceptance', async t => {

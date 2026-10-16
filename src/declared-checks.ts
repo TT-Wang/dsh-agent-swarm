@@ -247,16 +247,24 @@ export class DeclaredChecks {
 
   /**
    * R11-19: record the measured envelope durably, even when the verdict below
-   * fails closed because the world moved during the check.
+   * fails closed because the world moved during the check. This is the
+   * verdict's one read of the adapter's report; it returns the environment
+   * that report carries, which `reproduce` compares with when the attempt was
+   * delivered no envelope.
    */
-  recordEnvelope(missionId: string, taskId: string, sourceTaskId: string, memberId: string): void {
-    const envelope = this.k.workers.checkEnvelope?.()
-    if (envelope === undefined) return
+  recordEnvelope(missionId: string, taskId: string, sourceTaskId: string, memberId: string): CheckEnvironment | undefined {
+    const envelope = this.envelope()
+    if (envelope === undefined) return undefined
     this.k.commit(missionId, () => this.k.store.event(missionId, 'task/check-envelope', memberId,
       { taskId, sourceTaskId, ...envelope }))
+    return envelope.environment
   }
 
-  /** ENV: the adapter's measured envelope, widened to the environment facts it also reports. */
+  /**
+   * ENV: the adapter's measured envelope, widened to the environment facts it
+   * also reports. The one door to that report, read once per assignment
+   * delivery and once per verdict; best-effort by contract.
+   */
   private envelope(): DeclaredCheckEnvelope | undefined {
     try { return this.k.workers.checkEnvelope?.() as DeclaredCheckEnvelope | undefined }
     catch { return undefined } // reporting the environment must never break a delivery or a verdict
@@ -321,14 +329,15 @@ export class DeclaredChecks {
    * reader sees both environments, not only a refusal. Both sides are
    * host-measured: the runtime constructs the envelope and runs the declared
    * checks itself, so nothing here is inferred from a member's command text. An
-   * attempt with no delivered envelope, or with no host check outcome that
-   * carries an environment, has nothing to compare and the verdict proceeds as
-   * before.
+   * attempt delivered no envelope is compared with `reported`, the environment
+   * the adapter reported at this verdict (`recordEnvelope`). With neither, or
+   * with no host check outcome that carries an environment, there is nothing
+   * to compare and the verdict proceeds as before.
    */
   reproduce(where: { missionId: string; taskId: string; sourceTaskId: string; attemptId: string; memberId: string; verdict: 'accept' | 'reject' },
-    checks: ReadonlyArray<CheckResult>): CheckEnvironmentComparison | undefined {
+    checks: ReadonlyArray<CheckResult>, reported: CheckEnvironment | undefined): CheckEnvironmentComparison | undefined {
     if (checks.length === 0) return undefined
-    const envelope = this.deliveredEnvironment(where.missionId, where.taskId, where.attemptId) ?? this.envelope()?.environment
+    const envelope = this.deliveredEnvironment(where.missionId, where.taskId, where.attemptId) ?? reported
     if (envelope === undefined) return undefined
     // Declared host checks are the supporting executions. A later unrelated
     // diagnostic cannot substitute its environment for those immutable-artifact checks.
