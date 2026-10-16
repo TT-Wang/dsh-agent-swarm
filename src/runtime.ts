@@ -7,7 +7,7 @@ import { PolicyError } from './policy-error.ts'
 export { WorkspaceRevokedError } from './authorization.ts'
 import { recordedClaim, type WorkspaceClaim } from './authorization.ts'
 import { WorkspaceAdmission, gitWriteDeniedMessage, TEMP_RENDEZVOUS_WINDOW_MS, type TempMention } from './workspace-admission.ts'
-import { Notices, NOTICE_TEMPLATES, REJECTION_DECISION_TRIGGER, assignmentCurrent, renderNotice, type NotifyOptions } from './notices.ts'
+import { Notices, NOTICE_TEMPLATES, REJECTION_DECISION_TRIGGER, assignmentCurrent, renderNotice } from './notices.ts'
 import { RefusalRegistry, requireStrings, requireText, sameChecks, unsupportedEffort, validatedBudget } from './refusals.ts'
 import { Scheduling } from './scheduling.ts'
 import { progressed, type Kernel, type SchedulingPass } from './kernel.ts'
@@ -309,29 +309,13 @@ export class SwarmRuntime implements Kernel {
 
   /**
    * M1a seam 3/7: owner notices, witnesses, guard terminals and the outbox that
-   * delivers them; a guard terminal a busy writer refused is queued on the one
-   * registry. A seam reaches it one way, as `rt.notices`; the forwarders below
-   * are the runtime's own surface (its body, index.ts, roles.ts, the tests).
+   * delivers them, on the kernel and the refusal registry, where a guard
+   * terminal a busy writer refused is queued. Every caller reaches it as
+   * `notices`: the runtime's body, the seams, index.ts, roles.ts and the tests.
+   * Its one reach above the kernel is the scheduling pass state its
+   * publication reads, handed down as a closure over `scheduling`.
    */
-  readonly notices = new Notices(this, this.refusals)
-  notify(missionId: string, content: string, subjects: string[], options: NotifyOptions): boolean { return this.notices.notify(missionId, content, subjects, options) }
-  ownerDeliveryRelevant(mission: Mission, delivery: Delivery): boolean { return this.notices.ownerDeliveryRelevant(mission, delivery) }
-  ownerDeliveryContent(mission: Mission, delivery: Delivery): string { return this.notices.ownerDeliveryContent(mission, delivery) }
-  /**
-   * Record consumption only when the host admits the relay into user/message,
-   * after native pre-step filtering, using the exact delivery id.
-   * Compare-and-swap inside the mission transaction; delivered, consumed and
-   * resolved stay three facts.
-   */
-  recordConsumption(deliveryId: string, options: { at?: number; source?: string } = {}): boolean { return this.notices.recordConsumption(deliveryId, options) }
-  private bounded(text: string): string { return this.notices.bounded(text) }
-  private ensureWitness(missionId: string): void { return this.notices.ensureWitness(missionId) }
-  /** R17-G5: the scheduling pass state at a committed transition (for publication; see `Scheduling.passState`). */
-  passState(missionId: string): { passLive: boolean; wedged: boolean } { return this.scheduling.passState(missionId) }
-  private warnIntegrationGap(mission: Mission, admitted: Task): void { return this.notices.warnIntegrationGap(mission, admitted) }
-  private notifyReviewBlocked(mission: Mission, source: Task, need: ReviewNeed, reason: string): void { return this.notices.notifyReviewBlocked(mission, source, need.id, reason) }
-  private topicDelivery(missionId: string, from: string, topic: string, content: string): void { return this.notices.topicDelivery(missionId, from, topic, content) }
-  async flushOutbox(missionId: string, pass?: SchedulingPass, only?: string): Promise<void> { return this.notices.flushOutbox(missionId, pass, only) }
+  readonly notices = new Notices(this, this.refusals, missionId => this.scheduling.passState(missionId))
 
   /** M1a seam 7/7: pass bookkeeping, the dispatch sweep and the attempt reporting bound; its predicates are the board's. */
   private readonly scheduling = new Scheduling(this)
@@ -786,6 +770,12 @@ export class SwarmRuntime implements Kernel {
     if (!task || task.missionId !== missionId) throw new PolicyError('task_not_in_mission', 'validation_error', 'Task is not in this mission')
     return task
   }
+  /** Free text a call records (a claim, an output, a reason, a message body), refused when it is empty or longer than `maxMessageChars`. */
+  private bounded(text: string): string {
+    requireText(text, 'content')
+    if (text.length > this.config.maxMessageChars) throw new PolicyError('content_too_long', 'tool_error', `Content exceeds ${this.config.maxMessageChars} characters`)
+    return text
+  }
   /**
    * A repair redirects existing dependencies, so even a fresh task can close a
    * cycle. Validate its prospective effective graph before writing anything.
@@ -1233,7 +1223,7 @@ export class SwarmRuntime implements Kernel {
       for (const change of checkChanges) this.store.event(missionId, 'task/check-changed', key, { taskId: task.id, reason: 'replacement', ...change })
     })
     this.warnBudget(this.mission(missionId))
-    this.warnIntegrationGap(mission, task)
+    this.notices.warnIntegrationGap(mission, task)
     this.kick(missionId)
     return owner ? task : this.memberTask(task)
   }
@@ -1404,7 +1394,7 @@ export class SwarmRuntime implements Kernel {
     task.evidenceIds.push(evidence.id)
     this.commit(missionId, () => {
       this.store.put('evidence', evidence); this.store.put('tasks', task); this.store.event(missionId, 'evidence/published', member.id, evidence)
-      this.topicDelivery(missionId, member.id, task.workstreamId, `New unverified finding ${evidence.id}: ${evidence.claim}`)
+      this.notices.topicDelivery(missionId, member.id, task.workstreamId, `New unverified finding ${evidence.id}: ${evidence.claim}`)
     })
     this.kick(missionId)
     return evidence
@@ -1558,7 +1548,7 @@ export class SwarmRuntime implements Kernel {
           task.verificationRecovery = { sourceTaskId: source.id, commit: artifact.commit, reason, at: this.now() }
           this.store.put('tasks', task)
           this.store.event(missionId, 'task/verification-deferred', member.id, { sourceTaskId: source.id, verificationTaskId: task.id, commit: artifact.commit, reason, checks: runIds })
-          this.notify(missionId, reason, this.notices.interpretation(missionId).subjectsOf([source, task]), { from: member.id, trigger: 'task/verification-deferred', reason })
+          this.notices.notify(missionId, reason, this.notices.interpretation(missionId).subjectsOf([source, task]), { from: member.id, trigger: 'task/verification-deferred', reason })
         })
         this.kick(missionId)
         return this.memberTask(task)
@@ -1635,7 +1625,7 @@ export class SwarmRuntime implements Kernel {
         // Acceptance is routine progress; a rejection blocks work and needs a repair decision.
         if (!passed) {
           const repair = rejectionRepair(source, task.id)
-          this.notify(missionId, `${source.title} (${source.id}) was blocked by independent verification: ${rejection}. ${repair.owner}`, this.notices.interpretation(missionId).subjectsOf([source]), { from: member.id, trigger: REJECTION_DECISION_TRIGGER, reason: rejection })
+          this.notices.notify(missionId, `${source.title} (${source.id}) was blocked by independent verification: ${rejection}. ${repair.owner}`, this.notices.interpretation(missionId).subjectsOf([source]), { from: member.id, trigger: REJECTION_DECISION_TRIGGER, reason: rejection })
           // R11-18: the rejection reason and the repair path must reach the
           // source author, not only the owner. The author's re-claim is refused
           // (the task is blocked), so without this delivery the only exit is
@@ -1721,7 +1711,7 @@ export class SwarmRuntime implements Kernel {
     if (input.to === 'subscribers' && !input.topic) throw new Error('Broadcast requires a topic')
     this.commit(missionId, () => {
       if (question !== undefined) this.receipt(missionId, question, key, 'answered', content)
-      if (input.to === 'subscribers') this.topicDelivery(missionId, key, input.topic!, content)
+      if (input.to === 'subscribers') this.notices.topicDelivery(missionId, key, input.topic!, content)
       else {
         const deliveryId = id('msg')
         this.store.put('deliveries', {
@@ -2016,7 +2006,7 @@ export class SwarmRuntime implements Kernel {
       const challenge = this.store.event(missionId, 'evidence/challenged', key, input)
       // The challenged claim's own task is the subject and this challenge's event
       // the fact; the dependents it invalidated are named by `task/invalidated`.
-      this.notify(missionId, `Evidence ${evidence.id} challenged: ${input.reason}`, this.notices.interpretation(missionId).subjectsOf([source]), { from: key, trigger: 'evidence/challenged', reason: `${evidence.id} challenge ${challenge}` })
+      this.notices.notify(missionId, `Evidence ${evidence.id} challenged: ${input.reason}`, this.notices.interpretation(missionId).subjectsOf([source]), { from: key, trigger: 'evidence/challenged', reason: `${evidence.id} challenge ${challenge}` })
     })
     for (const dependent of interrupted) this.attempts.resumeStoppedAttempt(missionId, dependent)
     this.kick(missionId)
@@ -2192,7 +2182,7 @@ export class SwarmRuntime implements Kernel {
     if (duplicates.length > 0) {
       for (const row of duplicates) this.store.event(missionId, 'task/duplicate-carrier', 'runtime', { taskId: row.id, carriedBy: accepted.id, status: row.status, code: 'lineage_duplicate_carrier' })
       const { content, statement } = renderNotice('duplicate-carrier', { acceptedId: accepted.id, duplicates })
-      this.notify(missionId, content, this.notices.interpretation(missionId).subjectsOf([...duplicates, accepted]), { trigger: NOTICE_TEMPLATES['duplicate-carrier'].trigger, reason: `${accepted.id} accepted`, statement })
+      this.notices.notify(missionId, content, this.notices.interpretation(missionId).subjectsOf([...duplicates, accepted]), { trigger: NOTICE_TEMPLATES['duplicate-carrier'].trigger, reason: `${accepted.id} accepted`, statement })
     }
     return { retired, released }
   }
@@ -2225,7 +2215,7 @@ export class SwarmRuntime implements Kernel {
       if (!need.ripe) continue
       if (!need.recorded) this.reportMissingReview(mission, source)
       const blocked = reviewPathBlocker(this.boardOf(mission.id), source, need, stalled)
-      if (blocked !== undefined) this.notifyReviewBlocked(mission, source, need, blocked)
+      if (blocked !== undefined) this.notices.notifyReviewBlocked(mission, source, need.id, blocked)
       else this.admitAutomaticReview(mission, source, need)
     }
   }
@@ -2254,7 +2244,7 @@ export class SwarmRuntime implements Kernel {
       // what to admit instead. A busy writer or any other failure is not a
       // refusal: it leaves the pass, and the next pass proposes again.
       if (!(error instanceof PolicyError)) throw error
-      this.notifyReviewBlocked(mission, source, need, `${ADMISSION_REFUSED}${error instanceof Error ? error.message : String(error)}`)
+      this.notices.notifyReviewBlocked(mission, source, need.id, `${ADMISSION_REFUSED}${error instanceof Error ? error.message : String(error)}`)
       return
     }
     // The review already exists and its task/proposed event is durable; a busy
@@ -3216,7 +3206,7 @@ export class SwarmRuntime implements Kernel {
       // R15-A1: the completion notice names every accepted deliverable (the
       // mission's lineage roots), so the final decision is attributable too.
       const view = this.notices.interpretation(missionId)
-      this.notify(missionId, `Completed ${mission.title}: all required deliverables were independently accepted. Review the evidence and final artifact in Agent Swarm.`, view.subjectsOf(view.tasks.filter(task => task.status === 'accepted')), { noticeClass: 'completion', trigger: 'automatic/completed' })
+      this.notices.notify(missionId, `Completed ${mission.title}: all required deliverables were independently accepted. Review the evidence and final artifact in Agent Swarm.`, view.subjectsOf(view.tasks.filter(task => task.status === 'accepted')), { noticeClass: 'completion', trigger: 'automatic/completed' })
     })
     return true
   }
@@ -3647,7 +3637,7 @@ export class SwarmRuntime implements Kernel {
           secondMemberId: rendezvous.second.memberId, secondTaskId: rendezvous.second.taskId, secondAt: rendezvous.second.at,
           windowMs: TEMP_RENDEZVOUS_WINDOW_MS, detection: 'command-mention',
         })
-        this.notify(member.missionId, `Two members named the same shared temp path ${rendezvous.path} inside ${Math.round(TEMP_RENDEZVOUS_WINDOW_MS / 60_000)} minute(s): ${rendezvous.first.memberId} then ${rendezvous.second.memberId}. The host temp roots are writable by every workspace-write execution; never use them to pass state between members or missions.`,
+        this.notices.notify(member.missionId, `Two members named the same shared temp path ${rendezvous.path} inside ${Math.round(TEMP_RENDEZVOUS_WINDOW_MS / 60_000)} minute(s): ${rendezvous.first.memberId} then ${rendezvous.second.memberId}. The host temp roots are writable by every workspace-write execution; never use them to pass state between members or missions.`,
           tempRendezvousSubjects(this, member.missionId, rendezvous), { from: memberId, trigger: 'isolation/temp-rendezvous', reason: rendezvous.path })
       }
       if (typed === undefined) return
@@ -3660,7 +3650,7 @@ export class SwarmRuntime implements Kernel {
     // model, so delivering the typed denial here puts it in the worker's inbox
     // ahead of its next model step instead of whenever the outbox pump runs.
     // A failed attempt leaves the row queued for the pump; the run stays recorded.
-    if (typed !== undefined) await this.flushOutbox(member.missionId, undefined, typed).catch(() => undefined)
+    if (typed !== undefined) await this.notices.flushOutbox(member.missionId, undefined, typed).catch(() => undefined)
     return run.id
   }
   /**
@@ -3686,7 +3676,7 @@ export class SwarmRuntime implements Kernel {
     // return to a class already told on that work, is that fact again.
     // R15-A1/A4: the subject is the task whose clock the outage holds, never the
     // whole board; the mission root only when the member owns no open task.
-    this.notify(member.missionId,
+    this.notices.notify(member.missionId,
       `${member.name} provider ${outage.class} outage${outage.status === undefined ? '' : ` (HTTP ${outage.status})`}: ${outage.message}. Its attempt is preserved and no recovery credit is spent while the route is quiescent.`,
       open.length ? view.subjectsOf(open) : [missionSubject(view.mission)], { from: member.id, trigger: 'provider/outage', reason: outage.class })
   }
@@ -3731,7 +3721,7 @@ export class SwarmRuntime implements Kernel {
       this.store.event(member.missionId, 'member/failure', memberId, { error })
       // R15-A1: it names the member's unfinished work, else the mission root. The fact
       // is the member on that work; the provider's text (per-request data) is the body.
-      this.notify(member.missionId, message, noticeSubjectsFor(this.boardOf(member.missionId), { memberId: member.id }), { trigger: 'member/failure', reason: member.id })
+      this.notices.notify(member.missionId, message, noticeSubjectsFor(this.boardOf(member.missionId), { memberId: member.id }), { trigger: 'member/failure', reason: member.id })
     })
   }
   /**
@@ -3771,7 +3761,7 @@ export class SwarmRuntime implements Kernel {
       this.store.put('tasks', task)
       this.store.event(info.missionId, 'task/recovery-fallback', 'runtime', { taskId: info.taskId, epoch: info.epoch, from: info.previousOwnerId, to: info.memberId, commit: info.commit, preserved: info.preserved, reason: info.reason })
       // A carried snapshot asks nothing of the owner; a left-behind worktree may.
-      this.notify(info.missionId, content, noticeSubjectsFor(this.boardOf(info.missionId), { taskId: info.taskId }), { noticeClass: info.preserved ? 'progress' : 'decision', trigger: 'task/recovery-fallback', reason: info.reason })
+      this.notices.notify(info.missionId, content, noticeSubjectsFor(this.boardOf(info.missionId), { taskId: info.taskId }), { noticeClass: info.preserved ? 'progress' : 'decision', trigger: 'task/recovery-fallback', reason: info.reason })
     })
   }
   /**
@@ -3792,7 +3782,7 @@ export class SwarmRuntime implements Kernel {
     const content = `Verification checkout ${info.checkout} for ${info.taskId} could not be removed cleanly after its checks ran (${info.reason}). The check results and the verdict stand. The mission's next verification reclaims what is left of the checkout and its worktree registration, so no repository-wide prune is needed.`
     this.commit(info.missionId, () => {
       this.store.event(info.missionId, 'task/verification-cleanup-failed', 'runtime', { taskId: info.taskId, memberId: info.memberId, checkout: info.checkout, reason: info.reason })
-      this.notify(info.missionId, content, noticeSubjectsFor(this.boardOf(info.missionId), { taskId: info.taskId }), { noticeClass: 'progress', trigger: 'task/verification-cleanup-failed', reason: info.reason })
+      this.notices.notify(info.missionId, content, noticeSubjectsFor(this.boardOf(info.missionId), { taskId: info.taskId }), { noticeClass: 'progress', trigger: 'task/verification-cleanup-failed', reason: info.reason })
     })
   }
   /**
@@ -3867,7 +3857,7 @@ export class SwarmRuntime implements Kernel {
       // recovery credit that was never spent.
       if (outage !== undefined) return
       if (!reroute) {
-        this.notify(missionId, `${member.name} could not start (failure ${consecutiveFailures} of ${START_FAILURE_REROUTE_LIMIT}); its queued work and task recovery allowance are preserved.`,
+        this.notices.notify(missionId, `${member.name} could not start (failure ${consecutiveFailures} of ${START_FAILURE_REROUTE_LIMIT}); its queued work and task recovery allowance are preserved.`,
           noticeSubjectsFor(this.boardOf(missionId), { memberId: member.id }), { trigger: 'member/resume-failed', reason: `${member.id} start failure ${failure}` })
         return
       }
@@ -3881,12 +3871,12 @@ export class SwarmRuntime implements Kernel {
         && (candidate.startFailures ?? 0) >= START_FAILURE_REROUTE_LIMIT && stranded.some(task => capable(board, task, candidate)))
       const options = { trigger: 'member/resume-failed', reason: `${member.id} retired after ${consecutiveFailures} consecutive start failures` }
       if (!stranded.length) {
-        this.notify(missionId, `${member.name} could not start after ${consecutiveFailures} consecutive failures; its work remains on the board; capable live routes may claim it, or use swarm_control with taskId and action=amend to choose an assignee.`,
+        this.notices.notify(missionId, `${member.name} could not start after ${consecutiveFailures} consecutive failures; its work remains on the board; capable live routes may claim it, or use swarm_control with taskId and action=amend to choose an assignee.`,
           noticeSubjectsFor(this.boardOf(missionId), { memberId: member.id }), options)
         return
       }
       const routes = retired.map(candidate => `${candidate.name} (${candidate.id}): ${candidate.startFailures} consecutive start failures, last error: ${candidate.startError ?? 'not recorded'}`)
-      this.notify(missionId, `No live member can start ${stranded.map(task => `${task.id} (${task.title})`).join(', ')}: every route that could was retired for start failures. ${routes.join('; ')}. The work stays pending with its recovery allowance preserved and nothing retries it. Admit a working route with swarm_add_member (it claims unpinned work), move pinned work to it with swarm_control(taskId, action: "amend", changes: { assigneeId: "member id" }, reason: "reassign"), or withdraw work that is no longer required with swarm_cancel.`,
+      this.notices.notify(missionId, `No live member can start ${stranded.map(task => `${task.id} (${task.title})`).join(', ')}: every route that could was retired for start failures. ${routes.join('; ')}. The work stays pending with its recovery allowance preserved and nothing retries it. Admit a working route with swarm_add_member (it claims unpinned work), move pinned work to it with swarm_control(taskId, action: "amend", changes: { assigneeId: "member id" }, reason: "reassign"), or withdraw work that is no longer required with swarm_cancel.`,
         this.notices.interpretation(missionId).subjectsOf(stranded), options)
     })
   }
@@ -4043,15 +4033,15 @@ export class SwarmRuntime implements Kernel {
     // The body starts: its first progress (the queue wait is not its own).
     progressed(pass, this.now())
     const mission = this.mission(missionId)
-    if (mission.status !== 'active') { await this.flushOutbox(missionId, pass); return }
+    if (mission.status !== 'active') { await this.notices.flushOutbox(missionId, pass); return }
     if (mission.budgetPause) {
       if (!mission.budgetPause.quiesced) {
         this.beginBudgetStop(missionId, mission.budgetPause.id)
-        await this.flushOutbox(missionId, pass); return
+        await this.notices.flushOutbox(missionId, pass); return
       }
       this.resumeBudgetTasks(mission)
     }
-    if (this.completeAutomatic(missionId)) { await this.flushOutbox(missionId, pass); return }
+    if (this.completeAutomatic(missionId)) { await this.notices.flushOutbox(missionId, pass); return }
     if (this.now() >= mission.deadline || mission.usedTokens >= mission.budget.maxTokens || mission.usedSteps >= mission.budget.maxSteps) { this.blockBudget(mission); return }
     // F2: a submitted code deliverable no live review can accept is repaired
     // before dispatch, so the auto-admitted review can be scheduled this tick.
@@ -4065,12 +4055,12 @@ export class SwarmRuntime implements Kernel {
     // returns did.
     if (!await this.scheduling.dispatch(mission, missionId, pass)) return
     // Backstop: a full pass that dispatched nothing must still witness the state.
-    this.ensureWitness(missionId)
+    this.notices.ensureWitness(missionId)
     // S2: the pass flushes its own outbox (bounded per delivery), and the
     // queue-external tick pump is the backstop that delivers durable notices
     // while this pass is wedged or the mission lock is held. Each delivery
     // await is the body's own, stamped before its result commits.
-    await this.flushOutbox(missionId, pass)
+    await this.notices.flushOutbox(missionId, pass)
   }
 
   /** Drain all runtime operations and worker handles before releasing database ownership. */

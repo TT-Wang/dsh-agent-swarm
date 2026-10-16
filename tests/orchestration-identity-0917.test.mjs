@@ -145,7 +145,7 @@ test('C09: a scope correction preserves untouched preferred borrowing, while exe
 for (const paused of [false, true]) test(`C06: a ${paused ? 'paused' : 'live'} owner cannot settle a question by sending its answer to another member`, async t => {
   const f = await fixture(t)
   f.runtime.message(f.actor(f.author), f.mission.id, { to: 'owner', kind: 'question', content: 'Which result should I produce?' })
-  await f.runtime.flushOutbox(f.mission.id)
+  await f.runtime.notices.flushOutbox(f.mission.id)
   const question = openAsks(f.runtime.store.list('deliveries', f.mission.id), 'owner')[0]
   if (paused) f.runtime.control(f.owner, f.mission.id, 'pause', 'Pause while considering the answer')
   const before = f.runtime.store.list('deliveries', f.mission.id)

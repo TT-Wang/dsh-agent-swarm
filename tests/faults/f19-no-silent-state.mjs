@@ -31,7 +31,7 @@ const accepted = (f, task) => events(f.runtime, f.mission.id, 'task/accepted').f
 const assertWitness = (f, row, family, since, label) => {
   assert.ok(row, `${label}: the state left no witness`)
   assert.equal(noticeFamily(row), family, `${label}: the witness is its condition's own family`)
-  assert.equal(f.runtime.ownerDeliveryRelevant(f.runtime.mission(f.mission.id), f.runtime.store.get('deliveries', row.id)), true, `${label}: the witness row is open`)
+  assert.equal(f.runtime.notices.ownerDeliveryRelevant(f.runtime.mission(f.mission.id), f.runtime.store.get('deliveries', row.id)), true, `${label}: the witness row is open`)
   assert.ok(row.createdAt >= since, `${label}: written once the state held`)
   return row
 }

@@ -135,7 +135,7 @@ test('a refused admission is a decision only while the limit it met is current: 
   await owner('swarm_budget', { budget: { ...f.runtime.mission(f.mission.id).budget, maxTasks: 3 }, reason: 'Room for tasks' })
   await assert.rejects(worker('swarm_propose', proposal('An experiment', { experiment: true })), /experiment budget exhausted \(1\/1 experiments admitted\)/)
   const requests = () => admissionRequests(f).map(([opener]) => opener)
-    .map(opener => [opener, f.runtime.ownerDeliveryRelevant(f.runtime.mission(f.mission.id), ownerRows(f, /^\[task_ceiling_terminal\]/).find(delivery => delivery.notice.dedupKey.endsWith(opener)))])
+    .map(opener => [opener, f.runtime.notices.ownerDeliveryRelevant(f.runtime.mission(f.mission.id), ownerRows(f, /^\[task_ceiling_terminal\]/).find(delivery => delivery.notice.dedupKey.endsWith(opener)))])
   assert.deepEqual(requests(), [['task-budget:1', false], ['experiment-budget:1', true]], 'the raised task limit answers its request; the experiment limit still holds')
   const more = await worker('swarm_propose', proposal('More after the raise'))
   // Nothing unfinished remains, which a decision naming the mission root is reminded on.
@@ -165,7 +165,7 @@ test('an escalation names its fact like every notice: over the wake budget the w
   const f = await fixture(t)
   const work = f.propose({ title: 'Assigned work' })
   f.runtime.notices.wakeBudget = 1
-  f.runtime.commit(f.mission.id, () => f.runtime.notify(f.mission.id, 'An earlier owner decision', [`mission:${f.mission.id}`], { trigger: 'test/earlier', reason: 'spends the window' }))
+  f.runtime.commit(f.mission.id, () => f.runtime.notices.notify(f.mission.id, 'An earlier owner decision', [`mission:${f.mission.id}`], { trigger: 'test/earlier', reason: 'spends the window' }))
   const escalation = f.runtime.escalate(f.actor(f.author), f.mission.id, { body: 'Please decide how to proceed.' })
   const carrier = f.runtime.store.get('deliveries', escalation.deliveryId)
   assert.match(carrier?.notice?.dedupKey ?? 'no delivery', /^wake-budget:/, 'the deliveryId names the summary that carries it')

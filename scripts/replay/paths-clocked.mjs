@@ -215,7 +215,7 @@ async function pumpAgeOut() {
   try {
     const bound = f.runtime.config.stallPassTimeoutMs
     await f.runtime.settle(f.mission.id)
-    f.runtime.commit(f.mission.id, () => f.runtime.notify(f.mission.id, HELD_NOTICE, [`mission:${f.mission.id}`], { trigger: 'test/held', reason: 'held' }))
+    f.runtime.commit(f.mission.id, () => f.runtime.notices.notify(f.mission.id, HELD_NOTICE, [`mission:${f.mission.id}`], { trigger: 'test/held', reason: 'held' }))
     f.runtime.notices.pumpOutbox()
     await workers.delivering.promise
     workers.wedgeNext = true

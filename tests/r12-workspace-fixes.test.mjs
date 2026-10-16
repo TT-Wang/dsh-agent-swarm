@@ -51,7 +51,7 @@ test('M2-1: a repeated pass-timeout naming is recorded once, through the ledger'
     bounds: { stallPassTimeoutMs: 1000 }, fingerprint: () => 'same', commit: (_id, fn) => fn(),
     boardOf: missionId => ({ missionId, mission, tasks: [], members: [], graph: taskGraphIndex([]) }) })
   // The runtime's own telling, over this store; the publication is outside this test.
-  const notices = new Notices(rt, new RefusalRegistry(rt))
+  const notices = new Notices(rt, new RefusalRegistry(rt), () => ({ passLive: false, wedged: false }))
   rt.notices = { tell: notices.tell.bind(notices), expectWedgedRelease() {}, transition() {} }
   const scheduling = new Scheduling(rt)
   // Two bodies wedge in turn on one naming fact. The first naming's row is the

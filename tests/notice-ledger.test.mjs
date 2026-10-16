@@ -35,7 +35,7 @@ const deadAssigneeBoard = async t => {
   await ticks(f, 1)
   return { f, dead }
 }
-const relevant = (f, delivery) => f.runtime.ownerDeliveryRelevant(f.runtime.mission(f.mission.id), f.runtime.store.get('deliveries', delivery.id))
+const relevant = (f, delivery) => f.runtime.notices.ownerDeliveryRelevant(f.runtime.mission(f.mission.id), f.runtime.store.get('deliveries', delivery.id))
 /** The one field: key prefix, family and, for a templated body, its template and statement. */
 const names = delivery => ({ prefix: delivery.notice.dedupKey.split(':')[0], family: noticeFamily(delivery),
   template: noticeTemplateKey(delivery), statement: delivery.notice.statement?.family })
@@ -426,9 +426,9 @@ test('coverage-complete is told whenever completion is allowed, whatever the sta
   })
   await acceptThroughReview(f, f.propose())
   // The held stop is the one operation left: every pass and publication since has settled.
-  await eventually(() => !f.runtime.passState(f.mission.id).passLive, 'the last pass ends')
+  await eventually(() => !f.runtime.scheduling.passState(f.mission.id).passLive, 'the last pass ends')
   await ticks(f, 1)
-  await eventually(() => !f.runtime.passState(f.mission.id).passLive, 'the tick\'s pass ends')
+  await eventually(() => !f.runtime.scheduling.passState(f.mission.id).passLive, 'the tick\'s pass ends')
   const view = f.runtime.notices.interpretation(f.mission.id)
   assert.deepEqual([completionError(view), view.stalled, taskOf(f.runtime, experiment.id).status], [undefined, false, 'blocked'], 'completion is allowed on a board the stall predicate calls live')
   assert.equal(ownerRows(f).filter(delivery => noticeFamily(delivery) === 'coverage-complete').length, 1, 'coverage-complete is told')
@@ -646,8 +646,8 @@ test('a board with no live work is the stall\'s to name: inside a review grace i
   assert.deepEqual([families(dead), families(source)], [[], []], 'nothing is told inside the grace')
   await ticks(f, 150)
   assert.deepEqual([families(dead), families(source)], [['board-stall'], ['review-blocked']], 'past the grace the admission names the source and the W3 stall names the dead work beside it')
-  await f.runtime.flushOutbox(f.mission.id)
-  for (let interval = 0; interval < 4; interval += 1) { f.clock.advance(f.runtime.notices.obligationFollowupMs); f.runtime.notices.absenceNet(f.mission.id); await f.runtime.flushOutbox(f.mission.id) }
+  await f.runtime.notices.flushOutbox(f.mission.id)
+  for (let interval = 0; interval < 4; interval += 1) { f.clock.advance(f.runtime.notices.obligationFollowupMs); f.runtime.notices.absenceNet(f.mission.id); await f.runtime.notices.flushOutbox(f.mission.id) }
   assert.deepEqual(naming(dead).filter(delivery => relevant(f, delivery)).map(delivery => noticeFamily(delivery)), ['board-stall'], 'one outstanding decision names it')
   const reminded = ownerRows(f).filter(delivery => delivery.notice.trigger === 'owner-decision-unresolved' && (delivery.subjects ?? []).some(subject => subject.startsWith(`${dead.id}@`)))
   assert.equal(reminded.length, f.runtime.notices.maxObligationFollowups, 'and it is reminded as one obligation')
@@ -696,8 +696,8 @@ test('a review-blocked decision an older build wrote for a submission without an
     assert.equal(relevant(f, legacy), false, `running=${running}: the older decision is withheld`)
     // As the older build left it: delivered before the upgrade.
     f.runtime.commit(f.mission.id, () => f.runtime.store.put('deliveries', { ...f.runtime.store.get('deliveries', legacy.id), deliveredAt: f.clock.now() }))
-    await f.runtime.flushOutbox(f.mission.id)
-    for (let interval = 0; interval < 3; interval += 1) { f.clock.advance(f.runtime.notices.obligationFollowupMs); f.runtime.notices.absenceNet(f.mission.id); await f.runtime.flushOutbox(f.mission.id) }
+    await f.runtime.notices.flushOutbox(f.mission.id)
+    for (let interval = 0; interval < 3; interval += 1) { f.clock.advance(f.runtime.notices.obligationFollowupMs); f.runtime.notices.absenceNet(f.mission.id); await f.runtime.notices.flushOutbox(f.mission.id) }
     assert.deepEqual(ownerRows(f).filter(delivery => delivery.notice.dedupKey.startsWith(`obligation-followup:${legacy.id}:`)), [], `running=${running}: and it is never reminded`)
   }
 })
@@ -711,7 +711,7 @@ test('a queued W3 stall is withheld once its board can progress, and coverage-co
   const stall = stallRow(stalled)
   assert.ok(stall, 'the stalled board told the owner')
   assert.equal(relevant(stalled, stall), true, 'outstanding while the board stays stalled')
-  await stalled.runtime.flushOutbox(stalled.mission.id)
+  await stalled.runtime.notices.flushOutbox(stalled.mission.id)
   const stallReminder = ordinal => ownerRows(stalled).find(delivery => delivery.notice.dedupKey === `obligation-followup:${stall.id}:${ordinal}`)
   stalled.clock.advance(stalled.runtime.notices.obligationFollowupMs)
   stalled.runtime.notices.absenceNet(stalled.mission.id)
@@ -730,7 +730,7 @@ test('a queued W3 stall is withheld once its board can progress, and coverage-co
   await ticks(f, 1)
   const coverage = coverageRow(f)
   assert.ok(coverage, 'the coverage-complete board told the owner')
-  await f.runtime.flushOutbox(f.mission.id)
+  await f.runtime.notices.flushOutbox(f.mission.id)
   assert.ok(f.runtime.store.get('deliveries', coverage.id).deliveredAt !== undefined, 'the decision reached the owner')
   f.clock.advance(f.runtime.notices.obligationFollowupMs)
   f.runtime.notices.absenceNet(f.mission.id)
@@ -762,7 +762,7 @@ test('a mission blocked on its budget keeps its board decision: a told W3 stall 
   await ticks(stalled, 1)
   const stall = stallRow(stalled)
   assert.ok(stall, 'the stalled board told the owner')
-  await stalled.runtime.flushOutbox(stalled.mission.id)
+  await stalled.runtime.notices.flushOutbox(stalled.mission.id)
   await block(stalled)
   assert.equal(relevant(stalled, stall), true, 'the blocked mission keeps the stall outstanding')
   const reminders = () => ownerRows(stalled).filter(delivery => delivery.notice.dedupKey.startsWith(`obligation-followup:${stall.id}:`)).length
@@ -845,7 +845,7 @@ test('a wedged pass is named once per naming fact, on the ledger alone: a body o
 test('M-1: a notice is its ledger row and nothing else: the same fact on another board digest is no second row and nothing on the mission row records it, and a notice committed with the board change that owes another family\'s fact does not stand for that fact', async t => {
   const f = await setup({ clock: new FakeClock() })
   t.after(f.cleanup)
-  const unrelated = () => f.runtime.notify(f.mission.id, 'An unrelated owner decision', [`mission:${f.mission.id}`], { trigger: 'test/unrelated', reason: 'one fact' })
+  const unrelated = () => f.runtime.notices.notify(f.mission.id, 'An unrelated owner decision', [`mission:${f.mission.id}`], { trigger: 'test/unrelated', reason: 'one fact' })
   f.runtime.commit(f.mission.id, unrelated)
   const board = f.runtime.fingerprint(f.mission.id)
   f.propose({ title: 'A board change', kind: 'research', checks: [], assigneeId: f.reviewer.id })
@@ -863,7 +863,7 @@ test('M-1: a notice is its ledger row and nothing else: the same fact on another
   await dead.runtime.settle(dead.mission.id)
   dead.runtime.commit(dead.mission.id, () => {
     dead.runtime.store.put('members', { ...dead.runtime.store.get('members', dead.reviewer.id), phase: 'stopped' })
-    dead.runtime.notify(dead.mission.id, 'An unrelated owner decision', [`mission:${dead.mission.id}`], { trigger: 'test/unrelated', reason: 'co-committed' })
+    dead.runtime.notices.notify(dead.mission.id, 'An unrelated owner decision', [`mission:${dead.mission.id}`], { trigger: 'test/unrelated', reason: 'co-committed' })
   })
   await dead.runtime.settle(dead.mission.id)
   await ticks(dead, 3)
@@ -874,7 +874,7 @@ test('M-1: a notice is its ledger row and nothing else: the same fact on another
   t.after(pinned.cleanup)
   pinned.workers.idle.add(pinned.reviewer.id)
   const task = pinned.propose({ title: 'Pinned to a busy handle' })
-  pinned.runtime.commit(pinned.mission.id, () => pinned.runtime.notify(pinned.mission.id, 'An unrelated owner decision', [`mission:${pinned.mission.id}`], { trigger: 'test/unrelated', reason: 'co-committed' }))
+  pinned.runtime.commit(pinned.mission.id, () => pinned.runtime.notices.notify(pinned.mission.id, 'An unrelated owner decision', [`mission:${pinned.mission.id}`], { trigger: 'test/unrelated', reason: 'co-committed' }))
   await pinned.runtime.settle(pinned.mission.id)
   await ticks(pinned, 3)
   assert.equal(taskOf(pinned.runtime, task.id).status, 'pending', 'the task was not dispatched')
@@ -1057,7 +1057,7 @@ test('a judgement of a board whose fact the owner holds commits nothing, and a t
     const f = await build()
     await f.runtime.settle(f.mission.id)
     await ticks(f, 2)
-    await f.runtime.flushOutbox(f.mission.id)
+    await f.runtime.notices.flushOutbox(f.mission.id)
     assert.equal(ownerRows(f).filter(delivery => noticeFamily(delivery) === family).length, 1, `${family}: the board's fact is told`)
     const judged = [], committed = []
     let judging = false
@@ -1085,7 +1085,7 @@ test('a wedged pass\'s naming is outstanding while the work it named is unfinish
   assert.deepEqual(naming.subjects, [`${task.id}@${taskOf(f.runtime, task.id).epoch}`], 'the naming names the work the pass never reached')
   // The hung call returns at its own bound before the owner has read the naming.
   scheduling.closePass(f.mission.id, first)
-  assert.deepEqual([f.runtime.passState(f.mission.id).wedged, relevant(f, naming)], [false, true], 'no body is wedged, and the naming is still the owner\'s to read')
+  assert.deepEqual([f.runtime.scheduling.passState(f.mission.id).wedged, relevant(f, naming)], [false, true], 'no body is wedged, and the naming is still the owner\'s to read')
   // Later bodies wedge on the same fact and settle: the one row tells them, in every phase.
   for (const operationId of ['operation_wedge_2', 'operation_wedge_3']) {
     const body = wedgedBody(t, f, operationId)
@@ -1093,7 +1093,7 @@ test('a wedged pass\'s naming is outstanding while the work it named is unfinish
     scheduling.closePass(f.mission.id, body)
     assert.equal(relevant(f, naming), true)
   }
-  await f.runtime.flushOutbox(f.mission.id)
+  await f.runtime.notices.flushOutbox(f.mission.id)
   assert.ok(f.runtime.store.get('deliveries', naming.id).deliveredAt !== undefined, 'it is delivered with no body wedged')
   const reminder = ordinal => ownerRows(f).find(delivery => delivery.notice.dedupKey === `obligation-followup:${naming.id}:${ordinal}`)
   f.clock.advance(f.runtime.notices.obligationFollowupMs)
@@ -1189,7 +1189,7 @@ const nextWindow = f => f.clock.advance(f.runtime.notices.wakeBudgetWindowMs + 1
 const reminders = (f, row) => ownerRows(f).filter(delivery => delivery.notice.dedupKey.startsWith(`obligation-followup:${row.id}:`))
 /** Deliver what is queued, let one reminder interval pass, and return the reminders the absence net then wrote for a row. */
 const remind = async (f, row) => {
-  await f.runtime.flushOutbox(f.mission.id)
+  await f.runtime.notices.flushOutbox(f.mission.id)
   const before = reminders(f, row).length
   f.clock.advance(f.runtime.notices.obligationFollowupMs)
   f.runtime.notices.absenceNet(f.mission.id)
@@ -1477,12 +1477,12 @@ test('a wedged pass\'s naming of several tasks is outstanding for the work still
     const body = wedgedBody(t, f, 'operation_wedge_two')
     const [naming] = wedgeRows(f)
     assert.deepEqual([...naming.subjects].sort(), [subjectOf(f, one), subjectOf(f, two)].sort(), 'the naming names both tasks the pass never reached')
-    if (delivered) await f.runtime.flushOutbox(f.mission.id)
+    if (delivered) await f.runtime.notices.flushOutbox(f.mission.id)
     assert.equal(f.runtime.store.get('deliveries', naming.id).deliveredAt !== undefined, delivered)
     // The owner withdraws one named task. The body is still wedged, and a body is named once.
     f.runtime.cancel(f.owner, f.mission.id, { taskId: two.id, reason: 'Not needed' })
     await ticks(f, 2)
-    assert.deepEqual([f.runtime.passState(f.mission.id).wedged, f.runtime.scheduling.passes.get(f.mission.id) === body, wedgeRows(f).length, taskOf(f.runtime, one.id).status], [true, true, 1, 'pending'],
+    assert.deepEqual([f.runtime.scheduling.passState(f.mission.id).wedged, f.runtime.scheduling.passes.get(f.mission.id) === body, wedgeRows(f).length, taskOf(f.runtime, one.id).status], [true, true, 1, 'pending'],
       'the body is still wedged on work it named, and nothing names it again')
     assert.equal(relevant(f, naming), true, `the ${delivered ? 'delivered naming stays in the owner\'s inbox' : 'queued naming is still delivered'}: it is the one record of the wedge that holds the remaining work`)
     assert.deepEqual((await remind(f, naming)).map(delivery => delivery.subjects), [[subjectOf(f, one)]], 'its reminder names the work still unfinished')

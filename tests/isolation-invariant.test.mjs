@@ -89,7 +89,7 @@ test('S7: a shared worktree is refused durably, never dispatched into, and its d
     const task = f.propose({ assigneeId: f.reviewer.id })
     const terminals = () => f.runtime.store.list('deliveries', f.mission.id)
       .filter(delivery => delivery.to === 'owner' && /\[workspace_terminal\]/.test(delivery.content))
-    const relevant = notice => f.runtime.ownerDeliveryRelevant(f.runtime.mission(f.mission.id), f.runtime.store.get('deliveries', notice.id))
+    const relevant = notice => f.runtime.notices.ownerDeliveryRelevant(f.runtime.mission(f.mission.id), f.runtime.store.get('deliveries', notice.id))
     const refused = { notice: await eventually(() => terminals()[0], 'a shared worktree must produce a durable refusal', 6_000) }
     const [violation] = f.runtime.isolationViolations(f.mission.id)
     assert.match(violation, new RegExp(`${f.author.id}.*${f.reviewer.id}|${f.reviewer.id}.*${f.author.id}`), 'the violation names both members that share the worktree')

@@ -95,7 +95,7 @@ function refusalFixture() {
     }, boardOf: missionId => ({ missionId, tasks: [] }),
   })
   const registry = new RefusalRegistry(kernel)
-  return { registry, notices: new Notices(kernel, registry), admissions, events, release: () => { busy = false } }
+  return { registry, notices: new Notices(kernel, registry, () => ({ passLive: false, wedged: false })), admissions, events, release: () => { busy = false } }
 }
 
 test('R12: writer recovery retains distinct refusals and flushes them only under their own mission', () => {

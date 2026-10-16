@@ -189,7 +189,7 @@ async function followExits(f, { source }, { steps, refused = [] }) {
     await assertNamedCalls(notice.content, calls)
     for (const [tool, named] of alternatives(notice.content)[0]) await perform(f, source, notice.notice.reason, tool, named)
     await f.pass()
-    assert.equal(f.runtime.ownerDeliveryRelevant(f.runtime.mission(f.mission.id), f.runtime.store.get('deliveries', notice.id)), false, `the exit retires its decision: ${notice.content}`)
+    assert.equal(f.runtime.notices.ownerDeliveryRelevant(f.runtime.mission(f.mission.id), f.runtime.store.get('deliveries', notice.id)), false, `the exit retires its decision: ${notice.content}`)
   }
   assert.equal(f.live(source), true, 'the exits named give the source a live review')
   assert.equal(f.refused.length, refused.length, `the refusals met: ${JSON.stringify(f.refused)}`)
@@ -485,7 +485,7 @@ test('beside running work, no reminder repeats the budget cause the owner remove
 })
 
 /** Whether the owner's delivery is still outstanding. */
-const outstanding = (f, delivery) => f.runtime.ownerDeliveryRelevant(f.runtime.mission(f.mission.id), f.runtime.store.get('deliveries', delivery.id))
+const outstanding = (f, delivery) => f.runtime.notices.ownerDeliveryRelevant(f.runtime.mission(f.mission.id), f.runtime.store.get('deliveries', delivery.id))
 
 test('a refused admission is its review need\'s cause, as a withdrawn host review is: beside running work and once the board stalls again it stays the one recorded cause and the outstanding decision, and the host never proposes that review again', async t => {
   const f = await fixture(t)
@@ -541,7 +541,7 @@ test('a refusal written in the pass that admitted another source\'s review is ou
   assert.match(f.reviewsOf(other)[0]?.id ?? 'none', /^task_auto_review_/, 'the pass admitted the other source\'s review first')
   const refusal = blockedNotice(f, source, REFUSED)
   assert.equal(outstanding(f, refusal), true, 'the refusal is outstanding')
-  await f.runtime.flushOutbox(f.mission.id)
+  await f.runtime.notices.flushOutbox(f.mission.id)
   assert.notEqual(f.runtime.store.get('deliveries', refusal.id).deliveredAt, undefined, 'and delivered')
 })
 
@@ -682,7 +682,7 @@ test('every exit the W3 stall and the fall-through name for a submission an olde
     const namings = f.runtime.store.list('deliveries', f.mission.id).filter(delivery => delivery.to === 'owner' && delivery.notice !== undefined && (delivery.subjects ?? []).includes(subject))
     assert.deepEqual(namings.map(delivery => noticeFamily(delivery)), [running ? 'fallthrough' : 'board-stall'], `running=${running}: the board's decision names the submission`)
     assert.match(namings[0].content, running ? /admit a repair or review with swarm_propose, or decide with swarm_control/ : /amend the existing task dependencies or assignee with swarm_control, admit a repair or review with swarm_propose.*withdraw it explicitly with swarm_cancel.*Use swarm_control stop/)
-    const relevant = () => f.runtime.ownerDeliveryRelevant(f.runtime.mission(f.mission.id), f.runtime.store.get('deliveries', namings[0].id))
+    const relevant = () => f.runtime.notices.ownerDeliveryRelevant(f.runtime.mission(f.mission.id), f.runtime.store.get('deliveries', namings[0].id))
     assert.equal(relevant(), true, `running=${running}: and it is outstanding`)
     return { f, source, relevant }
   }
@@ -729,7 +729,7 @@ test('while a wedged pass keeps the host\'s admission from running, the classifi
       // No member may review it: the cause the admission would name next is true of the board now.
       const next = blockedNotice(f, source, NO_MEMBER)
       assert.deepEqual(decisionsOn(f, source).map(delivery => delivery.id), [first.id, next.id], 'the wedged classifier names the cause that holds now')
-      assert.deepEqual([first, next].map(notice => f.runtime.ownerDeliveryRelevant(f.runtime.mission(f.mission.id), f.runtime.store.get('deliveries', notice.id))), [false, true], 'and it alone is outstanding')
+      assert.deepEqual([first, next].map(notice => f.runtime.notices.ownerDeliveryRelevant(f.runtime.mission(f.mission.id), f.runtime.store.get('deliveries', notice.id))), [false, true], 'and it alone is outstanding')
       await followExits(f, { source }, { steps: [[NO_MEMBER, ['swarm_add_member', 'swarm_cancel']]] })
     } else {
       // An independent member is live: the host admits its review at its next pass, so no cause holds and none is invented.
@@ -752,7 +752,7 @@ test('two sources share the last task slot: the first gets the host review, the 
   // The host judged the second source after the first's admission: it proposed no review the budget refuses.
   assert.deepEqual(decisions.filter(delivery => delivery.notice.dedupKey.startsWith(`review-blocked:${f.mission.id}:${second.id}:`)).map(delivery => delivery.notice.reason),
     [blockedNotice(f, second, BUDGET(3)).notice.reason], 'the second source has the one budget decision')
-  assert.deepEqual(decisions.filter(delivery => !f.runtime.ownerDeliveryRelevant(f.runtime.mission(f.mission.id), delivery)).map(delivery => delivery.content), [], 'no decision is stale when written')
+  assert.deepEqual(decisions.filter(delivery => !f.runtime.notices.ownerDeliveryRelevant(f.runtime.mission(f.mission.id), delivery)).map(delivery => delivery.content), [], 'no decision is stale when written')
   assert.deepEqual(f.reviewsOf(second), [])
 })
 

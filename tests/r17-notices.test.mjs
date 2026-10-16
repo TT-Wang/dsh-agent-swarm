@@ -73,7 +73,7 @@ async function fixture(t, config = {}) {
   const addMember = async name => { const member = await runtime.addMember(owner, mission.id, { name, role: 'implementation' }); await runtime.settle(mission.id); return member }
   const propose = (title, input = {}) => runtime.propose(owner, mission.id, { outputs: [], workstreamId: stream.id, title, objective: title, kind: 'implementation', scope: ['src/'], acceptance: ['works'], checks: ['test -d .'], ...input })
   const ownerNotices = () => runtime.store.list('deliveries', mission.id).filter(delivery => delivery.to === 'owner')
-  const emit = (content, subjects, options = {}) => runtime.commit(mission.id, () => runtime.notify(mission.id, content, subjects, options))
+  const emit = (content, subjects, options = {}) => runtime.commit(mission.id, () => runtime.notices.notify(mission.id, content, subjects, options))
   return { dir, ctx, runtime, owner, mission, stream, addMember, propose, ownerNotices, emit }
 }
 
@@ -114,7 +114,7 @@ test('one enforcement point: a no-live-path decision is withheld at delivery whi
   const f = await fixture(t)
   const builder = await f.addMember('Builder')
   const block = task => { const row = f.runtime.store.get('tasks', task.id); row.status = 'blocked'; row.epoch++; row.output = 'blocked for repair'; f.runtime.store.put('tasks', row); return row }
-  const relevant = delivery => f.runtime.ownerDeliveryRelevant(f.runtime.mission(f.mission.id), f.runtime.store.get('deliveries', delivery.id))
+  const relevant = delivery => f.runtime.notices.ownerDeliveryRelevant(f.runtime.mission(f.mission.id), f.runtime.store.get('deliveries', delivery.id))
   const original = block(f.propose('Blocked original', { assigneeId: builder.id }))
   const repair = f.propose('Repair', { replaces: [original.id], assigneeId: builder.id })
   await f.runtime.claim({ sessionId: builder.sessionId }, f.mission.id, repair.id)
@@ -197,8 +197,8 @@ test('R17-G8: consumption is recorded from the host claimed signal with a CAS; d
   // The host can claim the item while the adapter call is still in flight, so
   // consumption is not gated on our transported timestamp; delivery follows.
   await eventually(() => f.runtime.store.get('deliveries', notice.id).deliveredAt !== undefined ? true : undefined, 'the outbox delivers the notice')
-  assert.equal(f.runtime.recordConsumption(notice.id, { at: 1_700_000_000_000, source: 'agent/inbox/claimed' }), true)
-  assert.equal(f.runtime.recordConsumption(notice.id), false, 'the compare-and-swap refuses a second signal')
+  assert.equal(f.runtime.notices.recordConsumption(notice.id, { at: 1_700_000_000_000, source: 'agent/inbox/claimed' }), true)
+  assert.equal(f.runtime.notices.recordConsumption(notice.id), false, 'the compare-and-swap refuses a second signal')
   const row = f.runtime.store.get('deliveries', notice.id)
   assert.equal(row.notice.consumedAt, 1_700_000_000_000, 'the recorded instant is the host signal, not the delivery time')
   assert.equal(row.notice.consumptionSource, 'agent/inbox/claimed')

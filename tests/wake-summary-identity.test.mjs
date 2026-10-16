@@ -27,7 +27,7 @@ async function fixture(t) {
     workspace: directory, scope: ['**'], acceptance: ['facts reach the owner'], budget }, { grantRoot: directory, source: 'session' })
   const rows = () => runtime.store.list('deliveries', mission.id).filter(row => row.to === 'owner')
   const emit = (content, { subject = 'task_delivery@0', reason = content, ...options } = {}) => {
-    runtime.commit(mission.id, () => runtime.notify(mission.id, content, [subject], {
+    runtime.commit(mission.id, () => runtime.notices.notify(mission.id, content, [subject], {
       trigger: 'test/fact', reason, ...options,
     }))
     return factKey(mission.id, { subjects: [subject], trigger: 'test/fact', reason })
@@ -51,10 +51,10 @@ test('a summarized fact is deduplicated before, during and after its transport',
   f.workers.intercept = async delivery => {
     if (delivery.id === summary.id) f.emit('same decision')
   }
-  await f.runtime.flushOutbox(f.mission.id)
+  await f.runtime.notices.flushOutbox(f.mission.id)
   for (let index = 0; index < 3; index++) {
     f.emit('same decision')
-    await f.runtime.flushOutbox(f.mission.id)
+    await f.runtime.notices.flushOutbox(f.mission.id)
   }
   assert.equal(f.workers.sent.filter(row => row.content.includes('same decision')).length, 1,
     'a handed-off summary keeps its fact identity even after its aggregation window detaches')
@@ -66,14 +66,14 @@ for (const delivered of [false, true]) {
     const f = await fixture(t)
     f.fillBudget()
     const key = f.emit('durable decision')
-    if (delivered) await f.runtime.flushOutbox(f.mission.id)
+    if (delivered) await f.runtime.notices.flushOutbox(f.mission.id)
     const rowIds = f.rows().map(row => row.id)
     await f.restart()
     assert.equal(hasNotice(f.rows(), { class: 'decision', from: 'runtime', dedupKey: key }), true,
       'the shared predicate must find facts carried by summaries in the durable store')
     f.emit('durable decision')
     assert.deepEqual(f.rows().map(row => row.id), rowIds, 'restart must not re-arm an already recorded fact')
-    await f.runtime.flushOutbox(f.mission.id)
+    await f.runtime.notices.flushOutbox(f.mission.id)
     assert.equal(f.workers.sent.filter(row => row.content.includes('durable decision')).length, 1)
   })
 }
@@ -96,9 +96,9 @@ test('summary dedup keeps class, sender, epoch and reason, and a new fact after 
     'the optional exact-content match remains meaningful after aggregation')
   assert.equal(hasNotice(f.rows(), { ...match, from: 'member-b' }), false)
   assert.equal(hasNotice(f.rows(), { ...match, class: 'failure' }), false)
-  await f.runtime.flushOutbox(f.mission.id)
+  await f.runtime.notices.flushOutbox(f.mission.id)
   f.emit('decision body', { reason: 'still waiting' })
-  await f.runtime.flushOutbox(f.mission.id)
+  await f.runtime.notices.flushOutbox(f.mission.id)
   assert.equal(f.workers.sent.filter(row => row.notice?.facts).length, 2,
     'a new fact after handoff gets a new immutable delivery')
 })

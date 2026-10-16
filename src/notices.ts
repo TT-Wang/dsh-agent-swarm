@@ -8,13 +8,11 @@ import { createHash } from 'node:crypto'
 import { covered, hasNotice } from './arena.ts'
 import { hostContextOf } from './projection.ts'
 import { formatDiagnostic, missingReviewDiagnostic } from './admission.ts'
-import { guardTerminal, guardTerminalKey, requireText, type GuardChainId, type GuardTerminal, type GuardTerminalContext, type RefusalRegistry } from './refusals.ts'
+import { guardTerminal, guardTerminalKey, type GuardChainId, type GuardTerminal, type GuardTerminalContext, type RefusalRegistry } from './refusals.ts'
 import { TERMINAL_STATES, missionSubject, stopPending, taskSubject, terminal } from './task-graph.ts'
-import { PolicyError } from './policy-error.ts'
-import type { SwarmRuntime } from './runtime.ts'
 import { WriterBusyError, id, type SwarmStore } from './store.ts'
-import { awaited, type SchedulingPass } from './kernel.ts'
-import { completionError, dependentsOf, eligible, interpret, newestReviewBlock, noticeSubjectsFor, overdueStop, reviewNeed, reviewPathBlocker, reviewPathStalled, stallRoots, startBlocker, unreviewedSources, waitsLegitimately, type Board, type Interpretation } from './board.ts'
+import { awaited, type Kernel, type PassState, type SchedulingPass } from './kernel.ts'
+import { completionError, dependentsOf, eligible, interpret, isolationIssues, newestReviewBlock, noticeSubjectsFor, overdueStop, reviewNeed, reviewPathBlocker, reviewPathStalled, stallRoots, startBlocker, unreviewedSources, waitsLegitimately, type Board, type Interpretation } from './board.ts'
 import type { Delivery, Escalation, Member, Mission, NoticeClass, Task, WorkerAdapter } from './types.ts'
 
 /**
@@ -467,8 +465,14 @@ export class Notices {
    */
   private readonly wedgedReleases = new Set<string>()
 
-  /** `refusals` holds the writes a busy writer refused: a guard terminal it could not tell is queued there (`emitGuardTerminal`). */
-  constructor(private readonly rt: SwarmRuntime, private readonly refusals: RefusalRegistry) {}
+  /**
+   * The notices stand on the kernel and the refusal registry below them:
+   * `refusals` holds the writes a busy writer refused, and a guard terminal it
+   * could not tell is queued there (`emitGuardTerminal`). `passState` is their
+   * one reach above the kernel, the scheduling pass state a publication reads
+   * when it runs (`publishTransition`).
+   */
+  constructor(private readonly k: Kernel, private readonly refusals: RefusalRegistry, private readonly passState: (missionId: string) => PassState) {}
 
   /**
    * Owner notices wake the primary agent and replay its whole context, so only
@@ -489,7 +493,7 @@ export class Notices {
    */
   notify(missionId: string, content: string, subjects: string[], options: NotifyOptions): boolean {
     const { fact, identity } = noticeIdentity(missionId, subjects, options)
-    if (hasNotice(this.rt.store.list('deliveries', missionId), identity)) return false
+    if (hasNotice(this.k.store.list('deliveries', missionId), identity)) return false
     this.enqueueOwnerNotice(missionId, content, identity, fact)
     return true
   }
@@ -497,7 +501,7 @@ export class Notices {
   /** Tell the owner one fact in a transaction of its own: a fact the ledger already holds (its class, key and sender) commits nothing; otherwise one commit writes its row, then `then`, the record that exists only with that row. */
   tell(missionId: string, content: string, subjects: string[], options: NotifyOptions, then?: () => void): boolean {
     const { fact, identity } = noticeIdentity(missionId, subjects, options)
-    return !hasNotice(this.rt.store.list('deliveries', missionId), identity) && this.rt.commit(missionId, () => { this.enqueueOwnerNotice(missionId, content, identity, fact); then?.(); return true })
+    return !hasNotice(this.k.store.list('deliveries', missionId), identity) && this.k.commit(missionId, () => { this.enqueueOwnerNotice(missionId, content, identity, fact); then?.(); return true })
   }
 
   /**
@@ -515,7 +519,7 @@ export class Notices {
    * (`noticeSubjectsFor`).
    */
   emitGuardTerminal(missionId: string, chain: GuardChainId, context: GuardTerminalContext): GuardTerminal | undefined {
-    const mission = this.rt.store.get('missions', missionId)
+    const mission = this.k.store.get('missions', missionId)
     // S4r-D5: only a terminal mission (completed/stopped) ends the chain's duty to
     // speak. A mission that left `active` without reaching a terminal status —
     // most importantly `blocked` after a budget stop, which is when the owner needs
@@ -523,14 +527,14 @@ export class Notices {
     if (mission === undefined || terminal(mission)) return undefined
     const request = guardTerminal(chain, context)
     const key = guardTerminalKey(chain, context)
-    const subjects = context.subjects ?? noticeSubjectsFor(this.rt.boardOf(missionId), { taskId: context.taskId, memberId: context.memberId })
+    const subjects = context.subjects ?? noticeSubjectsFor(this.k.boardOf(missionId), { taskId: context.taskId, memberId: context.memberId })
     try {
       // The board-stall event type is reused with `cause: 'guard-terminal'`, so the
       // durable log names the chain and the code without inventing an unregistered
       // event type (the vocabulary is a separate owner surface). It exists only
       // with the row its `noticeKey` names. The notice path must not share the fate
       // of the pass that could not report it: the queue-external pump delivers it.
-      if (this.tell(missionId, request.message, [...new Set(subjects)], { dedupKey: key, reason: context.detail, questionId: context.questionId }, () => this.rt.store.event(missionId, 'mission/stalled', 'runtime', {
+      if (this.tell(missionId, request.message, [...new Set(subjects)], { dedupKey: key, reason: context.detail, questionId: context.questionId }, () => this.k.store.event(missionId, 'mission/stalled', 'runtime', {
         cause: 'guard-terminal', chain, code: request.code, taskId: context.taskId ?? null, memberId: context.memberId ?? null, detail: context.detail ?? null, noticeKey: key,
       }))) this.pumpOutbox()
     } catch (error) {
@@ -538,7 +542,7 @@ export class Notices {
       // recorded once the writer is free (`RefusalRegistry.recordWriterBusyRecovery`),
       // never an unhandled rejection, and the chain re-derives its state on the next pass.
       if (!(error instanceof WriterBusyError)) throw error
-      this.refusals.queueWriterBusy({ at: this.rt.now(), attempts: error.attempts, missionId, chain, context, detail: error.message })
+      this.refusals.queueWriterBusy({ at: this.k.now(), attempts: error.attempts, missionId, chain, context, detail: error.message })
     }
     return request
   }
@@ -552,7 +556,7 @@ export class Notices {
    */
   enqueueOwnerNotice(missionId: string, content: string, identity: { class: NoticeClass; dedupKey: string; from: string }, fact: NoticeFactRecord): Delivery {
     const { class: noticeClass, dedupKey, from } = identity
-    const at = this.rt.now()
+    const at = this.k.now()
     // R17-G4: one per-owner budget bounds every family together. Over budget, the
     // fact is carried by the window's degraded summary instead of being dropped.
     // A covered fact is no wake, so it neither spends a slot nor joins a summary.
@@ -573,7 +577,7 @@ export class Notices {
         ...(fact.coveredBy === undefined ? {} : { coveredBy: fact.coveredBy }), ...(fact.statement === undefined ? {} : { statement: fact.statement }) } as NonNullable<Delivery['notice']>,
       escalation: fact.escalation, subjects: fact.subjects,
     }
-    const limit = Math.min(MAX_OWNER_NOTICE_CHARS, this.rt.config.maxMessageChars)
+    const limit = Math.min(MAX_OWNER_NOTICE_CHARS, this.k.config.maxMessageChars)
     if (content.length > limit) {
       const row = noticeRow(delivery)!
       row.facts ??= [content]
@@ -581,7 +585,7 @@ export class Notices {
       delivery.content = renderNoticeFacts(`Owner ${noticeClass}: ${row.facts.length} recorded fact(s).`, row.facts, missionId, delivery.id, limit)
     }
     if (summary !== undefined) summary.count += 1
-    this.rt.store.put('deliveries', delivery)
+    this.k.store.put('deliveries', delivery)
     return delivery
   }
 
@@ -609,7 +613,7 @@ export class Notices {
    * the class, sender and key used to deduplicate its constituent facts.
    */
   private appendToWakeSummary(missionId: string, window: { startedAt: number; count: number; summaryId?: string }, addedFacts: string[], identities: NonNullable<NoticeRow['aggregatedIdentities']>, at: number, constituent: Omit<NonNullable<NoticeRow['aggregatedFacts']>[number], 'factStart' | 'factCount'>): Delivery {
-    const existing = window.summaryId === undefined ? undefined : this.rt.store.get('deliveries', window.summaryId)
+    const existing = window.summaryId === undefined ? undefined : this.k.store.get('deliveries', window.summaryId)
     if (existing !== undefined && existing.deliveredAt === undefined && existing.notice !== undefined) {
       const row = noticeRow(existing)!
       const factStart = row.facts?.length ?? 0
@@ -617,8 +621,8 @@ export class Notices {
       row.facts = facts
       row.aggregatedIdentities = [...(row.aggregatedIdentities ?? []), ...identities]
       row.aggregatedFacts = [...(row.aggregatedFacts ?? []), { ...constituent, factStart, factCount: addedFacts.length }]
-      existing.content = renderNoticeFacts(WAKE_SUMMARY_HEADER, facts, missionId, existing.id, Math.min(MAX_OWNER_NOTICE_CHARS, this.rt.config.maxMessageChars))
-      this.rt.store.put('deliveries', existing)
+      existing.content = renderNoticeFacts(WAKE_SUMMARY_HEADER, facts, missionId, existing.id, Math.min(MAX_OWNER_NOTICE_CHARS, this.k.config.maxMessageChars))
+      this.k.store.put('deliveries', existing)
       return existing
     }
     const summary: Delivery = {
@@ -626,9 +630,9 @@ export class Notices {
       content: '', createdAt: at,
       notice: { dedupKey: `wake-budget:${missionId}:${window.startedAt}`, class: 'decision', sentAt: at, queuedAt: at, facts: addedFacts, aggregatedIdentities: identities, aggregatedFacts: [{ ...constituent, factStart: 0, factCount: addedFacts.length }], trigger: 'wake-budget', reason: 'per-owner wake budget exceeded' } as NonNullable<Delivery['notice']>,
     }
-    summary.content = renderNoticeFacts(WAKE_SUMMARY_HEADER, addedFacts, missionId, summary.id, Math.min(MAX_OWNER_NOTICE_CHARS, this.rt.config.maxMessageChars))
+    summary.content = renderNoticeFacts(WAKE_SUMMARY_HEADER, addedFacts, missionId, summary.id, Math.min(MAX_OWNER_NOTICE_CHARS, this.k.config.maxMessageChars))
     window.summaryId = summary.id
-    this.rt.store.put('deliveries', summary)
+    this.k.store.put('deliveries', summary)
     return summary
   }
 
@@ -646,8 +650,8 @@ export class Notices {
         if (event.type !== 'user/message') return
         const source = (event.data as { source?: { kind?: unknown; deliveryId?: unknown } } | undefined)?.source
         if (source === undefined || source.kind !== 'swarm' || typeof source.deliveryId !== 'string') return
-        const delivery = this.rt.store.get('deliveries', source.deliveryId)
-        if (delivery?.to !== 'owner' || this.rt.store.get('missions', delivery.missionId)?.ownerSessionId !== String(session.header.id)) return
+        const delivery = this.k.store.get('deliveries', source.deliveryId)
+        if (delivery?.to !== 'owner' || this.k.store.get('missions', delivery.missionId)?.ownerSessionId !== String(session.header.id)) return
         this.recordConsumption(source.deliveryId, { source: 'user/message' })
       })
     } catch { this.unsubscribeClaimed = undefined }
@@ -666,32 +670,26 @@ export class Notices {
    * timestamp. Delivered, consumed and resolved stay three separate facts.
    */
   recordConsumption(deliveryId: string, options: { at?: number; source?: string } = {}): boolean {
-    const delivery = this.rt.store.get('deliveries', deliveryId)
+    const delivery = this.k.store.get('deliveries', deliveryId)
     if (delivery === undefined || delivery.notice === undefined) return false
-    const at = options.at ?? this.rt.now()
+    const at = options.at ?? this.k.now()
     const source = options.source ?? 'user/message'
     let recorded = false
-    this.rt.commit(delivery.missionId, () => {
-      const fresh = this.rt.store.get('deliveries', deliveryId)
+    this.k.commit(delivery.missionId, () => {
+      const fresh = this.k.store.get('deliveries', deliveryId)
       if (fresh === undefined || fresh.notice === undefined) return
       const row = noticeRow(fresh)!
       if (row.consumedAt !== undefined) return
       row.consumedAt = at
       row.consumptionSource = source
-      this.rt.store.put('deliveries', fresh)
+      this.k.store.put('deliveries', fresh)
       recorded = true
     })
     return recorded
   }
 
-  bounded(text: string): string {
-    requireText(text, 'content')
-    if (text.length > this.rt.config.maxMessageChars) throw new PolicyError('content_too_long', 'tool_error', `Content exceeds ${this.rt.config.maxMessageChars} characters`)
-    return text
-  }
-
   /** R17-G1: the interpretation of one mission's board as the store holds it now (`interpret`), the one every notice generator and the dispatch sweep read. */
-  interpretation(missionId: string): Interpretation { return interpret(this.rt.boardOf(missionId)) }
+  interpretation(missionId: string): Interpretation { return interpret(this.k.boardOf(missionId)) }
 
   /**
    * R17-G5: the absence net — one of the two absence instruments a sampled tick
@@ -709,7 +707,7 @@ export class Notices {
     this.followupObligations(view)
     if (mission.status !== 'active' || mission.budgetPause !== undefined) return
     const lastAt = view.lastTransitionAt
-    const elapsed = Math.max(0, this.rt.now() - lastAt)
+    const elapsed = Math.max(0, this.k.now() - lastAt)
     const bound = options.boundMs ?? this.absenceBoundMs
     if (elapsed < bound) return
     // One long operation owns its existing activity bound. Starting another
@@ -730,8 +728,8 @@ export class Notices {
   private followupObligations(view: Interpretation): void {
     const mission = view.mission
     if (!['active', 'blocked'].includes(mission.status)) return
-    const now = this.rt.now()
-    for (const delivery of this.rt.store.list('deliveries', mission.id)) {
+    const now = this.k.now()
+    for (const delivery of this.k.store.list('deliveries', mission.id)) {
       const fact = noticeRow(delivery)
       // Only a sent fact is reminded: a covered one never is, and its covering delivery's reminders carry its root.
       if (delivery.to !== 'owner' || delivery.deliveredAt === undefined || fact === undefined
@@ -749,14 +747,14 @@ export class Notices {
       // A summary's reminder is counted per constituent it names.
       const ordinal = parts === undefined ? spent + 1 : Math.max(...parts.map(part => (part.followupCount ?? 0) + 1))
       const reminded = parts?.map(part => part.factStart) ?? []
-      this.rt.commit(mission.id, () => {
-        const current = this.rt.store.get('deliveries', delivery.id)
+      this.k.commit(mission.id, () => {
+        const current = this.k.store.get('deliveries', delivery.id)
         const currentFact = current === undefined ? undefined : noticeRow(current)
         if (current === undefined || currentFact === undefined || (currentFact.followupCount ?? 0) !== spent) return
         currentFact.followupCount = spent + 1
         currentFact.followupAt = now
         for (const part of currentFact.aggregatedFacts ?? []) if (reminded.includes(part.factStart)) part.followupCount = (part.followupCount ?? 0) + 1
-        this.rt.store.put('deliveries', current)
+        this.k.store.put('deliveries', current)
         this.notify(mission.id, `Owner decision still unresolved (reminder ${ordinal} of ${this.maxObligationFollowups}, original delivery ${delivery.id}). Subjects: ${unresolved.join(', ')}. Prior notice: ${compactFact(priorContent, 600)}\nRead the original with swarm_observe({ missionId: "${mission.id}", deliveryId: "${delivery.id}" }) and apply the decision.${ordinal === this.maxObligationFollowups ? '\nReminder limit reached; the unresolved obligation remains on the board.' : ''}`, unresolved,
           { dedupKey: `obligation-followup:${delivery.id}:${spent + 1}`, trigger: 'owner-decision-unresolved', reason: delivery.id })
       })
@@ -813,13 +811,13 @@ export class Notices {
     const legacyQuestionKey = fact?.dedupKey.startsWith('owner-reply-missing:') ? fact.dedupKey.slice('owner-reply-missing:'.length, fact.dedupKey.lastIndexOf(':')) : undefined
     const questionId = fact?.questionId ?? legacyQuestionKey
     if (questionId !== undefined) {
-      const question = this.rt.store.get('deliveries', questionId)
+      const question = this.k.store.get('deliveries', questionId)
       if (question?.missionId !== mission.id || question.to !== 'owner' || question.replyExpected !== true || question.answeredBy !== undefined) return false
     }
     if (fact?.deliveryFailureId !== undefined) {
-      const failed = this.rt.store.get('deliveries', fact.deliveryFailureId)
+      const failed = this.k.store.get('deliveries', fact.deliveryFailureId)
       if (failed?.missionId !== mission.id || failed.deliveryFailure === undefined) return false
-      if (!this.rt.store.list('deliveries', mission.id).some(row => row.to === failed.to && row.deliveredAt === undefined
+      if (!this.k.store.list('deliveries', mission.id).some(row => row.to === failed.to && row.deliveredAt === undefined
         && row.deliveryFailure?.reason === failed.deliveryFailure!.reason && row.deliveryFailure.at >= failed.deliveryFailure!.at)) return false
     }
     if (fact?.trigger === 'mission/budget-warning' && !this.currentBudgetWarnings(mission, fact).some(Boolean)) return false
@@ -829,13 +827,13 @@ export class Notices {
     if (mission.status === 'completed' && (['budget', 'stall', 'blocker'].includes(fact.class)
       || (DECISION_FAMILIES.includes(family) && !family.startsWith('owner-reply-')))) return false
     if (family === 'obligation-followup') {
-      const original = fact.reason === undefined ? undefined : this.rt.store.get('deliveries', fact.reason)
+      const original = fact.reason === undefined ? undefined : this.k.store.get('deliveries', fact.reason)
       return this.unresolvedSubjects(this.interpretation(mission.id), original ?? delivery).length > 0
     }
     if (BOARD_FAMILIES.includes(family)) return this.boardFactOpen(this.interpretation(mission.id), delivery)
     if (family === 'review-blocked' || family === 'fallthrough' || family === 'stall-root'
       || family === 'dispatch-question' || family === 'parked' || family === 'scheduling-pass') {
-      const board = this.rt.boardOf(mission.id), tasks = board.tasks
+      const board = this.k.boardOf(mission.id), tasks = board.tasks
       const subjects = delivery.subjects ?? fact.subjects ?? []
       // Old unattributed rows cannot be judged from their text alone.
       if (subjects.length === 0) return true
@@ -897,7 +895,7 @@ export class Notices {
     const fact = (body: { content: string; statement: NoticeStatement }, subjects: string[], reason: string) =>
       ({ ...body, subjects, reason, key: factKey(view.missionId, { trigger: NOTICE_TEMPLATES[body.statement.family].trigger, reason, subjects, statement: body.statement }) })
     const refusal = completionError(view)
-    if (refusal === undefined) return this.rt.store.list('starts', view.missionId).length > 0 ? undefined
+    if (refusal === undefined) return this.k.store.list('starts', view.missionId).length > 0 ? undefined
       : fact(renderNotice('coverage-complete', { missionTitle: view.mission.title }), view.subjectsOf(view.tasks.filter(task => TERMINAL_STATES.has(task.status))), 'every acceptance criterion is independently covered')
     if (!view.stalled) return undefined
     const subjects = view.subjectsOf(view.unschedulable.length ? view.unschedulable : view.nonTerminal)
@@ -923,10 +921,10 @@ export class Notices {
       return [`task-budget:${mission.budget.maxTasks}`, `experiment-budget:${mission.budget.maxExperiments}`].some(localKey => key === guardTerminalKey('task_ceiling', { localKey })) ? undefined : []
     }
     if (key?.startsWith(guardTerminalKey('workspace', { localKey: 'isolation:' }))) {
-      return this.rt.isolationViolations(mission.id).some(violation => key === guardTerminalKey('workspace', { localKey: isolationOpener(violation) })) ? delivery.subjects ?? [] : []
+      return isolationIssues(this.k.store.list('members', mission.id), this.k.store.list('tasks', mission.id)).some(issue => key === guardTerminalKey('workspace', { localKey: isolationOpener(issue.message) })) ? delivery.subjects ?? [] : []
     }
     if (!key?.startsWith(guardTerminalKey('attempt_lease', { localKey: 'stop:' }))) return undefined
-    const tasks = this.rt.store.list('tasks', mission.id)
+    const tasks = this.k.store.list('tasks', mission.id)
     return (delivery.subjects ?? []).filter(subject => {
       const task = taskFromSubject(subject, tasks)
       if (task === undefined || !stopPending(task) || task.resumeAfterStop.failure === undefined) return false
@@ -939,12 +937,12 @@ export class Notices {
     const fact = noticeRow(delivery)
     if (fact?.aggregatedFacts !== undefined) {
       const facts = this.relevantSummaryFacts(mission, delivery).flatMap(part => this.summaryFactText(delivery, part))
-      return renderNoticeFacts('Current owner facts; superseded actions remain in the durable record.', facts, mission.id, delivery.id, Math.min(MAX_OWNER_NOTICE_CHARS, this.rt.config.maxMessageChars))
+      return renderNoticeFacts('Current owner facts; superseded actions remain in the durable record.', facts, mission.id, delivery.id, Math.min(MAX_OWNER_NOTICE_CHARS, this.k.config.maxMessageChars))
     }
     if (fact?.trigger === 'mission/budget-warning' && fact.facts !== undefined) {
       const flags = this.currentBudgetWarnings(mission, fact)
       if (flags.some(current => !current)) return renderNoticeFacts('Current resource review; superseded limits remain in the durable record.',
-        fact.facts.filter((_text, index) => index >= flags.length || flags[index]), mission.id, delivery.id, Math.min(MAX_OWNER_NOTICE_CHARS, this.rt.config.maxMessageChars))
+        fact.facts.filter((_text, index) => index >= flags.length || flags[index]), mission.id, delivery.id, Math.min(MAX_OWNER_NOTICE_CHARS, this.k.config.maxMessageChars))
     }
     return delivery.content
   }
@@ -958,7 +956,7 @@ export class Notices {
       if (match === null) return true
       const [, owner, dimension, limit] = match
       if (owner === 'mission') return (mission.budget as unknown as Record<string, number>)[dimension!] === Number(limit)
-      const task = this.rt.store.get('tasks', owner!)
+      const task = this.k.store.get('tasks', owner!)
       return task?.missionId === mission.id && !TERMINAL_STATES.has(task.status)
         && (task as unknown as Record<string, unknown>)[dimension!] === Number(limit)
     })
@@ -983,7 +981,7 @@ export class Notices {
   private summaryFactText(delivery: Delivery, fact: NonNullable<NoticeRow['aggregatedFacts']>[number]): string[] {
     const text = (noticeRow(delivery)?.facts ?? []).slice(fact.factStart, fact.factStart + fact.factCount)
     if (fact.trigger !== 'mission/budget-warning') return text
-    const flags = this.currentBudgetWarnings(this.rt.mission(delivery.missionId), fact)
+    const flags = this.currentBudgetWarnings(this.k.mission(delivery.missionId), fact)
     return text.filter((_text, index) => index >= flags.length || flags[index])
   }
 
@@ -1027,7 +1025,7 @@ export class Notices {
       // the pass, and by a wedged pass, which never reached its own question; a
       // body that made progress of its own within the last bound past its bound
       // is running, not wedged (`Scheduling.passState`).
-      const state = this.rt.passState(missionId)
+      const state = this.passState(missionId)
       const released = this.wedgedReleases.delete(missionId)
       // A live, un-wedged pass owns generation: it will publish at its own close
       // (the commit that closes the pass is a transition of this same funnel), so
@@ -1056,7 +1054,7 @@ export class Notices {
    * whose facts the owner holds writes nothing, and no other family's row
    * stands in for it.
    *
-   * Every notice below is recorded inside `rt.commit`, so the delivery row that
+   * Every notice below is recorded inside `commit`, so the delivery row that
    * carries the subjects is written in the SAME transaction as the event that
    * accompanies it.
    */
@@ -1160,9 +1158,9 @@ export class Notices {
       // that was not written must not leave an event per tick behind it.
       this.tell(mission.id, body, view.subjectsOf([root, ...dependents]), { dedupKey: key, trigger: NOTICE_TEMPLATES['stall-root'].trigger, reason: cause,
         statement, ...(cover === undefined ? {} : { coveredBy: cover.id }) }, () => {
-        this.rt.store.event(mission.id, 'mission/stalled', 'runtime', {
+        this.k.store.event(mission.id, 'mission/stalled', 'runtime', {
           cause: 'stall-root', taskId: root.id, epoch: root.epoch, reason: root.output ?? null, noticeKey: key,
-          dependents: dependents.map(task => task.id), boundMs: this.rt.bounds.stallPassTimeoutMs,
+          dependents: dependents.map(task => task.id), boundMs: this.k.bounds.stallPassTimeoutMs,
           // R14-F2v D1: the W3 stall event carries `unschedulable` and readers
           // (fault F19 row 7) take it from the LATEST mission/stalled event; a
           // stall-root event without it broke that reader. The root plus the
@@ -1181,7 +1179,7 @@ export class Notices {
    * summarized like any other, with its own reminder allowance.
    */
   private rejectionDecisionFor(missionId: string, subject: string): Delivery | undefined {
-    return this.rt.store.list('deliveries', missionId).find(delivery => {
+    return this.k.store.list('deliveries', missionId).find(delivery => {
       const row = delivery.to === 'owner' ? noticeRow(delivery) : undefined
       return row?.trigger === REJECTION_DECISION_TRIGGER && (delivery.subjects ?? row.subjects ?? []).includes(subject)
     })
@@ -1201,7 +1199,7 @@ export class Notices {
     const { content, subjects, key, reason, statement } = fact
     // F(S), the board digest the W3 stall was told on, is an audit field of its event.
     this.tell(missionId, content, subjects, { dedupKey: key, trigger: NOTICE_TEMPLATES[statement.family].trigger, reason, statement }, statement.family !== 'board-stall' ? undefined
-      : () => this.rt.store.event(missionId, 'mission/stalled', 'runtime', { reason, fingerprint: this.rt.fingerprint(missionId), unschedulable: view.unschedulable.map(task => task.id), noticeKey: key }))
+      : () => this.k.store.event(missionId, 'mission/stalled', 'runtime', { reason, fingerprint: this.k.fingerprint(missionId), unschedulable: view.unschedulable.map(task => task.id), noticeKey: key }))
   }
 
   /**
@@ -1239,38 +1237,38 @@ export class Notices {
   notifyReviewBlocked(mission: Mission, source: Task, need: string, reason: string): void {
     const view = this.interpretation(mission.id)
     const row = view.tasks.find(candidate => candidate.id === source.id) ?? source
-    const record = () => this.rt.store.event(mission.id, 'task/review-blocked', 'runtime', { taskId: source.id, kind: source.kind, reason })
+    const record = () => this.k.store.event(mission.id, 'task/review-blocked', 'runtime', { taskId: source.id, kind: source.kind, reason })
     const { content, statement } = renderNotice('review-blocked', { sourceId: row.id, reason })
     if (this.tell(mission.id, content, view.subjectsOf([row]), { dedupKey: reviewBlockedKey(mission.id, row.id, need, reason), trigger: NOTICE_TEMPLATES['review-blocked'].trigger, reason, statement }, record)) return
-    if (newestReviewBlock(this.rt.store, mission.id, source.id)?.reason !== reason) this.rt.commit(mission.id, record)
+    if (newestReviewBlock(this.k.store, mission.id, source.id)?.reason !== reason) this.k.commit(mission.id, record)
   }
 
   topicDelivery(missionId: string, from: string, topic: string, content: string): void {
-    for (const member of this.rt.store.list('members', missionId)) {
+    for (const member of this.k.store.list('members', missionId)) {
       if (member.id !== from && member.status !== 'stopped' && (member.subscriptions.includes(topic) || member.subscriptions.includes('*'))) {
-        this.rt.store.put('deliveries', { id: id('msg'), missionId, from, to: member.id, topic, kind: 'finding', content, createdAt: this.rt.now() })
+        this.k.store.put('deliveries', { id: id('msg'), missionId, from, to: member.id, topic, kind: 'finding', content, createdAt: this.k.now() })
       }
     }
   }
 
   /** The same durable failure covers missing recipients, transport errors and retries. */
   private recordDeliveryFailure(missionId: string, delivery: Delivery, reason: string): void {
-    const member = this.rt.store.get('members', delivery.to)
-    this.rt.commit(missionId, () => {
-      const current = this.rt.store.get('deliveries', delivery.id)
+    const member = this.k.store.get('members', delivery.to)
+    this.k.commit(missionId, () => {
+      const current = this.k.store.get('deliveries', delivery.id)
       if (current === undefined || current.deliveredAt !== undefined || current.deliveryFailure?.reason === reason) return
-      current.deliveryFailure = { reason, at: this.rt.now() }
-      this.rt.store.put('deliveries', current)
-      this.rt.store.event(missionId, 'mission/stalled', 'runtime', { cause: delivery.to === 'owner' ? 'owner-delivery-failed' : 'worker-delivery-failed', deliveryId: delivery.id, to: delivery.to, reason })
+      current.deliveryFailure = { reason, at: this.k.now() }
+      this.k.store.put('deliveries', current)
+      this.k.store.event(missionId, 'mission/stalled', 'runtime', { cause: delivery.to === 'owner' ? 'owner-delivery-failed' : 'worker-delivery-failed', deliveryId: delivery.id, to: delivery.to, reason })
       if (delivery.to !== 'owner') {
         // One local incident for a member/error, even when many messages
         // are queued. A recovered queue makes this notice obsolete; a new
         // failed delivery afterwards establishes a fresh incident.
-        const anchor = this.rt.store.list('deliveries', missionId).filter(row => row.to === delivery.to
+        const anchor = this.k.store.list('deliveries', missionId).filter(row => row.to === delivery.to
           && row.deliveredAt === undefined && row.deliveryFailure?.reason === reason)
           .sort((a, b) => a.deliveryFailure!.at - b.deliveryFailure!.at)[0]!
         this.notify(missionId, `Messages to ${member?.name ?? delivery.to} (${delivery.to}) are queued but cannot be delivered: ${reason}. Inspect that member's current task and stop/recovery state; repair or reassign its work to an available member. Increasing the task budget will not repair this transport failure.`,
-          noticeSubjectsFor(this.rt.boardOf(missionId), { memberId: delivery.to }), {
+          noticeSubjectsFor(this.k.boardOf(missionId), { memberId: delivery.to }), {
             noticeClass: 'blocker', trigger: 'worker-delivery-failed', reason,
             dedupKey: `worker-delivery-failed:${anchor.id}:${reasonDigest(reason)}`, deliveryFailureId: anchor.id,
           })
@@ -1284,17 +1282,17 @@ export class Notices {
    * stamped (`awaited`) before its result commits. `only` delivers that one row.
    */
   async flushOutbox(missionId: string, pass?: SchedulingPass, only?: string): Promise<void> {
-    if (this.rt.shuttingDown) return
-    for (const queued of this.rt.store.list('deliveries', missionId)) {
-      if (this.rt.shuttingDown) return
+    if (this.k.shuttingDown) return
+    for (const queued of this.k.store.list('deliveries', missionId)) {
+      if (this.k.shuttingDown) return
       if (only !== undefined && queued.id !== only) continue
       // A preceding transport can yield to stop/pause, receipts or another pump.
       // Read both rows again before deciding whether this delivery may start.
-      const mission = this.rt.mission(missionId)
-      const delivery = this.rt.store.get('deliveries', queued.id)
+      const mission = this.k.mission(missionId)
+      const delivery = this.k.store.get('deliveries', queued.id)
       if (delivery === undefined || delivery.deliveredAt !== undefined) continue
-      if (delivery.kind === 'assignment' && !assignmentCurrent(this.rt.store, delivery)) {
-        delivery.deliveredAt = this.rt.now(); this.rt.commit(missionId, () => this.rt.store.put('deliveries', delivery)); continue
+      if (delivery.kind === 'assignment' && !assignmentCurrent(this.k.store, delivery)) {
+        delivery.deliveredAt = this.k.now(); this.k.commit(missionId, () => this.k.store.put('deliveries', delivery)); continue
       }
       // OWNER QUIET: a delivery the owner's own lifecycle decision made moot is
       // not sent, and its row stays durable and undelivered rather than being
@@ -1303,7 +1301,7 @@ export class Notices {
       if (delivery.to !== 'owner' && (mission.status !== 'active' || mission.budgetPause)) continue
       const member = delivery.to === 'owner'
         ? { id: 'owner', missionId, name: 'owner', role: 'owner', sessionId: mission.ownerSessionId, workspace: mission.workspace, status: 'idle' as const, subscriptions: [] }
-        : this.rt.store.get('members', delivery.to)
+        : this.k.store.get('members', delivery.to)
       if (!member || member.status === 'stopped') {
         this.recordDeliveryFailure(missionId, delivery, !member
           ? `Recipient ${delivery.to} is missing from the durable member roster`
@@ -1318,10 +1316,10 @@ export class Notices {
       if (this.delivering.has(delivery.id)) continue
       if (delivery.to === 'owner' && delivery.notice !== undefined && delivery.notice.handoffAt === undefined) {
         delivery.content = this.ownerDeliveryContent(mission, delivery)
-        delivery.notice.handoffAt = this.rt.now()
-        this.rt.commit(missionId, () => this.rt.store.put('deliveries', delivery))
+        delivery.notice.handoffAt = this.k.now()
+        this.k.commit(missionId, () => this.k.store.put('deliveries', delivery))
       }
-      this.delivering.set(delivery.id, this.rt.now())
+      this.delivering.set(delivery.id, this.k.now())
       // An adapter may accept the message before its acknowledgement times out.
       // Detach a summary at its first handoff: retries keep this ID's content
       // immutable, and later facts get a fresh ID even after the attempt gate
@@ -1331,29 +1329,29 @@ export class Notices {
       let bound: ReturnType<typeof setTimeout> | undefined
       try {
         const settled = await awaited(pass, Promise.race([
-          this.rt.workers.deliver(member, delivery).then(() => true),
-          new Promise<boolean>(resolve => { bound = setTimeout(() => resolve(false), this.rt.bounds.stallPassTimeoutMs) }),
-        ]), this.rt.now)
+          this.k.workers.deliver(member, delivery).then(() => true),
+          new Promise<boolean>(resolve => { bound = setTimeout(() => resolve(false), this.k.bounds.stallPassTimeoutMs) }),
+        ]), this.k.now)
         if (!settled) { this.recordOutboxStarvation(missionId, delivery); continue }
         // R17-G8: delivery is the transport fact. It is never relabelled as
         // consumption; the host's claimed signal records consumption separately
         // (`recordConsumption`), with the adapter delivery timestamp as intake.
-        this.rt.commit(missionId, () => {
-          const current = this.rt.store.get('deliveries', delivery.id)
+        this.k.commit(missionId, () => {
+          const current = this.k.store.get('deliveries', delivery.id)
           if (current !== undefined && current.deliveredAt === undefined) {
-            current.deliveredAt = this.rt.now()
-            this.rt.store.put('deliveries', current)
+            current.deliveredAt = this.k.now()
+            this.k.store.put('deliveries', current)
           }
           // Only acknowledge the failure this retry observed. New lifecycle,
           // budget, receipt and starvation decisions may have landed while the
           // adapter awaited persistence; none may be replaced by the old rows.
-          const latest = this.rt.mission(missionId)
+          const latest = this.k.mission(missionId)
           const previous = mission.outboxStarved
           const starvation = latest.outboxStarved
           if (previous?.deliveryId === delivery.id && starvation?.deliveryId === delivery.id
             && starvation.attempts === previous.attempts && starvation.at === previous.at) {
             delete latest.outboxStarved
-            this.rt.store.put('missions', latest)
+            this.k.store.put('missions', latest)
           }
         })
       } catch (error) {
@@ -1373,11 +1371,11 @@ export class Notices {
    */
   recordOutboxStarvation(missionId: string, delivery: Delivery): void {
     try {
-      const mission = this.rt.store.get('missions', missionId)
+      const mission = this.k.store.get('missions', missionId)
       if (mission === undefined) return
       const attempts = (mission.outboxStarved?.deliveryId === delivery.id ? mission.outboxStarved.attempts : 0) + 1
-      mission.outboxStarved = { deliveryId: delivery.id, attempts, at: this.rt.now() }
-      this.rt.commit(missionId, () => this.rt.store.put('missions', mission))
+      mission.outboxStarved = { deliveryId: delivery.id, attempts, at: this.k.now() }
+      this.k.commit(missionId, () => this.k.store.put('missions', mission))
     } catch { /* Recording a starvation must never break the pump. */ }
   }
 
@@ -1413,21 +1411,21 @@ export class Notices {
    *    supersession and reaches every mission.
    */
   pumpOutbox(): void {
-    if (this.rt.shuttingDown || this.rt.closed || this.pumpStartPending) return
+    if (this.k.shuttingDown || this.k.closed || this.pumpStartPending) return
     this.pumpStartPending = true
-    this.rt.defer(async () => {
+    this.k.defer(async () => {
       this.pumpStartPending = false
-      const now = this.rt.now()
+      const now = this.k.now()
       const current = this.pump
-      if (current !== undefined && now - current.sweepStartedAt < this.rt.bounds.stallPassTimeoutMs) { current.requested = true; return }
+      if (current !== undefined && now - current.sweepStartedAt < this.k.bounds.stallPassTimeoutMs) { current.requested = true; return }
       const pump: Pump = { sweepStartedAt: now, requested: true }
       this.pump = pump
       try {
         while (pump.requested) {
           pump.requested = false
-          pump.sweepStartedAt = this.rt.now()
-          for (const mission of this.rt.store.list('missions')) {
-            if (this.rt.closed || this.rt.shuttingDown || this.pump !== pump) return
+          pump.sweepStartedAt = this.k.now()
+          for (const mission of this.k.store.list('missions')) {
+            if (this.k.closed || this.k.shuttingDown || this.pump !== pump) return
             try { await this.flushOutbox(mission.id) }
             catch { /* Durable outbox retries; one mission must not stop the pump. */ }
           }

@@ -151,7 +151,7 @@ test('R16-D1: a pass wedged on live work is named inside its declared live-work 
   // R16-D1(d): the named body no longer owns generation: the mission publishes
   // as wedged, not as inside a live pass, while the sibling lease still lives.
   // No second body is queued behind the one the queue still owns.
-  assert.deepEqual(f.runtime.passState(f.mission.id), { passLive: false, wedged: true }, 'the sibling lease does not keep the named pass live')
+  assert.deepEqual(f.runtime.scheduling.passState(f.mission.id), { passLive: false, wedged: true }, 'the sibling lease does not keep the named pass live')
   assert.equal(f.pass(), wedged, 'no later tick queued a second body behind the wedged one')
 })
 
@@ -237,7 +237,7 @@ test('R16-D4: an attempt with no durable progress past its bound escalates with 
   const escalation = await eventually(() => f.escalations('attempt-silent:')[0], 'the silence must escalate inside the declared bound plus one tick', 3000)
   assert.equal(escalation.notice.class, 'stall', 'the escalation is a liveness notice')
   assert.equal(noticeFamily(escalation), 'stall', 'its family is its class, never the W3 board stall (`board-stall`)')
-  assert.equal(f.runtime.ownerDeliveryRelevant(f.runtime.mission(f.mission.id), escalation), true, 'it stays relevant while the attempt runs')
+  assert.equal(f.runtime.notices.ownerDeliveryRelevant(f.runtime.mission(f.mission.id), escalation), true, 'it stays relevant while the attempt runs')
   assert.equal(escalation.notice.dedupKey, `attempt-silent:${attemptId}:${claimedAt}`, 'the dedup key is the attempt and the instant its silence began')
   assert.deepEqual(escalation.subjects, [`${task.id}@${claimed.epoch}`], 'the subject is the attempt task at its epoch')
   assert.match(escalation.content, new RegExp(`Builder \\(${builder.id}\\)`), 'the member is named')
