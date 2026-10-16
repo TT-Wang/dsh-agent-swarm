@@ -14,7 +14,7 @@ import { TERMINAL_STATES, currentEvidenceIds, holdsAttempt, holdsOpenAttempt, su
 import { excerpt } from './declared-checks.ts'
 import { executionElapsed } from './resource-time.ts'
 import { memberPhaseOf } from './projection.ts'
-import { dispatchable } from './board.ts'
+import { dispatchable, inFlightEstimate } from './board.ts'
 import { noticeFamily, noticeIdentity } from './notices.ts'
 import type { SwarmRuntime } from './runtime.ts'
 import type { Delivery, Mission, Post, Task, UsageBuckets, UsageSnapshotSource } from './types.ts'
@@ -232,7 +232,7 @@ export class RuntimeGates {
     const pairedSources = new Set(tasks.filter(task => task.kind === 'verification' && task.status !== 'cancelled').map(task => task.reviewOf))
     const pendingReviewSlots = tasks.filter(task => task.kind !== 'verification' && !TERMINAL_STATES.has(task.status) && !pairedSources.has(task.id)).length
     const dimensions: Array<{ dimension: string; used: number; limit: number; inFlight: number; reviewSlots?: number; task?: Task }> = [
-      { dimension: 'maxTokens', used: mission.usedTokens, limit: mission.budget.maxTokens, inFlight: this.rt.inFlightEstimate(members) },
+      { dimension: 'maxTokens', used: mission.usedTokens, limit: mission.budget.maxTokens, inFlight: inFlightEstimate(this.rt.view, members) },
       { dimension: 'maxSteps', used: mission.usedSteps, limit: mission.budget.maxSteps, inFlight: inFlight.length },
       { dimension: 'maxDurationMs', used: executionElapsed(mission, this.rt.now()), limit: mission.budget.maxDurationMs, inFlight: 0 },
       { dimension: 'maxTasks', used: tasks.length, limit: mission.budget.maxTasks, inFlight: 0, reviewSlots: pendingReviewSlots },

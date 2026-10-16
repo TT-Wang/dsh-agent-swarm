@@ -11,7 +11,7 @@ import { Notices, NOTICE_TEMPLATES, REJECTION_DECISION_TRIGGER, assignmentCurren
 import { RefusalRegistry, requireStrings, requireText, sameChecks, unsupportedEffort, validatedBudget } from './refusals.ts'
 import { Scheduling } from './scheduling.ts'
 import { progressed, type Kernel, type SchedulingPass } from './kernel.ts'
-import { ADMISSION_REFUSED, AUTOMATIC_REVIEW_PREFIX, bounds, capable, completionError, fingerprintBoard, missionFingerprint, noticeSubjectsFor, readBoard, readinessBlocker, readMission, ready, rerouteTarget, reviewable, reviewNeed, reviewPathBlocker, reviewPathStalled, unreviewedSources, unschedulable, type AdapterView, type Board, type Bounds, type ReviewNeed } from './board.ts'
+import { ADMISSION_REFUSED, AUTOMATIC_REVIEW_PREFIX, bounds, capable, completionError, fingerprintBoard, inFlightEstimate, missionFingerprint, noticeSubjectsFor, readBoard, readinessBlocker, readMission, ready, rerouteTarget, reviewable, reviewNeed, reviewPathBlocker, reviewPathStalled, unreviewedSources, unschedulable, type AdapterView, type Board, type Bounds, type ReviewNeed } from './board.ts'
 // R17-G6/G7: the one derivation of mission derived state and its host projection.
 import { deriveMemberStatus, memberPhaseOf, memberDeliveryHealth, type MissionBoardMember } from './projection.ts'
 export { emptyUsage, addUsage } from './gates.ts'
@@ -644,7 +644,7 @@ export class SwarmRuntime implements Kernel {
    * every ask and never memoized: asking whether a handle is idle can drain a
    * stranded inbox item.
    */
-  readonly view: AdapterView = { startable: memberId => this.workers.isIdle(memberId) }
+  readonly view: AdapterView = { startable: memberId => this.workers.isIdle(memberId), activity: memberId => this.workers.currentActivity(memberId) }
   /** One mission's board as the store holds it now: a decision reads it where it decides. */
   boardOf(missionId: string): Board { return readBoard(this.store, missionId, this.now, this.bounds, this.view) }
   /** One projection per reader. A member reads this wherever the runtime hands it a task, in its assignment, in `swarm_observe` and in the result of its own propose, claim, submit and verify: `acceptance` is its derived checklist, which holds the text of every criterion it cites, never the bare ids. The owner reads the stored row at every exit and resolves its `covers` through the mission's criteria. */
@@ -2911,7 +2911,7 @@ export class SwarmRuntime implements Kernel {
     const fetched = this.store.events(missionId, after ? eventLimit + 1 : eventLimit, after ?? 0)
     const events = fetched.slice(0, eventLimit).map(event => ({ seq: event.seq, type: event.type, actor: event.actor, summary: excerpt(event.data, 240) }))
     const eventCursor = { ...(events.length ? { nextAfter: events.at(-1)!.seq } : {}), ...(fetched.length > eventLimit ? { moreEvents: true } : {}) }
-    const budget = { usedTokens: mission.usedTokens, maxTokens: mission.budget.maxTokens, usedSteps: mission.usedSteps, maxSteps: mission.budget.maxSteps, deadline: mission.deadline, inFlightTokensEstimate: this.inFlightEstimate(members) }
+    const budget = { usedTokens: mission.usedTokens, maxTokens: mission.budget.maxTokens, usedSteps: mission.usedSteps, maxSteps: mission.budget.maxSteps, deadline: mission.deadline, inFlightTokensEstimate: inFlightEstimate(board.view, members) }
     const full = query.detail === 'full'
     if (member) {
       const current = openAttempt(tasks, member.id)
@@ -3011,19 +3011,6 @@ export class SwarmRuntime implements Kernel {
     }
   }
   
-  /** Requests already streaming have no reported usage yet; estimate each at its worker's average. */
-  inFlightEstimate(members: Member[]): number {
-    let total = 0
-    for (const member of members) {
-      if (memberPhaseOf(member) === 'stopped') continue
-      const activity = this.workers.currentActivity(member.id)
-      if (activity?.kind !== 'model') continue
-      const requests = member.usage?.requests ?? 0
-      if (requests > 0) total += Math.ceil((member.accountedTokens ?? 0) / requests)
-    }
-    return total
-  }
-
   async inspectDelivery(actor: Actor, missionId: string) {
     const { mission, task } = this.deliveryTarget(actor, missionId)
     await this.workspaceAdmission.assertWorkspaceAuthorized(mission)
@@ -3391,7 +3378,7 @@ export class SwarmRuntime implements Kernel {
       if (ceiling !== undefined) { this.blockTaskCeiling(mission, activeTask, ceiling); return false }
     }
     // Requests still streaming for other workers will settle against the same pool.
-    if (mission.usedSteps >= mission.budget.maxSteps || mission.usedTokens + this.inFlightEstimate(this.store.list('members', mission.id).filter(item => item.id !== memberId)) >= mission.budget.maxTokens || this.now() >= mission.deadline) {
+    if (mission.usedSteps >= mission.budget.maxSteps || mission.usedTokens + inFlightEstimate(this.view, this.store.list('members', mission.id).filter(item => item.id !== memberId)) >= mission.budget.maxTokens || this.now() >= mission.deadline) {
       this.blockBudget(mission); throw new Error('Mission aggregate budget exhausted')
     }
     mission.usedSteps++; mission.updatedAt = this.now()

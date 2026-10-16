@@ -22,7 +22,7 @@ import { memberPhaseOf } from './projection.ts'
 import { recoveryExit } from './declared-checks.ts'
 import { scopeKeysOverlap } from './scheduler.ts'
 import { TERMINAL_STATES, blockCauses, completionExempt, holdsOpenAttempt, missionSubject, openAttempt, pendingStopOwner, quiescencePending, selectAcceptedDelivery, stopPending, subjectsOfTasks, taskGraphIndex, taskSubject, terminal, uncoveredCriteria, type HeldTask, type TaskGraphIndex } from './task-graph.ts'
-import { providerQuiescent, type CheckResult, type Delivery, type Evidence, type Member, type Mission, type RuntimeConfig, type Task } from './types.ts'
+import { providerQuiescent, type CheckResult, type Delivery, type Evidence, type Member, type Mission, type RuntimeConfig, type Task, type WorkerActivity } from './types.ts'
 
 /**
  * S1: the bound on one scheduling pass before the runtime names it wedged, in
@@ -113,6 +113,8 @@ function declaredBound(value: number | undefined, fallback: number): number {
 export interface AdapterView {
   /** Whether the member's worker handle can take an assignment now (`WorkerAdapter.isIdle`). */
   startable(memberId: string): boolean
+  /** What the member's worker handle is doing now (`WorkerAdapter.currentActivity`). */
+  activity(memberId: string): WorkerActivity | undefined
 }
 
 /**
@@ -180,6 +182,22 @@ export function readBoard(store: Pick<SwarmStore, 'get' | 'list' | 'latestTaskEv
 export function startBlocker(view: AdapterView, member: Member): 'handle-busy' | undefined {
   if (memberPhaseOf(member) === 'parked') return undefined
   return view.startable(member.id) ? undefined : 'handle-busy'
+}
+
+/**
+ * The tokens `members` are spending in model requests that have reported no
+ * usage yet, each estimated at its worker's average request: the budget gate's
+ * and the owner's in-flight projection, read where they read it.
+ */
+export function inFlightEstimate(view: AdapterView, members: readonly Member[]): number {
+  let total = 0
+  for (const member of members) {
+    if (memberPhaseOf(member) === 'stopped') continue
+    if (view.activity(member.id)?.kind !== 'model') continue
+    const requests = member.usage?.requests ?? 0
+    if (requests > 0) total += Math.ceil((member.accountedTokens ?? 0) / requests)
+  }
+  return total
 }
 
 export function ready(board: Board, task: Task, member: Member): boolean {
