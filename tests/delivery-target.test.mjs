@@ -69,3 +69,44 @@ test('applyDelivery records the applied result durably and projects it in the sn
   assert.equal(f.runtime.store.get('missions', f.mission.id).appliedDelivery, undefined)
   assert.equal(f.runtime.snapshot(f.owner, f.mission.id).appliedDelivery, undefined)
 })
+
+test('only the owner session, never a worker session, inspects or applies a delivery; shutdown, owner, acceptance and baseline refuse in that order', async t => {
+  const f = await fixture(t)
+  f.put(record(f.mission, 'impl', 'implementation', 'accepted', [], '1'.repeat(40)))
+  f.put(record(f.mission, 'int-1', 'integration', 'accepted', ['impl'], '2'.repeat(40)))
+  const reached = []
+  f.workers.inspectDelivery = async (_mission, resultCommit) => { reached.push('inspect'); return { resultCommit } }
+  f.workers.applyDelivery = async () => { reached.push('apply'); return { status: 'applied', changedPaths: [], conflicts: [] } }
+  // Each refusal is the runtime's own (web-api.ts checks the owner in front of
+  // it, so its tests never reach this one), for both calls, before the adapter.
+  const refused = async (actor, code) => {
+    for (const call of ['inspectDelivery', 'applyDelivery']) {
+      await assert.rejects(f.runtime[call](actor, f.mission.id), error => error.code === code, `${call} is refused with ${code}`)
+    }
+  }
+  const stranger = { sessionId: 'stranger-session' }
+  const member = await f.runtime.addMember(f.owner, f.mission.id, { name: 'Worker', role: 'implementation', maxOutputTokens: 5_000 })
+  // An active mission with no baseline: the owner check precedes acceptance and baseline.
+  await refused(stranger, 'delivery_owner_required')
+  await refused(f.owner, 'delivery_acceptance_required')
+  const mission = f.runtime.store.get('missions', f.mission.id)
+  mission.status = 'completed'
+  f.runtime.store.put('missions', mission)
+  await refused(stranger, 'delivery_owner_required')
+  await refused(f.owner, 'delivery_baseline_missing')
+  complete(f)
+  await refused(stranger, 'delivery_owner_required')
+  // Shutdown is refused before the owner is asked.
+  f.runtime.shuttingDown = true
+  await refused(stranger, 'runtime_shutting_down')
+  await refused(f.owner, 'runtime_shutting_down')
+  f.runtime.shuttingDown = false
+  assert.deepEqual(reached, [], 'no refused call reached the adapter')
+  assert.equal((await f.runtime.inspectDelivery(f.owner, f.mission.id)).resultCommit, '2'.repeat(40))
+  assert.equal((await f.runtime.applyDelivery(f.owner, f.mission.id)).status, 'applied')
+  assert.deepEqual(reached, ['inspect', 'apply'], 'the owner session reaches both')
+  // A worker session never holds the owner's authority, even under the owner's session id.
+  f.runtime.store.put('members', { ...f.runtime.store.get('members', member.id), sessionId: f.owner.sessionId })
+  await refused(f.owner, 'delivery_owner_required')
+  assert.deepEqual(reached, ['inspect', 'apply'], 'the worker session reached neither')
+})
