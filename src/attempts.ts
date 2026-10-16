@@ -100,9 +100,9 @@ interface SilentOperation {
 export class Attempts {
   /**
    * S5 cache-only: the durable `Task.idleSignal` row carries the same value and
-   * the scheduling pass re-reads it; losing this map changes no durable outcome.
+   * `turnEnded` re-reads it; losing this map changes no durable outcome.
    */
-  readonly idleSignals = new Map<string, { attemptId: string; at: number }>()
+  private readonly idleSignals = new Map<string, { attemptId: string; at: number }>()
   /** Retry timing is disposable; the fenced task row owns the recovery obligation. */
   private readonly stopRetries = new Map<string, { epoch: number; memberId?: string; retries: number; retryAt: number; inFlight: boolean }>()
 
@@ -454,6 +454,14 @@ export class Attempts {
     // A lease extension is liveness bookkeeping, not a new progress timestamp or milestone.
     this.k.commit(mission.id, () => this.k.store.put('tasks', task))
     return task
+  }
+  /**
+   * W6: whether the owner of an open attempt ended its turn on it (`onIdle`).
+   * The durable signal on the row is the record; the in-memory one stands in
+   * for its row write while that is still in flight.
+   */
+  turnEnded(open: HeldTask): boolean {
+    return open.idleSignal?.attemptId === open.attempt.id || this.idleSignals.get(open.attempt.ownerId)?.attemptId === open.attempt.id
   }
   onIdle(memberId: string): void {
     if (this.k.closed || this.k.shuttingDown) return

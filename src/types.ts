@@ -480,7 +480,7 @@ export interface Task {
   /**
    * S5: durable form of the adapter's "this member ended a turn while still
    * owning this attempt" signal. The scheduling path re-reads it from the store
-   * instead of trusting the in-memory `idleSignals` map, which is now only a
+   * (`Attempts.turnEnded`) instead of trusting the in-memory `idleSignals` map, which is now only a
    * cache: a lost cache delays the bounded close-out until lease expiry, it
    * cannot make the close-out wrong. It names its attempt and leaves the row with it.
    */
