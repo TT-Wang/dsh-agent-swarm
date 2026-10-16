@@ -31,6 +31,7 @@
  * face whether or not a projection registry is mounted.
  */
 import type { Context } from '@deepseek-ai/cordis'
+import { openAttempt } from './task-graph.ts'
 import type { Delivery, Member, MemberPhase, MemberStatus, Task, WorkerAdapter } from './types.ts'
 
 /** Current transport trouble, derived from pending delivery rows rather than another health state machine. */
@@ -63,11 +64,6 @@ export function memberPhaseOf(member: Pick<Member, 'phase'> & { status?: MemberS
   return 'active'
 }
 
-/** Whether a member currently owns a running task attempt. */
-function ownsLiveAttempt(memberId: string, tasks: readonly Task[]): boolean {
-  return tasks.some(task => task.status === 'running' && task.attempt !== undefined && task.attempt.ownerId === memberId)
-}
-
 /**
  * R17-G7: the one derivation of the live member status.
  *
@@ -93,7 +89,7 @@ export function deriveMemberStatus(phase: MemberPhase, ownsLiveAttempt: boolean)
 /** One member view: the durable row plus the derived status, from the one derivation. */
 function memberView(member: Member, tasks: readonly Task[]): Member {
   const phase = memberPhaseOf(member)
-  return { ...member, phase, status: deriveMemberStatus(phase, ownsLiveAttempt(member.id, tasks)) }
+  return { ...member, phase, status: deriveMemberStatus(phase, openAttempt(tasks, member.id) !== undefined) }
 }
 
 /** The derived view of every member row, in the input order. */
