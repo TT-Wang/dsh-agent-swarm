@@ -840,7 +840,8 @@ export function fingerprintBoard(board: Board): MissionFingerprintBoard {
 
 /* ----------------------------------------------------------------------- *
  * R17-G1: the interpretation, the one judgement of a board the board
- * classifiers read. A reader of rows alone reads the board.
+ * classifiers read. A reader of rows alone reads the board; until A1 the one
+ * other builder is the dispatch sweep's member step (`interpret`).
  * ----------------------------------------------------------------------- */
 
 /** Whether a durably parked member holds this task's open attempt (the R10-15 holder family): rows alone, so asking asks the adapter nothing. */
@@ -874,7 +875,11 @@ export interface Interpretation extends Board {
  * nothing, holds no cache, and asks the adapter exactly where its predicates
  * ask it. A reader of rows alone (the sweep's member order, a notice naming the
  * tasks it is about with `subjectsOfTasks`) reads the board, and asks the
- * adapter nothing.
+ * adapter nothing. One caller outside the classifiers builds it: each member
+ * step of the dispatch sweep, which reads none of its judged fields, so that
+ * its asks come before that member's eligibility asks (an ask can drain a
+ * stranded inbox, R15-A5). A1 separates isIdle's question from its drain and
+ * deletes that call with this sentence.
  */
 export function interpret(board: Board): Interpretation {
   return {

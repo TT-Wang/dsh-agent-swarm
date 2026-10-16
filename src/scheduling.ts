@@ -139,6 +139,10 @@ export class Scheduling {
           // described to the owner with a cause the sweep did not test. The
           // parked-member hatch keeps priority: a parked member is dispatchable.
           if (startBlocker(this.k.view, member) !== undefined) continue
+          // Built for its adapter asks alone (no judged field is read): they come
+          // before this member's eligibility asks, and an ask can drain a stranded
+          // inbox (R15-A5), so their order is behaviour (board-read-points' drain
+          // case) until A1 separates isIdle's question from its drain.
           const view = interpret(this.k.boardOf(missionId))
           if (pendingStopOwner(view.tasks, member.id)) continue
           const open = openAttempt(view.tasks, member.id)
