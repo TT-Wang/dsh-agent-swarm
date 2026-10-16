@@ -187,12 +187,14 @@ test('S2: a pump past its bound is superseded, ends with the flush in flight, an
     const superseded = request()
     await first.entered.promise
     assert.equal(attempts(), 1, 'the first pump swept the unrostered row and holds the first owner row')
+    clock.advance(bound / 2)
     await request()
     assert.equal(attempts(), 1, 'a request inside its bound joins it and starts no sweep')
-    clock.advance(bound)
+    clock.advance(bound / 2)
     const successor = request()
-    await second.entered.promise
-    assert.equal(attempts(), 2, 'a request past its bound starts a successor, which sweeps while the first pump is held')
+    // The successor's start has run once it is held on the second row; a start that joined would end at once.
+    await Promise.race([second.entered.promise, successor])
+    assert.equal(attempts(), 2, 'a request one bound after the sweep started starts a successor, which sweeps while the first pump is held: the join half a bound earlier did not extend the bound of the sweep in flight')
     first.release.resolve()
     await superseded
     assert.ok(delivered('msg_s2_held_first'), 'the superseded pump finished the attempt in flight')
