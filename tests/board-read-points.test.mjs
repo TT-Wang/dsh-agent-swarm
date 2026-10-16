@@ -11,6 +11,8 @@
  *  - dispatch alone also decides the isolation invariant again on the board
  *    the preparation left: a worktree shared during the await is refused and
  *    recorded there (S7's decide, record, skip), never assigned into;
+ *  - the assignment asserts the admission again (`RefusalRegistry.assertAdmission`):
+ *    a stop the member came to owe during a claim's preparation refuses it;
  *  - one board asks the adapter about one member twice and gets two answers:
  *    the view is called through and never memoized, because asking whether a
  *    handle is idle can drain a stranded inbox item (R15-A5).
@@ -94,6 +96,28 @@ test('claim reads the board again after preparing: a prerequisite challenged dur
   await assert.rejects(claim, error => error.code === 'task_changed_during_preparation', 'the claim is refused by the board read after the await')
   const row = taskOf(f.runtime, f.dependent.id)
   assert.deepEqual([row.status, row.attempt, row.epoch], ['pending', undefined, f.dependent.epoch])
+})
+
+test('the assignment asserts admission again after preparing: a stop the member came to owe during the preparation refuses the claim', async t => {
+  const f = await fixture(t)
+  const earlier = f.propose({ title: 'Earlier work' })
+  await f.runtime.settle(f.mission.id)
+  const claim = f.runtime.claim(f.actor(f.author), f.mission.id, f.dependent.id)
+  await f.entered.promise
+  // A commit outside the mission queue records, during the preparation, a stop
+  // the author owes on other work, as a fence of its attempt there writes it.
+  // The claim's own check before its preparation passed, and the fresh-row
+  // check after it reads only the dependent and its readiness, so the
+  // admission the assignment asserts again is the only check that sees it.
+  f.runtime.commit(f.mission.id, () => {
+    const row = taskOf(f.runtime, earlier.id)
+    f.runtime.store.put('tasks', { ...row, status: 'blocked', resumeAfterStop: { epoch: row.epoch, memberId: f.author.id, reason: 'handoff', at: f.clock.now() } })
+  })
+  f.gate.resolve()
+  await assert.rejects(claim, /^Error: Worker is waiting for its previous attempt to stop$/, 'the assignment refuses a member that owes a stop')
+  const row = taskOf(f.runtime, f.dependent.id)
+  assert.deepEqual([row.status, row.attempt, row.epoch], ['pending', undefined, f.dependent.epoch], 'no attempt was assigned')
+  assert.deepEqual(f.runtime.store.events(f.mission.id, 5_000).filter(event => event.type === 'task/claimed'), [], 'nothing was claimed')
 })
 
 test('a board asks the adapter at every ask: two asks about one member on one board reach the adapter twice', async t => {
