@@ -19,11 +19,15 @@ import assert from 'node:assert/strict'
 import { assertNamedCalls, ownerTools } from './refusal-inventory.mjs'
 import { FakeClock, events, setup, taskOf } from './faults/harness.mjs'
 
-/** A fixture runtime on the fake clock, with every tick failure the runtime logs collected. */
+/**
+ * A fixture runtime on the fake clock, with every line the runtime logs
+ * collected: a failed tick, a failed decision sweep, and a deferred scheduling
+ * pass that threw (`Kernel.defer` logs it as `[agent-swarm] <error>`).
+ */
 async function fixture(t, options = {}) {
   const f = await setup({ clock: new FakeClock(), ...options })
   const failures = [], write = process.stderr.write.bind(process.stderr)
-  process.stderr.write = (chunk, ...rest) => { if (/tick failed|sweep failed/.test(String(chunk))) { failures.push(String(chunk)); return true } return write(chunk, ...rest) }
+  process.stderr.write = (chunk, ...rest) => { if (String(chunk).startsWith('[agent-swarm] ')) { failures.push(String(chunk)); return true } return write(chunk, ...rest) }
   t.after(async () => { process.stderr.write = write; await f.cleanup() })
   return { ...f, failures, tool: await ownerTools(f) }
 }
