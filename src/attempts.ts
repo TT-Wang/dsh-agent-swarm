@@ -52,8 +52,9 @@ export function clearCloseout(task: Task): void {
 /**
  * The markers one attempt writes while it runs: the budget pause that
  * preserved it, its idle close-out, its denied git write and its lease warning.
- * None of them means anything once that attempt ends, so they leave the row
- * with it, and a new attempt starts without them.
+ * They leave the row when the attempt does, and a new attempt starts without
+ * them. A submission or a verdict keeps the attempt on the row as its record,
+ * and these markers with it.
  */
 export function clearAttemptMarkers(task: Task): void {
   delete task.budgetResume; clearCloseout(task); delete task.gitWriteDenied; delete task.leaseWarned
@@ -76,8 +77,8 @@ function dropAttempt(task: Task): void {
  * End the row's attempt when no handle owes a stop for it: the epoch bump
  * fences its lease and every write it could still present. A host restart
  * re-pending running work (the old process is gone), a rework re-opening a
- * rejected task or its review (the attempt already ended in its submission or
- * its verdict), and a worker start that failed end an attempt this way. An
+ * rejected task or its review (their handles finished with the submission and
+ * the verdict), and a worker start that failed end an attempt this way. An
  * attempt a handle may still be running is fenced instead (`Attempts.fenceForStop`).
  */
 export function endAttempt(task: Task): void {
