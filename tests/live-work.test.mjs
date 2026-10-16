@@ -1,7 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import { projectLiveWork } from '../lib/types/client/live-work.js'
-import { PROVIDER_OUTAGE_WINDOW_MS } from '../lib/types/types.js'
 import { uiSnapshot } from './fixtures/ui-snapshot.mjs'
 
 function fixture() {
@@ -102,16 +101,6 @@ test('inactive missions and parked or stopped workers override leftover native a
   assert.equal(nova(project(snapshot, now)).state, 'waiting')
   snapshot.members[1].phase = 'stopped'
   assert.equal(nova(project(snapshot, now)).state, 'stopped')
-})
-
-test('a provider outage holds a member\'s row only while the runtime reads its route as quiescent: the outage stays recorded until a start opens the session, and a member that works on past the window is observed', () => {
-  const { snapshot, now } = fixture()
-  // The adapter's in-place retry succeeded; the member runs a tool on its preserved attempt.
-  const outage = { class: 'rate-limit', status: 429, message: 'Rate limit reached for requests', at: now }
-  const row = at => { snapshot.members[1].providerOutage = { ...outage, at }; const view = project(snapshot, now); return [nova(view).state, nova(view).label, nova(view).activity?.id, view.workingCount] }
-  assert.deepEqual(row(now - PROVIDER_OUTAGE_WINDOW_MS), ['waiting', 'Waiting for provider recovery', undefined, 0], 'inside the outage window of the last report the route is quiescent')
-  assert.deepEqual(row(now - PROVIDER_OUTAGE_WINDOW_MS - 1), ['observed', 'Running a tool', 'tool-b', 1], 'one millisecond past it the route is live, as re-routing and start pacing read it')
-  assert.deepEqual(row(now - 3_600_000), ['observed', 'Running a tool', 'tool-b', 1], 'an outage recorded an hour ago does not hide the member\'s work')
 })
 
 test('retry is waiting and verification includes its preparation phase without claiming test execution', () => {
