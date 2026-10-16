@@ -22,7 +22,7 @@ import assert from 'node:assert/strict'
 import { setup, events, eventually, now, runScenario, taskOf, wait } from './harness.mjs'
 
 const K = 3 // START_FAILURE_REROUTE_LIMIT in src/runtime.ts
-const OUTAGE_WINDOW_MS = 5 * 60_000 // PROVIDER_OUTAGE_WINDOW_MS in src/runtime.ts
+const OUTAGE_WINDOW_MS = 5 * 60_000 // PROVIDER_OUTAGE_WINDOW_MS in src/types.ts
 const ownerNotices = f => f.runtime.store.list('deliveries', f.mission.id).filter(delivery => delivery.to === 'owner')
 
 /** Every start of every route fails with `fault(member)`; returns the per-member start counts. */

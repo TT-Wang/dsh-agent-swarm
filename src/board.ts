@@ -21,7 +21,7 @@ import { assignmentAllows, authorIdsOf, canBorrowTask, canOwnReview, strandedRev
 import { memberPhaseOf } from './projection.ts'
 import { recoveryExit } from './declared-checks.ts'
 import { TERMINAL_STATES, blockCauses, completionExempt, missionSubject, pendingStopOwner, quiescencePending, selectAcceptedDelivery, stopPending, subjectsOfTasks, taskGraphIndex, taskSubject, terminal, uncoveredCriteria, type TaskGraphIndex } from './task-graph.ts'
-import type { CheckResult, Delivery, Evidence, Member, Mission, RuntimeConfig, Task } from './types.ts'
+import { providerQuiescent, type CheckResult, type Delivery, type Evidence, type Member, type Mission, type RuntimeConfig, type Task } from './types.ts'
 
 /**
  * S1: the bound on one scheduling pass before the runtime names it wedged, in
@@ -325,14 +325,6 @@ export function reviewPathStalled(board: Board): boolean {
  */
 export function stalled(board: Board): boolean {
   return board.tasks.length > 0 && reviewPathStalled(board) && !unreviewable(board).some(task => awaitsReviewAdmission(board, task))
-}
-
-/** R11-01: how long a classified provider outage keeps a member's route quiescent. */
-export const PROVIDER_OUTAGE_WINDOW_MS = 5 * 60_000
-/** R11-01: the member's route is quiescent only inside the outage window. */
-export function providerQuiescent(member: Member, now: number): Member['providerOutage'] {
-  const outage = member.providerOutage
-  return outage !== undefined && now - outage.at <= PROVIDER_OUTAGE_WINDOW_MS ? outage : undefined
 }
 
 /**

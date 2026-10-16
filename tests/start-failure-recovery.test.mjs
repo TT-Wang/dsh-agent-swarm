@@ -70,7 +70,7 @@ async function setup(t, { gamma = false, tickMs = 20 } = {}) {
 
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
 const startsOf = (f, memberId) => f.workers.starts.filter(id => id === memberId).length
-/** Must match PROVIDER_OUTAGE_WINDOW_MS in src/runtime.ts. */
+/** Must match PROVIDER_OUTAGE_WINDOW_MS in src/types.ts. */
 const OUTAGE_WINDOW_MS = 5 * 60_000
 
 test('R5-02: a start failure preserves task credit, re-pends, and re-routes after k consecutive failures', async t => {

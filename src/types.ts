@@ -102,6 +102,17 @@ export interface ProviderOutage {
 }
 /** The last classified outage observed for a member, used to avoid spending recovery credit. */
 export interface MemberProviderOutage extends ProviderOutage { at: number }
+/** R11-01: how long a classified provider outage keeps a member's route quiescent. */
+export const PROVIDER_OUTAGE_WINDOW_MS = 5 * 60_000
+/**
+ * R11-01: the member's route is quiescent only inside the outage window of its
+ * last classified outage. The one reading of `Member.providerOutage`: the start
+ * path, re-routing and the live-work panel all ask it.
+ */
+export function providerQuiescent(member: Pick<Member, 'providerOutage'>, now: number): MemberProviderOutage | undefined {
+  const outage = member.providerOutage
+  return outage !== undefined && now - outage.at <= PROVIDER_OUTAGE_WINDOW_MS ? outage : undefined
+}
 /**
  * R11-19: the host's measured declared-check envelope. Structural mirror of the
  * `Workspaces` value so the adapter interface never imports the Node-only
@@ -288,10 +299,11 @@ export interface Member {
   /** Current native session's cumulative watermarks, separate from lifetime usage. */
   usageSession?: { generation: number; accountedTokens: number; usage?: UsageBuckets }
   /**
-   * R11-01: the last provider outage classified for this member. Present means
-   * the member's route is quiescent (capacity/quota/availability), so a start
-   * failure or stop must not spend the task's recovery credit; it is cleared by
-   * a successful start or a successful operation.
+   * R11-01: the last provider outage classified for this member, kept until a
+   * start opens the member's session (`recordStarted`). It is read only through
+   * `providerQuiescent`: inside its window the route is quiescent, so a start
+   * failure is the outage, spending no recovery credit and not counted, starts
+   * are paced to one probe per window, and re-routed work prefers other members.
    */
   providerOutage?: MemberProviderOutage
   /** S5c: consecutive `workers.start` failures and the last one's error, cleared by the next successful start; a restart continues the count. */
