@@ -1,11 +1,8 @@
 import { providerQuiescent, type Member, type Snapshot, type SwarmEvent, type Task, type WorkerActivity } from '../types.ts'
-import { recentProgress, type ConnectionState } from './progress.ts'
+import { recentProgress, type ConnectionState, type ObservedWork } from './progress.ts'
 
 type LiveWorkState = 'observed' | 'quiet' | 'waiting' | 'idle' | 'stale' | 'paused' | 'stopped' | 'complete'
-export interface LiveWorkRow {
-  member: Member
-  task?: Task
-  activity?: WorkerActivity
+export interface LiveWorkRow extends ObservedWork {
   state: LiveWorkState
   label: string
   /** Native operation observation, not a completed-work timestamp. */
