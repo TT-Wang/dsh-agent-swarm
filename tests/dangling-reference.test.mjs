@@ -240,7 +240,7 @@ test('a worker\'s proposal behind a review whose source names no task is refused
   error => error.code === 'task_graph_invalid' && error.diagnostics.some(diagnostic => diagnostic.code === 'task_graph_unknown_edge' && diagnostic.path === 'task_missing_source'))
 })
 
-test('one rule decides whether an assignment delivery is current: the host admits the claim\'s own, and the outbox marks moot, never sends, and the host never admits one whose task names no task, is another mission\'s, or is not named', async t => {
+test('one rule decides whether an assignment delivery is current: the host admits the claim\'s own, and the outbox marks moot, never sends, and the host never admits one whose task names no task, is another mission\'s, is not named, or runs the named attempt for another member', async t => {
   const f = await fixture(t)
   const work = f.propose({ title: 'Running work' })
   const claimed = await f.runtime.claim(f.actor(f.author), f.mission.id, work.id)
@@ -252,10 +252,14 @@ test('one rule decides whether an assignment delivery is current: the host admit
     f.runtime.store.put('deliveries', assignment('msg_dangling', { taskId: 'task_missing', attemptId: 'attempt_missing' }))
     f.runtime.store.put('deliveries', assignment('msg_elsewhere', { taskId: 'task_elsewhere', attemptId: 'attempt_elsewhere' }))
     f.runtime.store.put('deliveries', assignment('msg_taskless', {}))
+    // The task runs the named attempt, but the author owns it, not this recipient.
+    f.runtime.store.put('deliveries', assignment('msg_other_owner', { to: f.reviewer.id, taskId: work.id, attemptId: claimed.attempt.id }))
   })
-  const corrupted = ['msg_dangling', 'msg_elsewhere', 'msg_taskless']
-  assert.equal(f.workers.callbacks.admitDelivery(f.author.id, current.id), true, 'the claim\'s own assignment is current')
-  for (const id of corrupted) assert.equal(f.workers.callbacks.admitDelivery(f.author.id, id), false, `the host does not admit ${id}`)
+  const corrupted = ['msg_dangling', 'msg_elsewhere', 'msg_taskless', 'msg_other_owner']
+  /** The host's answer when the delivery's own recipient asks to admit it. */
+  const admitted = id => f.workers.callbacks.admitDelivery(f.runtime.store.get('deliveries', id).to, id)
+  assert.equal(admitted(current.id), true, 'the claim\'s own assignment is current')
+  for (const id of corrupted) assert.equal(admitted(id), false, `the host does not admit ${id}`)
   await tick(f)
   assert.deepEqual(f.failures, [], 'no pass fails on the outbox')
   for (const id of corrupted) {
