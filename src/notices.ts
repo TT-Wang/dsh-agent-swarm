@@ -1452,8 +1452,11 @@ export class Notices {
    *    a mission's outbox before the request's rows existed, so the pump sweeps
    *    again once it ends;
    *  - a sweep past the bound never holds a request (the reviewer's D2): the
-   *    start supersedes its pump with a new one. The superseded pump ends with
-   *    its sweep, and every request it was holding is its successor's.
+   *    start supersedes its pump with a new one, and every request the
+   *    superseded pump was holding is its successor's;
+   *  - only the current pump starts a mission's flush. A superseded pump ends
+   *    with the flush in flight: its successor's sweep started after the
+   *    supersession and reaches every mission.
    */
   pumpOutbox(): void {
     if (this.rt.shuttingDown || this.rt.closed || this.pumpStartPending) return
@@ -1466,11 +1469,11 @@ export class Notices {
       const pump: Pump = { sweepStartedAt: now, requested: true }
       this.pump = pump
       try {
-        while (pump.requested && this.pump === pump) {
+        while (pump.requested) {
           pump.requested = false
           pump.sweepStartedAt = this.rt.now()
           for (const mission of this.rt.store.list('missions')) {
-            if (this.rt.closed || this.rt.shuttingDown) return
+            if (this.rt.closed || this.rt.shuttingDown || this.pump !== pump) return
             try { await this.flushOutbox(mission.id) }
             catch { /* Durable outbox retries; one mission must not stop the pump. */ }
           }
