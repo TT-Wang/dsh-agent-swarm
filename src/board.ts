@@ -357,12 +357,20 @@ export function rerouteTarget(board: Board, task: Task, failedId: string): Membe
 export interface IsolationIssue { memberIds: string[]; message: string }
 
 /**
- * The isolation invariant over one mission's members and tasks (S7, stated at
- * `WorkspaceAdmission.isolationViolations`), each breach with the members it
- * lists: dispatch admission refuses a listed member
- * (`WorkspaceAdmission.isolationAllows`), and the workspace terminal a breach
- * raised is outstanding while the invariant still lists it
- * (`Notices.openGuardTerminal`).
+ * S7: the isolation invariant over one mission's members and tasks, decided
+ * from durable state only, each breach with the members it lists:
+ *  - live workers ≤ provisioned isolated worktrees: every non-stopped member
+ *    owns a provisioned workspace and no two live members share one, so the
+ *    number of worker handles the runtime may hold can never exceed the number
+ *    of distinct isolated worktrees;
+ *  - two concurrently running tasks that share one isolated worktree must
+ *    declare disjoint scope: the dispatch path admits at most one running task
+ *    per worktree and refuses a second whose scope overlaps.
+ * It asserts the isolation the runtime already has; it never weakens
+ * per-member worktrees, it refuses a dispatch that would lose them. Dispatch
+ * admission refuses a listed member (`WorkspaceAdmission.isolationAllows`), and
+ * the workspace terminal a breach raised is outstanding while the invariant
+ * still lists it (`Notices.openGuardTerminal`).
  */
 export function isolationIssues(allMembers: readonly Member[], tasks: readonly Task[]): IsolationIssue[] {
   const violations: IsolationIssue[] = []

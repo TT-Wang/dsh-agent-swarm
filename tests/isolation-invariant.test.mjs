@@ -10,7 +10,7 @@
  *    per-member worktree is the isolation mechanism; this test never weakens it).
  *
  * The test asserts the invariant through the runtime's own durable-state check
- * (`isolationViolations`), not by inspecting code: a generated plan is scheduled
+ * (`isolationIssues` over the board), not by inspecting code: a generated plan is scheduled
  * and every observation must be violation-free. The second test corrupts the
  * durable state (two live members in one worktree) and requires the dispatch
  * path to record a durable refusal instead of starting a worker there: one
@@ -26,6 +26,8 @@ const SCOPES = ['src/', 'docs/', 'scripts/faults/', 'tests/', '**', 'src/runtime
 /** Deterministic generator so a failing seed is reproducible. */
 const rng = seed => { let state = seed >>> 0; return () => { state = (state * 1664525 + 1013904223) >>> 0; return state / 0x1_0000_0000 } }
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
+/** The breaches the invariant lists on one fixture's board, by their text. */
+const violationsOf = f => { const { members, tasks } = f.runtime.boardOf(f.mission.id); return isolationIssues(members, tasks).map(issue => issue.message) }
 
 test('S7: generated member/task sets keep live workers within provisioned worktrees and concurrent scopes disjoint per worktree', async () => {
   for (const seed of [1, 2, 3, 4, 5]) {
@@ -51,7 +53,7 @@ test('S7: generated member/task sets keep live workers within provisioned worktr
         `seed ${seed}: generated work must dispatch`, 6_000)
       for (let observation = 0; observation < 10; observation++) {
         await sleep(20)
-        const violations = f.runtime.isolationViolations(f.mission.id)
+        const violations = violationsOf(f)
         assert.deepEqual(violations, [], `seed ${seed}: the isolation invariant must hold: ${violations.join('; ')}`)
         const running = f.runtime.store.list('tasks', f.mission.id).filter(task => task.status === 'running' && task.attempt !== undefined)
         const workspaces = new Set(f.runtime.store.list('members', f.mission.id)
@@ -91,7 +93,7 @@ test('S7: a shared worktree is refused durably, never dispatched into, and its d
       .filter(delivery => delivery.to === 'owner' && /\[workspace_terminal\]/.test(delivery.content))
     const relevant = notice => f.runtime.notices.ownerDeliveryRelevant(f.runtime.mission(f.mission.id), f.runtime.store.get('deliveries', notice.id))
     const refused = { notice: await eventually(() => terminals()[0], 'a shared worktree must produce a durable refusal', 6_000) }
-    const [violation] = f.runtime.isolationViolations(f.mission.id)
+    const [violation] = violationsOf(f)
     assert.match(violation, new RegExp(`${f.author.id}.*${f.reviewer.id}|${f.reviewer.id}.*${f.author.id}`), 'the violation names both members that share the worktree')
     assert.match(refused.notice.notice.dedupKey, /^guard-terminal:workspace:workspace_terminal:isolation:[0-9a-f]{16}$/, 'the refusal is keyed by the violation, not by a member or the board')
     assert.equal(refused.notice.notice.reason, `the isolation invariant refuses dispatch: ${violation}`, 'and records the violation as its reason')
@@ -117,7 +119,7 @@ test('S7: a shared worktree is refused durably, never dispatched into, and its d
       reviewer.workspace = `${authorWorkspace}-repaired`
       f.runtime.store.put('members', reviewer)
     })
-    assert.deepEqual(f.runtime.isolationViolations(f.mission.id), [], 'the repaired board satisfies the invariant')
+    assert.deepEqual(violationsOf(f), [], 'the repaired board satisfies the invariant')
     assert.equal(relevant(refused.notice), false, 'the repair ends the decision: a queued one is withheld')
     const running = await eventually(() => taskOf(f.runtime, task.id).status === 'running' ? taskOf(f.runtime, task.id) : undefined,
       'after the repair the pending task is dispatched normally', 6_000)

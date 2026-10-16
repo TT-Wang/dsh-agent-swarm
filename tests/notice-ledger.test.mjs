@@ -15,7 +15,7 @@ import { createHash } from 'node:crypto'
 import { writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { FakeClock, FakeWorkers, MISSION_ACCEPTANCE, acceptThroughReview, blockThroughReview, eventually, events, setup, taskOf } from './faults/harness.mjs'
-import { BOARD_RUNNING, completionError, reviewNeed } from '../lib/board.js'
+import { BOARD_RUNNING, completionError, isolationIssues, reviewNeed } from '../lib/board.js'
 import { ownerTools } from './refusal-inventory.mjs'
 import { NOTICE_TEMPLATES, factKey, noticeFamily, noticeTemplateKey } from '../lib/notices.js'
 
@@ -1619,6 +1619,9 @@ test('every exit a failed dispatch\'s request names, performed through the owner
   assert.deepEqual((await remind(f, request)).map(delivery => delivery.subjects), [request.subjects], 'which is reminded while the task it names is stuck')
 })
 
+/** The breaches the isolation invariant lists on one fixture's board, by their text. */
+const violationsOf = f => { const { members, tasks } = f.runtime.boardOf(f.mission.id); return isolationIssues(members, tasks).map(issue => issue.message) }
+
 test('the isolation request is its violation\'s: keyed by the violation\'s text and naming the unfinished work of every member it lists, told once however often it refuses them; a changed violation is a second request, and only the violation the invariant lists is outstanding and reminded', async t => {
   const f = await setup({ clock: new FakeClock(), workers: new FakeWorkers({ autoIdle: true }), budget: LONG })
   t.after(f.cleanup)
@@ -1630,7 +1633,7 @@ test('the isolation request is its violation\'s: keyed by the violation\'s text 
   await quiet(f)
   const request = (violation, tasks) => [`guard-terminal:workspace:workspace_terminal:isolation:${sha16(violation)}`, `the isolation invariant refuses dispatch: ${violation}`, tasks.map(task => subjectOf(f, task)).sort()]
   const told = () => terminalRows(f, 'workspace').map(delivery => [delivery.notice.dedupKey, delivery.notice.reason, [...delivery.subjects].sort()])
-  const [sharing, ...others] = f.runtime.isolationViolations(f.mission.id)
+  const [sharing, ...others] = violationsOf(f)
   assert.match(sharing, /share one provisioned worktree/)
   assert.deepEqual(others, [])
   const shared = request(sharing, [reviewers, authors])
@@ -1641,7 +1644,7 @@ test('the isolation request is its violation\'s: keyed by the violation\'s text 
   nextWindow(f)
   worktree(f.author, '')
   await quiet(f)
-  const [missing, ...rest] = f.runtime.isolationViolations(f.mission.id)
+  const [missing, ...rest] = violationsOf(f)
   assert.match(missing, /has no provisioned isolated worktree/)
   assert.deepEqual(rest, [], 'the invariant lists the new violation alone')
   assert.deepEqual(told(), [shared, request(missing, [authors])], 'the changed violation is a second request, keyed by its own text and naming the work of the one member it lists')
@@ -1675,7 +1678,7 @@ test('the isolation request is outstanding exactly while the invariant lists its
     assert.ok(request.content.includes(exit), `the request names: ${exit}`)
     await perform(fixture)
     await quiet(f)
-    assert.deepEqual([taskOf(f.runtime, task.id).status, f.runtime.isolationViolations(f.mission.id).length, terminalRows(f, 'workspace').length, relevant(f, request)], ['pending', 1, 1, true],
+    assert.deepEqual([taskOf(f.runtime, task.id).status, violationsOf(f).length, terminalRows(f, 'workspace').length, relevant(f, request)], ['pending', 1, 1, true],
       `${exit}, without the repair, leaves the violation listed: the one request stays outstanding`)
     assert.deepEqual((await remind(f, request)).map(delivery => delivery.subjects), [request.subjects], 'and the owner is reminded of it')
   }
@@ -1685,7 +1688,7 @@ test('the isolation request is outstanding exactly while the invariant lists its
   const later = changed.f.propose({ title: 'Later work', assigneeId: changed.f.author.id, kind: 'research', checks: [] })
   await quiet(changed.f)
   await ticks(changed.f, 3)
-  assert.deepEqual([taskOf(changed.f.runtime, later.id).status, changed.f.runtime.isolationViolations(changed.f.mission.id).length, terminalRows(changed.f, 'workspace').map(delivery => [subjectOf(changed.f, changed.task), subjectOf(changed.f, later)].map(subject => delivery.subjects.includes(subject)))],
+  assert.deepEqual([taskOf(changed.f.runtime, later.id).status, violationsOf(changed.f).length, terminalRows(changed.f, 'workspace').map(delivery => [subjectOf(changed.f, changed.task), subjectOf(changed.f, later)].map(subject => delivery.subjects.includes(subject)))],
     ['pending', 1, [[true, false]]], 'the violation still refuses both members, and its one request names the work it saw when first told')
   const questions = ownerRows(changed.f).filter(delivery => noticeFamily(delivery) === 'dispatch-question')
   assert.deepEqual(questions.map(delivery => [delivery.subjects, relevant(changed.f, delivery)]), [[[subjectOf(changed.f, changed.task)], true], [[subjectOf(changed.f, later)], true]],
@@ -1694,7 +1697,7 @@ test('the isolation request is outstanding exactly while the invariant lists its
   const { f, task, request, repair, tool } = await board()
   assert.match(request.content, /Repair the condition, then use `swarm_control`/)
   repair()
-  assert.deepEqual([f.runtime.isolationViolations(f.mission.id), relevant(f, request)], [[], false], 'the repaired worktrees end the request: a queued one is withheld')
+  assert.deepEqual([violationsOf(f), relevant(f, request)], [[], false], 'the repaired worktrees end the request: a queued one is withheld')
   assert.deepEqual(await remind(f, request), [], 'and no reminder follows it, though the task it named is still pending')
   await tool('swarm_control', { taskId: task.id, action: 'resume', reason: 'Repaired' })
   await quiet(f)

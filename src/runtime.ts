@@ -301,7 +301,6 @@ export class SwarmRuntime implements Kernel {
   deniedGitWrite(input: { tool: string; arguments: unknown; result: unknown; isError: boolean }): string | undefined { return this.workspaceAdmission.deniedGitWrite(input) }
   tempRendezvous(memberId: string, taskId: string, input: { tool: string; arguments: unknown }): { path: string; first: TempMention; second: TempMention } | undefined { return this.workspaceAdmission.tempRendezvous(memberId, taskId, input) }
   isolationAllows(missionId: string, member: Member): boolean { return this.workspaceAdmission.isolationAllows(missionId, member) }
-  isolationViolations(missionId: string): string[] { return this.workspaceAdmission.isolationViolations(missionId) }
 
   readonly attempts = new Attempts(this)
   /** M1a seam 4/7: the durable refusal registry and its writer-busy recovery, on the kernel alone. */
