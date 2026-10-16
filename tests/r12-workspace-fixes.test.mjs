@@ -13,11 +13,11 @@ const sourceMode = process.env.SWARM_TEST_SOURCE === '1'
 const moduleOf = name => import(new URL(`../${sourceMode ? 'src' : 'lib'}/${name}.${sourceMode ? 'ts' : 'js'}`, import.meta.url))
 const { Scheduling } = await moduleOf('scheduling')
 const { Notices, dispatchQuestion } = await moduleOf('notices')
-const { reviewNeed } = await moduleOf('board')
+const { isolationIssues, reviewNeed } = await moduleOf('board')
 const { taskGraphIndex } = await moduleOf('task-graph')
 const { RefusalRegistry } = await moduleOf('refusals')
 const { Workspaces, runProcess } = await moduleOf('workspaces')
-const { WorkspaceAdmission, isolationIssues } = await moduleOf('workspace-admission')
+const { WorkspaceAdmission } = await moduleOf('workspace-admission')
 const { SwarmStore } = await moduleOf('store')
 const { captureGitSnapshot } = await moduleOf('git-snapshot')
 const git = (cwd, args, env) => execFileSync('git', ['-c', 'user.name=R12 Test', '-c', 'user.email=r12@example.invalid', ...args], {

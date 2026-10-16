@@ -20,6 +20,7 @@ import { executionClock } from './resource-time.ts'
 import { assignmentAllows, authorIdsOf, canBorrowTask, canOwnReview, strandedReview } from './assignment.ts'
 import { memberPhaseOf } from './projection.ts'
 import { recoveryExit } from './declared-checks.ts'
+import { scopeKeysOverlap } from './scheduler.ts'
 import { TERMINAL_STATES, blockCauses, completionExempt, missionSubject, pendingStopOwner, quiescencePending, selectAcceptedDelivery, stopPending, subjectsOfTasks, taskGraphIndex, taskSubject, terminal, uncoveredCriteria, type TaskGraphIndex } from './task-graph.ts'
 import { providerQuiescent, type CheckResult, type Delivery, type Evidence, type Member, type Mission, type RuntimeConfig, type Task } from './types.ts'
 
@@ -350,6 +351,48 @@ export function rerouteTarget(board: Board, task: Task, failedId: string): Membe
   const target = planned ?? [...candidates].sort((a, b) => a.name.localeCompare(b.name) || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))[0]
   if (target === undefined || providerQuiescent(target, board.clock()) === undefined) return target
   return candidates.find(member => providerQuiescent(member, board.clock()) === undefined) ?? target
+}
+
+/** One breach of the isolation invariant: the members it lists and the text that names it. */
+export interface IsolationIssue { memberIds: string[]; message: string }
+
+/**
+ * The isolation invariant over one mission's members and tasks (S7, stated at
+ * `WorkspaceAdmission.isolationViolations`), each breach with the members it
+ * lists: dispatch admission refuses a listed member
+ * (`WorkspaceAdmission.isolationAllows`), and the workspace terminal a breach
+ * raised is outstanding while the invariant still lists it
+ * (`Notices.openGuardTerminal`).
+ */
+export function isolationIssues(allMembers: readonly Member[], tasks: readonly Task[]): IsolationIssue[] {
+  const violations: IsolationIssue[] = []
+  const members = allMembers.filter(member => member.status !== 'stopped')
+  const byWorkspace = new Map<string, Member[]>()
+  for (const member of members) {
+    if (!member.workspace) { violations.push({ memberIds: [member.id], message: `member ${member.id} (${member.name}) has no provisioned isolated worktree` }); continue }
+    byWorkspace.set(member.workspace, [...(byWorkspace.get(member.workspace) ?? []), member])
+  }
+  for (const [workspace, group] of byWorkspace) {
+    if (group.length > 1) violations.push({ memberIds: group.map(member => member.id), message: `live workers ${group.map(member => member.id).join(', ')} share one provisioned worktree (${workspace}); live workers must never exceed provisioned worktrees` })
+  }
+  const running = tasks.filter(task => task.status === 'running' && task.attempt !== undefined)
+  const byTaskWorkspace = new Map<string, Task[]>()
+  for (const task of running) {
+    const owner = allMembers.find(member => member.id === task.attempt!.ownerId)
+    if (owner === undefined || owner.status === 'stopped') { violations.push({ memberIds: [task.attempt!.ownerId], message: `running task ${task.id} has no live owner (${task.attempt!.ownerId})` }); continue }
+    byTaskWorkspace.set(owner.workspace, [...(byTaskWorkspace.get(owner.workspace) ?? []), task])
+  }
+  for (const [workspace, group] of byTaskWorkspace) {
+    if (group.length > 1) violations.push({ memberIds: group.map(task => task.attempt!.ownerId), message: `concurrently running tasks ${group.map(task => task.id).join(', ')} share worktree ${workspace}` })
+    for (let left = 0; left < group.length; left++) {
+      for (let right = left + 1; right < group.length; right++) {
+        if (group[left]!.scope.some(a => group[right]!.scope.some(b => scopeKeysOverlap(a, b)))) {
+          violations.push({ memberIds: [group[left]!.attempt!.ownerId, group[right]!.attempt!.ownerId], message: `concurrently running tasks ${group[left]!.id} and ${group[right]!.id} declare overlapping scope in worktree ${workspace}` })
+        }
+      }
+    }
+  }
+  return violations
 }
 
 /* ----------------------------------------------------------------------- *

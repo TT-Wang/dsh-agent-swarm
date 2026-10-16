@@ -20,7 +20,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { setup, eventually, taskOf } from './faults/harness.mjs'
-import { isolationIssues } from '../lib/workspace-admission.js'
+import { isolationIssues } from '../lib/board.js'
 
 const SCOPES = ['src/', 'docs/', 'scripts/faults/', 'tests/', '**', 'src/runtime.ts']
 /** Deterministic generator so a failing seed is reproducible. */
