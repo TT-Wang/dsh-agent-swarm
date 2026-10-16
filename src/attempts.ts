@@ -11,7 +11,7 @@ import { stopFaultKey, type Notices } from './notices.ts'
 import { memberPhaseOf } from './projection.ts'
 import { PolicyError } from './policy-error.ts'
 import { awaited, formatSpan, type Kernel, type SchedulingPass } from './kernel.ts'
-import type { Artifact, Member, Mission, Task, WorkerActivity } from './types.ts'
+import type { Artifact, Attempt, Member, Mission, Task, WorkerActivity } from './types.ts'
 
 /**
  * The detail a terminal message embeds. A guard's own message may already carry
@@ -52,12 +52,13 @@ export function dropAttempt(task: Task): void {
 }
 
 /**
- * A re-read row still holds the attempt the caller read earlier: the same
- * epoch, still running, the same attempt. A fencing transition committed in
- * between fails it, so the caller never writes over that transition.
+ * A re-read row still holds the attempt the caller read earlier: it exists in
+ * the same mission, at the same epoch, still running, the same attempt. A
+ * fencing transition committed in between fails it, so the caller never writes
+ * over that transition.
  */
-const holdsAttempt = (row: Task, epoch: number, attemptId: string | undefined): boolean =>
-  row.epoch === epoch && row.status === 'running' && row.attempt?.id === attemptId
+const holdsAttempt = (row: Task | undefined, missionId: string, epoch: number, attemptId: string): row is Task & { attempt: Attempt } =>
+  row !== undefined && row.missionId === missionId && row.epoch === epoch && row.status === 'running' && row.attempt?.id === attemptId
 
 /** W6: bounded idle close-outs before the workspace is checkpointed and re-pended. */
 const DEFAULT_IDLE_CLOSEOUTS = 2
@@ -391,17 +392,17 @@ export class Attempts {
    * operation past its declared bound keeps every other property of a live
    * operation, but it is no longer plausible liveness, so the lease stops being
    * renewed and the existing expiry path — not a new kill switch — frees the
-   * attempt. Inside the bound the rule is unchanged.
+   * attempt. Inside the bound the rule is unchanged. `read` and `attemptId` are
+   * the row and the attempt the lease-expiry sweep read.
    */
-  renewActiveOperation(task: Task, mission: Mission, silent = false): void {
+  private renewActiveOperation(read: Task, attemptId: string, mission: Mission, silent: boolean): void {
     // S1 (P0): fence the renewal itself. The caller may hold a row read before
     // an earlier iteration's await; re-read and never extend a lease, clear a
     // warning or write a whole record over a row that moved epoch, status or
     // attempt (cancel, handoff, challenge, beforeStep, recordToolRun).
-    const current = this.k.store.get('tasks', task.id)
-    if (current === undefined || current.missionId !== mission.id || !holdsAttempt(current, task.epoch, task.attempt?.id)) return
-    task = current
-    if (!task.attempt || task.attempt.leaseUntil >= this.k.now() + this.k.config.leaseMs / 2) return
+    const task = this.k.store.get('tasks', read.id)
+    if (!holdsAttempt(task, mission.id, read.epoch, attemptId)) return
+    if (task.attempt.leaseUntil >= this.k.now() + this.k.config.leaseMs / 2) return
     // A live operation is liveness for its full duration: match by member and
     // activity id, never by the attempt the operation happens to be stored under.
     // The adapter must confirm the operation is live; a durable activity alone never renews.
@@ -411,7 +412,7 @@ export class Attempts {
         task.leaseWarned = task.attempt.leaseUntil
         this.k.commit(mission.id, () => {
           this.k.store.put('tasks', task)
-          this.k.store.event(mission.id, 'task/lease-expiring', 'runtime', { taskId: task.id, ownerId: task.attempt!.ownerId, leaseUntil: task.attempt!.leaseUntil })
+          this.k.store.event(mission.id, 'task/lease-expiring', 'runtime', { taskId: task.id, ownerId: task.attempt.ownerId, leaseUntil: task.attempt.leaseUntil })
         })
       }
       return
@@ -455,13 +456,13 @@ export class Attempts {
    * task with the same member preferred so recovery resumes partial work.
    * `pass` is the dispatching body's record: its capture await is the body's own.
    */
-  async closeOutIdleAttempt(mission: Mission, member: Member, task: Task, pass?: SchedulingPass): Promise<void> {
+  async closeOutIdleAttempt(mission: Mission, member: Member, task: Task & { attempt: Attempt }, pass?: SchedulingPass): Promise<void> {
+    const attemptId = task.attempt.id
     const bound = this.k.config.maxIdleCloseouts ?? DEFAULT_IDLE_CLOSEOUTS
     const nudges = task.closeout?.nudges ?? 0
     if (nudges < bound) {
       const nudge = nudges + 1
       const remaining = bound - nudge
-      const attemptId = task.attempt!.id
       task.closeout = { nudges: nudge, at: this.k.now() }
       this.k.commit(mission.id, () => {
         this.k.store.put('tasks', task)
@@ -475,7 +476,7 @@ export class Attempts {
     try { checkpoint = await awaited(pass, this.k.workers.captureArtifact(member, task), this.k.now) }
     catch (error) {
       const failed = this.k.task(mission.id, task.id)
-      if (failed.status !== 'running' || failed.attempt?.id !== task.attempt?.id) return
+      if (!holdsAttempt(failed, mission.id, task.epoch, attemptId)) return
       failed.status = 'blocked'; failed.epoch++; dropAttempt(failed); delete failed.closeout; delete failed.idleSignal
       failed.resumeAfterStop = { epoch: failed.epoch, reason: 'invalidated', memberId: member.id, at: this.k.now() }
       failed.output = `Worker ended its turn without submitting (${task.id}) and its workspace could not be checkpointed: ${error instanceof Error ? error.message : String(error)}. Inspect the member workspace before proposing a replacement.`
@@ -493,7 +494,7 @@ export class Attempts {
     }
     const current = this.k.task(mission.id, task.id)
     // The attempt may have finished while the checkpoint committed; never mutate terminal work.
-    if (current.status !== 'running' || current.attempt?.id !== task.attempt?.id) return
+    if (!holdsAttempt(current, mission.id, task.epoch, attemptId)) return
     current.checkpoint = { commit: checkpoint.commit, at: this.k.now() }
     current.status = 'blocked'; current.epoch++
     current.recoveryCount = (current.recoveryCount ?? 0) + 1
@@ -514,7 +515,7 @@ export class Attempts {
     // chain fires with the workspace capture guard that produced the checkpoint,
     // with the dispatch sweep that re-pends the task, and (when the recovery
     // limit is already spent) with the close-out exhaustion terminal below.
-    this.notices.emitGuardTerminal(mission.id, 'attempt_lease', { taskId: current.id, memberId: member.id, localKey: `closeout-abandoned:${task.attempt!.id}`, detail: `idle close-out abandoned attempt ${task.attempt?.id ?? 'unknown'}: the workspace was checkpointed at ${checkpoint.commit} and the task was re-pended (recovery ${current.recoveryCount ?? 0})` })
+    this.notices.emitGuardTerminal(mission.id, 'attempt_lease', { taskId: current.id, memberId: member.id, localKey: `closeout-abandoned:${attemptId}`, detail: `idle close-out abandoned attempt ${attemptId}: the workspace was checkpointed at ${checkpoint.commit} and the task was re-pended (recovery ${current.recoveryCount ?? 0})` })
     this.idleSignals.delete(member.id)
     this.resumeStoppedAttempt(mission.id, current)
   }
@@ -554,16 +555,15 @@ export class Attempts {
           // lease so the existing expiry path can free the attempt.
           const silent = this.silentOperation(task, mission)
           if (silent !== undefined) this.escalateSilentOperation(mission, task, silent)
-          this.renewActiveOperation(task, mission, silent !== undefined)
+          this.renewActiveOperation(task, attemptId, mission, silent !== undefined)
           // S1r: the renewal commits a re-read row, so the caller's snapshot can
           // still look expired after a successful renewal. Re-read again and use the
           // current row for every later comparison, or a live operation is renewed
           // and then expired in the same pass (the documented "a live operation is
           // liveness for its full duration" invariant).
           const renewed = this.k.store.get('tasks', task.id)
-          if (renewed === undefined || renewed.missionId !== missionId || !holdsAttempt(renewed, task.epoch, attemptId)) continue
+          if (!holdsAttempt(renewed, missionId, task.epoch, attemptId) || renewed.attempt.leaseUntil >= this.k.now()) continue
           task = renewed
-          if (task.attempt === undefined || task.attempt.leaseUntil >= this.k.now()) continue
           // W6: capture a durable checkpoint before any reassignment when the old
           // owner is quiescent, so the next attempt resumes committed work instead
           // of falling back to the mission baseline.
@@ -573,7 +573,7 @@ export class Attempts {
               try {
                 const checkpoint = await awaited(pass, this.k.workers.captureArtifact(owner, task), this.k.now)
                 const current = this.k.task(missionId, task.id)
-                if (holdsAttempt(current, task.epoch, attemptId)) {
+                if (holdsAttempt(current, missionId, task.epoch, attemptId)) {
                   // S1 (P0): commit the row re-read after the await, never the
                   // pre-await object, so a concurrent transition is not reverted.
                   current.checkpoint = { commit: checkpoint.commit, at: this.k.now() }
@@ -583,7 +583,7 @@ export class Attempts {
                 // Auditable and non-fatal: the workspace stays untouched and
                 // prepareTask refuses a dirty workspace rather than losing it.
                 const current = this.k.task(missionId, task.id)
-                if (holdsAttempt(current, task.epoch, attemptId)) {
+                if (holdsAttempt(current, missionId, task.epoch, attemptId)) {
                   const reason = `Lease-expiry checkpoint failed for ${task.id}: ${error instanceof Error ? error.message : String(error)}. The member workspace is preserved; recovery will refuse a dirty workspace instead of losing it.`
                   this.k.commit(missionId, () => {
                     this.k.store.event(missionId, 'task/checkpoint-failed', 'runtime', { taskId: task.id, ownerId: oldOwner, reason })
@@ -601,7 +601,7 @@ export class Attempts {
           // fencing transition) committed during it must win over lease recovery:
           // re-read and only transition the record that still owns this attempt.
           const expiring = this.k.task(missionId, task.id)
-          if (!holdsAttempt(expiring, task.epoch, attemptId)) continue
+          if (!holdsAttempt(expiring, missionId, task.epoch, attemptId)) continue
           // A lease that expired while the task was budget-paused is host policy, not
           // a recovery failure, and the plan's intended owner must survive it. A
           // lease that expired while its owner was parked is the same class of

@@ -124,7 +124,7 @@ export class Scheduling {
           if (startBlocker(this.rt.view, member) !== undefined) continue
           const view = this.rt.notices.interpretation(missionId)
           if (pendingStopOwner(view.tasks, member.id)) continue
-          const open = view.tasks.find(t => t.status === 'running' && t.attempt?.ownerId === member.id)
+          const open = view.tasks.find((t): t is Task & { attempt: Attempt } => t.status === 'running' && t.attempt?.ownerId === member.id)
           if (open !== undefined) {
             // W6: the worker ended its turn with an open attempt. Nudge within a
             // bounded retry, then checkpoint the workspace and re-pend the task
@@ -132,8 +132,8 @@ export class Scheduling {
             // not an abandoned turn: the lease path re-pends it without a credit.
             // S5: the signal is re-read from the durable task row; the in-memory map
             // is only a cache for an attempt whose row write is still in flight.
-            const durableIdle = open.idleSignal?.attemptId === open.attempt?.id
-            const cachedIdle = this.rt.attempts.idleSignals.get(member.id)?.attemptId === open.attempt?.id
+            const durableIdle = open.idleSignal?.attemptId === open.attempt.id
+            const cachedIdle = this.rt.attempts.idleSignals.get(member.id)?.attemptId === open.attempt.id
             if (!parkedMember && (durableIdle || cachedIdle)) await this.rt.attempts.closeOutIdleAttempt(mission, member, open, pass)
             continue
           }
