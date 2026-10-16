@@ -25,7 +25,7 @@ import { AdmissionRefusedError, classifyProviderOutage, LIMIT_LEVELS, TASK_CLASS
 import { validScope, scopeSubset } from './scope.ts'
 import { AdmissionError, assertDeclaredOutputs, assertScopeSelectors, citedCovers, dependencyAssumptions, formatDiagnostic, isNoopCheck, loadPackageScripts, normalizeReviewDependencies, normalizeScopeSelectors, normalizeTaskCeilings, reconcileTaskAdmission, requireHostChecks, taskCeilingBlock, taskGraphDefects, TaskGraphAdmissionError, type TaskGraphNode } from './admission.ts'
 import { canBorrowTask, canOwnReview, strandedReview } from './assignment.ts'
-import { executionClock, executionElapsed } from './resource-time.ts'
+import { executionClock, executionElapsed, exhaustedDimensions } from './resource-time.ts'
 import { TERMINAL_STATES, blockCauses, currentEvidenceIds, holdsAttempt, holdsOpenAttempt, memberTask, missionSubject, openAttempt, pendingStopOwner, quiescencePending, selectAcceptedDelivery, stopPending, taskEdges, taskGraphIndex, taskSubject, terminal, uncoveredCriteria, type BlockCause, type HeldTask } from './task-graph.ts'
 import { checkSyntaxDetail, declaredPlanChecks, orderedTasks, pairReviews, planAdvisories, validatePlan } from './plans.ts'
 import { OWNER_ONLY_TOOLS, type Actor, type AutoStart, BoardQuery, Budget, CheckAttribution, CreateMissionInput, CriticalPath, criterionId, Delivery, DraftPlan, Escalation, Evidence, EvidenceStatus, Member, Mission, nextWorkerName, ObserveQuery, MessageInput, PlanInput, Post, PostInput, PostKind, PROVIDER_OUTAGE_WINDOW_MS, ProposeTaskInput, ProviderOutage, providerQuiescent, PublishInput, RecoveryFallback, RequestStartInput, RuntimeConfig, Snapshot, Task, TaskAmendment, TaskRejection, TaskCeiling, ToolRun, VerificationCleanupFailure, WorkerAdapter, WorkerActivity, Workstream } from './types.ts'
@@ -3239,8 +3239,7 @@ export class SwarmRuntime implements Kernel {
     mission.budget = budget; mission.updatedAt = this.now(); mission.budgetReviewedAt = mission.updatedAt
     executionClock(mission, mission.status === 'active' && !mission.budgetPause && this.store.list('tasks', missionId).some(task => task.status === 'running'), this.now())
     const deadline = mission.deadline
-    const resumeResourceWait = mission.status === 'blocked' && mission.budgetPause !== undefined
-      && mission.usedTokens < budget.maxTokens && mission.usedSteps < budget.maxSteps && this.now() < deadline
+    const resumeResourceWait = mission.status === 'blocked' && mission.budgetPause !== undefined && !exhaustedDimensions(mission, this.now()).length
     if (resumeResourceWait) { mission.status = 'active'; mission.reason = reason ?? 'Owner reviewed and extended the execution budget' }
     this.commit(missionId, () => {
       this.store.put('missions', mission)
@@ -3267,7 +3266,7 @@ export class SwarmRuntime implements Kernel {
       if (error) throw new PolicyError('mission_completion_pending', 'validation_error', error)
       mission.status = 'completed'
     } else if (action === 'resume') {
-      if (mission.usedSteps >= mission.budget.maxSteps || mission.usedTokens >= mission.budget.maxTokens || this.now() >= mission.deadline) throw new PolicyError('mission_budget_exhausted', 'budget_error', 'Mission budget exhausted; it cannot be resumed with a fresh allowance')
+      if (exhaustedDimensions(mission, this.now()).length) throw new PolicyError('mission_budget_exhausted', 'budget_error', 'Mission budget exhausted; it cannot be resumed with a fresh allowance')
       mission.status = 'active'
     } else mission.status = action === 'pause' ? 'paused' : 'stopped'
     if (mission.status !== 'active' && mission.executionTime !== undefined) executionClock(mission, false, this.now())
@@ -3864,7 +3863,7 @@ export class SwarmRuntime implements Kernel {
       this.gates.resumeBudgetTasks(mission)
     }
     if (this.completeAutomatic(missionId)) { await this.notices.flushOutbox(missionId, pass); return }
-    if (this.now() >= mission.deadline || mission.usedTokens >= mission.budget.maxTokens || mission.usedSteps >= mission.budget.maxSteps) { this.gates.blockBudget(mission); return }
+    if (exhaustedDimensions(mission, this.now()).length) { this.gates.blockBudget(mission); return }
     // F2: a submitted code deliverable no live review can accept is repaired
     // before dispatch, so the auto-admitted review can be scheduled this tick.
     this.admitMissingReviews(this.mission(missionId))

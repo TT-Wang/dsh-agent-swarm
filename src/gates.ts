@@ -15,7 +15,7 @@ import { id } from './store.ts'
 import { arenaView as projectArenaView, hasNotice, openAsks } from './arena.ts'
 import { TERMINAL_STATES, currentEvidenceIds, holdsAttempt, holdsOpenAttempt, subjectsOfTasks, terminal } from './task-graph.ts'
 import { excerpt, type DeclaredChecks } from './declared-checks.ts'
-import { executionElapsed } from './resource-time.ts'
+import { executionElapsed, exhaustedDimensions } from './resource-time.ts'
 import { dispatchable, inFlightEstimate, stepsInFlight } from './board.ts'
 import { noticeFamily, noticeIdentity, type Notices } from './notices.ts'
 import type { RefusalRegistry } from './refusals.ts'
@@ -208,15 +208,6 @@ export class RuntimeGates {
     this.k.commit(request.id, () => this.k.store.put('starts', request))
   }
 
-  /** Budget dimensions that are currently exhausted; used by the pause reason and event. */
-  exhaustedDimensions(mission: Mission): string[] {
-    const dimensions: string[] = []
-    if (mission.usedTokens >= mission.budget.maxTokens) dimensions.push('maxTokens')
-    if (mission.usedSteps >= mission.budget.maxSteps) dimensions.push('maxSteps')
-    if (this.k.now() >= mission.deadline) dimensions.push('maxDurationMs')
-    return dimensions
-  }
-
   /**
    * Emit at most one approaching-limit warning per allocation (scope, dimension
    * and limit) and threshold: a durable owner review notice; thresholds default
@@ -289,7 +280,7 @@ export class RuntimeGates {
 
   blockBudget(mission: Mission): void {
     if (terminal(mission) || mission.status === 'blocked') return
-    const dimensions = this.exhaustedDimensions(mission)
+    const dimensions = exhaustedDimensions(mission, this.k.now())
     mission.status = 'blocked'
     mission.reason = dimensions.length ? `Aggregate mission budget exhausted: ${dimensions.join(', ')}` : 'Aggregate mission budget exhausted'
     mission.budgetPause = { id: id('budget-pause'), quiesced: false }

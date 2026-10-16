@@ -7,6 +7,19 @@ export function executionElapsed(mission: Mission, now = Date.now()): number {
   return clock.usedMs + (clock.since === undefined ? 0 : Math.max(0, now - clock.since))
 }
 
+/**
+ * The budget dimensions a mission has exhausted at `now`: the one statement of
+ * that rule, which the pass gate, both resumes, an admission and the pause
+ * reason all ask.
+ */
+export function exhaustedDimensions(mission: Mission, now: number): Array<'maxTokens' | 'maxSteps' | 'maxDurationMs'> {
+  const dimensions: Array<'maxTokens' | 'maxSteps' | 'maxDurationMs'> = []
+  if (mission.usedTokens >= mission.budget.maxTokens) dimensions.push('maxTokens')
+  if (mission.usedSteps >= mission.budget.maxSteps) dimensions.push('maxSteps')
+  if (now >= mission.deadline) dimensions.push('maxDurationMs')
+  return dimensions
+}
+
 /** Settle only elapsed execution; the separate absolute deadline never pauses. */
 export function executionClock(mission: Mission, running: boolean, now = Date.now()): void {
   const usedMs = executionElapsed(mission, now)

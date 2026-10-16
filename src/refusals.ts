@@ -9,6 +9,7 @@
 import { admissionRowId, decideAdmission, defaultLimitRules, scopeKeysOverlap, type AdmissionCandidate, type AdmissionDecision, type AdmissionRecord, type AdmissionUsage, type LimitRule } from './scheduler.ts'
 import { WriterBusyError } from './store.ts'
 import { openAttempt } from './task-graph.ts'
+import { exhaustedDimensions } from './resource-time.ts'
 import { PolicyError } from './policy-error.ts'
 import type { Kernel } from './kernel.ts'
 import type { Budget, Member, Mission, Task } from './types.ts'
@@ -98,11 +99,12 @@ export class RefusalRegistry {
     }
   }
 
-  /** Budget dimensions that must refuse a new lease; undefined when the mission can admit. */
+  /** The exhausted budget dimension that refuses a new lease, the deadline named first; undefined when the mission can admit. */
   budgetBlocked(mission: Mission): string | undefined {
-    if (this.k.now() >= mission.deadline) return `mission duration budget exhausted (deadline ${new Date(mission.deadline).toISOString()})`
-    if (mission.usedTokens >= mission.budget.maxTokens) return `token budget exhausted (${mission.usedTokens}/${mission.budget.maxTokens})`
-    if (mission.usedSteps >= mission.budget.maxSteps) return `step budget exhausted (${mission.usedSteps}/${mission.budget.maxSteps})`
+    const exhausted = exhaustedDimensions(mission, this.k.now())
+    if (exhausted.includes('maxDurationMs')) return `mission duration budget exhausted (deadline ${new Date(mission.deadline).toISOString()})`
+    if (exhausted.includes('maxTokens')) return `token budget exhausted (${mission.usedTokens}/${mission.budget.maxTokens})`
+    if (exhausted.includes('maxSteps')) return `step budget exhausted (${mission.usedSteps}/${mission.budget.maxSteps})`
     return undefined
   }
 
