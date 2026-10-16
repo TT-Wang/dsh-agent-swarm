@@ -136,9 +136,18 @@ export function taskGraphIndex(tasks: readonly Task[]) {
   }
   const dependencyMet = (id: string): boolean => effective(id)?.status === 'accepted'
   /**
-   * Effective prerequisites for workspace preparation; one accepted repair
-   * covering several originals is merged once. Asked of ready work, every one
-   * of whose prerequisites is met, so each names a task.
+   * The first id `task` holds that names no task of the mission: a dependency,
+   * in order, then its review source. No work can ever meet such an edge, so
+   * the board's readers share this one rule: readiness refuses the task naming
+   * it, `unschedulable` holds the pending task dead, and `waitsLegitimately`
+   * holds that it waits on nothing, whatever else it also waits on.
+   */
+  const danglingReference = (task: Pick<Task, 'dependencies' | 'reviewOf'>): string | undefined =>
+    [...task.dependencies, ...(task.reviewOf === undefined ? [] : [task.reviewOf])].find(id => !byId.has(id))
+  /**
+   * The effective task of each dependency that names one, an accepted repair
+   * covering several originals merged once: the prerequisites workspace
+   * preparation merges, and the ones `unschedulable` judges.
    */
   const effectiveDependencies = (task: Pick<Task, 'dependencies'>): Task[] => {
     const seen = new Set<string>()
@@ -201,7 +210,7 @@ export function taskGraphIndex(tasks: readonly Task[]) {
       return identities(id).has(sourceId) || covers(endpoint, sourceId, seen)
     })
   }
-  return { byId, lineage, effective, identities, dependencyMet, effectiveDependencies, unfinishedDependencies,
+  return { byId, lineage, effective, identities, dependencyMet, danglingReference, effectiveDependencies, unfinishedDependencies,
     reviewSource, covers, replacementDescendants, liveReplacement, replacedLineage, criteriaOf, checklist }
 }
 

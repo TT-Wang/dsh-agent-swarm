@@ -227,18 +227,20 @@ export function capable(board: Board, task: Task, member: Member): boolean {
 }
 
 function capabilityBlocker(board: Board, task: Task, member: Member): string | undefined {
-  const waiting = task.dependencies.find(dependency => !board.graph.dependencyMet(dependency))
-  if (waiting !== undefined) {
-    const effective = board.graph.effective(waiting)
-    if (effective === undefined) return `dependency ${waiting} names no task in this mission, so the task can never be ready; the owner can amend its dependencies with swarm_control(action: "amend", taskId, changes, reason) or withdraw it with swarm_cancel(taskId, reason)`
-    return `dependency ${waiting}${effective.id === waiting ? '' : ` (effective replacement ${effective.id})`} is ${effective.status}, not accepted; inspect it or amend the dependency plan`
+  // An edge that names no task can never be met, so it is named before any
+  // unmet edge that still can be.
+  const dangling = board.graph.danglingReference(task)
+  if (dangling !== undefined) return task.dependencies.includes(dangling)
+    ? `dependency ${dangling} names no task in this mission, so the task can never be ready; the owner can amend its dependencies with swarm_control(action: "amend", taskId, changes, reason) or withdraw it with swarm_cancel(taskId, reason)`
+    : `review source ${dangling} names no task in this mission, so the review can never begin; the owner can withdraw it with swarm_cancel(taskId, reason)`
+  for (const dependency of task.dependencies) {
+    const effective = board.graph.effective(dependency)
+    if (effective !== undefined && effective.status !== 'accepted') return `dependency ${dependency}${effective.id === dependency ? '' : ` (effective replacement ${effective.id})`} is ${effective.status}, not accepted; inspect it or amend the dependency plan`
   }
-  if (task.reviewOf) {
-    const source = board.graph.reviewSource(task)
-    if (source === undefined) return `review source ${task.reviewOf} names no task in this mission, so the review can never begin; the owner can withdraw it with swarm_cancel(taskId, reason)`
-    if (source.status !== 'submitted') return `review source ${source.id} is ${source.status}; review begins only after its artifact is submitted`
-    if (!canOwnReview(source, member.id)) return `member ${member.id} authored review source ${source.id}; assign an independent reviewer`
-  }
+  const source = board.graph.reviewSource(task)
+  if (source === undefined) return undefined
+  if (source.status !== 'submitted') return `review source ${source.id} is ${source.status}; review begins only after its artifact is submitted`
+  if (!canOwnReview(source, member.id)) return `member ${member.id} authored review source ${source.id}; assign an independent reviewer`
   return undefined
 }
 
@@ -258,18 +260,17 @@ export function unschedulable(board: Board): Task[] {
   // `resumeAfterStop` only until `workers.stop()` resolves; treating it as
   // unschedulable lets `control complete` cancel recoverable work.
   const dead = new Set(tasks.filter(task => task.status === 'blocked' && !quiescencePending(task)).map(task => task.id))
-  // Fixpoint: work waiting on dead prerequisites or an unreachable review source
-  // is dead too, and so is work waiting on an id that names no task.
+  // Fixpoint: work holding an id that names no task (`danglingReference`) is
+  // dead, and so is work waiting on dead prerequisites or an unreachable review source.
   for (let changed = true; changed;) {
     changed = false
     for (const task of tasks) {
       if (dead.has(task.id) || task.status !== 'pending') continue
-      const stuck = task.dependencies.some(dependency => { const effective = board.graph.effective(dependency); return effective === undefined || effective.status === 'cancelled' || dead.has(effective.id) })
-        || (task.reviewOf !== undefined && (() => {
-          const source = board.graph.reviewSource(task)
-          return source === undefined || TERMINAL_STATES.has(source.status) || dead.has(source.id)
-            || !live.some(member => assignmentAllows(task, member.id, tasks) && canOwnReview(source, member.id))
-        })())
+      const source = board.graph.reviewSource(task)
+      const stuck = board.graph.danglingReference(task) !== undefined
+        || board.graph.effectiveDependencies(task).some(effective => effective.status === 'cancelled' || dead.has(effective.id))
+        || (source !== undefined && (TERMINAL_STATES.has(source.status) || dead.has(source.id)
+          || !live.some(member => assignmentAllows(task, member.id, tasks) && canOwnReview(source, member.id))))
         || !live.some(member => assignmentAllows(task, member.id, tasks))
       if (stuck) { dead.add(task.id); changed = true }
     }
@@ -633,14 +634,16 @@ export function waitsLegitimately(board: Board, task: Task): boolean {
     return board.graph.unfinishedDependencies(task).length > 0
   }
   if (task.status === 'pending') {
-    // Reviews wait on their exact source; no worker stop can repair a missing
-    // or terminal source, and a review path no live member may own (the one
-    // live-review rule, `reviewable`) waits on nothing. Ordinary prerequisites
-    // keep the shared lineage rule.
-    if (task.reviewOf !== undefined) {
-      const source = tasks.find(candidate => candidate.id === task.reviewOf)
-      return source !== undefined && !TERMINAL_STATES.has(source.status) && reviewable(board, source)
-    }
+    // An id the task holds that names no task (`danglingReference`, the rule
+    // `unschedulable` holds it dead by) is a prerequisite nothing can meet: the
+    // task waits on nothing, whatever else it also waits on.
+    if (board.graph.danglingReference(task) !== undefined) return false
+    // Reviews wait on their exact source; no worker stop can repair a terminal
+    // source, and a review path no live member may own (the one live-review
+    // rule, `reviewable`) waits on nothing. Ordinary prerequisites keep the
+    // shared lineage rule.
+    const source = board.graph.reviewSource(task)
+    if (source !== undefined) return !TERMINAL_STATES.has(source.status) && reviewable(board, source)
     if (board.graph.unfinishedDependencies(task).length > 0) return true
     if (!task.dependencies.every(dependency => board.graph.dependencyMet(dependency))) return false
     // A preparation failure the host will not retry is a block cause the owner

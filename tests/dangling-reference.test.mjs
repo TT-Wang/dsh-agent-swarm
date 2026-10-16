@@ -106,6 +106,29 @@ test('a review source that names no task under running work: the fall-through na
   assert.equal(taskOf(f.runtime, dependent.id).status, 'cancelled')
 })
 
+test('pending work holding an id that names no task beside live edges is dead whatever else it waits on: the fall-through names it within one tick, and its refusal names that edge first', async t => {
+  const f = await fixture(t)
+  const source = f.propose({ title: 'Submitted source' })
+  const sourceAttempt = await f.runtime.claim(f.actor(f.author), f.mission.id, source.id)
+  await f.runtime.submit(f.actor(f.author), f.mission.id, { taskId: source.id, attemptId: sourceAttempt.attempt.id, output: 'candidate' })
+  const running = f.propose({ title: 'Running work' })
+  await f.runtime.claim(f.actor(f.author), f.mission.id, running.id)
+  // One prerequisite still runs and one names no task.
+  const mixed = inject(f, running, { id: 'task_mixed', title: 'Waits on live work and on nothing', dependencies: [running.id, 'task_missing'] })
+  // A review whose source is submitted and live, behind a prerequisite that names no task.
+  const review = inject(f, running, { id: 'task_review_behind_nothing', title: 'Reviews behind nothing', kind: 'verification', reviewOf: source.id,
+    dependencies: ['task_missing'], covers: undefined, assigneeId: f.reviewer.id })
+  await tick(f)
+  assert.deepEqual(f.failures, [], 'no pass fails on the board')
+  const named = ownerNotices(f).find(delivery => /no live path will advance/.test(delivery.content))
+  assert.ok(named?.subjects.includes(`${mixed.id}@0`) && named.subjects.includes(`${review.id}@0`), `the fall-through names both: ${JSON.stringify(named?.subjects)}`)
+  const unschedulable = f.runtime.observe(f.owner, f.mission.id).unschedulable
+  assert.ok(unschedulable.includes(mixed.id) && unschedulable.includes(review.id), `the owner board holds both dead: ${JSON.stringify(unschedulable)}`)
+  const refused = await refusal(f.runtime.claim(f.actor(f.reviewer), f.mission.id, mixed.id))
+  assert.equal(refused.code, 'task_not_ready')
+  assert.ok(refused.message.includes('dependency task_missing names no task in this mission'), `the edge no work can meet is named before the running one: ${refused.message}`)
+})
+
 test('a challenge reads past a dangling row: the disputed source re-opens', async t => {
   const f = await fixture(t)
   const source = f.propose({ title: 'Accepted source' })
