@@ -25,7 +25,8 @@ import type { Mission, RuntimeConfig, Task, WorkerAdapter } from './types.ts'
 export interface Kernel {
   readonly store: SwarmStore
   readonly config: RuntimeConfig
-  readonly workers: WorkerAdapter
+  /** The adapter's commands. Its two questions, `isIdle` and `currentActivity`, are asked through `view` alone. */
+  readonly workers: Omit<WorkerAdapter, 'isIdle' | 'currentActivity'>
   readonly now: () => number
   readonly closed: boolean
   readonly shuttingDown: boolean

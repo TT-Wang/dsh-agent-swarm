@@ -325,7 +325,7 @@ export class Attempts {
     if (ownerId === undefined) return undefined
     const activity = this.k.store.get('members', ownerId)?.activity
     if (activity === undefined) return undefined
-    const observed = this.k.workers.currentActivity(ownerId)
+    const observed = this.k.view.activity(ownerId)
     return observed !== undefined && observed.id === activity.id ? activity : undefined
   }
   /**
@@ -588,7 +588,7 @@ export class Attempts {
           // W6: capture a durable checkpoint before any reassignment when the old
           // owner is quiescent, so the next attempt resumes committed work instead
           // of falling back to the mission baseline.
-          if (this.k.workers.isIdle(oldOwner)) {
+          if (this.k.view.startable(oldOwner)) {
             const owner = this.k.store.get('members', oldOwner)
             if (owner !== undefined && owner.status !== 'stopped') {
               try {
