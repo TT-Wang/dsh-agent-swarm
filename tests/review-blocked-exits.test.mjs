@@ -29,7 +29,7 @@ import assert from 'node:assert/strict'
 import { writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { assertNamedCalls, ownerTools, toolSchemaIndex } from './refusal-inventory.mjs'
-import { FakeClock, MISSION_ACCEPTANCE, acceptThroughReview, events, makeRuntime, taskOf } from './faults/harness.mjs'
+import { FakeClock, MISSION_ACCEPTANCE, events, makeRuntime, taskOf } from './faults/harness.mjs'
 import { reviewPathStalled, reviewable } from '../lib/board.js'
 import { sidebarState } from '../lib/types/client/progress.js'
 import { noticeFamily } from '../lib/notices.js'
@@ -648,6 +648,7 @@ test('a wedged pass keeps the host\'s admission from running: the classifier nam
   await followExits(f, { source }, { steps: [[BUDGET(2), ['swarm_budget', 'swarm_cancel']]] })
 })
 
+// The exits those decisions name for such a submission are performed in the one table of every board decision's exits (tests/notice-ledger.test.mjs).
 test('a submission an older build left without an artifact is ordinary stuck work: no review-path decision names it, the W3 stall does on a board with nothing else to do and the fall-through beside running work, each once its grace ends, so no board that holds one is silent', async t => {
   for (const running of [false, true]) {
     const f = await fixture(t)
@@ -664,55 +665,6 @@ test('a submission an older build left without an artifact is ordinary stuck wor
     await f.pass()
     assert.deepEqual(naming().map(delivery => noticeFamily(delivery)), [running ? 'fallthrough' : 'board-stall'], `running=${running}: past its grace one decision names it`)
     assert.deepEqual([decisionsOn(f, source), events(f.runtime, f.mission.id, 'task/review-blocked'), f.reviewsOf(source)], [[], [], []], `running=${running}: no review-path decision, blocker or host review`)
-  }
-})
-
-test('every exit the W3 stall and the fall-through name for a submission an older build left without an artifact, performed through the owner\'s registered tools: swarm_control stops the mission; amending its dependencies or assignee with swarm_control and a repair are refused while the submission stands, and a review of it never reaches a verdict (docs/known-limitations.md); withdrawing it with swarm_cancel retires the decision and the repair it then admits reaches a verdict', async t => {
-  /** A legacy submission past its grace, named by the board's own decision: the W3 stall on a board with nothing else to do, the fall-through beside a third member's running work. */
-  const legacyBoard = async running => {
-    const f = await fixture(t, { members: ['Author', 'Reviewer', 'Runner'] })
-    const source = f.propose()
-    await f.submit(source)
-    f.runtime.store.transaction(() => { const row = taskOf(f.runtime, source.id); delete row.artifact; f.runtime.store.put('tasks', row) })
-    if (running) await f.run(f.runtime.store.list('members', f.mission.id).find(member => member.name === 'Runner'))
-    await f.runtime.settle(f.mission.id)
-    await f.pass()
-    await f.pass()
-    const subject = `${source.id}@${taskOf(f.runtime, source.id).epoch}`
-    const namings = f.runtime.store.list('deliveries', f.mission.id).filter(delivery => delivery.to === 'owner' && delivery.notice !== undefined && (delivery.subjects ?? []).includes(subject))
-    assert.deepEqual(namings.map(delivery => noticeFamily(delivery)), [running ? 'fallthrough' : 'board-stall'], `running=${running}: the board's decision names the submission`)
-    assert.match(namings[0].content, running ? /admit a repair or review with swarm_propose, decide with swarm_control, or withdraw the stuck work with swarm_cancel\(taskId, reason\)/ :/amend the existing task dependencies or assignee with swarm_control, admit a repair or review with swarm_propose.*withdraw it explicitly with swarm_cancel.*Use swarm_control stop/)
-    const relevant = () => f.runtime.notices.ownerDeliveryRelevant(f.runtime.mission(f.mission.id), f.runtime.store.get('deliveries', namings[0].id))
-    assert.equal(relevant(), true, `running=${running}: and it is outstanding`)
-    return { f, source, relevant }
-  }
-  const repairOf = (f, source) => ({ workstreamId: f.stream.id, title: 'Repair the submission', objective: 'Implement the scoped change', kind: 'implementation', scope: ['**'],
-    acceptance: MISSION_ACCEPTANCE, checks: ['test -d .'], outputs: [], assigneeId: f.author.id, replaces: [source.id] })
-  for (const running of [false, true]) {
-    {
-      const { f, relevant } = await legacyBoard(running)
-      await f.tool('swarm_control', { action: 'stop', reason: 'Follow the exit the decision names' })
-      assert.deepEqual([f.runtime.mission(f.mission.id).status, relevant()], ['stopped', false], `running=${running}: swarm_control stop ends the mission and the decision`)
-    }
-    const { f, source, relevant } = await legacyBoard(running)
-    // The W3 stall names amending the task's dependencies or assignee with swarm_control, which the fall-through's "decide with swarm_control" covers.
-    for (const changes of [{ assigneeId: f.reviewer.id }, { dependencies: [] }]) {
-      await assert.rejects(f.tool('swarm_control', { action: 'amend', taskId: source.id, changes, reason: 'Follow the exit the decision names' }), /\[artifact_policy_immutable\]/,
-        `running=${running}: amending ${Object.keys(changes)[0]} is refused while the submission stands`)
-    }
-    assert.deepEqual([taskOf(f.runtime, source.id).status, relevant()], ['submitted', true], `running=${running}: the refused amendments change nothing, and the decision is still outstanding`)
-    await assert.rejects(f.tool('swarm_propose', repairOf(f, source)), /only blocked or cancelled work can be replaced/, `running=${running}: a repair is refused while the submission stands`)
-    const review = await f.tool('swarm_propose', { workstreamId: f.stream.id, title: 'Review the source', objective: 'Independently review the submitted artifact', kind: 'verification', scope: ['**'],
-      acceptance: MISSION_ACCEPTANCE, outputs: [], reviewOf: source.id, assigneeId: f.reviewer.id })
-    const claimed = await f.runtime.claim(f.actor(f.reviewer), f.mission.id, review.id)
-    await assert.rejects(f.runtime.verify(f.actor(f.reviewer), f.mission.id, { taskId: review.id, attemptId: claimed.attempt.id, verdict: 'accept', reason: 'Independent host checks pass' }),
-      /Only independent verification of a submitted artifact/, `running=${running}: the review is admitted but can never reach a verdict`)
-    await f.tool('swarm_cancel', { taskId: source.id, reason: 'Follow the exit the decision names' })
-    await f.pass()
-    assert.equal(relevant(), false, `running=${running}: the withdrawal retires the decision`)
-    const repair = await f.tool('swarm_propose', repairOf(f, source))
-    await acceptThroughReview(f, repair)
-    assert.equal(taskOf(f.runtime, repair.id).status, 'accepted', `running=${running}: the repair the withdrawal admits reaches a verdict`)
   }
 })
 
