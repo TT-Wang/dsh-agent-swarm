@@ -203,7 +203,7 @@ test('R17-G8: consumption is recorded from the host claimed signal with a CAS; d
   assert.equal(row.notice.consumedAt, 1_700_000_000_000, 'the recorded instant is the host signal, not the delivery time')
   assert.equal(row.notice.consumptionSource, 'agent/inbox/claimed')
   assert.notEqual(row.notice.consumedAt, row.deliveredAt, 'consumed is its own fact, never the transport timestamp')
-  const entry = f.runtime.noticeLedger(f.owner, f.mission.id).ledger.find(item => item.deliveryId === notice.id)
+  const entry = f.runtime.observe(f.owner, f.mission.id, { detail: 'full' }).noticeLedger.find(item => item.deliveryId === notice.id)
   assert.equal(entry.consumedAt, 1_700_000_000_000)
   assert.equal(entry.deliveredAt, row.deliveredAt)
   assert.equal('claimedAt' in entry, false, 'the claimedAt placeholder is gone from the ledger')

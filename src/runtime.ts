@@ -324,7 +324,6 @@ export class SwarmRuntime implements Kernel {
    * resolved stay three facts.
    */
   recordConsumption(deliveryId: string, options: { at?: number; source?: string } = {}): boolean { return this.notices.recordConsumption(deliveryId, options) }
-  noticeLedger(actor: Actor, missionId: string, query: { limit?: number } = {}): unknown { return this.notices.noticeLedger(actor, missionId, query) }
   private bounded(text: string): string { return this.notices.bounded(text) }
   private ensureWitness(missionId: string): void { return this.notices.ensureWitness(missionId) }
   /** R17-G5: the scheduling pass state at a committed transition (for publication; see `Scheduling.passState`). */

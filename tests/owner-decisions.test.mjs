@@ -285,26 +285,29 @@ test('R15-A5: the stranded-inbox hatch drains or stays dispatchable, and the nai
   assert.equal(fixed.runtime.store.get('tasks', task.id).status, 'running', 'and the member stayed dispatchable')
 })
 
-test('R15-A1/B: the owner ledger carries subjects, reports consumption unknown, and never collapses the three facts', async t => {
+test('R15-A1/B: the owner ledger entry and its delivery row name the subjects, and transport is never relabelled as consumption or resolution', async t => {
   const f = await scenario(t)
   const builder = await f.addMember('Builder')
   const root = f.block(f.propose('Ledger root', { assigneeId: builder.id }))
   await sleep(250)
-  const ledger = f.runtime.noticeLedger(f.owner, f.mission.id, { limit: 10 })
-  assert.ok(ledger.ledger.length > 0, 'the decision produced a durable ledger row')
-  const row = ledger.ledger.find(entry => typeof entry.dedupKey === 'string' && entry.dedupKey.startsWith('stall-root:'))
-  assert.ok(row, `the stall-root row is in the ledger: ${JSON.stringify(ledger.ledger.map(entry => entry.dedupKey))}`)
-  assert.ok(Array.isArray(row.subjects) && row.subjects.includes(`${root.id}@${root.epoch}`), `the ledger row exposes the subjects: ${JSON.stringify(row.subjects)}`)
-  assert.equal(row.consumption, 'unknown', 'consumption is reported unknown, never relabelled from transport')
-  assert.equal(Object.hasOwn(row, 'resolved'), false, 'a transport fact never records resolution')
-  assert.equal(Object.hasOwn(row, 'resolvedAt'), false, 'a transport fact never records resolution')
-  // A read receipt (claimed) is transport acceptance only: the decision stays
-  // pending and the ledger still reports consumption as unknown.
-  const store = f.runtime.store.get('deliveries', row.deliveryId)
-  assert.equal(store.to, 'owner')
-  const reread = f.runtime.noticeLedger(f.owner, f.mission.id, { limit: 10 }).ledger.find(entry => entry.deliveryId === row.deliveryId)
-  assert.equal(reread.consumption, 'unknown')
-  assert.equal(reread.state === 'queued' || reread.state === 'claimed', true, 'the transport state stays a transport state')
+  // The ledger is the owner's arena instrument (swarm_observe detail=full); the
+  // delivery row it projects is the authority for what the notice is about.
+  const ledger = f.runtime.observe(f.owner, f.mission.id, { detail: 'full' }).noticeLedger
+  assert.ok(ledger.length > 0, 'the decision produced a durable ledger row')
+  const entry = ledger.find(item => typeof item.dedupKey === 'string' && item.dedupKey.startsWith('stall-root:'))
+  assert.ok(entry, `the stall-root row is in the ledger: ${JSON.stringify(ledger.map(item => item.dedupKey))}`)
+  const row = f.runtime.store.get('deliveries', entry.deliveryId)
+  assert.equal(row.to, 'owner')
+  assert.ok(Array.isArray(row.subjects) && row.subjects.includes(`${root.id}@${root.epoch}`), `the delivery row names the subjects: ${JSON.stringify(row.subjects)}`)
+  // Three facts: transport is `state` (queued, or claimed once deliveredAt is
+  // set); consumption is `consumedAt`, which only the host's admitted message
+  // records, so a claimed transport never stands in for it; resolution is a
+  // task or mission transition, never a ledger field.
+  assert.equal(entry.state === 'queued' || entry.state === 'claimed', true, 'the transport state stays a transport state')
+  assert.equal(Object.hasOwn(entry, 'consumedAt'), false, 'no host signal, so no consumption: transport is never relabelled as consumption')
+  assert.equal(row.notice.consumedAt, undefined)
+  assert.equal(Object.hasOwn(entry, 'resolved'), false, 'a transport fact never records resolution')
+  assert.equal(Object.hasOwn(entry, 'resolvedAt'), false, 'a transport fact never records resolution')
 })
 
 test('R15-F1: a pending verification waits on its live source and is named only when the source closes', async t => {

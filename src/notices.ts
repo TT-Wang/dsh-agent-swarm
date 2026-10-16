@@ -5,7 +5,7 @@
  * classifier whose families each tell their own fact. M1a seam 3/7.
  */
 import { createHash } from 'node:crypto'
-import { covered, hasNotice, noticeLedger as projectNoticeLedger } from './arena.ts'
+import { covered, hasNotice } from './arena.ts'
 import { hostContextOf } from './projection.ts'
 import { formatDiagnostic, missingReviewDiagnostic } from './admission.ts'
 import { guardTerminal, guardTerminalKey, requireText, type GuardChainId, type GuardTerminal, type GuardTerminalContext, type RefusalRegistry } from './refusals.ts'
@@ -15,7 +15,7 @@ import type { SwarmRuntime } from './runtime.ts'
 import { WriterBusyError, id, type SwarmStore } from './store.ts'
 import { awaited, type SchedulingPass } from './kernel.ts'
 import { completionError, dependentsOf, eligible, interpret, newestReviewBlock, noticeSubjectsFor, overdueStop, reviewNeed, reviewPathBlocker, reviewPathStalled, stallRoots, startBlocker, unreviewedSources, waitsLegitimately, type Board, type Interpretation } from './board.ts'
-import type { Actor, Delivery, Escalation, Member, Mission, NoticeClass, Task, WorkerAdapter } from './types.ts'
+import type { Delivery, Escalation, Member, Mission, NoticeClass, Task, WorkerAdapter } from './types.ts'
 
 /**
  * R15-A1: a notice without a subject is unattributable, so it is refused rather
@@ -682,62 +682,6 @@ export class Notices {
       recorded = true
     })
     return recorded
-  }
-
-  /**
-   * R16-A: the single owner gate for the read-only owner instruments (the notice
-   * ledger). One refusal site: the retained S3 inventory counts uncoded throw
-   * sites and may only shrink, and the ledger's observable message is preserved
-   * verbatim through `instrument`.
-   */
-  private requireOwner(actor: Actor, missionId: string, instrument: string): void {
-    const { owner } = this.rt.participant(actor, missionId)
-    if (!owner) throw new PolicyError('observe_owner_required', 'authorization_error', `Only the mission owner can read the ${instrument}`)
-  }
-
-  /**
-   * Read-only notice-delivery ledger: every owner notice with its class, dedup
-   * key and sent/queued/claimed lifecycle, newest first. Owner-only: owner
-   * notices are control-plane decisions, not worker-visible board content.
-   *
-   * R15-A1/B: three facts that are never collapsed into one.
-   * - delivery/transport: `sentAt`/`queuedAt` and `state` (`queued` / `claimed`
-   *   by the adapter call that put the notice in front of the owner session);
-   * - consumption: reported as `unknown`, because this host exposes no reliable
-   *   native signal proving the owner consumed the notice. A `claimed` transport
-   *   is never relabelled as handled;
-   * - resolution: not a transport event at all. It is the mission/task/owner
-   *   transition that made the decision moot, and it is not recorded here. A
-   *   resolution never clears another subject's pending decision, and a healthy
-   *   sibling never resets this subject's clock.
-   *
-   * The projected subjects are merged back from the durable delivery row (the
-   * row, not the prose, is the authority for what the notice was about).
-   */
-  noticeLedger(actor: Actor, missionId: string, query: { limit?: number } = {}): unknown {
-    this.requireOwner(actor, missionId, 'notice-delivery ledger')
-    const limit = query.limit === undefined ? 20 : Math.max(1, Math.min(100, Math.trunc(query.limit)))
-    const rows = this.rt.store.list('deliveries', missionId)
-    const subjectRow = (deliveryId: string): string[] | undefined => {
-      // A bounded linear lookup rather than a second in-memory index: the ledger
-      // is a read-only page of at most `limit` rows over one mission's deliveries.
-      for (const row of rows) if (row.id === deliveryId) return row.subjects
-      return undefined
-    }
-    const entries = projectNoticeLedger(rows, limit).map(entry => {
-      const subjects = subjectRow(entry.deliveryId)
-      return {
-        ...entry,
-        ...(subjects === undefined ? {} : { subjects }),
-        consumption: 'unknown' as const,
-      }
-    })
-    return {
-      ledger: entries,
-      page: { limit, returned: entries.length },
-      fingerprint: this.rt.fingerprint(missionId),
-      note: 'Read-only: each row names the subjects the notice is about (`taskId@epoch` or `mission:<id>`) and the dedup key it was told under, which names its fact. `state` is the transport fact (queued, or claimed by the adapter that put it in front of the owner session); consumption is unknown because this host exposes no reliable signal for it; resolution is a task/mission transition, never a transport event. Recording a notice changes no task, member or budget state.',
-    }
   }
 
   bounded(text: string): string {

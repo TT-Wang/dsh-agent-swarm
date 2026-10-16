@@ -308,7 +308,7 @@ test('one rejection is one owner wake for its root: the stall root is recorded a
   const precision = wakePrecision(f.runtime, f.mission.id)
   assert.equal(precision.decisions.byFamily['stall-root'], undefined, `the covered row is no wake: ${JSON.stringify(precision.decisions.byFamily)}`)
   assert.equal(precision.falseWakes.total, 0, `its listed rejecting review is no false wake: ${JSON.stringify(precision.falseWakes)}`)
-  const ledger = f.runtime.noticeLedger(f.owner, f.mission.id).ledger
+  const ledger = f.runtime.observe(f.owner, f.mission.id, { detail: 'full' }).noticeLedger
   assert.equal(ledger.some(entry => entry.deliveryId === root.id), false, 'the covered row is not a ledger entry')
   assert.deepEqual(ledger.filter(entry => entry.state === 'queued').map(entry => entry.dedupKey), [], 'nothing is left queued')
   const observed = f.runtime.observe(f.owner, f.mission.id)
