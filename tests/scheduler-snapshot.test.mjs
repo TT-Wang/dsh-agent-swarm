@@ -7,38 +7,40 @@
  * still held the snapshot taken before the await, so it wrote a stale full row
  * back: an owner's `swarm_cancel` was silently undone (task resurrected at the
  * old epoch with a cancelled attempt and a stopped owner) and a latched
- * git-write denial disappeared. This test gates the capture, performs both
- * concurrent transitions, and asserts neither is reverted: the cancel stands,
- * no write after the await is refused as stale, and the denial stays durable
- * while the expiry fence takes its marker off the row with the attempt (F1).
+ * git-write denial disappeared. This test gates the capture on a FakeClock,
+ * performs both concurrent transitions, and asserts neither is reverted: the
+ * cancel stands, no write after the await is refused as stale, and the denial
+ * stays on the row in every commit while the attempt does, until the expiry
+ * fence, written over the newest row, takes it off with the attempt (F1).
  */
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { FakeWorkers, eventually, makeRuntime } from './faults/harness.mjs'
+import { FakeClock, FakeWorkers, eventually, makeRuntime } from './faults/harness.mjs'
 
-/** The checkpoint capture waits on `captureGate`, here a promise, and reports that it started. */
+/** The checkpoint capture reports that it started (`reached`), then waits on `captureGate`, here a promise. */
 class SnapshotWorkers extends FakeWorkers {
-  captureStarted = false
   /** Flipped off before the gate releases so the member loop cannot re-dispatch. */
   idleNow = true
   artifact = { commit: 'c'.repeat(40), baseCommit: 'b'.repeat(40), workspace: '/isolated', changedPaths: ['src/a.ts'] }
   checks = [{ command: 'test', exitCode: 0, output: 'ok' }]
   isIdle() { return this.idleNow }
   async captureArtifact(member, task) {
-    this.captureStarted = true
+    this.reached?.()
     if (this.captureGate) await this.captureGate
     return { ...this.artifact, workspace: member.workspace ?? '/isolated' }
   }
 }
 
-const snapshotRuntime = t => makeRuntime(t, {
+const snapshotRuntime = (t, clock) => makeRuntime(t, {
   workers: new SnapshotWorkers(),
   config: { maxEvents: 500, checkTimeoutMs: undefined },
   budget: { maxTokens: 100000, maxSteps: 1000, maxWorkers: 4, maxDurationMs: 3600000, maxTasks: 50 },
+  clock,
 })
 
 test('S1: a cancel committed during a lease-expiry await is not reverted by a stale snapshot', async t => {
-  const { dir: directory, runtime, workers, budget } = await snapshotRuntime(t)
+  const clock = new FakeClock()
+  const { dir: directory, runtime, workers, budget } = await snapshotRuntime(t, clock)
   await runtime.start()
   const owner = { sessionId: 's1-owner' }
   const mission = runtime.create(owner, { title: 'S1', objective: 'No stale snapshot write', workspace: directory, scope: ['src/'], acceptance: ['works'], budget }, { grantRoot: directory, source: 'session' })
@@ -60,26 +62,32 @@ test('S1: a cancel committed during a lease-expiry await is not reverted by a st
   await runtime.settle(mission.id)
   const second = propose('Renewal window')
   const secondClaim = await runtime.claim(actor(other), mission.id, second.id)
+  await runtime.settle(mission.id)
   runtime.store.transaction(() => {
     const t1 = runtime.store.get('tasks', first.id)
-    t1.attempt.leaseUntil = Date.now() - 1
+    t1.attempt.leaseUntil = clock.now() - 1
     runtime.store.put('tasks', t1)
     const t2 = runtime.store.get('tasks', second.id)
-    t2.attempt.leaseUntil = Date.now() + 1000
+    t2.attempt.leaseUntil = clock.now() + 1000
     runtime.store.put('tasks', t2)
   })
   assert.equal(taskOf(first.id).attempt.id, firstClaim.attempt.id)
   assert.equal(taskOf(second.id).attempt.id, secondClaim.attempt.id)
 
-  // Gate the capture the scheduler awaits for T1.
+  // Gate the capture the scheduler awaits for T1, and run the pass up to it.
   let release
   workers.captureGate = new Promise(resolve => { release = resolve })
-  await eventually(() => workers.captureStarted, 'the scheduler must reach the gated checkpoint capture', 4000)
+  const reached = new Promise(resolve => { workers.reached = resolve })
+  const ticking = runtime.tick()
+  await reached
   const secondEpoch = taskOf(second.id).epoch
   // Injection 1: a host tool run during the await latches the git-write denial on T1.
   const runId = await workers.callbacks.toolRun(author.id, { tool: 'bash', arguments: { command: 'git commit -m "work"' }, result: { exitCode: 128, output: 'index.lock: Operation not permitted' }, isError: true })
   assert.ok(runId, 'the tool run is recorded')
   assert.match(taskOf(first.id).gitWriteDenied.command, /git commit/, 'the denial is latched on the running row')
+  // T1's row as every later commit leaves it.
+  const committed = []
+  runtime.subscribe(missionId => { if (missionId === mission.id) committed.push(structuredClone(taskOf(first.id))) })
   // Injection 2: the owner withdraws T2 during the same await.
   runtime.cancel(owner, mission.id, { taskId: second.id, reason: 'withdrawn while the scheduler awaited' })
   assert.equal(taskOf(second.id).status, 'cancelled')
@@ -89,7 +97,9 @@ test('S1: a cancel committed during a lease-expiry await is not reverted by a st
   // Stop the member loop from re-dispatching, then let the scheduler continue.
   workers.idleNow = false
   release()
-  await eventually(() => taskOf(first.id).status !== 'running', 'the expired task completes its lease transition', 4000)
+  await ticking
+  await runtime.settle(mission.id)
+  assert.deepEqual(events('task/stale-revision-refused'), [], 'every write after the await presented the revision the tool run left')
   assert.equal(taskOf(first.id).status, 'pending', 'the expired attempt re-pends within its recovery limit')
 
   const after = taskOf(second.id)
@@ -98,11 +108,15 @@ test('S1: a cancel committed during a lease-expiry await is not reverted by a st
   assert.equal(after.attempt, undefined, 'the cancelled attempt must not be resurrected')
   assert.equal(after.assigneeId, other.id, 'the cancelled row is otherwise unchanged')
   assert.equal(events('task/lease-expired').filter(event => event.data.taskId === second.id).length, 0, 'a cancelled task never expires its lease')
-  // F1: the denial is latched on the attempt, so the expiry fence takes it off
-  // the row with that attempt; the durable record of it stays.
-  assert.equal(taskOf(first.id).gitWriteDenied, undefined, 'the denial left the row with the expired attempt it was latched on')
+  // F1: the denial is latched on the attempt. It stays on the row in every
+  // commit while the attempt does, and the expiry fence, written over the
+  // newest row rather than the pre-await snapshot, takes it off with the attempt.
+  const fencedAt = committed.findIndex(row => row.attempt === undefined)
+  assert.ok(fencedAt > 0, 'the expiry fence committed after the rows that held the attempt')
+  assert.ok(committed.slice(0, fencedAt).every(row => row.attempt.id === firstClaim.attempt.id && row.gitWriteDenied?.runId === runId), 'the denial stays while the attempt does')
+  assert.equal(committed[fencedAt].revision, committed[fencedAt - 1].revision + 1, 'the fence wrote over the newest row')
+  assert.equal(committed[fencedAt].gitWriteDenied, undefined, 'the denial left the row with the expired attempt it was latched on')
   assert.ok(events('task/git-write-denied').some(event => event.data.taskId === first.id), 'the denial is durable')
-  assert.deepEqual(events('task/stale-revision-refused'), [], 'every write after the await presented the revision the tool run left')
   assert.equal(taskOf(first.id).checkpoint?.commit, 'c'.repeat(40), 'the checkpoint was captured and committed')
 })
 
