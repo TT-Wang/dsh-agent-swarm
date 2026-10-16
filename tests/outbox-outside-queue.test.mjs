@@ -296,3 +296,36 @@ test('S2: a row told while a pump sweeps is delivered by that pump\'s next sweep
     assert.equal(attempts(), 3, 'which swept once more for the request that joined its second sweep')
   } finally { for (const held of holds.values()) held.release.resolve(); await f.runtime.settle(f.mission.id); await f.cleanup() }
 })
+
+test('S2: a request whose in-flight pump ends before its start runs is answered by a sweep that starts after it', async () => {
+  // Whether a request joins the pump in flight is judged when its deferred start
+  // runs, not when the request is made: a pump that ended in between cannot
+  // sweep again for it, so the start begins a sweep of its own. The owner row
+  // hangs until released, so the first pump is in flight when the request is made.
+  const clock = new FakeClock()
+  const workers = new FakeWorkers()
+  const held = { entered: Promise.withResolvers(), release: Promise.withResolvers() }
+  workers.deliver = async (member, delivery) => {
+    if (delivery.id === 'msg_s2_held') { held.entered.resolve(); await held.release.promise }
+    return await FakeWorkers.prototype.deliver.call(workers, member, delivery)
+  }
+  const f = await setup({ workers, clock })
+  try {
+    await f.runtime.settle(f.mission.id)
+    const put = id => f.runtime.store.transaction(() => f.runtime.store.put('deliveries', { id, missionId: f.mission.id, from: 'runtime', to: 'owner', kind: 'control', content: `S2 fixture ${id}`, createdAt: clock.now() }))
+    const delivered = id => f.runtime.store.get('deliveries', id).deliveredAt !== undefined
+    /** One request; resolves to the operation its deferred start runs as. */
+    const request = () => { const before = new Set(f.runtime.operations); f.runtime.notices.pumpOutbox(); return [...f.runtime.operations].find(operation => !before.has(operation)) }
+    put('msg_s2_held')
+    const pump = request()
+    await held.entered.promise
+    put('msg_s2_told_after')
+    const later = request()
+    held.release.resolve()
+    await pump
+    assert.ok(delivered('msg_s2_held'))
+    assert.equal(delivered('msg_s2_told_after'), false, 'the pump read the outbox before the row existed and ended before the later request\'s start ran')
+    await later
+    assert.ok(delivered('msg_s2_told_after'), 'the later request\'s start found no pump in flight and swept: the row told after the ended pump\'s read was delivered')
+  } finally { held.release.resolve(); await f.runtime.settle(f.mission.id); await f.cleanup() }
+})
