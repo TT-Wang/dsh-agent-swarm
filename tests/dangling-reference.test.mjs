@@ -191,12 +191,26 @@ test('a worker\'s proposal behind a review whose source names no task is refused
   error => error.code === 'task_graph_invalid' && error.diagnostics.some(diagnostic => diagnostic.code === 'task_graph_unknown_edge' && diagnostic.path === 'task_missing_source'))
 })
 
-test('an assignment delivery whose task names no task is moot: the outbox marks it delivered without sending it, and no pass fails', async t => {
+test('one rule decides whether an assignment delivery is current: the host admits the claim\'s own, and the outbox marks moot, never sends, and the host never admits one whose task names no task, is another mission\'s, or is not named', async t => {
   const f = await fixture(t)
-  f.runtime.store.transaction(() => f.runtime.store.put('deliveries', { id: 'msg_dangling', missionId: f.mission.id, from: 'runtime', to: f.author.id, kind: 'assignment',
-    taskId: 'task_missing', attemptId: 'attempt_missing', content: '{}', createdAt: f.clock.now() }))
+  const work = f.propose({ title: 'Running work' })
+  const claimed = await f.runtime.claim(f.actor(f.author), f.mission.id, work.id)
+  const current = f.runtime.store.list('deliveries', f.mission.id).find(delivery => delivery.kind === 'assignment' && delivery.attemptId === claimed.attempt.id)
+  const assignment = (id, fields) => ({ id, missionId: f.mission.id, from: 'runtime', to: f.author.id, kind: 'assignment', content: '{}', createdAt: f.clock.now(), ...fields })
+  f.runtime.store.transaction(() => {
+    // Another mission's row that runs an attempt this member owns.
+    f.runtime.store.put('tasks', { ...taskOf(f.runtime, work.id), id: 'task_elsewhere', missionId: 'mission_elsewhere', attempt: { ...claimed.attempt, id: 'attempt_elsewhere' } })
+    f.runtime.store.put('deliveries', assignment('msg_dangling', { taskId: 'task_missing', attemptId: 'attempt_missing' }))
+    f.runtime.store.put('deliveries', assignment('msg_elsewhere', { taskId: 'task_elsewhere', attemptId: 'attempt_elsewhere' }))
+    f.runtime.store.put('deliveries', assignment('msg_taskless', {}))
+  })
+  const corrupted = ['msg_dangling', 'msg_elsewhere', 'msg_taskless']
+  assert.equal(f.workers.callbacks.admitDelivery(f.author.id, current.id), true, 'the claim\'s own assignment is current')
+  for (const id of corrupted) assert.equal(f.workers.callbacks.admitDelivery(f.author.id, id), false, `the host does not admit ${id}`)
   await tick(f)
   assert.deepEqual(f.failures, [], 'no pass fails on the outbox')
-  assert.notEqual(f.runtime.store.get('deliveries', 'msg_dangling').deliveredAt, undefined, 'the moot assignment is marked delivered')
-  assert.ok(!f.workers.deliveries.some(delivery => delivery.id === 'msg_dangling'), 'and never sent')
+  for (const id of corrupted) {
+    assert.notEqual(f.runtime.store.get('deliveries', id).deliveredAt, undefined, `the outbox marks ${id} moot`)
+    assert.ok(!f.workers.deliveries.some(delivery => delivery.id === id), `and never sends ${id}`)
+  }
 })

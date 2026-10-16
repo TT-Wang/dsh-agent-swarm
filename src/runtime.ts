@@ -7,7 +7,7 @@ import { PolicyError } from './policy-error.ts'
 export { WorkspaceRevokedError } from './authorization.ts'
 import { recordedClaim, type WorkspaceClaim } from './authorization.ts'
 import { WorkspaceAdmission, gitWriteDeniedMessage, TEMP_RENDEZVOUS_WINDOW_MS, type TempMention } from './workspace-admission.ts'
-import { Notices, NOTICE_TEMPLATES, REJECTION_DECISION_TRIGGER, renderNotice, type NotifyOptions } from './notices.ts'
+import { Notices, NOTICE_TEMPLATES, REJECTION_DECISION_TRIGGER, assignmentCurrent, renderNotice, type NotifyOptions } from './notices.ts'
 import { RefusalRegistry, requireStrings, requireText, sameChecks, unsupportedEffort, validatedBudget } from './refusals.ts'
 import { Scheduling } from './scheduling.ts'
 import { progressed, type Kernel, type SchedulingPass } from './kernel.ts'
@@ -370,8 +370,7 @@ export class SwarmRuntime implements Kernel {
         if (!delivery || delivery.to !== memberId) return false
         if (delivery.kind !== 'assignment') return true
         if (this.store.get('missions', delivery.missionId)?.budgetPause) return false
-        const task = delivery.taskId ? this.store.get('tasks', delivery.taskId) : undefined
-        return task?.status === 'running' && task.attempt?.id === delivery.attemptId && task.attempt?.ownerId === memberId
+        return assignmentCurrent(this.store, delivery)
       },
       toolRun: (memberId, run) => this.recordToolRun(memberId, run),
       guard: (memberId, tool) => this.guard(memberId, tool),
@@ -778,9 +777,10 @@ export class SwarmRuntime implements Kernel {
    * (`task_not_in_mission`): a task id a caller supplies, where it enters (the
    * task of the evidence a challenge names included), and the re-read of a row
    * a call already holds. An id a stored row holds for another task (a task's
-   * dependency, its review source, a review recovery's source, an assignment
-   * delivery's task) is read through the task graph instead, where an id that
-   * names no task reads as no task (`taskGraphIndex`).
+   * dependency, its review source, a review recovery's source) is read through
+   * the task graph instead (`taskGraphIndex`), and an assignment delivery's
+   * task by `assignmentCurrent`: either way an id that names no task of the
+   * mission reads as no task.
    */
   task(missionId: string, taskId: string): Task {
     const task = this.store.get('tasks', taskId)

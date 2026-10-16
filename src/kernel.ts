@@ -41,7 +41,7 @@ export interface Kernel {
   exclusive<T>(missionId: string, fn: () => Promise<T>): Promise<T>
   kick(missionId: string, after?: SchedulingPass): void
   mission(missionId: string): Mission
-  /** A caller's task id, refused where it enters, or the re-read of a row the call holds; an id a stored row holds for another task is read through `boardOf(missionId).graph`. */
+  /** A caller's task id, refused where it enters, or the re-read of a row the call holds; an id a stored row holds for another task is read through `boardOf(missionId).graph` (an assignment delivery's, by `assignmentCurrent`). */
   task(missionId: string, taskId: string): Task
   isWorkerSession(sessionId: string): boolean
   fingerprint(missionId: string): string

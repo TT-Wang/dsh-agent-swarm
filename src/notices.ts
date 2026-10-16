@@ -12,7 +12,7 @@ import { guardTerminal, guardTerminalKey, requireText, type GuardChainId, type G
 import { TERMINAL_STATES, missionSubject, stopPending, taskSubject, terminal } from './task-graph.ts'
 import { PolicyError } from './policy-error.ts'
 import type { SwarmRuntime } from './runtime.ts'
-import { WriterBusyError, id } from './store.ts'
+import { WriterBusyError, id, type SwarmStore } from './store.ts'
 import { awaited, type SchedulingPass } from './kernel.ts'
 import { completionError, dependentsOf, eligible, interpret, newestReviewBlock, noticeSubjectsFor, overdueStop, reviewNeed, reviewPathBlocker, reviewPathStalled, stallRoots, startBlocker, unreviewedSources, waitsLegitimately, type Board, type Interpretation } from './board.ts'
 import type { Actor, Delivery, Escalation, Member, Mission, NoticeClass, Task, WorkerAdapter } from './types.ts'
@@ -159,6 +159,19 @@ function ownerDeliveryMoot(mission: Pick<Mission, 'status'>, delivery: Pick<Deli
   if (mission.status === 'stopped') return true
   if (mission.status !== 'paused') return false
   return !(delivery.kind === 'question' && delivery.replyExpected === true && delivery.answeredBy === undefined)
+}
+
+/**
+ * Whether an assignment delivery is still current: its task, read in the
+ * delivery's own mission, runs the delivered attempt, owned by the delivery's
+ * recipient. A task id that names no task of that mission reads as no task, so
+ * the delivery is not current. The one rule the outbox (which marks an
+ * assignment that is not current moot, `flushOutbox`) and the host's admission
+ * of a queued assignment (`admitDelivery`) both read.
+ */
+export function assignmentCurrent(store: Pick<SwarmStore, 'get'>, delivery: Pick<Delivery, 'missionId' | 'to' | 'taskId' | 'attemptId'>): boolean {
+  const task = delivery.taskId === undefined ? undefined : store.get('tasks', delivery.taskId)
+  return task?.missionId === delivery.missionId && task.status === 'running' && task.attempt?.id === delivery.attemptId && task.attempt?.ownerId === delivery.to
 }
 
 /** R17-G3: the stable digest of a recorded reason, so a fact key stays bounded. */
@@ -1336,12 +1349,8 @@ export class Notices {
       const mission = this.rt.mission(missionId)
       const delivery = this.rt.store.get('deliveries', queued.id)
       if (delivery === undefined || delivery.deliveredAt !== undefined) continue
-      if (delivery.kind === 'assignment' && delivery.taskId) {
-        // Moot unless its task, read as the row holds the id, still runs this attempt.
-        const task = this.rt.boardOf(missionId).graph.byId.get(delivery.taskId)
-        if (task?.status !== 'running' || task.attempt?.id !== delivery.attemptId) {
-          delivery.deliveredAt = this.rt.now(); this.rt.commit(missionId, () => this.rt.store.put('deliveries', delivery)); continue
-        }
+      if (delivery.kind === 'assignment' && !assignmentCurrent(this.rt.store, delivery)) {
+        delivery.deliveredAt = this.rt.now(); this.rt.commit(missionId, () => this.rt.store.put('deliveries', delivery)); continue
       }
       // OWNER QUIET: a delivery the owner's own lifecycle decision made moot is
       // not sent, and its row stays durable and undelivered rather than being
