@@ -6,6 +6,13 @@
  * scheduling, workspace-admission): each imported a pure helper or a pass
  * stamp from another, so no one of them could be built or read alone. The
  * helpers now live in leaves (`task-graph.ts`, `kernel.ts`, `scheduler.ts`).
+ *
+ * The runtime is on no cycle even when type-only imports count: no seam imports
+ * runtime.ts, not even for a type. Each seam once held the whole runtime
+ * (`rt: SwarmRuntime`), which made one type cycle through runtime.ts and every
+ * seam; a seam now stands on the `Kernel` interface (src/kernel.ts) and the
+ * collaborators below it, so the compiler, not a reviewer, keeps it from
+ * reaching a sibling through the runtime.
  */
 import test from 'node:test'
 import assert from 'node:assert/strict'
@@ -17,8 +24,11 @@ import { sourceTree } from './source-semantics.mjs'
 
 const SRC = fileURLToPath(new URL('../src/', import.meta.url))
 
-/** Each src module and the local modules it imports a value from. */
-function valueImports() {
+/** The seams the runtime builds, each from the kernel and the seams below it. */
+const SEAMS = ['refusals.ts', 'notices.ts', 'attempts.ts', 'workspace-admission.ts', 'declared-checks.ts', 'gates.ts', 'scheduling.ts']
+
+/** Each src module and the local modules it imports a value from, or with `types` any name at all. */
+function localImports({ types = false } = {}) {
   const files = []
   const walk = directory => { for (const entry of readdirSync(directory, { withFileTypes: true })) entry.isDirectory() ? walk(join(directory, entry.name)) : /\.tsx?$/.test(entry.name) && files.push(join(directory, entry.name)) }
   walk(SRC)
@@ -32,7 +42,7 @@ function valueImports() {
       const value = ts.isImportDeclaration(statement)
         ? clause === undefined || (!clause.isTypeOnly && (clause.name !== undefined || clause.namedBindings === undefined || ts.isNamespaceImport(clause.namedBindings) || clause.namedBindings.elements.some(element => !element.isTypeOnly)))
         : !statement.isTypeOnly && (statement.exportClause === undefined || !ts.isNamedExports(statement.exportClause) || statement.exportClause.elements.some(element => !element.isTypeOnly))
-      if (value) edges.add(relative(SRC, normalize(join(dirname(file), specifier.text))).replace(/\.js$/, '.ts'))
+      if (value || types) edges.add(relative(SRC, normalize(join(dirname(file), specifier.text))).replace(/\.js$/, '.ts'))
     }
     graph.set(relative(SRC, file), edges)
   }
@@ -62,9 +72,17 @@ function cycles(graph) {
 }
 
 test('the src value-import graph has no cycle', () => {
-  const graph = valueImports()
+  const graph = localImports()
   assert.ok(graph.size > 30 && graph.get('notices.ts')?.has('task-graph.ts'), 'the scan reads the real src graph')
   assert.deepEqual(cycles(graph), [])
+})
+
+test('no seam imports the runtime, even for a type, so the runtime is on no cycle of the src import graph', () => {
+  const graph = localImports({ types: true })
+  assert.ok(graph.get('kernel.ts')?.has('board.ts') && !localImports().get('kernel.ts')?.has('board.ts'), 'the scan counts a type-only import as an edge')
+  assert.deepEqual(SEAMS.filter(seam => !graph.get('runtime.ts').has(seam)), [], 'the runtime builds every seam')
+  assert.deepEqual(SEAMS.filter(seam => graph.get(seam).has('runtime.ts')), [], 'a seam stands on the kernel and its collaborators, never on the runtime')
+  assert.deepEqual(cycles(graph).filter(component => component.includes('runtime.ts')), [])
 })
 
 test('the cycle check names a cycle and passes an acyclic graph', () => {
