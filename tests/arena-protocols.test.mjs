@@ -131,10 +131,12 @@ test('the notice ledger records sent, queued and claimed with the state fingerpr
   // the same call through the tool would yield to the scheduler before the read.
   assert.throws(() => f.runtime.propose(f.aliceActor, f.mission.id, proposal(f, { title: 'Ledger over capacity' })), /task budget exhausted/)
 
-  // Synchronous read: the notice is recorded and queued, not yet delivered.
-  const queuedView = f.runtime.noticeLedger(f.owner, f.mission.id)
+  // Synchronous read: the notice is recorded and queued, not yet delivered. The
+  // ledger is the owner's arena instrument, read through swarm_observe detail=full.
+  const ledger = () => f.runtime.observe(f.owner, f.mission.id, { detail: 'full' }).noticeLedger
+  const queuedLedger = ledger()
   const admission = entry => entry.dedupKey.startsWith('guard-terminal:task_ceiling:')
-  const queued = queuedView.ledger.find(admission)
+  const queued = queuedLedger.find(admission)
   assert.ok(queued, 'the ledger exposes the notice')
   assert.equal(queued.state, 'queued')
   assert.equal(queued.deliveredAt, undefined)
@@ -147,14 +149,13 @@ test('the notice ledger records sent, queued and claimed with the state fingerpr
   assert.equal(queued.deliveryId, queued.id)
   // Read-only: two reads of the same state are identical and mutate nothing.
   const revision = f.runtime.store.revision()
-  assert.deepEqual(f.runtime.noticeLedger(f.owner, f.mission.id), queuedView)
-  f.runtime.observe(f.owner, f.mission.id, { detail: 'full' })
+  assert.deepEqual(ledger(), queuedLedger)
   assert.equal(f.runtime.store.revision(), revision, 'reading the ledger and instruments commits no state change')
   assert.equal(f.runtime.store.list('deliveries', f.mission.id).filter(delivery => delivery.deliveredAt === undefined).length, 1, 'only the notice itself is pending')
 
   // The outbox drains on the scheduler pass: the transport fact is `delivered`.
   const deliveredEntry = await eventually(() => {
-    const entry = f.runtime.noticeLedger(f.owner, f.mission.id).ledger.find(admission)
+    const entry = ledger().find(admission)
     return entry?.state === 'claimed' ? entry : undefined
   }, 'the owner notice was never delivered', 5000)
   assert.ok(deliveredEntry.deliveredAt >= deliveredEntry.sentAt)
@@ -163,14 +164,13 @@ test('the notice ledger records sent, queued and claimed with the state fingerpr
 
   // R17-G8: consumption is a separate fact, recorded once from the host's
   // claimed signal (the adapter maps the delivery id), with a compare-and-swap.
-  assert.equal(f.runtime.recordConsumption(deliveredEntry.deliveryId), true, 'the host claimed signal records consumption')
-  assert.equal(f.runtime.recordConsumption(deliveredEntry.deliveryId), false, 'a second signal cannot move the timestamp')
-  const consumed = f.runtime.noticeLedger(f.owner, f.mission.id).ledger.find(row => row.deliveryId === deliveredEntry.deliveryId)
+  assert.equal(f.runtime.notices.recordConsumption(deliveredEntry.deliveryId), true, 'the host claimed signal records consumption')
+  assert.equal(f.runtime.notices.recordConsumption(deliveredEntry.deliveryId), false, 'a second signal cannot move the timestamp')
+  const consumed = ledger().find(row => row.deliveryId === deliveredEntry.deliveryId)
   assert.ok(consumed.consumedAt >= consumed.deliveredAt, 'consumption is recorded after delivery, as its own fact')
   assert.equal(consumed.state, 'claimed', 'the transport state stays transport: consumption never rewrites it')
 
   // The ledger is owner-only; workers must not read control-plane notices.
-  assert.throws(() => f.runtime.noticeLedger(f.aliceActor, f.mission.id), /Only the mission owner/)
   const ownerView = f.runtime.observe(f.owner, f.mission.id, { detail: 'full' })
   assert.ok(Array.isArray(ownerView.noticeLedger) && ownerView.noticeLedger.length >= 1)
   assert.match(ownerView.fingerprint, /^[a-f0-9]{32}$/, 'the owner sees the no-silent-state F(S), not the 64-hex ledger digest')

@@ -10,6 +10,7 @@
  */
 import type { SwarmRuntime } from './runtime.ts'
 import { id } from './store.ts'
+import { openAttempt } from './task-graph.ts'
 import type { Artifact, CheckResult, Member, Task, ToolRun } from './types.ts'
 
 
@@ -82,10 +83,8 @@ export class DeclaredChecks {
    * the durable rows must name the verification consistently on both sides.
    */
   private verificationAttempt(member: Member, source: Task): { taskId: string; attemptId: string } | undefined {
-    const verification = this.rt.store.list('tasks', member.missionId).find(task =>
-      task.kind === 'verification' && task.reviewOf === source.id && task.status === 'running' && task.attempt?.ownerId === member.id)
-    const attemptId = verification?.attempt?.id
-    return verification === undefined || attemptId === undefined ? undefined : { taskId: verification.id, attemptId }
+    const open = openAttempt(this.rt.store.list('tasks', member.missionId), member.id)
+    return open?.kind === 'verification' && open.reviewOf === source.id ? { taskId: open.id, attemptId: open.attempt.id } : undefined
   }
 
   /**

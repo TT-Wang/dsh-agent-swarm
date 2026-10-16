@@ -29,7 +29,7 @@ async function fixture(t) {
   const rows = () => runtime.store.list('deliveries', mission.id)
   const question = async () => {
     runtime.message({ sessionId: member.sessionId }, mission.id, { to: 'owner', kind: 'question', content: 'Which complete answer?' })
-    await runtime.flushOutbox(mission.id)
+    await runtime.notices.flushOutbox(mission.id)
     return rows().filter(row => row.replyExpected).at(-1)
   }
   return { root, owner, mission, member, workers, rows, question, get runtime() { return runtime }, async reload() {
@@ -49,7 +49,7 @@ for (const status of ['paused', 'blocked', 'budget-quiescing']) test(`R02: full 
   const input = { to: f.member.id, kind: 'question', replyTo: question.id, content }
   assert.equal(f.runtime.message(f.owner, row.id, input).queued, true)
   f.runtime.message(f.owner, row.id, input)
-  await f.runtime.flushOutbox(row.id)
+  await f.runtime.notices.flushOutbox(row.id)
   assert.equal(f.rows().filter(item => item.inReplyTo === question.id).length, 1)
   assert.equal(f.workers.deliveries.filter(item => item.inReplyTo === question.id).length, 0)
   assert.equal(openAsks(f.runtime.store.list('deliveries', row.id), 'owner').length, 0)
@@ -60,9 +60,9 @@ for (const status of ['paused', 'blocked', 'budget-quiescing']) test(`R02: full 
   assert.equal(restored.deliveredAt, undefined)
   const resumed = f.runtime.mission(row.id); resumed.status = 'active'; delete resumed.budgetPause
   f.runtime.commit(row.id, () => f.runtime.store.put('missions', resumed))
-  await f.runtime.flushOutbox(row.id)
+  await f.runtime.notices.flushOutbox(row.id)
   f.runtime.message(f.owner, row.id, input)
-  await f.runtime.flushOutbox(row.id)
+  await f.runtime.notices.flushOutbox(row.id)
   assert.equal(f.workers.deliveries.filter(item => item.inReplyTo === question.id).length, 1)
   assert.equal(f.rows().filter(item => item.inReplyTo === question.id).length, 1)
 })
@@ -103,19 +103,19 @@ test('R03: a host append rejection is never an acknowledgement, even one naming 
 
 test('R03: unrelated host invariant retains outbox identity and one durable failure until retry succeeds', async t => {
   const f = await fixture(t)
-  f.runtime.notify(f.mission.id, 'Choose a recoverable route', [`mission:${f.mission.id}`], { dedupKey: 'route-decision' })
+  f.runtime.notices.notify(f.mission.id, 'Choose a recoverable route', [`mission:${f.mission.id}`], { dedupKey: 'route-decision' })
   const delivery = f.rows().find(item => item.content === 'Choose a recoverable route')
   const error = Object.assign(new Error('other package invariant rejects append'), { name: 'InvariantError', code: 'INVARIANT' })
   f.workers.deliver = async () => { throw error }
-  await f.runtime.flushOutbox(f.mission.id)
-  await f.runtime.flushOutbox(f.mission.id)
+  await f.runtime.notices.flushOutbox(f.mission.id)
+  await f.runtime.notices.flushOutbox(f.mission.id)
   assert.equal(f.runtime.store.get('deliveries', delivery.id).deliveredAt, undefined)
   assert.equal(f.runtime.store.events(f.mission.id, 500).filter(event => event.data.cause === 'owner-delivery-failed' && event.data.deliveryId === delivery.id).length, 1)
   await f.reload()
-  await f.runtime.flushOutbox(f.mission.id)
+  await f.runtime.notices.flushOutbox(f.mission.id)
   assert.equal(f.runtime.store.events(f.mission.id, 500).filter(event => event.data.cause === 'owner-delivery-failed' && event.data.deliveryId === delivery.id).length, 1)
   f.workers.deliver = async (_member, message) => f.workers.deliveries.push(message)
-  await f.runtime.flushOutbox(f.mission.id)
+  await f.runtime.notices.flushOutbox(f.mission.id)
   assert.ok(f.runtime.store.get('deliveries', delivery.id).deliveredAt)
   assert.equal(f.workers.deliveries.filter(item => item.id === delivery.id).length, 1)
 })
@@ -124,9 +124,9 @@ async function stalledDecision(f) {
   const task = { id: 'blocked-task', missionId: f.mission.id, workstreamId: 'stream', title: 'Needs owner action', objective: 'Progress', kind: 'research', status: 'blocked', epoch: 1, dependencies: [], scope: ['**'], acceptance: ['works'], checks: [], evidenceIds: [], priority: 0, experiment: false, createdAt: Date.now() }
   f.runtime.commit(f.mission.id, () => {
     f.runtime.store.put('tasks', task)
-    f.runtime.notify(f.mission.id, 'Repair the task with owner control', ['blocked-task@1'], { dedupKey: 'test-unresolved' })
+    f.runtime.notices.notify(f.mission.id, 'Repair the task with owner control', ['blocked-task@1'], { dedupKey: 'test-unresolved' })
   })
-  await f.runtime.flushOutbox(f.mission.id)
+  await f.runtime.notices.flushOutbox(f.mission.id)
   return f.rows().find(row => row.notice?.dedupKey === 'test-unresolved')
 }
 
@@ -210,7 +210,7 @@ test('a reminder queued before review admission is retained in the ledger but ne
     f.runtime.notices.notifyReviewBlocked(mission, task, need.id, reviewPathBlocker(board, task, need) ?? `no live independent review admits ${task.id}`)
   }
   const decisionOf = task => f.rows().find(row => row.notice?.dedupKey?.startsWith(`review-blocked:${f.mission.id}:${task.id}:`))
-  await f.runtime.flushOutbox(f.mission.id)
+  await f.runtime.notices.flushOutbox(f.mission.id)
   for (const row of [f.rows().find(row => row.id === reminder.id), decisionOf(source)]) {
     assert.equal(row.deliveredAt, undefined, 'suppression is not a transport acknowledgement')
     assert.equal(f.workers.deliveries.some(delivery => delivery.id === row.id), false)
@@ -226,12 +226,12 @@ test('a generic decision an older build wrote is an unclassified legacy fact: no
     f.runtime.store.put('tasks', source)
     f.runtime.store.put('tasks', { ...source, id: 'review', kind: 'verification', reviewOf: source.id, status: 'pending', artifact: undefined })
     // The row an older build wrote for a notice that named no fact: its trigger is its class.
-    f.runtime.notify(f.mission.id, 'Legacy review decision', [`${source.id}@${source.epoch}`], { trigger: 'decision' })
+    f.runtime.notices.notify(f.mission.id, 'Legacy review decision', [`${source.id}@${source.epoch}`], { trigger: 'decision' })
   })
   const legacy = f.rows().find(row => row.content === 'Legacy review decision')
   assert.equal(legacy.notice.dedupKey, `decision:${f.mission.id}:${source.id}@${source.epoch}:none`, 'the key an older build wrote')
   assert.equal(reviewable(f.runtime.boardOf(f.mission.id), f.runtime.task(f.mission.id, source.id)), true, 'the source has a live review')
-  assert.equal(f.runtime.ownerDeliveryRelevant(f.runtime.mission(f.mission.id), legacy), true, 'and the legacy decision is still deliverable')
+  assert.equal(f.runtime.notices.ownerDeliveryRelevant(f.runtime.mission(f.mission.id), legacy), true, 'and the legacy decision is still deliverable')
 })
 
 test('bounded reminders do not create reminders of reminders', async t => {
@@ -239,7 +239,7 @@ test('bounded reminders do not create reminders of reminders', async t => {
   f.runtime.notices.obligationFollowupMs = 0
   for (let i = 0; i < 6; i++) {
     f.runtime.notices.absenceNet(f.mission.id)
-    await f.runtime.flushOutbox(f.mission.id)
+    await f.runtime.notices.flushOutbox(f.mission.id)
   }
   const reminders = f.rows().filter(row => row.notice?.dedupKey.startsWith('obligation-followup:'))
   assert.equal(reminders.filter(row => row.notice.dedupKey.startsWith(`obligation-followup:${original.id}:`)).length, 2)
@@ -263,7 +263,7 @@ test('review admission retires only the reviewed source\'s decision; the other s
     attempt: { id: 'review-attempt', ownerId: f.member.id, epoch: 1, leaseUntil: Date.now() + 3600000 },
   }))
   await flush()
-  await f.runtime.flushOutbox(f.mission.id)
+  await f.runtime.notices.flushOutbox(f.mission.id)
   assert.equal(f.workers.deliveries.some(row => row.id === decisionOf(source).id), false, 'the admitted review retired its source\'s decision')
   assert.equal(f.workers.deliveries.some(row => row.id === decisionOf(other).id), true, 'retiring one source\'s decision does not suppress the other\'s owner wake')
   assert.equal(f.rows().filter(row => row.notice?.dedupKey?.startsWith('review-blocked:')).length, 2, 'no decision is regenerated for the source still blocked')
@@ -272,16 +272,16 @@ test('review admission retires only the reviewed source\'s decision; the other s
 test('completion suppresses old actions while delivering the final result and historical facts once', async t => {
   const f = await fixture(t)
   f.runtime.store.transaction(() => {
-    f.runtime.notify(f.mission.id, 'Old review action', ['old-source@1'], { dedupKey: `review-blocked:${f.mission.id}:old-source:need:reason` })
-    f.runtime.notify(f.mission.id, 'Old silence action', ['old-source@1'], { noticeClass: 'stall', trigger: 'test/stall' })
-    f.runtime.notify(f.mission.id, 'Old budget action', ['mission:' + f.mission.id], { noticeClass: 'budget', trigger: 'test/budget' })
-    f.runtime.notify(f.mission.id, 'Retained host fact', ['mission:' + f.mission.id], { noticeClass: 'progress', trigger: 'test/progress' })
-    f.runtime.notify(f.mission.id, 'Completed result', ['mission:' + f.mission.id], { noticeClass: 'completion', trigger: 'test/completion' })
+    f.runtime.notices.notify(f.mission.id, 'Old review action', ['old-source@1'], { dedupKey: `review-blocked:${f.mission.id}:old-source:need:reason` })
+    f.runtime.notices.notify(f.mission.id, 'Old silence action', ['old-source@1'], { noticeClass: 'stall', trigger: 'test/stall' })
+    f.runtime.notices.notify(f.mission.id, 'Old budget action', ['mission:' + f.mission.id], { noticeClass: 'budget', trigger: 'test/budget' })
+    f.runtime.notices.notify(f.mission.id, 'Retained host fact', ['mission:' + f.mission.id], { noticeClass: 'progress', trigger: 'test/progress' })
+    f.runtime.notices.notify(f.mission.id, 'Completed result', ['mission:' + f.mission.id], { noticeClass: 'completion', trigger: 'test/completion' })
     const mission = f.runtime.mission(f.mission.id); mission.status = 'completed'; f.runtime.store.put('missions', mission)
   })
-  await f.runtime.flushOutbox(f.mission.id)
+  await f.runtime.notices.flushOutbox(f.mission.id)
   await f.reload()
-  await f.runtime.flushOutbox(f.mission.id)
+  await f.runtime.notices.flushOutbox(f.mission.id)
   assert.equal(f.workers.deliveries.filter(row => row.content === 'Old review action').length, 0)
   assert.equal(f.workers.deliveries.filter(row => row.content === 'Old silence action' || row.content === 'Old budget action').length, 0)
   assert.equal(f.workers.deliveries.filter(row => row.content === 'Completed result').length, 1)
@@ -292,18 +292,18 @@ for (const includeCompletion of [false, true]) test(`wake summaries recheck indi
   const f = await fixture(t)
   f.runtime.notices.wakeBudget = 1
   f.runtime.store.transaction(() => {
-    f.runtime.notify(f.mission.id, 'First fact occupies the individual wake', ['mission:' + f.mission.id], { noticeClass: 'progress', trigger: 'test/progress' })
-    f.runtime.notify(f.mission.id, 'Obsolete review request', ['old-source@1'], { dedupKey: `review-blocked:${f.mission.id}:old-source:need:reason` })
-    f.runtime.notify(f.mission.id, 'Obsolete silence request', ['old-source@1'], { noticeClass: 'stall', trigger: 'test/stall' })
-    if (includeCompletion) f.runtime.notify(f.mission.id, 'Final accepted deliverable', ['mission:' + f.mission.id], { noticeClass: 'completion', trigger: 'test/completion' })
+    f.runtime.notices.notify(f.mission.id, 'First fact occupies the individual wake', ['mission:' + f.mission.id], { noticeClass: 'progress', trigger: 'test/progress' })
+    f.runtime.notices.notify(f.mission.id, 'Obsolete review request', ['old-source@1'], { dedupKey: `review-blocked:${f.mission.id}:old-source:need:reason` })
+    f.runtime.notices.notify(f.mission.id, 'Obsolete silence request', ['old-source@1'], { noticeClass: 'stall', trigger: 'test/stall' })
+    if (includeCompletion) f.runtime.notices.notify(f.mission.id, 'Final accepted deliverable', ['mission:' + f.mission.id], { noticeClass: 'completion', trigger: 'test/completion' })
     const mission = f.runtime.mission(f.mission.id); mission.status = 'completed'; f.runtime.store.put('missions', mission)
   })
   const summary = f.rows().find(row => row.notice?.dedupKey.startsWith('wake-budget:'))
   assert.ok(summary.notice.aggregatedFacts.length >= 2, 'new summaries retain each fact identity and subject')
   await f.reload()
-  assert.equal(f.runtime.ownerDeliveryRelevant(f.runtime.mission(f.mission.id), summary), includeCompletion)
-  await f.runtime.flushOutbox(f.mission.id)
-  await f.runtime.flushOutbox(f.mission.id)
+  assert.equal(f.runtime.notices.ownerDeliveryRelevant(f.runtime.mission(f.mission.id), summary), includeCompletion)
+  await f.runtime.notices.flushOutbox(f.mission.id)
+  await f.runtime.notices.flushOutbox(f.mission.id)
   const sent = f.workers.deliveries.filter(row => row.id === summary.id)
   assert.equal(sent.length, includeCompletion ? 1 : 0)
   if (includeCompletion) {
@@ -325,9 +325,9 @@ test('a delivered summary does not revive a resolved review request because unre
   })
   t.mock.timers.tick(120000)
   f.runtime.notices.wakeBudget = 1
-  f.runtime.store.transaction(() => f.runtime.notify(f.mission.id, 'An observed fact', ['mission:' + f.mission.id], { noticeClass: 'progress', trigger: 'test/progress' }))
+  f.runtime.store.transaction(() => f.runtime.notices.notify(f.mission.id, 'An observed fact', ['mission:' + f.mission.id], { noticeClass: 'progress', trigger: 'test/progress' }))
   f.runtime.notices.notifyReviewBlocked(f.runtime.mission(f.mission.id), source, reviewNeed(f.runtime.boardOf(f.mission.id), source).id, 'Please admit the review')
-  await f.runtime.flushOutbox(f.mission.id)
+  await f.runtime.notices.flushOutbox(f.mission.id)
   const summary = f.rows().find(row => row.notice?.aggregatedFacts?.some(part => part.subjects.includes(`${source.id}@1`)))
   assert.ok(summary.deliveredAt)
   const review = { ...source, id: 'summary-review', kind: 'verification', reviewOf: source.id, status: 'pending' }
@@ -476,7 +476,7 @@ test('bounded notice summaries retain complete facts and original identities thr
   const f = await fixture(t)
   f.runtime.notices.wakeBudget = 1
   const facts = Array.from({ length: 30 }, (_, index) => `Fact ${index}: ${'diagnostic detail '.repeat(200)} Action ${index}: repair the recorded condition.`)
-  const emit = (fact, index) => f.runtime.commit(f.mission.id, () => f.runtime.notify(f.mission.id, fact, [`mission:${f.mission.id}`], { trigger: 'test/long-fact', dedupKey: `long-fact:${index}` }))
+  const emit = (fact, index) => f.runtime.commit(f.mission.id, () => f.runtime.notices.notify(f.mission.id, fact, [`mission:${f.mission.id}`], { trigger: 'test/long-fact', dedupKey: `long-fact:${index}` }))
   facts.forEach(emit)
   const first = f.rows().find(row => row.notice?.dedupKey === 'long-fact:0')
   const summary = f.rows().find(row => row.notice?.dedupKey.startsWith('wake-budget:'))
@@ -497,7 +497,7 @@ test('bounded notice summaries retain complete facts and original identities thr
 test('a resource batch crossing the wake budget retains each dimension identity and keeps paused work quiet', async t => {
   const f = await fixture(t)
   f.runtime.notices.wakeBudget = 1
-  f.runtime.commit(f.mission.id, () => f.runtime.notify(f.mission.id, 'Existing owner decision', [`mission:${f.mission.id}`], { dedupKey: 'prefill' }))
+  f.runtime.commit(f.mission.id, () => f.runtime.notices.notify(f.mission.id, 'Existing owner decision', [`mission:${f.mission.id}`], { dedupKey: 'prefill' }))
   const mission = f.runtime.mission(f.mission.id)
   mission.usedTokens = 70000; mission.usedSteps = 700
   f.runtime.store.put('missions', mission)

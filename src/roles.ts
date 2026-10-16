@@ -56,7 +56,7 @@ export class RoleScoper {
       // a stale action the outbox will not send cannot pin the large protocol.
       || (mission.status === 'completed' && this.runtime.store.list('deliveries', mission.id)
         .some(delivery => delivery.to === 'owner' && delivery.notice !== undefined && !handled?.has(delivery.id)
-          && this.runtime.ownerDeliveryRelevant(mission, delivery))))) return 'owner'
+          && this.runtime.notices.ownerDeliveryRelevant(mission, delivery))))) return 'owner'
     // Claiming a notice happens before prompt assembly. Do not shorten the
     // protocol midway through the turn that closes the last obligation.
     if (agent.status !== 'idle' && this.applied.get(sessionId)?.role === 'owner') return 'owner'

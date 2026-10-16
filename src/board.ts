@@ -20,8 +20,9 @@ import { executionClock } from './resource-time.ts'
 import { assignmentAllows, authorIdsOf, canBorrowTask, canOwnReview, strandedReview } from './assignment.ts'
 import { memberPhaseOf } from './projection.ts'
 import { recoveryExit } from './declared-checks.ts'
-import { TERMINAL_STATES, blockCauses, completionExempt, missionSubject, pendingStopOwner, quiescencePending, selectAcceptedDelivery, stopPending, subjectsOfTasks, taskGraphIndex, taskSubject, terminal, uncoveredCriteria, type TaskGraphIndex } from './task-graph.ts'
-import type { CheckResult, Delivery, Evidence, Member, Mission, RuntimeConfig, Task } from './types.ts'
+import { scopeKeysOverlap } from './scheduler.ts'
+import { TERMINAL_STATES, blockCauses, completionExempt, holdsOpenAttempt, missionSubject, openAttempt, pendingStopOwner, quiescencePending, selectAcceptedDelivery, stopPending, subjectsOfTasks, taskGraphIndex, taskSubject, terminal, uncoveredCriteria, type HeldTask, type TaskGraphIndex } from './task-graph.ts'
+import { providerQuiescent, type CheckResult, type Delivery, type Evidence, type Member, type Mission, type RuntimeConfig, type Task } from './types.ts'
 
 /**
  * S1: the bound on one scheduling pass before the runtime names it wedged, in
@@ -209,7 +210,7 @@ export function readinessBlocker(board: Board, task: Task, member: Member): stri
   // an untouched task while another member is idle. This adds no reservation.
   const preferred = board.members.find(candidate => candidate.id === task.assigneeId)
   const availableForBorrowing = preferred === undefined || !eligible(board, task, preferred)
-    || all.some(candidate => candidate.status === 'running' && candidate.attempt?.ownerId === preferred.id)
+    || openAttempt(all, preferred.id) !== undefined
     || startBlocker(board.view, preferred) !== undefined
   return availableForBorrowing ? undefined : `preferred member ${task.assigneeId} is available for this task; the owner can amend assigneeId to change the preference`
 }
@@ -227,22 +228,26 @@ export function capable(board: Board, task: Task, member: Member): boolean {
 }
 
 function capabilityBlocker(board: Board, task: Task, member: Member): string | undefined {
-  const waiting = task.dependencies.find(dependency => !board.graph.dependencyMetOf(dependency))
-  if (waiting !== undefined) {
-    const effective = board.graph.effectiveOf(waiting)
-    return `dependency ${waiting}${effective.id === waiting ? '' : ` (effective replacement ${effective.id})`} is ${effective.status}, not accepted; inspect it or amend the dependency plan`
+  // An edge that names no task can never be met, so it is named before any
+  // unmet edge that still can be.
+  const dangling = board.graph.danglingReference(task)
+  if (dangling !== undefined) return task.dependencies.includes(dangling)
+    ? `dependency ${dangling} names no task in this mission, so the task can never be ready; the owner can amend its dependencies with swarm_control(action: "amend", taskId, changes, reason) or withdraw it with swarm_cancel(taskId, reason)`
+    : `review source ${dangling} names no task in this mission, so the review can never begin; the owner can withdraw it with swarm_cancel(taskId, reason)`
+  for (const dependency of task.dependencies) {
+    const effective = board.graph.effective(dependency)
+    if (effective !== undefined && effective.status !== 'accepted') return `dependency ${dependency}${effective.id === dependency ? '' : ` (effective replacement ${effective.id})`} is ${effective.status}, not accepted; inspect it or amend the dependency plan`
   }
-  if (task.reviewOf) {
-    const source = board.graph.taskOf(task.reviewOf)
-    if (source.status !== 'submitted') return `review source ${source.id} is ${source.status}; review begins only after its artifact is submitted`
-    if (!canOwnReview(source, member.id)) return `member ${member.id} authored review source ${source.id}; assign an independent reviewer`
-  }
+  const source = board.graph.reviewSource(task)
+  if (source === undefined) return undefined
+  if (source.status !== 'submitted') return `review source ${source.id} is ${source.status}; review begins only after its artifact is submitted`
+  if (!canOwnReview(source, member.id)) return `member ${member.id} authored review source ${source.id}; assign an independent reviewer`
   return undefined
 }
 
 /**
  * Tasks that cannot be dispatched under the current plan: pending work whose dependency
- * lineage or review source is dead, reviews assigned to their own author,
+ * lineage or review source is dead or names no task, reviews assigned to their own author,
  * pending work no live member may take (`assignmentAllows`: a source only its
  * own bound reviewer is left to take included), and blocked work. This is a
  * diagnostic for owner repair, not permission to
@@ -256,17 +261,17 @@ export function unschedulable(board: Board): Task[] {
   // `resumeAfterStop` only until `workers.stop()` resolves; treating it as
   // unschedulable lets `control complete` cancel recoverable work.
   const dead = new Set(tasks.filter(task => task.status === 'blocked' && !quiescencePending(task)).map(task => task.id))
-  // Fixpoint: work waiting on dead prerequisites or an unreachable review source is dead too.
+  // Fixpoint: work holding an id that names no task (`danglingReference`) is
+  // dead, and so is work waiting on dead prerequisites or an unreachable review source.
   for (let changed = true; changed;) {
     changed = false
     for (const task of tasks) {
       if (dead.has(task.id) || task.status !== 'pending') continue
-      const stuck = task.dependencies.some(dependency => { const effective = board.graph.effectiveOf(dependency); return effective.status === 'cancelled' || dead.has(effective.id) })
-        || (task.reviewOf !== undefined && (() => {
-          const source = board.graph.taskOf(task.reviewOf)
-          return TERMINAL_STATES.has(source.status) || dead.has(source.id)
-            || !live.some(member => assignmentAllows(task, member.id, tasks) && canOwnReview(source, member.id))
-        })())
+      const source = board.graph.reviewSource(task)
+      const stuck = board.graph.danglingReference(task) !== undefined
+        || board.graph.effectiveDependencies(task).some(effective => effective.status === 'cancelled' || dead.has(effective.id))
+        || (source !== undefined && (TERMINAL_STATES.has(source.status) || dead.has(source.id)
+          || !live.some(member => assignmentAllows(task, member.id, tasks) && canOwnReview(source, member.id))))
         || !live.some(member => assignmentAllows(task, member.id, tasks))
       if (stuck) { dead.add(task.id); changed = true }
     }
@@ -323,14 +328,6 @@ export function stalled(board: Board): boolean {
   return board.tasks.length > 0 && reviewPathStalled(board) && !unreviewable(board).some(task => awaitsReviewAdmission(board, task))
 }
 
-/** R11-01: how long a classified provider outage keeps a member's route quiescent. */
-export const PROVIDER_OUTAGE_WINDOW_MS = 5 * 60_000
-/** R11-01: the member's route is quiescent only inside the outage window. */
-export function providerQuiescent(member: Member, now: number): Member['providerOutage'] {
-  const outage = member.providerOutage
-  return outage !== undefined && now - outage.at <= PROVIDER_OUTAGE_WINDOW_MS ? outage : undefined
-}
-
 /**
  * R5-02: the live members a failed attempt may be re-routed to, in store
  * order: capable of the task, and never the member one of its own reviews is
@@ -354,6 +351,55 @@ export function rerouteTarget(board: Board, task: Task, failedId: string): Membe
   const target = planned ?? [...candidates].sort((a, b) => a.name.localeCompare(b.name) || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))[0]
   if (target === undefined || providerQuiescent(target, board.clock()) === undefined) return target
   return candidates.find(member => providerQuiescent(member, board.clock()) === undefined) ?? target
+}
+
+/** One breach of the isolation invariant: the members it lists and the text that names it. */
+export interface IsolationIssue { memberIds: string[]; message: string }
+
+/**
+ * S7: the isolation invariant over one board's members and tasks, decided
+ * from durable state only, each breach with the members it lists:
+ *  - live workers ≤ provisioned isolated worktrees: every non-stopped member
+ *    owns a provisioned workspace and no two live members share one, so the
+ *    number of worker handles the runtime may hold can never exceed the number
+ *    of distinct isolated worktrees;
+ *  - two concurrently running tasks that share one isolated worktree must
+ *    declare disjoint scope: the dispatch path admits at most one running task
+ *    per worktree and refuses a second whose scope overlaps.
+ * It asserts the isolation the runtime already has; it never weakens
+ * per-member worktrees, it refuses a dispatch that would lose them. Dispatch
+ * admission refuses a listed member (`WorkspaceAdmission.isolationAllows`), and
+ * the workspace terminal a breach raised is outstanding while the invariant
+ * still lists it (`Notices.openGuardTerminal`).
+ */
+export function isolationIssues(board: Pick<Board, 'members' | 'tasks'>): IsolationIssue[] {
+  const violations: IsolationIssue[] = []
+  const live = board.members.filter(member => member.status !== 'stopped')
+  const byWorkspace = new Map<string, Member[]>()
+  for (const member of live) {
+    if (!member.workspace) { violations.push({ memberIds: [member.id], message: `member ${member.id} (${member.name}) has no provisioned isolated worktree` }); continue }
+    byWorkspace.set(member.workspace, [...(byWorkspace.get(member.workspace) ?? []), member])
+  }
+  for (const [workspace, group] of byWorkspace) {
+    if (group.length > 1) violations.push({ memberIds: group.map(member => member.id), message: `live workers ${group.map(member => member.id).join(', ')} share one provisioned worktree (${workspace}); live workers must never exceed provisioned worktrees` })
+  }
+  const byTaskWorkspace = new Map<string, HeldTask[]>()
+  for (const task of board.tasks.filter(holdsOpenAttempt)) {
+    const owner = board.members.find(member => member.id === task.attempt.ownerId)
+    if (owner === undefined || owner.status === 'stopped') { violations.push({ memberIds: [task.attempt.ownerId], message: `running task ${task.id} has no live owner (${task.attempt.ownerId})` }); continue }
+    byTaskWorkspace.set(owner.workspace, [...(byTaskWorkspace.get(owner.workspace) ?? []), task])
+  }
+  for (const [workspace, group] of byTaskWorkspace) {
+    if (group.length > 1) violations.push({ memberIds: group.map(task => task.attempt.ownerId), message: `concurrently running tasks ${group.map(task => task.id).join(', ')} share worktree ${workspace}` })
+    for (let left = 0; left < group.length; left++) {
+      for (let right = left + 1; right < group.length; right++) {
+        if (group[left]!.scope.some(a => group[right]!.scope.some(b => scopeKeysOverlap(a, b)))) {
+          violations.push({ memberIds: [group[left]!.attempt.ownerId, group[right]!.attempt.ownerId], message: `concurrently running tasks ${group[left]!.id} and ${group[right]!.id} declare overlapping scope in worktree ${workspace}` })
+        }
+      }
+    }
+  }
+  return violations
 }
 
 /* ----------------------------------------------------------------------- *
@@ -630,16 +676,18 @@ export function waitsLegitimately(board: Board, task: Task): boolean {
     return board.graph.unfinishedDependencies(task).length > 0
   }
   if (task.status === 'pending') {
-    // Reviews wait on their exact source; no worker stop can repair a missing
-    // or terminal source, and a review path no live member may own (the one
-    // live-review rule, `reviewable`) waits on nothing. Ordinary prerequisites
-    // keep the shared lineage rule.
-    if (task.reviewOf !== undefined) {
-      const source = tasks.find(candidate => candidate.id === task.reviewOf)
-      return source !== undefined && !TERMINAL_STATES.has(source.status) && reviewable(board, source)
-    }
+    // An id the task holds that names no task (`danglingReference`, the rule
+    // `unschedulable` holds it dead by) is a prerequisite nothing can meet: the
+    // task waits on nothing, whatever else it also waits on.
+    if (board.graph.danglingReference(task) !== undefined) return false
+    // Reviews wait on their exact source; no worker stop can repair a terminal
+    // source, and a review path no live member may own (the one live-review
+    // rule, `reviewable`) waits on nothing. Ordinary prerequisites keep the
+    // shared lineage rule.
+    const source = board.graph.reviewSource(task)
+    if (source !== undefined) return !TERMINAL_STATES.has(source.status) && reviewable(board, source)
     if (board.graph.unfinishedDependencies(task).length > 0) return true
-    if (!task.dependencies.every(dependency => board.graph.dependencyMet(dependency))) return false
+    if (!board.graph.dependenciesMet(task)) return false
     // A preparation failure the host will not retry is a block cause the owner
     // repairs (`blockCauses` owns that distinction). One carrying `retryAt` is the
     // host's own bounded back-off: a live wait until one tick past `retryAt`.
@@ -659,8 +707,8 @@ export function waitsLegitimately(board: Board, task: Task): boolean {
     if (stops.length > 0) return stops.every(marker => stopInBound(board, marker))
     // Once the stop settles, another live attempt may take the selected member
     // first. Its bounded lease provides the next chance to run this ready work.
-    return memberId !== undefined && tasks.some(candidate => candidate.status === 'running'
-      && candidate.attempt?.ownerId === memberId && candidate.attempt.leaseUntil >= board.clock())
+    const held = memberId === undefined ? undefined : openAttempt(tasks, memberId)
+    return held !== undefined && held.attempt.leaseUntil >= board.clock()
   }
   return false
 }
@@ -774,7 +822,7 @@ export interface Interpretation extends Board {
   /** The scheduler's stalled predicate for this board. */
   stalled: boolean
   /** Running tasks whose owning member is durably parked (the R10-15 holder family). */
-  parkedHolders: Array<{ task: Task; member: Member }>
+  parkedHolders: Array<{ task: HeldTask; member: Member }>
   implementations: Task[]
   /** Latest task, evidence or owner-decision progress; telemetry does not reset this clock. */
   lastTransitionAt: number
@@ -801,9 +849,10 @@ export function interpret(board: Board): Interpretation {
     unreviewed: unreviewedSources(board),
     unschedulable: unschedulable(board),
     stalled: stalled(board),
-    parkedHolders: tasks.filter(task => task.status === 'running' && task.attempt !== undefined
-      && members.some(member => member.id === task.attempt?.ownerId && memberPhaseOf(member) === 'parked'))
-      .map(task => ({ task, member: members.find(member => member.id === task.attempt?.ownerId)! })),
+    parkedHolders: tasks.filter(holdsOpenAttempt).flatMap(task => {
+      const member = members.find(candidate => candidate.id === task.attempt.ownerId)
+      return member !== undefined && memberPhaseOf(member) === 'parked' ? [{ task, member }] : []
+    }),
     implementations: tasks.filter(task => task.kind === 'implementation'),
     lastTransitionAt: board.records.progressAt(mission),
     subjectsOf: list => subjectsOfTasks(list, mission),

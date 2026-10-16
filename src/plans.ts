@@ -2,6 +2,7 @@
 import { isAbsolute } from 'node:path'
 import { AdmissionError, assertDeclaredOutputs, assertScopeSelectors, citedCovers, classifyCheck, loadPackageScripts, dependencyAssumptions, formatDiagnostic, normalizeReviewDependencies, normalizeScopeSelectors, normalizeTaskCeilings, requireHostChecks, type AdmissionDiagnostic, type TaskCeilingInput } from './admission.ts'
 import { canOwnReview } from './assignment.ts'
+import { taskEdges } from './task-graph.ts'
 import type { PolicyErrorCategory } from './policy-error.ts'
 import { nextWorkerName, type CheckSyntaxIssue, type PlanInput, type PlanReviewOverride, type PlanTask } from './types.ts'
 
@@ -199,7 +200,7 @@ export function validatePlan(value: unknown, options: PlanValidationOptions = {}
       for (const diagnostic of dependencyAssumptions({
         objective: task.objective,
         acceptance: taskAcceptance,
-        dependencies: [...(Array.isArray(task.dependencies) ? task.dependencies as string[] : []), ...(typeof task.reviewOf === 'string' ? [task.reviewOf] : [])],
+        edges: { dependencies: Array.isArray(task.dependencies) ? task.dependencies as string[] : [], reviewOf: typeof task.reviewOf === 'string' ? task.reviewOf : undefined },
         replaces: Array.isArray(task.replaces) ? task.replaces as string[] : [],
       }, `${at}.objective`)) if (diagnostic.severity !== 'advisory') admissionIssues.push({ category: 'tool_error', diagnostics: [diagnostic], message: formatDiagnostic(diagnostic) })
     }
@@ -358,7 +359,7 @@ export function orderedTasks(tasks: PlanTask[]): PlanTask[] {
     const task = byKey.get(key)
     if (!task) throw new Error('Unknown dependency')
     visiting.add(key)
-    for (const dependency of [...(task.dependencies ?? []), ...(task.reviewOf ? [task.reviewOf] : [])]) visit(dependency)
+    for (const dependency of taskEdges({ dependencies: task.dependencies ?? [], reviewOf: task.reviewOf })) visit(dependency)
     visiting.delete(key); done.add(key); result.push(task)
   }
   for (const task of tasks) visit(task.key)

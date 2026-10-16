@@ -1,5 +1,6 @@
 import { useId, useMemo, useState } from 'react'
 import type { Snapshot, Task } from '../types.ts'
+import { taskEdges } from '../task-graph.ts'
 import { boardIndex, type BoardLane } from './projection.ts'
 import { useCopy } from './locale.tsx'
 
@@ -13,7 +14,7 @@ export function graphLayout(tasks: readonly Task[]) {
     const task = byId.get(id)
     if (!task) return 0
     const next = new Set(seen).add(id)
-    const deps = [...task.dependencies, ...(task.reviewOf ? [task.reviewOf] : [])].filter(dep => byId.has(dep))
+    const deps = taskEdges(task).filter(dep => byId.has(dep))
     const value = deps.length ? 1 + Math.max(...deps.map(dep => rank(dep, next))) : 0
     ranks.set(id, value)
     return value
@@ -57,7 +58,7 @@ export function DependencyGraph({ snapshot, tasks }: { snapshot: Snapshot; tasks
       </button>)}
     </div></div>
     {focused ? <div className="sw-graph-detail"><strong>{focused.title}</strong><p>{focused.objective}</p>
-      <p>{t('Prerequisites')}: {[...focused.dependencies, ...(focused.reviewOf ? [focused.reviewOf] : [])].map(id => index.byId.get(id)?.title ?? id).join('; ') || t('None')}</p>
+      <p>{t('Prerequisites')}: {taskEdges(focused).map(id => index.byId.get(id)?.title ?? id).join('; ') || t('None')}</p>
       {focused.attempt && <p>Attempt {focused.attempt.epoch} · {memberById.get(focused.attempt.ownerId)?.name}</p>}
       {focused.output && <p>{focused.output}</p>}</div> : <p className="sw-small">{t('Select a task to inspect its prerequisites, attempt and output.')}</p>}
   </section>

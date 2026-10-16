@@ -285,26 +285,29 @@ test('R15-A5: the stranded-inbox hatch drains or stays dispatchable, and the nai
   assert.equal(fixed.runtime.store.get('tasks', task.id).status, 'running', 'and the member stayed dispatchable')
 })
 
-test('R15-A1/B: the owner ledger carries subjects, reports consumption unknown, and never collapses the three facts', async t => {
+test('R15-A1/B: the delivery an owner ledger entry names carries the subjects, and transport is never relabelled as consumption or resolution', async t => {
   const f = await scenario(t)
   const builder = await f.addMember('Builder')
   const root = f.block(f.propose('Ledger root', { assigneeId: builder.id }))
   await sleep(250)
-  const ledger = f.runtime.noticeLedger(f.owner, f.mission.id, { limit: 10 })
-  assert.ok(ledger.ledger.length > 0, 'the decision produced a durable ledger row')
-  const row = ledger.ledger.find(entry => typeof entry.dedupKey === 'string' && entry.dedupKey.startsWith('stall-root:'))
-  assert.ok(row, `the stall-root row is in the ledger: ${JSON.stringify(ledger.ledger.map(entry => entry.dedupKey))}`)
-  assert.ok(Array.isArray(row.subjects) && row.subjects.includes(`${root.id}@${root.epoch}`), `the ledger row exposes the subjects: ${JSON.stringify(row.subjects)}`)
-  assert.equal(row.consumption, 'unknown', 'consumption is reported unknown, never relabelled from transport')
-  assert.equal(Object.hasOwn(row, 'resolved'), false, 'a transport fact never records resolution')
-  assert.equal(Object.hasOwn(row, 'resolvedAt'), false, 'a transport fact never records resolution')
-  // A read receipt (claimed) is transport acceptance only: the decision stays
-  // pending and the ledger still reports consumption as unknown.
-  const store = f.runtime.store.get('deliveries', row.deliveryId)
-  assert.equal(store.to, 'owner')
-  const reread = f.runtime.noticeLedger(f.owner, f.mission.id, { limit: 10 }).ledger.find(entry => entry.deliveryId === row.deliveryId)
-  assert.equal(reread.consumption, 'unknown')
-  assert.equal(reread.state === 'queued' || reread.state === 'claimed', true, 'the transport state stays a transport state')
+  // The owner's two reads: the ledger is the arena instrument (swarm_observe
+  // detail=full), and the delivery its entry names is read by deliveryId
+  // (swarm_observe deliveryId, owner-only); that delivery says what the notice is about.
+  const ledger = f.runtime.observe(f.owner, f.mission.id, { detail: 'full' }).noticeLedger
+  assert.ok(ledger.length > 0, 'the decision produced a durable ledger row')
+  const entry = ledger.find(item => typeof item.dedupKey === 'string' && item.dedupKey.startsWith('stall-root:'))
+  assert.ok(entry, `the stall-root row is in the ledger: ${JSON.stringify(ledger.map(item => item.dedupKey))}`)
+  const { delivery } = f.runtime.observe(f.owner, f.mission.id, { deliveryId: entry.deliveryId })
+  assert.equal(delivery.to, 'owner')
+  assert.ok(Array.isArray(delivery.subjects) && delivery.subjects.includes(`${root.id}@${root.epoch}`), `the delivery the entry names carries the subjects: ${JSON.stringify(delivery.subjects)}`)
+  // Three facts: transport is `state` (queued, or claimed once deliveredAt is
+  // set); consumption is `consumedAt`, which only the host's admitted message
+  // records, so a claimed transport never stands in for it; resolution is a
+  // task or mission transition, never a ledger field.
+  assert.equal(entry.state === 'queued' || entry.state === 'claimed', true, 'the transport state stays a transport state')
+  assert.equal(Object.hasOwn(entry, 'consumedAt'), false, 'no host signal, so no consumption: transport is never relabelled as consumption')
+  assert.equal(Object.hasOwn(entry, 'resolved'), false, 'a transport fact never records resolution')
+  assert.equal(Object.hasOwn(entry, 'resolvedAt'), false, 'a transport fact never records resolution')
 })
 
 test('R15-F1: a pending verification waits on its live source and is named only when the source closes', async t => {
@@ -497,7 +500,6 @@ test('R15-B: the sidebar phase, recovery age and pending decision come from dura
   const blocked = sidebarState(snapshot([{ id: 't1', epoch: 2, status: 'blocked', kind: 'implementation', dependencies: [], output: 'Needs a repair', createdAt: 1 }]), 'connected', 2000)
   assert.equal(blocked.phase, 'waiting-for-owner')
   assert.equal(blocked.decision.subject, 't1@2')
-  assert.equal(blocked.decision.consumption, 'unknown')
 
   const stopping = sidebarState(snapshot([{ id: 't2', epoch: 3, status: 'blocked', kind: 'implementation', dependencies: [], createdAt: 1, resumeAfterStop: { epoch: 3, reason: 'handoff', at: 1500 } }]), 'connected', 2000)
   assert.equal(stopping.phase, 'recovering')
@@ -544,7 +546,7 @@ const TERMINAL_STATES = new Set(['accepted', 'cancelled'])
  * weakened classifier did not).
  */
 function referenceCarried(board, task) {
-  const tail = board.graph.effectiveOf(task.id)
+  const tail = board.graph.effective(task.id)
   return tail.id !== task.id && !TERMINAL_STATES.has(tail.status)
 }
 
@@ -554,7 +556,9 @@ function referenceCarried(board, task) {
  * Removing the lineage resolution from the classifier makes these disagree on
  * the cancelled-A / live-A' / B-depends-on-A board, and a non-transitive
  * replacement-coverage helper makes them disagree on the two-hop chain, which is
- * what the mutation proofs exercise.
+ * what the mutation proofs exercise. The graph's plain reads answer an edge that
+ * names no task as no task; pending work holding one (`danglingReference`)
+ * waits on nothing, whatever else it waits on.
  */
 function referenceWaiting(board, task) {
   const tasks = board.tasks
@@ -569,18 +573,19 @@ function referenceWaiting(board, task) {
     const stop = task.resumeAfterStop
     return stop.at !== undefined && Date.now() - stop.at <= board.bounds.stallPassTimeoutMs
   }
+  if (task.status === 'pending' && board.graph.danglingReference(task) !== undefined) return false
   if (task.status === 'pending' && task.reviewOf !== undefined) {
     const source = tasks.find(candidate => candidate.id === task.reviewOf)
-    return source !== undefined && !TERMINAL_STATES.has(source.status) && reviewable(board, source)
+    return !TERMINAL_STATES.has(source.status) && reviewable(board, source)
   }
   if (task.status === 'pending' && task.resumeAfterStop?.epoch === task.epoch
-    && task.dependencies.every(id => tasks.some(candidate => candidate.id === id) && board.graph.effectiveOf(id).status === 'accepted')) {
+    && task.dependencies.every(id => board.graph.effective(id)?.status === 'accepted')) {
     const stop = task.resumeAfterStop
     return stop.at !== undefined && Date.now() - stop.at <= board.bounds.stallPassTimeoutMs
   }
   return task.dependencies.some(id => {
-    if (!tasks.some(candidate => candidate.id === id)) return false
-    return !TERMINAL_STATES.has(board.graph.effectiveOf(id).status)
+    const tail = board.graph.effective(id)
+    return tail !== undefined && !TERMINAL_STATES.has(tail.status)
   })
 }
 
@@ -599,9 +604,14 @@ test('R16-A1: the waiting classifier is enumerated over every constructed board 
   const owner = { sessionId: 'r16-a1' }
   const mission = f.runtime.create(owner, { title: 'Lineage enumeration', objective: 'Enumerate the classifier', workspace: f.directory, scope: ['src/'], acceptance: ['works'], budget }, { grantRoot: f.directory, source: 'session' })
   const stream = f.runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Main' })
+  // A live member the constructed review paths can be owned by; the boards
+  // below are judged both without a member and with it (\`memberShapes\`).
+  await f.runtime.addMember(owner, mission.id, { name: 'Reviewer', role: 'verification' })
+  await f.runtime.settle(mission.id)
   // Each constructed board is judged over its own rows; the mission and its members are read once.
   const base = f.runtime.boardOf(mission.id)
-  const over = tasks => ({ ...base, tasks, graph: taskGraphIndex(tasks) })
+  assert.equal(base.members.length, 1, 'the live member is on the board')
+  const over = (tasks, members = []) => ({ ...base, members, tasks, graph: taskGraphIndex(tasks) })
   const now = Date.now()
   let seq = 0
   const materialize = (id, status, extra = {}) => {
@@ -618,6 +628,7 @@ test('R16-A1: the waiting classifier is enumerated over every constructed board 
   const subjectStatuses = ['pending', 'blocked', 'running', 'submitted']
   const stopShapes = ['none', 'in-bound', 'expired', 'unbounded']
   const reviewShapes = ['none', 'live', 'terminal', 'missing']
+  const memberShapes = { none: [], live: base.members }
   const mismatches = []
   const naiveDivergences = []
   const naiveWaiting = (task, tasks) => {
@@ -659,27 +670,29 @@ test('R16-A1: the waiting classifier is enumerated over every constructed board 
               f.runtime.store.put('tasks', subject)
             }
             if (reviewShape !== 'none') {
-              subject.reviewOf = sourceId
+              subject.kind = 'verification'; subject.reviewOf = sourceId
               if (reviewShape === 'live') tasks.push(materialize(sourceId, 'submitted'))
               else if (reviewShape === 'terminal') tasks.push(materialize(sourceId, 'cancelled'))
               f.runtime.store.put('tasks', subject)
             }
             tasks.push(subject)
-            const got = waitsLegitimately(over(tasks), subject)
-            const want = referenceWaiting(over(tasks), subject)
-            if (got !== want) mismatches.push({ depStatus, replacement, subjectStatus, stopShape, reviewShape, got, want })
-            const rootTask = { ...subject }
-            const gotRoot = stallRoots(over(tasks)).some(root => root.id === subject.id)
-            const wantRoot = referenceStallRoot(over(tasks), rootTask, f.runtime.bounds.stallPassTimeoutMs)
-            if (gotRoot !== wantRoot) mismatches.push({ kind: 'stallRoot', depStatus, replacement, subjectStatus, stopShape, reviewShape, gotRoot, wantRoot })
-            if (naiveWaiting(subject, tasks) !== want) naiveDivergences.push({ depStatus, replacement, subjectStatus, stopShape, reviewShape })
-            checked += 1
+            for (const [memberShape, members] of Object.entries(memberShapes)) {
+              const got = waitsLegitimately(over(tasks, members), subject)
+              const want = referenceWaiting(over(tasks, members), subject)
+              if (got !== want) mismatches.push({ depStatus, replacement, subjectStatus, stopShape, reviewShape, memberShape, got, want })
+              const rootTask = { ...subject }
+              const gotRoot = stallRoots(over(tasks, members)).some(root => root.id === subject.id)
+              const wantRoot = referenceStallRoot(over(tasks, members), rootTask, f.runtime.bounds.stallPassTimeoutMs)
+              if (gotRoot !== wantRoot) mismatches.push({ kind: 'stallRoot', depStatus, replacement, subjectStatus, stopShape, reviewShape, memberShape, gotRoot, wantRoot })
+              if (naiveWaiting(subject, tasks) !== want) naiveDivergences.push({ depStatus, replacement, subjectStatus, stopShape, reviewShape, memberShape })
+              checked += 1
+            }
           }
         }
       }
     }
   }
-  assert.equal(checked, depStatuses.length * replacementStatuses.length * subjectStatuses.length * stopShapes.length * reviewShapes.length, 'every combination is visited')
+  assert.equal(checked, depStatuses.length * replacementStatuses.length * subjectStatuses.length * stopShapes.length * reviewShapes.length * Object.keys(memberShapes).length, 'every combination is visited')
 
   // R16-A1r/A1r2: the SUBJECT-covered dimension, derived from the runtime's own
   // lineage seam. Every board above gives the subject a dependency edge (or a
@@ -768,7 +781,7 @@ test("R16-A2: a cancelled predecessor with a live repair leaves its dependent wa
   const fallthroughs = () => f.notices().filter(delivery => typeof delivery.notice?.dedupKey === 'string' && delivery.notice.dedupKey.startsWith('fallthrough:'))
   await sleep(300)
   assert.deepEqual(fallthroughs(), [], `the dependent waits on the running repair instead of being named: ${JSON.stringify(fallthroughs().map(delivery => delivery.content.slice(0, 80)))}`)
-  assert.equal(f.runtime.boardOf(f.mission.id).graph.dependencyMetOf(original.id), false, 'the dispatcher still cannot start the dependent: its effective dependency is running, not accepted')
+  assert.equal(f.runtime.boardOf(f.mission.id).graph.dependencyMet(original.id), false, 'the dispatcher still cannot start the dependent: its effective dependency is running, not accepted')
   const live = f.runtime.store.get('tasks', dependent.id)
   assert.equal(waitsLegitimately(f.runtime.boardOf(f.mission.id), live), true, 'the dependent is waiting on the live repair, not dead')
   // Pair: closing the repair's whole lineage makes the same dependent a named
@@ -851,7 +864,7 @@ test('R16-A1r2 pair: a two-hop repair chain through a cancelled repair keeps the
     && Array.isArray(delivery.subjects) && delivery.subjects.some(subject => subject.startsWith(`${original.id}@`)))
   await sleep(300)
   const board = f.runtime.boardOf(f.mission.id)
-  const tail = board.graph.effectiveOf(original.id)
+  const tail = board.graph.effective(original.id)
   assert.equal(tail.id, secondRepair.id, 'the runtime seam resolves the original through the cancelled first repair to the second')
   assert.equal(tail.status, 'running', 'the seam tail is the running second repair')
   assert.equal(waitsLegitimately(board, f.runtime.store.get('tasks', original.id)), true, 'the original waits on the running second repair')
@@ -982,7 +995,7 @@ test('R16-A6 pair: the lineage rule reaches an ordinary dependent but not a revi
   const dependent = put('task_r16a6_dependent', 'pending', { dependencies: [source.id] })
   const review = put('task_r16a6_review', 'pending', { kind: 'verification', reviewOf: source.id, dependencies: [] })
   const board = f.runtime.boardOf(f.mission.id)
-  assert.equal(board.graph.dependencyMetOf(source.id), false, 'the effective dependency is running, not accepted')
+  assert.equal(board.graph.dependencyMet(source.id), false, 'the effective dependency is running, not accepted')
   assert.equal(waitsLegitimately(board, dependent), true, 'an ordinary dependent waits on the live repair')
   assert.equal(waitsLegitimately(board, review), false, 'the review follows its source IDENTITY, which is terminal: a review of a cancelled task has no path even when the obligation is repaired')
   assert.equal(stallRoots(board).some(root => root.id === review.id), false, 'a verdict record is never a stall root')

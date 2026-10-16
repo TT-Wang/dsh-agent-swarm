@@ -424,7 +424,7 @@ const GATE_TESTS = {
       // durable state (the pass row, the budget stop claim, the outbox), so a
       // lost drain cannot make a durable transition wrong. The queued owner
       // notice below is the durable record a later pump delivers from.
-      await f.runtime.commit(f.mission.id, () => f.runtime.notify(f.mission.id, 'S5c drain probe', [`mission:${f.mission.id}`], { trigger: 'test/probe', reason: 'S5c drain probe' }))
+      await f.runtime.commit(f.mission.id, () => f.runtime.notices.notify(f.mission.id, 'S5c drain probe', [`mission:${f.mission.id}`], { trigger: 'test/probe', reason: 'S5c drain probe' }))
       const queued = f.runtime.store.list('deliveries', f.mission.id).filter(delivery => delivery.to === 'owner' && delivery.deliveredAt === undefined)
       assert.ok(queued.length >= 1, 'the deferred notice is durable in the outbox, so a later pump re-derives it')
     } finally { await f.cleanup() }
@@ -559,7 +559,7 @@ const GATE_TESTS = {
       f.runtime.notices.pendingTransitions.clear()   // the loss
       // The commit itself is the gate: a durable notice still lands after the
       // publication queue was lost, because the write and its fact are committed.
-      f.runtime.commit(f.mission.id, () => f.runtime.notify(f.mission.id, 'probe after a lost queue', [`mission:${f.mission.id}`], { trigger: 'probe/lost-queue', reason: 'probe' }))
+      f.runtime.commit(f.mission.id, () => f.runtime.notices.notify(f.mission.id, 'probe after a lost queue', [`mission:${f.mission.id}`], { trigger: 'probe/lost-queue', reason: 'probe' }))
       const queued = f.runtime.store.list('deliveries', f.mission.id).filter(delivery => typeof delivery.notice?.dedupKey === 'string' && delivery.notice.dedupKey.startsWith('probe/lost-queue:'))
       assert.equal(queued.length, 1, 'the durable outbox is unaffected by the lost publication queue')
     } finally { await f.cleanup() }
@@ -573,7 +573,7 @@ const GATE_TESTS = {
       const task = f.propose({ title: 'Wedged marker lost' })
       assert.ok(task?.id, 'the durable write is unaffected by the lost wedge marker')
       // The release itself is durable; the next transition still publishes.
-      const state = f.runtime.passState(f.mission.id)
+      const state = f.runtime.scheduling.passState(f.mission.id)
       assert.equal(typeof state.passLive, 'boolean')
       assert.equal(typeof state.wedged, 'boolean')
     } finally { await f.cleanup() }
@@ -582,7 +582,7 @@ const GATE_TESTS = {
     const f = await setup({ config: { tickMs: 10, stallPassTimeoutMs: 100 } })
     try {
       const first = f.propose({ title: 'Notice' })
-      await f.runtime.commit(f.mission.id, () => f.runtime.notify(f.mission.id, 'S5 outbox probe', [`mission:${f.mission.id}`], { trigger: 'test/probe', reason: 'S5 outbox probe' }))
+      await f.runtime.commit(f.mission.id, () => f.runtime.notices.notify(f.mission.id, 'S5 outbox probe', [`mission:${f.mission.id}`], { trigger: 'test/probe', reason: 'S5 outbox probe' }))
       const queued = f.runtime.store.list('deliveries', f.mission.id).filter(delivery => delivery.to === 'owner')
       assert.ok(queued.length >= 1)
       // Gate the adapter delivery, so the per-attempt claim is observable and
@@ -591,14 +591,14 @@ const GATE_TESTS = {
       const gate = new Promise(resolve => { releaseDeliver = resolve })
       let attempts = 0
       f.workers.deliver = async () => { attempts += 1; await gate }
-      const pumping = f.runtime.flushOutbox(f.mission.id)
+      const pumping = f.runtime.notices.flushOutbox(f.mission.id)
       await eventually(() => f.runtime.notices.delivering.size === 1, 'the pump claims the delivery')
       assert.ok(f.runtime.notices.delivering.size > 0, 'the loss must be exercised on a non-empty collection')
       f.runtime.notices.delivering.clear()   // the loss
       // A second pump now starts while the first is still gated: the lost claim
       // makes the same delivery be attempted twice (duplicated idempotent work),
       // never written twice.
-      const duplicate = f.runtime.flushOutbox(f.mission.id)
+      const duplicate = f.runtime.notices.flushOutbox(f.mission.id)
       await eventually(() => attempts >= 2, 'the lost claim lets a second pump attempt the same delivery')
       releaseDeliver()
       await Promise.all([pumping, duplicate])

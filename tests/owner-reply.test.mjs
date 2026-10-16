@@ -43,7 +43,7 @@ async function fixture(t, config = {}) {
   async function ask(content = 'Which API version should I target?') {
     const queued = runtime.message(asker, mission.id, { to: 'owner', kind: 'question', content })
     assert.equal(queued.queued, true)
-    await runtime.flushOutbox(mission.id)
+    await runtime.notices.flushOutbox(mission.id)
     const delivery = deliveries().filter(item => item.from === member.id && item.to === 'owner').at(-1)
     assert.ok(delivery, 'the question reached the owner outbox')
     assert.equal(delivery.deliveredAt === undefined, false, 'the question is delivered, so it has a delivery time')
@@ -142,7 +142,7 @@ test('L2/L3: an owner turn that leaves a question open is recorded, nudged with 
   assert.match(nudge[0].content, new RegExp(`replyTo: "${ask.id}"`), 'the nudge carries the exact call')
   assert.match(nudge[0].content, /only that call writes the receipt/)
   assert.equal(openAsks(f.runtime.store.list('deliveries', f.mission.id), 'owner').length, 1, 'the receipt is still open')
-  await f.runtime.flushOutbox(f.mission.id)
+  await f.runtime.notices.flushOutbox(f.mission.id)
   assert.ok(f.runtime.store.get('deliveries', nudge[0].id).deliveredAt, 'the first nudge reached transport')
 
   // Turn 2: still unanswered — the second nudge is the last one.
@@ -154,7 +154,7 @@ test('L2/L3: an owner turn that leaves a question open is recorded, nudged with 
     && item.notice?.dedupKey?.startsWith('owner-reply-missing:') && item.id !== nudge[0].id)
   assert.ok(secondNudge, 'the second unanswered turn creates the next wake instead of deduping it away')
   assert.match(secondNudge.content, /nudge 2 of 2/)
-  await f.runtime.flushOutbox(f.mission.id)
+  await f.runtime.notices.flushOutbox(f.mission.id)
   assert.ok(f.runtime.store.get('deliveries', secondNudge.id).deliveredAt)
 
   // Turn 3: the bound is spent, so the guard terminal reports the decision once.
@@ -226,7 +226,7 @@ test('L2: replacing the guard resumes the durable nudge ordinal and reaches esca
   const first = new OwnerReplyGuard(fakeContext(), f.runtime, { maxNudges: 2 })
   first.observe(f.owner.sessionId, 'user/message', { createdAt: Date.now() + 1000 })
   first.observe(f.owner.sessionId, 'turn/end', { reason: { kind: 'completed' } })
-  await f.runtime.flushOutbox(f.mission.id)
+  await f.runtime.notices.flushOutbox(f.mission.id)
   first.dispose()
   const replacement = new OwnerReplyGuard(fakeContext(), f.runtime, { maxNudges: 2 })
   t.after(() => replacement.dispose())
@@ -236,7 +236,7 @@ test('L2: replacing the guard resumes the durable nudge ordinal and reaches esca
   const nudges = f.deliveries().filter(row => row.notice?.dedupKey?.startsWith(`owner-reply-missing:${ask.id}`))
   assert.equal(nudges.length, 2, 'guard state loss does not repeat or swallow a recovery ordinal')
   assert.equal(new Set(nudges.map(row => row.notice.dedupKey)).size, 2)
-  await f.runtime.flushOutbox(f.mission.id)
+  await f.runtime.notices.flushOutbox(f.mission.id)
   replacement.observe(f.owner.sessionId, 'user/message', { createdAt: Date.now() + 3000 })
   replacement.observe(f.owner.sessionId, 'turn/end', { reason: { kind: 'completed' } })
   assert.equal(f.events('mission/stalled').filter(event => event.data.cause === 'guard-terminal').length, 1)
@@ -313,7 +313,7 @@ for (const summarized of [false, true]) test(`answered receipts invalidate queue
   const question = await f.ask()
   if (summarized) {
     f.runtime.notices.wakeBudget = 1
-    f.runtime.commit(f.mission.id, () => f.runtime.notify(f.mission.id, 'first fact', [`mission:${f.mission.id}`], { trigger: 'test/fact' }))
+    f.runtime.commit(f.mission.id, () => f.runtime.notices.notify(f.mission.id, 'first fact', [`mission:${f.mission.id}`], { trigger: 'test/fact' }))
   }
   const guard = new OwnerReplyGuard(fakeContext(), f.runtime, { maxNudges: 1 })
   t.after(() => guard.dispose())
@@ -325,10 +325,10 @@ for (const summarized of [false, true]) test(`answered receipts invalidate queue
   assert.deepEqual([terminals.length, pumps], [1, 1], 'the one terminal escalation asked the held pump to deliver it')
   const reminders = f.deliveries().filter(row => row.notice?.questionId === question.id || row.notice?.aggregatedFacts?.some(fact => fact.questionId === question.id))
   assert.ok(reminders.length)
-  assert.ok(reminders.every(row => f.runtime.ownerDeliveryRelevant(f.runtime.mission(f.mission.id), row)))
+  assert.ok(reminders.every(row => f.runtime.notices.ownerDeliveryRelevant(f.runtime.mission(f.mission.id), row)))
   f.runtime.message(f.owner, f.mission.id, { to: f.member.id, kind: 'question', content: 'v2', replyTo: question.id })
-  assert.ok(reminders.every(row => !f.runtime.ownerDeliveryRelevant(f.runtime.mission(f.mission.id), row)))
-  await f.runtime.flushOutbox(f.mission.id)
+  assert.ok(reminders.every(row => !f.runtime.notices.ownerDeliveryRelevant(f.runtime.mission(f.mission.id), row)))
+  await f.runtime.notices.flushOutbox(f.mission.id)
   assert.ok(reminders.every(row => !f.workers.deliveries.some(sent => sent.id === row.id)), 'no answered reminder reaches transport')
 })
 
@@ -337,12 +337,12 @@ test('pre-upgrade receipt nudges expire by their existing structured question ke
   const f = await fixture(t)
   f.runtime.notices.pumpOutbox = () => {}
   const question = await f.ask()
-  f.runtime.commit(f.mission.id, () => f.runtime.notify(f.mission.id, 'legacy nudge', [`mission:${f.mission.id}`], { dedupKey: `owner-reply-missing:${question.id}:1` }))
+  f.runtime.commit(f.mission.id, () => f.runtime.notices.notify(f.mission.id, 'legacy nudge', [`mission:${f.mission.id}`], { dedupKey: `owner-reply-missing:${question.id}:1` }))
   const nudge = f.deliveries().find(row => row.notice?.dedupKey === `owner-reply-missing:${question.id}:1`)
   assert.equal(nudge.notice.questionId, undefined)
-  assert.equal(f.runtime.ownerDeliveryRelevant(f.runtime.mission(f.mission.id), nudge), true)
+  assert.equal(f.runtime.notices.ownerDeliveryRelevant(f.runtime.mission(f.mission.id), nudge), true)
   f.runtime.message(f.owner, f.mission.id, { to: f.member.id, kind: 'question', content: 'v2', replyTo: question.id })
-  assert.equal(f.runtime.ownerDeliveryRelevant(f.runtime.mission(f.mission.id), nudge), false)
+  assert.equal(f.runtime.notices.ownerDeliveryRelevant(f.runtime.mission(f.mission.id), nudge), false)
 })
 
 test('L2: a question one member asks another is not the owner\'s: an owner turn books no receipt and writes no nudge', async t => {
@@ -350,7 +350,7 @@ test('L2: a question one member asks another is not the owner\'s: an owner turn 
   const f = await fixture(t, { now: clock.now })
   const peer = await f.runtime.addMember(f.owner, f.mission.id, { name: 'Peer', role: 'implementation' })
   assert.equal(f.runtime.message(f.asker, f.mission.id, { to: peer.id, kind: 'question', content: 'Which API version did you target?' }).queued, true)
-  await f.runtime.flushOutbox(f.mission.id)
+  await f.runtime.notices.flushOutbox(f.mission.id)
   const ask = f.deliveries().find(row => row.from === f.member.id && row.to === peer.id)
   assert.deepEqual([ask.replyExpected, ask.state, ask.deliveredAt !== undefined], [true, 'open', true], 'the member\'s question is an open receipt, delivered')
   const guard = new OwnerReplyGuard(fakeContext(), f.runtime, { maxNudges: 2 })

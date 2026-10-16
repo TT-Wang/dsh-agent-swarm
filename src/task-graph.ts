@@ -1,8 +1,23 @@
-/** Pure functions of task and mission rows, shared by the runtime seams and the read-only projections. */
-import { PolicyError } from './policy-error.ts'
-import { criterionId, type EvidenceStatus, type Mission, type Task } from './types.ts'
+/**
+ * Pure functions of task and mission rows, shared by the runtime seams and the
+ * read-only projections. Every read takes an id as the rows hold it: one that
+ * names no task of the mission reads as no task (no row, an empty lineage, no
+ * effective task, a prerequisite never met). An id a caller supplies is refused
+ * where it enters (`SwarmRuntime.task`, the admission graph check), never here.
+ */
+import { criterionId, type Attempt, type EvidenceStatus, type Mission, type Task } from './types.ts'
 
 const oldest = (tasks: readonly Task[]): Task | undefined => [...tasks].sort((a, b) => a.createdAt - b.createdAt || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))[0]
+
+/**
+ * The edges of one task: its dependencies, in order, then its review source,
+ * which `prepareTask` merges into the worktree like a dependency. The graph
+ * validator, the board's dangling-edge rule, the plan order and the runtime's
+ * admission checks all read a task's edges here.
+ */
+export function taskEdges(node: { readonly dependencies: readonly string[]; readonly reviewOf?: string | undefined }): string[] {
+  return [...node.dependencies, ...(node.reviewOf === undefined ? [] : [node.reviewOf])]
+}
 
 export function taskGraphIndex(tasks: readonly Task[]) {
   const byId = new Map(tasks.map(task => [task.id, task]))
@@ -131,23 +146,27 @@ export function taskGraphIndex(tasks: readonly Task[]) {
   }
   const dependencyMet = (id: string): boolean => effective(id)?.status === 'accepted'
   /**
-   * The runtime's reads of an id it holds as one of this mission's tasks: the
-   * row, `lineage`, `effective` and `dependencyMet`, with one difference, an id
-   * that names no task of the mission is refused rather than read as no task.
-   * A projection, a classifier and a review source read the plain forms.
+   * Every prerequisite of `task` is met (`dependencyMet`). A worker tool's
+   * authority over its attempt, the worker step guard, a pending task's
+   * legitimate wait and a cancel's stranded dependents all ask it here.
    */
-  const taskOf = (id: string): Task => {
-    const task = byId.get(id)
-    if (task === undefined) throw new PolicyError('task_not_in_mission', 'validation_error', 'Task is not in this mission')
-    return task
-  }
-  const lineageOf = (id: string): Task[] => lineage(taskOf(id).id)
-  const effectiveOf = (id: string): Task => lineageOf(id).at(-1)!
-  const dependencyMetOf = (id: string): boolean => dependencyMet(taskOf(id).id)
-  /** Effective prerequisites for workspace preparation; one accepted repair covering several originals is merged once. */
+  const dependenciesMet = (task: Pick<Task, 'dependencies'>): boolean => task.dependencies.every(dependencyMet)
+  /**
+   * The first edge of `task` (`taskEdges`) that names no task of the mission.
+   * No work can ever meet such an edge, so the board's readers share this one
+   * rule: readiness refuses the task naming it, `unschedulable` holds the
+   * pending task dead, and `waitsLegitimately` holds that it waits on nothing,
+   * whatever else it also waits on.
+   */
+  const danglingReference = (task: Pick<Task, 'dependencies' | 'reviewOf'>): string | undefined => taskEdges(task).find(id => !byId.has(id))
+  /**
+   * The effective task of each dependency that names one, an accepted repair
+   * covering several originals merged once: the prerequisites workspace
+   * preparation merges, and the ones `unschedulable` judges.
+   */
   const effectiveDependencies = (task: Pick<Task, 'dependencies'>): Task[] => {
     const seen = new Set<string>()
-    return task.dependencies.map(dependency => effectiveOf(dependency)).filter(dependency => !seen.has(dependency.id) && seen.add(dependency.id))
+    return task.dependencies.flatMap(dependency => effective(dependency) ?? []).filter(dependency => !seen.has(dependency.id) && seen.add(dependency.id))
   }
   /**
    * R16-A: the EFFECTIVE unfinished prerequisites of one task, deduplicated in
@@ -206,7 +225,7 @@ export function taskGraphIndex(tasks: readonly Task[]) {
       return identities(id).has(sourceId) || covers(endpoint, sourceId, seen)
     })
   }
-  return { byId, lineage, effective, identities, dependencyMet, taskOf, lineageOf, effectiveOf, dependencyMetOf, effectiveDependencies, unfinishedDependencies,
+  return { byId, lineage, effective, identities, dependencyMet, dependenciesMet, danglingReference, effectiveDependencies, unfinishedDependencies,
     reviewSource, covers, replacementDescendants, liveReplacement, replacedLineage, criteriaOf, checklist }
 }
 
@@ -288,6 +307,40 @@ export function stopPending<T extends Pick<Task, 'epoch' | 'resumeAfterStop'>>(t
  * and completion decision treats it as live work.
  */
 export function quiescencePending<T extends Pick<Task, 'status' | 'epoch' | 'resumeAfterStop'>>(task: T): task is T & { resumeAfterStop: NonNullable<T['resumeAfterStop']> } { return task.status === 'blocked' && stopPending(task) }
+
+/** A task row that holds an attempt. */
+export type HeldTask = Task & { attempt: Attempt }
+
+/** The row holds an open attempt: it is running and carries its attempt. */
+export function holdsOpenAttempt(task: Task): task is HeldTask {
+  return task.status === 'running' && task.attempt !== undefined
+}
+
+/**
+ * The row still holds attempt `attemptId`: it exists in `missionId`, is
+ * running, and carries that attempt. The attempt id is the attempt's whole
+ * identity: assignment is the only way a row starts running, and it mints a
+ * fresh id at the row's new epoch, while every later epoch increment drops or
+ * replaces the attempt or touches a row that is not running. So a fencing
+ * transition committed since the caller read the attempt fails this check,
+ * and a caller that passes it writes over no such transition. The attempt
+ * seam's re-reads, the budget resume, a worker tool's authority over its
+ * attempt and an assignment delivery's currency all ask it; the last two put
+ * their owner check on top.
+ */
+export function holdsAttempt(row: Task | undefined, missionId: string, attemptId: string): row is HeldTask {
+  return row !== undefined && row.missionId === missionId && holdsOpenAttempt(row) && row.attempt.id === attemptId
+}
+
+/**
+ * The task on which `memberId` holds its open attempt, the one running attempt
+ * it owns: the attempt its tool calls, steps, activity and idle turns belong to.
+ * A member never holds two: assignment is the only way a row starts running,
+ * and its admission refuses a member that holds one (`lease_conflict`).
+ */
+export function openAttempt(tasks: readonly Task[], memberId: string): HeldTask | undefined {
+  return tasks.find((task): task is HeldTask => holdsOpenAttempt(task) && task.attempt.ownerId === memberId)
+}
 
 /** A fenced handle must finish stopping before that member can own new work. */
 export function pendingStopOwner(tasks: readonly Task[], memberId: string): boolean {

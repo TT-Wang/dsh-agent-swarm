@@ -1,7 +1,8 @@
 /**
  * Workspace and admission surface: the worker git-write refusal, the shared-temp
- * rendezvous detector, the human-authorized workspace roots and the isolation
- * invariant. M1a seam 6/7.
+ * rendezvous detector, the human-authorized workspace roots and dispatch
+ * admission by the isolation invariant (`isolationIssues`, a board function).
+ * M1a seam 6/7.
  *
  * Everything here is behaviour-identical to the code it was moved from
  * src/runtime.ts. The runtime keeps thin forwarding methods for the method group,
@@ -9,16 +10,15 @@
  */
 import { tmpdir } from 'node:os'
 import { stopPending, subjectsOfTasks, terminal } from './task-graph.ts'
-import { scopeKeysOverlap } from './scheduler.ts'
 import { claimFor, isContained, reauthorizeWorkspace, WorkspaceRevokedError, WORKSPACE_AUTHORIZATION_CODE, type WorkspaceClaim } from './authorization.ts'
 import { hasNotice } from './arena.ts'
 import { isolationOpener, noticeIdentity } from './notices.ts'
-import { noticeSubjectsFor } from './board.ts'
+import { isolationIssues, noticeSubjectsFor } from './board.ts'
 import { guardTerminalKey } from './refusals.ts'
 import type { SwarmRuntime } from './runtime.ts'
 import { progressed, type SchedulingPass } from './kernel.ts'
 import { absoluteCheckPaths, shellSegments } from './admission.ts'
-import type { Member, Mission, Task } from './types.ts'
+import type { Member, Mission } from './types.ts'
 
 /**
  * R11-15: the shared temp roots every workspace-write execution may write
@@ -508,65 +508,11 @@ export class WorkspaceAdmission {
    * (`Notices.openGuardTerminal`), and a changed violation is a new one.
    */
   isolationAllows(missionId: string, member: Member): boolean {
-    const violation = this.isolationIssues(missionId).find(entry => entry.memberIds.includes(member.id))
-    if (violation === undefined) return true
     const board = this.rt.boardOf(missionId)
+    const violation = isolationIssues(board).find(entry => entry.memberIds.includes(member.id))
+    if (violation === undefined) return true
     this.rt.notices.emitGuardTerminal(missionId, 'workspace', { subjects: violation.memberIds.flatMap(id => noticeSubjectsFor(board, { memberId: id })), localKey: isolationOpener(violation.message),
       detail: `the isolation invariant refuses dispatch: ${violation.message}` })
     return false
   }
-
-  /**
-   * S7: the isolation invariant, decided from durable state only.
-   *  - live workers ≤ provisioned isolated worktrees: every non-stopped member
-   *    owns a provisioned workspace and no two live members share one, so the
-   *    number of worker handles the runtime may hold can never exceed the number
-   *    of distinct isolated worktrees;
-   *  - two concurrently running tasks that share one isolated worktree must
-   *    declare disjoint scope: the dispatch path admits at most one running task
-   *    per worktree and refuses a second whose scope overlaps.
-   * This asserts the isolation the runtime already has; it never weakens
-   * per-member worktrees, it refuses a dispatch that would lose them.
-   */
-  isolationViolations(missionId: string): string[] {
-    return this.isolationIssues(missionId).map(issue => issue.message)
-  }
-
-  private isolationIssues(missionId: string): IsolationIssue[] {
-    return isolationIssues(this.rt.store.list('members', missionId), this.rt.store.list('tasks', missionId))
-  }
-}
-
-interface IsolationIssue { memberIds: string[]; message: string }
-
-/** Identity-bearing evidence shared by admission and its read-only explanation. */
-export function isolationIssues(allMembers: readonly Member[], tasks: readonly Task[]): IsolationIssue[] {
-    const violations: IsolationIssue[] = []
-    const members = allMembers.filter(member => member.status !== 'stopped')
-    const byWorkspace = new Map<string, Member[]>()
-    for (const member of members) {
-      if (!member.workspace) { violations.push({ memberIds: [member.id], message: `member ${member.id} (${member.name}) has no provisioned isolated worktree` }); continue }
-      byWorkspace.set(member.workspace, [...(byWorkspace.get(member.workspace) ?? []), member])
-    }
-    for (const [workspace, group] of byWorkspace) {
-      if (group.length > 1) violations.push({ memberIds: group.map(member => member.id), message: `live workers ${group.map(member => member.id).join(', ')} share one provisioned worktree (${workspace}); live workers must never exceed provisioned worktrees` })
-    }
-    const running = tasks.filter(task => task.status === 'running' && task.attempt !== undefined)
-    const byTaskWorkspace = new Map<string, Task[]>()
-    for (const task of running) {
-      const owner = allMembers.find(member => member.id === task.attempt!.ownerId)
-      if (owner === undefined || owner.status === 'stopped') { violations.push({ memberIds: [task.attempt!.ownerId], message: `running task ${task.id} has no live owner (${task.attempt!.ownerId})` }); continue }
-      byTaskWorkspace.set(owner.workspace, [...(byTaskWorkspace.get(owner.workspace) ?? []), task])
-    }
-    for (const [workspace, group] of byTaskWorkspace) {
-      if (group.length > 1) violations.push({ memberIds: group.map(task => task.attempt!.ownerId), message: `concurrently running tasks ${group.map(task => task.id).join(', ')} share worktree ${workspace}` })
-      for (let left = 0; left < group.length; left++) {
-        for (let right = left + 1; right < group.length; right++) {
-          if (group[left]!.scope.some(a => group[right]!.scope.some(b => scopeKeysOverlap(a, b)))) {
-            violations.push({ memberIds: [group[left]!.attempt!.ownerId, group[right]!.attempt!.ownerId], message: `concurrently running tasks ${group[left]!.id} and ${group[right]!.id} declare overlapping scope in worktree ${workspace}` })
-          }
-        }
-      }
-    }
-    return violations
 }

@@ -127,6 +127,48 @@ test('a failed checkpoint blocks the task and wakes the owner instead of reassig
   assert.match(notice.delivery.content, new RegExp(task.id))
 })
 
+/** An idle close-out whose checkpoint capture is held open until the owner has cancelled the task, then succeeds or fails. */
+async function cancelDuringCloseoutCapture(t, captureFails) {
+  const f = await fixture(t, { maxIdleCloseouts: 0, now: new FakeClock().now })
+  const task = f.propose()
+  await f.runtime.claim(f.actor(f.author), f.mission.id, task.id)
+  f.workers.idle.add(f.author.id)
+  const entered = deferred(), release = deferred()
+  f.workers.captureGate = async () => {
+    entered.resolve(); await release.promise
+    if (captureFails) throw new Error('git commit failed: index.lock EPERM')
+  }
+  f.workers.callbacks.idle(f.author.id)
+  await entered.promise
+  const cancelled = f.runtime.cancel(f.owner, f.mission.id, { taskId: task.id, reason: 'Owner withdraws while the close-out checkpoint is in flight' })
+  assert.equal(cancelled.status, 'cancelled')
+  release.resolve()
+  await f.runtime.settle(f.mission.id)
+  await f.runtime.tick()
+  const final = f.current(task.id)
+  assert.equal(final.status, 'cancelled', 'the close-out must not overwrite the owner cancel')
+  assert.equal(final.epoch, cancelled.epoch, 'the cancelled epoch is preserved')
+  assert.equal(f.events('task/claimed').filter(event => event.data.taskId === task.id).length, 1, 'the cancelled task is never re-claimed')
+  return { f, final }
+}
+
+test('an owner cancel during the idle close-out checkpoint is never overwritten by the close-out', async t => {
+  const { f, final } = await cancelDuringCloseoutCapture(t, false)
+  assert.equal(final.checkpoint, undefined, 'a checkpoint captured after the cancel is discarded')
+  assert.equal(f.events('task/closeout-abandoned').length, 0, 'the close-out abandons nothing the cancel already fenced')
+  assert.equal(f.events('mission/stalled').filter(event => event.data.cause === 'guard-terminal' && /idle close-out abandoned/.test(event.data.detail ?? '')).length, 0,
+    'no attempt/lease guard terminal names the cancelled attempt')
+})
+
+test('an idle close-out checkpoint that fails after an owner cancel reports nothing for the cancelled attempt', async t => {
+  const { f, final } = await cancelDuringCloseoutCapture(t, true)
+  assert.equal(final.resumeAfterStop, undefined, 'no invalidation barrier is laid over the cancel')
+  assert.equal(f.events('task/closeout-failed').length, 0, 'a capture failure after the cancel is not recorded as the attempt\'s close-out failure')
+  assert.equal(f.events('mission/stalled').filter(event => event.data.cause === 'guard-terminal' && /could not be checkpointed/.test(event.data.detail ?? '')).length, 0,
+    'no attempt/lease guard terminal names the cancelled attempt')
+  assert.equal(f.runtime.store.list('deliveries', f.mission.id).filter(row => /could not be checkpointed/.test(row.content ?? '')).length, 0, 'the owner is not told about the cancelled attempt')
+})
+
 test('an idle member without an open attempt is never treated as a close-out', async t => {
   const f = await fixture(t, { maxIdleCloseouts: 0 })
   f.workers.idle.add(f.author.id)
@@ -189,6 +231,35 @@ test('an owner cancel during the lease-expiry checkpoint is never overwritten by
   assert.equal(f.events('task/checkpointed').length, 0, 'a checkpoint committed after the cancel is discarded')
   assert.equal(f.events('task/claimed').filter(event => event.data.taskId === task.id).length, 1, 'the cancelled task is never re-claimed')
   assert.equal(f.workers.stopped.filter(id => id === f.author.id).length, 1, 'the released worker is stopped exactly once')
+})
+
+test('a lease-expiry checkpoint that fails after an owner cancel reports nothing for the cancelled attempt', async t => {
+  const clock = new FakeClock()
+  const leaseMs = 60
+  const f = await fixture(t, { leaseMs, now: clock.now })
+  const task = f.propose()
+  await f.runtime.claim(f.actor(f.author), f.mission.id, task.id)
+  f.workers.idle.add(f.author.id)
+  const entered = deferred(), release = deferred()
+  f.workers.captureGate = async () => { entered.resolve(); await release.promise; throw new Error('git commit failed: index.lock EPERM') }
+  clock.advance(leaseMs + 1)
+  f.workers.callbacks.idle(f.author.id)
+  await entered.promise
+  // The owner withdraws while captureArtifact is in flight, and the capture
+  // then fails: its failure belongs to an attempt the cancel already fenced.
+  const cancelled = f.runtime.cancel(f.owner, f.mission.id, { taskId: task.id, reason: 'Owner withdraws while the checkpoint is in flight' })
+  assert.equal(cancelled.status, 'cancelled')
+  release.resolve()
+  await f.runtime.settle(f.mission.id)
+  await f.runtime.tick()
+  const final = f.current(task.id)
+  assert.equal(final.status, 'cancelled', 'the failed checkpoint must not overwrite the owner cancel')
+  assert.equal(final.epoch, cancelled.epoch, 'the cancelled epoch is preserved')
+  assert.equal(f.events('task/checkpoint-failed').length, 0, 'a capture failure after the cancel is not audited as the attempt\'s checkpoint failure')
+  assert.equal(f.events('mission/stalled').filter(event => event.data.cause === 'guard-terminal' && /Lease-expiry checkpoint failed/.test(event.data.detail ?? '')).length, 0,
+    'no attempt/lease guard terminal names the cancelled attempt')
+  assert.equal(f.runtime.store.list('deliveries', f.mission.id).filter(row => /Lease-expiry checkpoint failed/.test(row.content ?? '')).length, 0, 'the owner is not told about the cancelled attempt')
+  assert.equal(f.events('task/lease-expired').length, 0, 'lease recovery abandons its transition after the cancel')
 })
 
 test('a failed lease-expiry checkpoint is audited and wakes the owner', async t => {

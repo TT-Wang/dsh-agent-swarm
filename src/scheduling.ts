@@ -6,11 +6,11 @@
  * board where it decides, after each of its awaits.
  */
 import { id } from './store.ts'
-import { TERMINAL_STATES, pendingStopOwner, quiescencePending, selectAcceptedDelivery, subjectsOfTasks, taskSubject, terminal } from './task-graph.ts'
+import { TERMINAL_STATES, holdsOpenAttempt, openAttempt, pendingStopOwner, quiescencePending, selectAcceptedDelivery, subjectsOfTasks, taskSubject, terminal } from './task-graph.ts'
 import { eligible, noticeSubjectsFor, overdueStop, ready, startBlocker, unschedulable } from './board.ts'
 import { factKey } from './notices.ts'
 import { AdmissionRefusedError } from './scheduler.ts'
-import { awaited, formatSpan, progressed, type SchedulingPass } from './kernel.ts'
+import { awaited, formatSpan, progressed, type PassState, type SchedulingPass } from './kernel.ts'
 // R17-G6/G7: the one derivation of the derived member status.
 import { memberPhaseOf } from './projection.ts'
 import { PolicyError } from './policy-error.ts'
@@ -124,7 +124,7 @@ export class Scheduling {
           if (startBlocker(this.rt.view, member) !== undefined) continue
           const view = this.rt.notices.interpretation(missionId)
           if (pendingStopOwner(view.tasks, member.id)) continue
-          const open = view.tasks.find(t => t.status === 'running' && t.attempt?.ownerId === member.id)
+          const open = openAttempt(view.tasks, member.id)
           if (open !== undefined) {
             // W6: the worker ended its turn with an open attempt. Nudge within a
             // bounded retry, then checkpoint the workspace and re-pend the task
@@ -132,9 +132,9 @@ export class Scheduling {
             // not an abandoned turn: the lease path re-pends it without a credit.
             // S5: the signal is re-read from the durable task row; the in-memory map
             // is only a cache for an attempt whose row write is still in flight.
-            const durableIdle = open.idleSignal?.attemptId === open.attempt?.id
-            const cachedIdle = this.rt.attempts.idleSignals.get(member.id)?.attemptId === open.attempt?.id
-            if (!parkedMember && (durableIdle || cachedIdle)) await this.rt.closeOutIdleAttempt(mission, member, open, pass)
+            const durableIdle = open.idleSignal?.attemptId === open.attempt.id
+            const cachedIdle = this.rt.attempts.idleSignals.get(member.id)?.attemptId === open.attempt.id
+            if (!parkedMember && (durableIdle || cachedIdle)) await this.rt.attempts.closeOutIdleAttempt(mission, member, open, pass)
             continue
           }
           const choices = view.tasks.filter(t => eligible(view, t, member)).sort((a, b) => b.priority - a.priority || a.createdAt - b.createdAt)
@@ -153,7 +153,8 @@ export class Scheduling {
             // (`SwarmRuntime.onRecoveryFallback`), which stamps the body that
             // marked the member it prepares before it commits the report.
             if (pass !== undefined) pass.preparing = member.id
-            try { await awaited(pass, this.rt.workers.prepareTask(member, { ...task, epoch: task.epoch + 1 }, this.rt.boardOf(missionId).graph.effectiveDependencies(task), task.reviewOf ? this.rt.task(missionId, task.reviewOf) : undefined), this.rt.now) }
+            const { graph } = this.rt.boardOf(missionId)
+            try { await awaited(pass, this.rt.workers.prepareTask(member, { ...task, epoch: task.epoch + 1 }, graph.effectiveDependencies(task), graph.reviewSource(task)), this.rt.now) }
             finally { if (pass !== undefined) delete pass.preparing }
             if (this.rt.shuttingDown || this.rt.mission(missionId).status !== 'active') return false
             const fresh = this.rt.task(missionId, task.id)
@@ -257,7 +258,7 @@ export class Scheduling {
     const now = this.rt.now()
     const holders: Array<{ subject: string; memberId?: string }> = []
     for (const task of this.rt.store.list('tasks', missionId)) {
-      const live = quiescencePending(task) || (task.status === 'running' && task.attempt !== undefined && task.attempt.leaseUntil >= now)
+      const live = quiescencePending(task) || (holdsOpenAttempt(task) && task.attempt.leaseUntil >= now)
       if (!live) continue
       const memberId = task.attempt?.ownerId ?? task.assigneeId
       holders.push({ subject: taskSubject(task), ...(memberId === undefined ? {} : { memberId }) })
@@ -277,7 +278,7 @@ export class Scheduling {
    * Co-firing guards: `livePass` (still the generation owner inside the bounded
    * live-work window), the wedge watchdog (`checkSchedulingPasses`, which names
    * the body inside the declared bound or the bounded live-work window), the
-   * notice publication (`SwarmRuntime.passState`) and `hasLiveWork`. It stays
+   * notice publication (`passState`) and `hasLiveWork`. It stays
    * true from the first bound until the body settles, named or not.
    */
   passWedged(missionId: string): boolean {
@@ -298,9 +299,10 @@ export class Scheduling {
   }
 
   /**
-   * R17-G5: the pass state a committed transition publishes with
-   * (`SwarmRuntime.passState`, read by the notice publication). A body past its
-   * bound that has itself made progress within the last bound (`progressAt`:
+   * R17-G5: the pass state a committed transition publishes with, which the
+   * notice publication reads through the closure the runtime hands `Notices`
+   * (`Notices.publishTransition`). A body past its bound that has itself made
+   * progress within the last bound (`progressAt`:
    * one of its own awaits returned, or it reached a member boundary) is not
    * sitting in the wedged await: it is running and reaches its own dispatch
    * question when it settles (or hands the unswept members to the next body),
@@ -310,7 +312,7 @@ export class Scheduling {
    * and wedged past it (`passWedged`), as before; a body without progress for a
    * whole bound is wedged again, whatever a worker turn it woke commits.
    */
-  passState(missionId: string): { passLive: boolean; wedged: boolean } {
+  passState(missionId: string): PassState {
     const pass = this.passes.get(missionId)
     const bound = this.rt.bounds.stallPassTimeoutMs
     if (pass?.progressAt !== undefined && this.pastBound(pass, pass.progressAt) && this.rt.now() - pass.progressAt <= bound) return { passLive: true, wedged: false }
@@ -495,7 +497,7 @@ export class Scheduling {
     const now = this.rt.now()
     return this.rt.store.list('tasks', missionId).some(task =>
       quiescencePending(task)
-      || (task.status === 'running' && task.attempt !== undefined && task.attempt.leaseUntil >= now))
+      || (holdsOpenAttempt(task) && task.attempt.leaseUntil >= now))
   }
 
   /* ----------------------------------------------------------------------- *
@@ -540,8 +542,8 @@ export class Scheduling {
    * `subject` is the attempt's task@epoch, the identity the escalation carries.
    */
   silentAttempt(task: Task, mission: Mission, now = this.rt.now()): SilentAttempt | undefined {
+    if (!holdsOpenAttempt(task)) return undefined
     const attempt = task.attempt
-    if (attempt === undefined || task.status !== 'running') return undefined
     const boundMs = this.rt.bounds.attemptSilenceBoundMs
     if (boundMs <= 0) return undefined
     if (!Number.isSafeInteger(attempt.leaseUntil)) return undefined

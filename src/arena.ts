@@ -9,7 +9,7 @@
  * board digest `F(S)` is the runtime's `missionFingerprint`, an instrument.
  */
 import { createHash } from 'node:crypto'
-import { taskGraphIndex } from './task-graph.ts'
+import { openAttempt, taskGraphIndex } from './task-graph.ts'
 import { assignmentAllows, canOwnReview } from './assignment.ts'
 import type { Delivery, Escalation, Member, Mission, NoticeClass, Task } from './types.ts'
 
@@ -152,14 +152,13 @@ interface ArenaView {
 export function arenaView(input: ArenaInput & { missionId: string; now: number; leaseMs: number; limit?: number }): ArenaView {
   const { missionId, now, leaseMs, limit = 20 } = input
   const notices = noticeLedger(input.deliveries, limit)
-  const running = input.tasks.filter(task => task.status === 'running' && task.attempt !== undefined)
   const graph = taskGraphIndex(input.tasks)
   return {
     missionId,
     status: input.mission.status,
     members: [...input.members].sort(byId).map(member => {
-      const current = running.find(task => task.attempt!.ownerId === member.id)
-      const attemptStart = current === undefined ? undefined : Math.max(0, current.attempt!.leaseUntil - leaseMs)
+      const current = openAttempt(input.tasks, member.id)
+      const attemptStart = current === undefined ? undefined : Math.max(0, current.attempt.leaseUntil - leaseMs)
       // A pending task illustrates a member's outstanding work. This diagnostic
       // is not a dispatch prediction: host readiness remains runtime-owned.
       const next = current === undefined
@@ -172,7 +171,7 @@ export function arenaView(input: ArenaInput & { missionId: string; now: number; 
       return {
         id: member.id, name: member.name, role: member.role, status: member.status,
         ...(member.activity === undefined ? {} : { activity: member.activity }),
-        ...(current === undefined ? {} : { currentTaskId: current.id, attemptId: current.attempt!.id, attemptAgeMs: Math.max(0, now - attemptStart!) }),
+        ...(current === undefined ? {} : { currentTaskId: current.id, attemptId: current.attempt.id, attemptAgeMs: Math.max(0, now - attemptStart!) }),
         ...(next === undefined ? {} : { pendingTaskId: next.id }),
         pendingDependencies: (current?.dependencies ?? next?.dependencies ?? []).filter(dependency => !graph.dependencyMet(dependency)),
         subscriptions: [...member.subscriptions],

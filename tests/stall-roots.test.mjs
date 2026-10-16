@@ -308,7 +308,7 @@ test('one rejection is one owner wake for its root: the stall root is recorded a
   const precision = wakePrecision(f.runtime, f.mission.id)
   assert.equal(precision.decisions.byFamily['stall-root'], undefined, `the covered row is no wake: ${JSON.stringify(precision.decisions.byFamily)}`)
   assert.equal(precision.falseWakes.total, 0, `its listed rejecting review is no false wake: ${JSON.stringify(precision.falseWakes)}`)
-  const ledger = f.runtime.noticeLedger(f.owner, f.mission.id).ledger
+  const ledger = f.runtime.observe(f.owner, f.mission.id, { detail: 'full' }).noticeLedger
   assert.equal(ledger.some(entry => entry.deliveryId === root.id), false, 'the covered row is not a ledger entry')
   assert.deepEqual(ledger.filter(entry => entry.state === 'queued').map(entry => entry.dedupKey), [], 'nothing is left queued')
   const observed = f.runtime.observe(f.owner, f.mission.id)
@@ -416,15 +416,15 @@ test('a rejected root whose decision was summarized is its own fact, and is name
   let held = 0
   const deliver = rt.workers.deliver.bind(rt.workers)
   rt.workers.deliver = async (member, delivery) => { if (member.id === 'owner' && hold) { held += 1; await gate } return deliver(member, delivery) }
-  const flush = rt.flushOutbox.bind(rt)
-  rt.flushOutbox = (missionId, pass, only) => hold && pass !== undefined ? Promise.resolve() : flush(missionId, pass, only)
+  const flush = rt.notices.flushOutbox.bind(rt.notices)
+  rt.notices.flushOutbox = (missionId, pass, only) => hold && pass !== undefined ? Promise.resolve() : flush(missionId, pass, only)
   const noBody = () => eventually(() => !rt.scheduling.passes.has(f.mission.id), 'no scheduling body is open')
   const reviewer = await rt.addMember(f.owner, f.mission.id, { name: 'Reviewer', role: 'verification' })
   const other = await rt.addMember(f.owner, f.mission.id, { name: 'Other', role: 'implementation' })
   await rt.settle(f.mission.id)
   const sibling = f.propose('Healthy sibling', { kind: 'research', checks: undefined, assigneeId: other.id })
   await rt.claim({ sessionId: other.sessionId }, f.mission.id, sibling.id)
-  rt.commit(f.mission.id, () => rt.notify(f.mission.id, 'First owner fact', [`mission:${f.mission.id}`], { trigger: 'probe/first', reason: 'first' }))
+  rt.commit(f.mission.id, () => rt.notices.notify(f.mission.id, 'First owner fact', [`mission:${f.mission.id}`], { trigger: 'probe/first', reason: 'first' }))
   const unrelated = f.propose('Unrelated dead end', { kind: 'research', checks: undefined, assigneeId: other.id })
   await eventually(() => held > 0, 'the first owner fact is held in transport')
   await noBody()
@@ -438,7 +438,7 @@ test('a rejected root whose decision was summarized is its own fact, and is name
   // In the same macrotask another task dies and the owner is asked to decide it.
   rt.commit(f.mission.id, () => {
     const row = rt.store.get('tasks', unrelated.id); row.status = 'blocked'; row.epoch++; row.output = 'blocked for repair'; rt.store.put('tasks', row)
-    rt.notify(f.mission.id, `Task ${unrelated.id} is blocked; decide`, [`${unrelated.id}@${row.epoch}`], { trigger: 'probe/unrelated-decision', reason: 'unrelated' })
+    rt.notices.notify(f.mission.id, `Task ${unrelated.id} is blocked; decide`, [`${unrelated.id}@${row.epoch}`], { trigger: 'probe/unrelated-decision', reason: 'unrelated' })
   })
   const rootSubject = `${source.id}@${rt.store.get('tasks', source.id).epoch}`
   const facts = () => f.notices().flatMap(delivery => delivery.notice?.aggregatedFacts === undefined
@@ -477,7 +477,7 @@ test('a stall root with no rejection decision (a permanent preparation failure) 
     row.preparationFailure = { reason: 'Workspace or worker preparation failed: EACCES', transient: false, attempts: 1 }
     row.output = 'Workspace or worker preparation failed: EACCES'
     f.runtime.store.put('tasks', row)
-    f.runtime.notify(f.mission.id, row.output, [`${row.id}@${row.epoch}`], { trigger: 'task/preparation-failed', reason: row.preparationFailure.reason })
+    f.runtime.notices.notify(f.mission.id, row.output, [`${row.id}@${row.epoch}`], { trigger: 'task/preparation-failed', reason: row.preparationFailure.reason })
   })
   await f.runtime.settle(f.mission.id)
   const root = await ticksUntil(f, () => f.stallRoots().find(delivery => delivery.deliveredAt !== undefined), 'the stall root is delivered as its own wake', 320)
@@ -648,7 +648,7 @@ for (const coNotice of ['stall-root', 'permanent-preparation-failure']) {
         dead.preparationFailure = { reason: 'Workspace or worker preparation failed: EACCES', transient: false, attempts: 1 }
         dead.output = 'Workspace or worker preparation failed: EACCES'
         f.runtime.store.put('tasks', dead)
-        f.runtime.notify(f.mission.id, dead.output, [`${dead.id}@${dead.epoch}`], { trigger: 'task/preparation-failed', reason: dead.preparationFailure.reason })
+        f.runtime.notices.notify(f.mission.id, dead.output, [`${dead.id}@${dead.epoch}`], { trigger: 'task/preparation-failed', reason: dead.preparationFailure.reason })
       } else {
         dead.output = 'blocked for repair'
         f.runtime.store.put('tasks', dead)
@@ -711,7 +711,7 @@ test('an expired back-off that still waits (queued behind a live lease) is never
   })
   await ticksUntil(f, () => f.stallRoots()[0] && f.fallthroughs()[0], 'the unrelated stall root and the dead work are told')
   await ticks(f, Math.ceil((Math.max(0, retryAt + tickMs - f.clock.now()) + 100) / tickMs))
-  await f.runtime.flushOutbox(f.mission.id)
+  await f.runtime.notices.flushOutbox(f.mission.id)
   const notices = f.runtime.notices
   const judged = [], commits = []
   const ensure = notices.ensureWitness.bind(notices)

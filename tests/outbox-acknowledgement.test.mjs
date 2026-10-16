@@ -28,7 +28,7 @@ async function fixture(t, config = {}) {
   const member = await runtime.addMember(owner, mission.id, { name: 'Asker', role: 'implementation' })
   const rows = () => runtime.store.list('deliveries', mission.id)
   const emit = key => {
-    runtime.commit(mission.id, () => runtime.notify(mission.id, key, [`mission:${mission.id}`], { dedupKey: key }))
+    runtime.commit(mission.id, () => runtime.notices.notify(mission.id, key, [`mission:${mission.id}`], { dedupKey: key }))
     return rows().find(row => row.notice?.dedupKey === key)
   }
   return { runtime, workers, owner, mission, member, rows, emit }
@@ -48,7 +48,7 @@ for (const action of ['stop', 'pause']) {
       interrupted = true
       f.runtime.control(f.owner, mission.id, action, 'owner decision during transport')
     }
-    await f.runtime.flushOutbox(mission.id)
+    await f.runtime.notices.flushOutbox(mission.id)
     assert.ok(interrupted, 'the lifecycle change happened inside the awaited transport')
     const current = f.runtime.mission(mission.id)
     assert.equal(current.status, action === 'stop' ? 'stopped' : 'paused')
@@ -70,7 +70,7 @@ test('outbox checks a queued question again after it is answered during another 
     f.runtime.message(f.owner, f.mission.id, { to: f.member.id, kind: 'question', content: 'v2', replyTo: question.id })
     f.runtime.control(f.owner, f.mission.id, 'pause', 'answer settled before pausing')
   }
-  await f.runtime.flushOutbox(f.mission.id)
+  await f.runtime.notices.flushOutbox(f.mission.id)
   assert.equal(f.runtime.store.get('deliveries', question.id).answeredBy, 'owner')
   assert.equal(f.workers.sent.some(row => row.id === question.id), false, 'pause retains only questions still awaiting an answer')
 })
@@ -89,7 +89,7 @@ for (const differentDelivery of [false, true]) {
       current.outboxStarved = newer
       f.runtime.store.put('missions', current)
     }
-    await f.runtime.flushOutbox(mission.id)
+    await f.runtime.notices.flushOutbox(mission.id)
     assert.deepEqual(f.runtime.mission(mission.id).outboxStarved, newer)
   })
 }
@@ -99,12 +99,12 @@ test('outbox acknowledgement preserves consumption and reply counters written du
   const notice = f.emit('consumption')
   f.workers.intercept = async (_member, delivery) => {
     if (delivery.id !== notice.id) return
-    assert.equal(f.runtime.recordConsumption(notice.id, { at: 123456, source: 'agent/inbox/claimed' }), true)
+    assert.equal(f.runtime.notices.recordConsumption(notice.id, { at: 123456, source: 'agent/inbox/claimed' }), true)
     const current = f.runtime.store.get('deliveries', notice.id)
     current.replyNudges = 2
     f.runtime.store.put('deliveries', current)
   }
-  await f.runtime.flushOutbox(f.mission.id)
+  await f.runtime.notices.flushOutbox(f.mission.id)
   const current = f.runtime.store.get('deliveries', notice.id)
   assert.ok(current.deliveredAt)
   assert.equal(current.notice.consumedAt, 123456)
@@ -121,7 +121,7 @@ for (const dismiss of [false, true]) {
       if (delivery.id !== question.id) return
       f.runtime.message(f.owner, f.mission.id, { to: f.member.id, kind: 'question', content: 'v2', replyTo: question.id, dismiss })
     }
-    await f.runtime.flushOutbox(f.mission.id)
+    await f.runtime.notices.flushOutbox(f.mission.id)
     const current = f.runtime.store.get('deliveries', question.id)
     assert.ok(current.deliveredAt)
     assert.equal(current.state, dismiss ? 'dismissed' : 'answered')
@@ -140,11 +140,11 @@ test('wake-summary facts arriving during transport get a new deliverable summary
   f.workers.intercept = async (_member, delivery) => {
     if (delivery.id === summary.id) f.emit('fact-during-transport')
   }
-  await f.runtime.flushOutbox(f.mission.id)
+  await f.runtime.notices.flushOutbox(f.mission.id)
   const queued = f.rows().find(row => row.id !== summary.id && row.notice?.facts?.some(fact => fact.includes('fact-during-transport')))
   assert.ok(queued, 'an already handed-off message cannot absorb a fact the owner never received')
   assert.equal(queued.deliveredAt, undefined)
-  await f.runtime.flushOutbox(f.mission.id)
+  await f.runtime.notices.flushOutbox(f.mission.id)
   assert.ok(f.workers.sent.some(row => row.id === queued.id && row.content.includes('fact-during-transport')))
 })
 
@@ -162,10 +162,10 @@ test('wake-summary facts after a transport timeout survive adapter deduplication
     // never settles. A later retry acknowledges its ID without replacing content.
     if (delivery.id === summary.id) return new Promise(() => {})
   }
-  await f.runtime.flushOutbox(f.mission.id)
+  await f.runtime.notices.flushOutbox(f.mission.id)
   assert.equal(f.runtime.mission(f.mission.id).outboxStarved?.deliveryId, summary.id)
   f.emit('fact-after-timeout')
-  await f.runtime.flushOutbox(f.mission.id)
+  await f.runtime.notices.flushOutbox(f.mission.id)
   const delivered = [...accepted.values()].find(row => row.content.includes('fact-after-timeout'))
   assert.ok(delivered, 'a retry must not acknowledge a new fact the native inbox never received')
   assert.notEqual(delivered.id, summary.id, 'an attempted summary stays immutable after its gate is released')
@@ -180,7 +180,7 @@ test('worker transport failure creates one actionable local incident and settles
   f.workers.intercept = async member => { if (member.id !== 'owner') throw new Error('Worker must be started before delivery') }
   const queue = content => f.runtime.message(f.owner, f.mission.id, { to: f.member.id, kind: 'finding', content })
   queue('first'); queue('second')
-  await f.runtime.flushOutbox(f.mission.id)
+  await f.runtime.notices.flushOutbox(f.mission.id)
   const health = () => f.rows().filter(row => row.notice?.deliveryFailureId)
   assert.equal(health().length, 1, 'one member fault despite two messages')
   const observed = f.runtime.observe(f.owner, f.mission.id, {})
@@ -192,18 +192,18 @@ test('worker transport failure creates one actionable local incident and settles
   assert.match(health()[0].content, /queued but cannot be delivered/)
   f.runtime.workstream(f.owner, f.mission.id, { title: 'Unrelated', objective: 'Unrelated board progress' })
   queue('third')
-  await f.runtime.flushOutbox(f.mission.id)
+  await f.runtime.notices.flushOutbox(f.mission.id)
   assert.equal(health().length, 1, 'unrelated progress does not repeat the same local incident')
-  assert.ok(f.runtime.ownerDeliveryRelevant(f.runtime.mission(f.mission.id), health()[0]))
+  assert.ok(f.runtime.notices.ownerDeliveryRelevant(f.runtime.mission(f.mission.id), health()[0]))
   f.workers.intercept = async () => {}
-  await f.runtime.flushOutbox(f.mission.id)
-  assert.equal(f.runtime.ownerDeliveryRelevant(f.runtime.mission(f.mission.id), health()[0]), false, 'successful retry settles the incident')
+  await f.runtime.notices.flushOutbox(f.mission.id)
+  assert.equal(f.runtime.notices.ownerDeliveryRelevant(f.runtime.mission(f.mission.id), health()[0]), false, 'successful retry settles the incident')
   const recovered = f.runtime.observe(f.owner, f.mission.id, { cursor: observed.nextCursor })
   assert.equal(recovered.members.find(member => member.id === f.member.id).deliveryHealth, undefined)
 
   f.workers.intercept = async member => { if (member.id !== 'owner') throw new Error('Worker must be started before delivery') }
   queue('new incident')
-  await f.runtime.flushOutbox(f.mission.id)
+  await f.runtime.notices.flushOutbox(f.mission.id)
   assert.equal(health().length, 2, 'a new outage after recovery remains visible')
 })
 
@@ -220,16 +220,16 @@ for (const summary of [false, true]) test(`budget allocation changes remove stal
   const warning = f.rows().find(row => summary ? row.notice?.aggregatedFacts?.some(fact => fact.trigger === 'mission/budget-warning') : row.notice?.trigger === 'mission/budget-warning')
   assert.ok(warning)
   f.runtime.updateBudget(f.owner, mission.id, { ...mission.budget, maxTokens: 200000 }, 'tokens reviewed')
-  assert.equal(f.runtime.ownerDeliveryRelevant(f.runtime.mission(mission.id), warning), true)
-  const content = f.runtime.ownerDeliveryContent(f.runtime.mission(mission.id), warning)
+  assert.equal(f.runtime.notices.ownerDeliveryRelevant(f.runtime.mission(mission.id), warning), true)
+  const content = f.runtime.notices.ownerDeliveryContent(f.runtime.mission(mission.id), warning)
   assert.doesNotMatch(content, /maxTokens settled/)
   assert.match(content, /maxSteps settled/)
-  await f.runtime.flushOutbox(mission.id)
+  await f.runtime.notices.flushOutbox(mission.id)
   const sent = f.workers.sent.find(row => row.id === warning.id)
   assert.doesNotMatch(sent.content, /maxTokens settled/)
   assert.match(sent.content, /maxSteps settled/)
   f.runtime.updateBudget(f.owner, mission.id, { ...mission.budget, maxTokens: 200000, maxSteps: 2000 }, 'steps reviewed')
-  assert.equal(f.runtime.ownerDeliveryRelevant(f.runtime.mission(mission.id), warning), false, 'all old allocations reviewed')
+  assert.equal(f.runtime.notices.ownerDeliveryRelevant(f.runtime.mission(mission.id), warning), false, 'all old allocations reviewed')
 })
 
 
@@ -239,17 +239,17 @@ for (const missing of [false, true]) test(`${missing ? 'missing' : 'stopped'} du
   const recipient = missing ? 'missing-recipient' : f.member.id
   for (let index = 0; index < 3; index++) f.runtime.store.put('deliveries', { id: `undeliverable-${index}`, missionId: f.mission.id, from: 'owner', to: recipient, kind: 'finding', content: `Pending fact ${index}`, createdAt: Date.now() })
   if (!missing) f.runtime.store.put('members', { ...f.member, phase: 'stopped' })
-  await f.runtime.flushOutbox(f.mission.id)
-  await f.runtime.flushOutbox(f.mission.id)
+  await f.runtime.notices.flushOutbox(f.mission.id)
+  await f.runtime.notices.flushOutbox(f.mission.id)
   const incidents = f.rows().filter(row => row.notice?.deliveryFailureId)
   assert.equal(incidents.length, 1)
   assert.match(incidents[0].content, missing ? /missing from the durable member roster/ : /is stopped/)
   assert.equal(f.workers.sent.filter(row => row.to === recipient).length, 0)
-  assert.ok(f.runtime.ownerDeliveryRelevant(f.runtime.mission(f.mission.id), incidents[0]))
+  assert.ok(f.runtime.notices.ownerDeliveryRelevant(f.runtime.mission(f.mission.id), incidents[0]))
   f.runtime.store.put('members', { ...f.member, id: recipient, phase: 'active' })
-  await f.runtime.flushOutbox(f.mission.id)
+  await f.runtime.notices.flushOutbox(f.mission.id)
   assert.equal(f.workers.sent.filter(row => row.to === recipient).length, 3)
-  assert.equal(f.runtime.ownerDeliveryRelevant(f.runtime.mission(f.mission.id), incidents[0]), false)
+  assert.equal(f.runtime.notices.ownerDeliveryRelevant(f.runtime.mission(f.mission.id), incidents[0]), false)
 })
 
 
@@ -267,11 +267,11 @@ for (const summary of [false, true]) test(`cancelled task preservation failure r
   f.runtime.attempts.reportStopFailure(f.mission.id, row)
   const notice = f.rows().find(item => summary ? item.notice?.aggregatedFacts?.some(fact => fact.dedupKey.includes(':stop:')) : item.notice?.dedupKey.includes(':stop:'))
   assert.ok(notice)
-  assert.equal(f.runtime.ownerDeliveryRelevant(f.runtime.mission(f.mission.id), notice), true)
+  assert.equal(f.runtime.notices.ownerDeliveryRelevant(f.runtime.mission(f.mission.id), notice), true)
   assert.deepEqual(f.runtime.notices.unresolvedSubjects(f.runtime.notices.interpretation(f.mission.id), notice), [`${row.id}@${row.epoch}`], 'cancelled execution still owes its saved workspace')
   const cleaned = f.runtime.task(f.mission.id, row.id); delete cleaned.resumeAfterStop
   f.runtime.commit(f.mission.id, () => f.runtime.store.put('tasks', cleaned))
-  assert.equal(f.runtime.ownerDeliveryRelevant(f.runtime.mission(f.mission.id), notice), false)
-  await f.runtime.flushOutbox(f.mission.id)
+  assert.equal(f.runtime.notices.ownerDeliveryRelevant(f.runtime.mission(f.mission.id), notice), false)
+  await f.runtime.notices.flushOutbox(f.mission.id)
   assert.equal(f.workers.sent.some(sent => sent.id === notice.id), false)
 })

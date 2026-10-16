@@ -116,7 +116,7 @@ test('failed idle capture follows the same confirmed stop barrier', async () => 
     f.workers.stop = async () => { await stop.promise }
     let saved = false
     f.workers.checkpointTask = async () => { saved = true }
-    await f.runtime.closeOutIdleAttempt(f.runtime.mission(f.mission.id), f.author, claimed)
+    await f.runtime.attempts.closeOutIdleAttempt(f.runtime.mission(f.mission.id), f.author, claimed)
     assert.equal(taskOf(f.runtime, task.id).resumeAfterStop.reason, 'invalidated')
     await assert.rejects(f.runtime.claim(f.actor(f.author), f.mission.id, next.id), /previous attempt to stop/)
     stop.resolve()

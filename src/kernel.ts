@@ -41,6 +41,7 @@ export interface Kernel {
   exclusive<T>(missionId: string, fn: () => Promise<T>): Promise<T>
   kick(missionId: string, after?: SchedulingPass): void
   mission(missionId: string): Mission
+  /** A caller's task id, refused where it enters, or the re-read of a row the call holds; an id a stored row holds for another task is read through `boardOf(missionId).graph` (an assignment delivery's, by `assignmentCurrent`). */
   task(missionId: string, taskId: string): Task
   isWorkerSession(sessionId: string): boolean
   fingerprint(missionId: string): string
@@ -107,6 +108,15 @@ export interface SchedulingPass {
   /** Set when this body stopped early at a member boundary: the first member it did not sweep. */
   stoppedBefore?: string
 }
+
+/**
+ * The scheduling pass state a committed transition is published with
+ * (`Scheduling.passState`): a live pass that is not wedged owns the
+ * publication, and a wedged one is published with the wedged branch. The
+ * notices read it through the closure the runtime hands them, their one reach
+ * above the kernel.
+ */
+export interface PassState { passLive: boolean; wedged: boolean }
 
 /**
  * A scheduling body's own progress stamp (`SchedulingPass.progressAt`). The body

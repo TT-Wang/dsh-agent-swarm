@@ -67,7 +67,7 @@ async function fixture(t, respond = () => text('Done'), configure, profile = {})
   // The owner session's own cwd, authorized as the session workspace every production caller records.
   const mission = rt.create(owner, { title: 'Native owner notices', objective: 'Preserve correct owner work', workspace: source, scope: ['**'], acceptance: ['correct'], budget: { ...budget, maxTokens: 100000, maxSteps: 1000, maxWorkers: 4, maxDurationMs: 3600000, maxTasks: 100 } }, { grantRoot: source, source: 'session' })
   const emit = (content, options = {}) => {
-    rt.commit(mission.id, () => rt.notify(mission.id, content, [`mission:${mission.id}`], { dedupKey: content, ...options }))
+    rt.commit(mission.id, () => rt.notices.notify(mission.id, content, [`mission:${mission.id}`], { dedupKey: content, ...options }))
     return rt.store.list('deliveries', mission.id).find(row => row.notice?.dedupKey === content)
   }
   return { ctx, rt, owner, agent: handle.agent, mission, requests, emit }
@@ -99,7 +99,7 @@ test('full plugin books first consumed question before the transport flush ackno
     }
   })
   f.rt.message({ sessionId: member.sessionId }, f.mission.id, { to: 'owner', kind: 'question', content: 'Which API?' })
-  await f.rt.flushOutbox(f.mission.id); await f.agent.whenIdle()
+  await f.rt.notices.flushOutbox(f.mission.id); await f.agent.whenIdle()
   const question = openAsks(f.rt.store.list('deliveries', f.mission.id), 'owner')[0]
   assert.ok(question?.consumedAt)
   assert.equal(ackAtConsumption, undefined, 'fixture reaches consumption before flush ack')
@@ -119,7 +119,7 @@ for (const continuation of ['prose', 'tool', 'mixed']) test(`stop filters queued
   f.agent.send(input('ordinary-work', 'Ordinary independent owner work'), 'next-turn', true)
   await entered.promise
   const notice = f.emit('STALE_MISSION_DECISION')
-  await f.rt.flushOutbox(f.mission.id)
+  await f.rt.notices.flushOutbox(f.mission.id)
   assert.ok(f.agent.inbox.nextStep.some(message => message.source.kind === 'swarm'))
   if (continuation === 'mixed') f.agent.send(input('second-ordinary', 'SECOND_INDEPENDENT_REQUEST'), 'next-step', true)
   f.rt.control(f.owner, f.mission.id, 'stop', 'user stopped only this mission')
@@ -141,7 +141,7 @@ test('consumer rechecks messages already claimed while another pre-step handler 
     })
   })
   const notice = f.emit('STALE_CLAIMED_DECISION')
-  const flushing = f.rt.flushOutbox(f.mission.id)
+  const flushing = f.rt.notices.flushOutbox(f.mission.id)
   await entered.promise
   assert.equal(f.agent.inbox.nextStep.length, 0, 'the native loop already claimed it')
   f.rt.control(f.owner, f.mission.id, 'stop', 'stopped during step preparation')
@@ -155,7 +155,7 @@ test('completed mission facts still reach the owner after automatic completion o
   const notice = f.emit('COMPLETION_FACT_MUST_SURVIVE', { noticeClass: 'completion' })
   const mission = f.rt.mission(f.mission.id); mission.status = 'completed'
   f.rt.commit(mission.id, () => f.rt.store.put('missions', mission))
-  await f.rt.flushOutbox(mission.id); await f.agent.whenIdle()
+  await f.rt.notices.flushOutbox(mission.id); await f.agent.whenIdle()
   assert.equal(f.requests.length, 1)
   assert.match(JSON.stringify(f.requests[0]), /COMPLETION_FACT_MUST_SURVIVE/)
   assert.ok(f.rt.store.get('deliveries', notice.id).notice.consumedAt)
@@ -182,7 +182,7 @@ test('a wedged pass\'s naming handed to a busy owner is read once the body has s
   f.agent.send(input('ordinary-work', 'Ordinary independent owner work'), 'next-turn', true)
   await entered.promise
   const first = wedge('operation_host_1')
-  await rt.flushOutbox(mid)
+  await rt.notices.flushOutbox(mid)
   assert.ok(namings()[0]?.deliveredAt !== undefined && f.agent.inbox.nextStep.some(message => message.source.kind === 'swarm'), 'the naming waits in the owner\'s inbox for its step to end')
   // The hung call returns at its own bound while that request is still streaming.
   scheduling.closePass(mid, first)
@@ -191,7 +191,7 @@ test('a wedged pass\'s naming handed to a busy owner is read once the body has s
   // The same call hangs again for later bodies: the naming fact the owner holds.
   for (const operationId of ['operation_host_2', 'operation_host_3']) {
     const pass = wedge(operationId)
-    await rt.flushOutbox(mid); await f.agent.whenIdle()
+    await rt.notices.flushOutbox(mid); await f.agent.whenIdle()
     assert.deepEqual([pass.escalatedAt !== undefined, namings().length, read()], [true, 1, 1], 'a body on the held fact is marked named by the row the owner has read')
     scheduling.closePass(mid, pass)
   }

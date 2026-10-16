@@ -11,6 +11,7 @@ import assert from 'node:assert/strict'
 import { join } from 'node:path'
 import { LlmError } from '@deepseek-ai/dsh-llm'
 import { classifyProviderOutage } from '../lib/scheduler.js'
+import { PROVIDER_OUTAGE_WINDOW_MS } from '../lib/types.js'
 import { FakeClock, FakeWorkers, eventually, makeRuntime } from './faults/harness.mjs'
 
 class OutageWorkers extends FakeWorkers {
@@ -135,4 +136,79 @@ test('R11-01: a reroute that passes over a name-first candidate inside its outag
   assert.deepEqual(reassigned.map(event => [event.data.from, event.data.to]), [[failing.id, cat.id]],
     `the work moved to Cat, first in store order outside an outage window, not to Bob, first by name (${JSON.stringify({ cat: cat.id, bob: bob.id, amy: amy.id })})`)
   assert.equal(runtime.store.get('tasks', task.id).assigneeId, cat.id)
+})
+
+/**
+ * One native session per member, as the Harness adapter keeps it: a start of a
+ * member whose session is running adopts it and resolves true, opening nothing,
+ * so the outage the member's provider reported stays recorded.
+ */
+class ResidentWorkers extends OutageWorkers {
+  sessions = new Set()
+  /** A member's next start throws this error once. */
+  nextStartFault = new Map()
+  async start(spec) {
+    if (spec.member.id === this.failFor) throw this.failWith
+    const fault = this.nextStartFault.get(spec.member.id)
+    if (fault !== undefined) { this.nextStartFault.delete(spec.member.id); throw fault }
+    this.started.push(spec.member.id)
+    const adopted = this.sessions.has(spec.member.id)
+    this.sessions.add(spec.member.id)
+    return adopted
+  }
+}
+
+test('R11-01: a recorded outage quiets its route only inside its window: past it, re-routed work takes the member and its start failure is counted', async t => {
+  const clock = new FakeClock()
+  const workers = new ResidentWorkers()
+  const { dir: directory, runtime, budget } = await makeRuntime(t, { workers, clock,
+    config: { maxMessageChars: 10000, maxEvents: 500, checkTimeoutMs: undefined },
+    budget: { maxTokens: 100000, maxSteps: 1000, maxWorkers: 4, maxDurationMs: 3600000, maxTasks: 100 } })
+  await runtime.start()
+  const owner = { sessionId: 'outage-owner' }
+  const mission = runtime.create(owner, { title: 'Outage', objective: 'Route around a provider outage', workspace: directory, scope: ['**'], acceptance: ['works'], budget }, { grantRoot: directory, source: 'session' })
+  const stream = runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Main' })
+  const failing = await runtime.addMember(owner, mission.id, { name: 'Failing', role: 'implementation' })
+  // Store order (Cat, Bob, Amy) is the reverse of name order.
+  const cat = await runtime.addMember(owner, mission.id, { name: 'Cat', role: 'implementation' })
+  const bob = await runtime.addMember(owner, mission.id, { name: 'Bob', role: 'implementation' })
+  const amy = await runtime.addMember(owner, mission.id, { name: 'Amy', role: 'implementation' })
+  await runtime.settle(mission.id)
+  const events = type => runtime.store.events(mission.id, 500).filter(event => event.type === type)
+  const ids = JSON.stringify({ cat: cat.id, bob: bob.id, amy: amy.id })
+
+  // Amy's provider reports an outage while her session runs. The passes after
+  // its window adopt her session, so the outage stays recorded past the window.
+  workers.callbacks.providerOutage(amy.id, { class: 'rate-limit', status: 429, message: 'Rate limit reached for requests' })
+  const startsOfAmy = () => workers.started.filter(id => id === amy.id).length
+  const before = startsOfAmy()
+  clock.advance(PROVIDER_OUTAGE_WINDOW_MS + 1)
+  await runtime.tick()
+  await runtime.settle(mission.id)
+  assert.ok(startsOfAmy() > before, 'a pass past the window started Amy, adopting her running session')
+  assert.equal(runtime.store.get('members', amy.id).providerOutage?.class, 'rate-limit', 'an adopting start leaves the outage recorded')
+  assert.deepEqual(events('provider/recovered'), [], 'and records no recovery')
+
+  // Work leaving a route in its own outage goes to Amy, first by name: past
+  // her window her recorded outage no longer makes her the last resort.
+  workers.failFor = failing.id
+  workers.failWith = new LlmError('insufficient quota for this account', 'QUOTA', { status: 402 })
+  const task = runtime.propose(owner, mission.id, { outputs: [], workstreamId: stream.id, title: 'Work', objective: 'Work', kind: 'implementation',
+    scope: ['**'], acceptance: ['works'], checks: ['test'], assigneeId: failing.id, maxRecoveryAttempts: 1 })
+  await runtime.settle(mission.id)
+  assert.deepEqual(events('task/reassigned').map(event => [event.data.from, event.data.to]), [[failing.id, amy.id]], `the work moved to Amy, not past her (${ids})`)
+  assert.equal(runtime.store.get('tasks', task.id).assigneeId, amy.id)
+
+  // Amy's next start fails with an ordinary error. Past her window it is her
+  // failure, not the outage: counted, the owner told failure 1 of 3, and the
+  // work kept on her route below the retirement bound.
+  workers.nextStartFault.set(amy.id, new Error('worker bootstrap failed for Amy'))
+  await runtime.tick()
+  await runtime.settle(mission.id)
+  const failed = events('member/resume-failed').filter(event => event.data.memberId === amy.id)
+  assert.deepEqual(failed.map(event => [event.data.consecutiveFailures, event.data.outage]), [[1, undefined]], 'the failure is counted, not read as the recorded outage')
+  assert.equal(runtime.store.get('members', amy.id).startFailures, 1)
+  assert.deepEqual(events('task/start-failed').filter(event => event.data.taskId === task.id && /bootstrap/.test(event.data.reason)).map(event => event.data.quiescent), [false])
+  assert.ok(runtime.store.list('deliveries', mission.id).some(delivery => /Amy could not start \(failure 1 of 3\)/.test(delivery.content)), 'the owner is told the counted failure')
+  assert.equal(runtime.store.get('tasks', task.id).assigneeId, amy.id, 'a counted failure below the bound keeps the work on the route')
 })

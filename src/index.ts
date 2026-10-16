@@ -158,7 +158,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     if (delivery === undefined || delivery.to !== 'owner') return undefined
     const mission = runtime.store.get('missions', delivery.missionId)
     if (mission?.ownerSessionId !== sessionId) return undefined
-    return runtime.ownerDeliveryRelevant(mission, delivery) ? runtime.ownerDeliveryContent(mission, delivery) : false
+    return runtime.notices.ownerDeliveryRelevant(mission, delivery) ? runtime.notices.ownerDeliveryContent(mission, delivery) : false
   })
   ctx.effect(() => runtime.subscribe(missionId => {
     const mission = runtime.store.get('missions', missionId)

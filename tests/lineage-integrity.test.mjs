@@ -79,6 +79,27 @@ test('lineage resolves deterministically to the oldest live replacement for impo
   assert.deepEqual(view(), view(), 'repeated resolution is identical')
 })
 
+test('a member\'s current assignment renders a replaced dependency as the task its lineage reaches, with that task\'s output and the ids it replaced, in the focused view and in the delta', async t => {
+  const f = await fixture(t)
+  const original = f.propose({ title: 'Original' })
+  await f.block(original)
+  const repair = f.propose({ title: 'Repair', replaces: [original.id] })
+  f.runtime.store.transaction(() => f.runtime.store.put('tasks', { ...f.current(repair), status: 'accepted', output: 'the accepted repair output' }))
+  const dependent = f.propose({ title: 'Dependent', dependencies: [original.id] })
+  // The first read sets the member's cursor with no current assignment, so the
+  // claim below changes it and the next default read (a delta) carries it.
+  assert.equal(f.runtime.observe(f.actor(f.author), f.mission.id).current, null)
+  await f.runtime.claim(f.actor(f.author), f.mission.id, dependent.id)
+  const rendered = view => view.current.dependencies.map(({ id, status, output, replacementOf }) => ({ id, status, output, replacementOf }))
+  const expected = [{ id: repair.id, status: 'accepted', output: 'the accepted repair output', replacementOf: [original.id] }]
+  const delta = f.runtime.observe(f.actor(f.author), f.mission.id)
+  assert.equal(delta.delta, true)
+  assert.deepEqual(rendered(delta), expected, 'the delta carries the effective dependency, its output and the replaced ids')
+  const focused = f.runtime.observe(f.actor(f.author), f.mission.id, { after: 0 })
+  assert.equal(focused.delta, undefined)
+  assert.deepEqual(rendered(focused), expected, 'and so does the focused view')
+})
+
 test('replacement admission rejects a cycle before persisting the task or check-change events', async t => {
   const f = await fixture(t)
   const original = f.propose({ title: 'Original' })

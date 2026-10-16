@@ -108,7 +108,7 @@ test('F1: a silent in-flight operation escalates with a durable witness naming m
   assert.equal(escalation.to, 'owner')
   assert.equal(escalation.notice.class, 'stall')
   assert.equal(noticeFamily(escalation), 'stall', 'its family is its class, never the W3 board stall (`board-stall`)')
-  assert.equal(runtime.ownerDeliveryRelevant(runtime.mission(mission.id), escalation), true, 'it stays relevant while the operation holds the attempt')
+  assert.equal(runtime.notices.ownerDeliveryRelevant(runtime.mission(mission.id), escalation), true, 'it stays relevant while the operation holds the attempt')
   assert.equal(escalation.notice.sentAt > 0, true)
   for (const needle of [member.name, member.id, task.id, task.title, 'job_output', 'without recording anything', 'operationBoundMs', 'swarm_cancel', 'swarm_observe']) {
     assert.ok(escalation.content.includes(needle), `the owner notice must name ${needle}: ${escalation.content}`)

@@ -10,8 +10,9 @@
 import { createHash } from 'node:crypto'
 import { id } from './store.ts'
 import { arenaView as projectArenaView, hasNotice, openAsks } from './arena.ts'
-import { TERMINAL_STATES, currentEvidenceIds, subjectsOfTasks, terminal } from './task-graph.ts'
+import { TERMINAL_STATES, currentEvidenceIds, holdsAttempt, holdsOpenAttempt, subjectsOfTasks, terminal } from './task-graph.ts'
 import { excerpt } from './declared-checks.ts'
+import { dropAttempt } from './attempts.ts'
 import { executionElapsed } from './resource-time.ts'
 import { memberPhaseOf } from './projection.ts'
 import { dispatchable } from './board.ts'
@@ -293,7 +294,7 @@ export class RuntimeGates {
     mission.budgetPause = { id: id('budget-pause'), quiesced: false }
     this.rt.commit(mission.id, () => {
       this.rt.store.put('missions', mission)
-      for (const task of this.rt.store.list('tasks', mission.id)) if (task.status === 'running' && task.attempt) {
+      for (const task of this.rt.store.list('tasks', mission.id)) if (holdsOpenAttempt(task)) {
         task.budgetResume = { pauseId: mission.budgetPause!.id, attemptId: task.attempt.id, epoch: task.epoch }
         // S5: every task write is a compare-and-swap on the task's own revision.
         // These records were read inside this transaction, so the presented
@@ -365,10 +366,10 @@ export class RuntimeGates {
         const resume = task.budgetResume
         if (!resume || resume.pauseId !== pause.id) continue
         delete task.budgetResume
-        if (task.status !== 'running' || !task.attempt || task.attempt.id !== resume.attemptId || task.epoch !== resume.epoch) {
+        if (!holdsAttempt(task, mission.id, resume.attemptId)) {
           // The pause marker outlived its attempt (challenge, handoff or restart):
           // re-pend the work without charging a recovery attempt.
-          if (task.status === 'running') { task.status = 'pending'; this.rt.dropAttempt(task) }
+          if (task.status === 'running') { task.status = 'pending'; dropAttempt(task) }
           // S5: compare-and-swap on the task's own revision (see blockBudget).
           this.rt.store.putTask(task)
           this.rt.store.event(mission.id, 'task/budget-resume-skipped', 'runtime', { taskId: task.id, pauseId: pause.id })

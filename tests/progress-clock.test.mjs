@@ -167,7 +167,7 @@ test('every real writer of a progress kind moves the clock to its own write; oth
   await step(['mission/resume'], () => runtime.control(owner, mission.id, 'resume', 'Continue the work'))
   const ask = async content => {
     await step(['message/queued'], () => runtime.message(f.actor(f.author), mission.id, { to: 'owner', kind: 'question', content }), { progress: false })
-    await runtime.flushOutbox(mission.id)
+    await runtime.notices.flushOutbox(mission.id)
     return runtime.store.list('deliveries', mission.id).filter(row => row.from === f.author.id && row.to === 'owner' && row.replyExpected).at(-1)
   }
   const first = await ask('Which answer is wanted?')

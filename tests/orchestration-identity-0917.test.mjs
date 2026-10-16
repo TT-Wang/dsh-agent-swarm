@@ -72,8 +72,8 @@ test('C04: an ancestor fork cannot displace an accepted repair or change a runni
   const tasksBefore = f.runtime.store.list('tasks', f.mission.id).length
   assert.throws(() => f.propose('Competing ancestor repair', { replaces: [original.id] }), error => /already replaced/.test(error.message) && error.message.includes(current.id))
   assert.equal(f.runtime.store.list('tasks', f.mission.id).length, tasksBefore)
-  assert.equal(f.runtime.boardOf(f.mission.id).graph.effectiveOf(original.id).id, current.id)
-  assert.equal(f.runtime.boardOf(f.mission.id).graph.dependencyMetOf(original.id), true)
+  assert.equal(f.runtime.boardOf(f.mission.id).graph.effective(original.id).id, current.id)
+  assert.equal(f.runtime.boardOf(f.mission.id).graph.dependencyMet(original.id), true)
   assert.equal(f.runtime.task(f.mission.id, integration.id).attempt.id, running.attempt.id)
   assert.equal(f.workers.callbacks.guard(f.integrator.id, 'write_file'), undefined)
 })
@@ -82,7 +82,7 @@ test('C04: a pending descendant also prevents an ancestor from admitting a compe
   const f = await fixture(t)
   const { original, current } = await replacementChain(f)
   assert.throws(() => f.propose('Competing repair', { replaces: [original.id] }), error => /already replaced/.test(error.message) && error.message.includes(current.id))
-  assert.equal(f.runtime.boardOf(f.mission.id).graph.effectiveOf(original.id).id, current.id)
+  assert.equal(f.runtime.boardOf(f.mission.id).graph.effective(original.id).id, current.id)
 })
 
 test('C04: legacy forks keep an accepted descendant visible and refuse ambiguous accepted branches', () => {
@@ -145,7 +145,7 @@ test('C09: a scope correction preserves untouched preferred borrowing, while exe
 for (const paused of [false, true]) test(`C06: a ${paused ? 'paused' : 'live'} owner cannot settle a question by sending its answer to another member`, async t => {
   const f = await fixture(t)
   f.runtime.message(f.actor(f.author), f.mission.id, { to: 'owner', kind: 'question', content: 'Which result should I produce?' })
-  await f.runtime.flushOutbox(f.mission.id)
+  await f.runtime.notices.flushOutbox(f.mission.id)
   const question = openAsks(f.runtime.store.list('deliveries', f.mission.id), 'owner')[0]
   if (paused) f.runtime.control(f.owner, f.mission.id, 'pause', 'Pause while considering the answer')
   const before = f.runtime.store.list('deliveries', f.mission.id)
@@ -185,7 +185,7 @@ test('dependency amendments report full replacement and cancellation names the s
   assert.deepEqual(withdrawn.strandedDependents, [integration.id])
   assert.equal(f.runtime.task(f.mission.id, integration.id).status, 'pending')
   const repair = f.propose('Corrected input', { replaces: [second.id] })
-  assert.equal(f.runtime.boardOf(f.mission.id).graph.effectiveOf(second.id).id, repair.id)
+  assert.equal(f.runtime.boardOf(f.mission.id).graph.effective(second.id).id, repair.id)
   assert.deepEqual(f.runtime.task(f.mission.id, integration.id).dependencies, [second.id], 'replacement reuses the dependent instead of duplicating delivery work')
 })
 

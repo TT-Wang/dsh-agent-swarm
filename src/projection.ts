@@ -3,9 +3,10 @@
  *
  * - R17-G6: mission derived state used to be re-derived by every consumer from
  *   raw rows. This module holds the single derivation (`memberPhaseOf`,
- *   `deriveMemberStatus`, `deriveMemberBoard`) that the runtime's read face, the
- *   guard model and the owner/UI views all consume, so no consumer carries its
- *   own version of it.
+ *   `deriveMemberStatus`), which the store applies at its one member read face
+ *   (`SwarmStore.list('members')`); the runtime's member board, the guard model
+ *   and the owner/UI views all read that hydrated row, so no consumer carries
+ *   its own version of it.
  *
  * - R17-G7: a durable member `status` mirrored a live fact (the R15-F2 seam: a
  *   member row reading `idle` while a live attempt exists). The status is now a
@@ -31,7 +32,7 @@
  * face whether or not a projection registry is mounted.
  */
 import type { Context } from '@deepseek-ai/cordis'
-import type { Delivery, Member, MemberPhase, MemberStatus, Task, WorkerAdapter } from './types.ts'
+import type { Delivery, Member, MemberPhase, MemberStatus, WorkerAdapter } from './types.ts'
 
 /** Current transport trouble, derived from pending delivery rows rather than another health state machine. */
 export function memberDeliveryHealth(deliveries: readonly Delivery[]): Map<string, { pending: number; failed: number; since: number; reason: string }> {
@@ -63,11 +64,6 @@ export function memberPhaseOf(member: Pick<Member, 'phase'> & { status?: MemberS
   return 'active'
 }
 
-/** Whether a member currently owns a running task attempt. */
-function ownsLiveAttempt(memberId: string, tasks: readonly Task[]): boolean {
-  return tasks.some(task => task.status === 'running' && task.attempt !== undefined && task.attempt.ownerId === memberId)
-}
-
 /**
  * R17-G7: the one derivation of the live member status.
  *
@@ -90,23 +86,7 @@ export function deriveMemberStatus(phase: MemberPhase, ownsLiveAttempt: boolean)
   return ownsLiveAttempt ? 'working' : 'idle'
 }
 
-/** One member view: the durable row plus the derived status, from the one derivation. */
-function memberView(member: Member, tasks: readonly Task[]): Member {
-  const phase = memberPhaseOf(member)
-  return { ...member, phase, status: deriveMemberStatus(phase, ownsLiveAttempt(member.id, tasks)) }
-}
-
-/** The derived view of every member row, in the input order. */
-function memberViews(members: readonly Member[], tasks: readonly Task[]): Member[] {
-  return members.map(member => memberView(member, tasks))
-}
-
-/** The derived member board: what every consumer reads instead of re-deriving. */
-export function deriveMemberBoard(members: readonly Member[], tasks: readonly Task[]): MissionBoardMember[] {
-  return memberViews(members, tasks).map(member => ({ id: member.id, phase: memberPhaseOf(member), status: member.status }))
-}
-
-/** The derived mission board, from durable rows only. */
+/** The host context the worker adapter carries, or undefined when it carries none. */
 export function hostContextOf(workers: WorkerAdapter): Context | undefined {
   const candidate = (workers as unknown as { ctx?: unknown }).ctx
   if (candidate === null || typeof candidate !== 'object') return undefined

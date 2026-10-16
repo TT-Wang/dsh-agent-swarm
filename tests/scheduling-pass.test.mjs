@@ -118,7 +118,7 @@ test('S1/S5: a body wedged past its bound is named while it holds the mission, a
     assert.equal(event.data.boundMs, 200, 'the declared bound is named in the event')
     assert.equal(event.data.runId, wedged.operationId, 'the event names the wedged body')
     assert.equal(workers.wedgeSettledAt, undefined, 'it was named while the body still held the mission')
-    assert.deepEqual(f.runtime.passState(f.mission.id), { passLive: false, wedged: true }, 'the mission publishes as wedged, not as inside a live pass')
+    assert.deepEqual(f.runtime.scheduling.passState(f.mission.id), { passLive: false, wedged: true }, 'the mission publishes as wedged, not as inside a live pass')
     assert.equal(scheduling.passes.get(f.mission.id), wedged, 'no later tick replaced the body the queue still owns')
     await ticks(f, (workers.wedgedAt + startBoundMs - clock.now()) / 20)
     assert.equal(scheduling.passes.get(f.mission.id), wedged, 'no tick up to the start bound replaced it either')
@@ -187,7 +187,7 @@ test('S2: the naming of a wedged body is delivered in its own tick, by the tick\
   try {
     const bound = f.runtime.bounds.stallPassTimeoutMs
     await f.runtime.settle(f.mission.id)
-    f.runtime.commit(f.mission.id, () => f.runtime.notify(f.mission.id, 'A notice whose delivery hangs', [`mission:${f.mission.id}`], { trigger: 'test/held', reason: 'held' }))
+    f.runtime.commit(f.mission.id, () => f.runtime.notices.notify(f.mission.id, 'A notice whose delivery hangs', [`mission:${f.mission.id}`], { trigger: 'test/held', reason: 'held' }))
     f.runtime.notices.pumpOutbox()
     await held.entered.promise
     f.runtime.kick(f.mission.id)
@@ -231,7 +231,7 @@ test('S2: every row a tick\'s guards tell is delivered by that tick\'s pump once
     await f.runtime.claim(f.actor(f.author), f.mission.id, task.id)
     await f.runtime.settle(f.mission.id)
     assert.equal(taskOf(f.runtime, task.id).status, 'running', 'a claimed attempt is running')
-    f.runtime.commit(f.mission.id, () => f.runtime.notify(f.mission.id, 'A notice whose delivery hangs', [`mission:${f.mission.id}`], { trigger: 'test/held', reason: 'held' }))
+    f.runtime.commit(f.mission.id, () => f.runtime.notices.notify(f.mission.id, 'A notice whose delivery hangs', [`mission:${f.mission.id}`], { trigger: 'test/held', reason: 'held' }))
     f.runtime.notices.pumpOutbox()
     await held.entered.promise
     clock.advance(bound / 2)
@@ -275,7 +275,7 @@ test('S2: a row a tick tells while the pump in flight is inside its bound is del
     const task = f.propose()
     await f.runtime.claim(f.actor(f.author), f.mission.id, task.id)
     await f.runtime.settle(f.mission.id)
-    f.runtime.commit(f.mission.id, () => f.runtime.notify(f.mission.id, 'A notice whose delivery hangs', [`mission:${f.mission.id}`], { trigger: 'test/held', reason: 'held' }))
+    f.runtime.commit(f.mission.id, () => f.runtime.notices.notify(f.mission.id, 'A notice whose delivery hangs', [`mission:${f.mission.id}`], { trigger: 'test/held', reason: 'held' }))
     const before = new Set(f.runtime.operations)
     f.runtime.notices.pumpOutbox()
     const pump = [...f.runtime.operations].find(operation => !before.has(operation))
@@ -377,12 +377,12 @@ test('S1: the exits a wedge naming names work through the owner\'s registered to
       if (exit === 'swarm_cancel') {
         assert.equal(taskOf(f.runtime, stuck.id).status, 'cancelled', 'the withdrawn work stays withdrawn')
         assert.equal(f.runtime.store.list('deliveries', f.mission.id).some(delivery => delivery.kind === 'assignment' && delivery.taskId === stuck.id), false, 'no pass dispatches it')
-        assert.equal(f.runtime.ownerDeliveryRelevant(mission, f.runtime.store.get('deliveries', naming.id)), false, 'the exit retires the naming')
+        assert.equal(f.runtime.notices.ownerDeliveryRelevant(mission, f.runtime.store.get('deliveries', naming.id)), false, 'the exit retires the naming')
       } else {
         const dispatched = taskOf(f.runtime, repair.id)
         assert.deepEqual([dispatched.status, dispatched.attempt?.ownerId], ['running', builder.id], 'the next pass dispatches the repair to its member')
         assert.ok(f.runtime.store.list('deliveries', f.mission.id).some(delivery => delivery.kind === 'assignment' && delivery.taskId === repair.id && delivery.deliveredAt !== undefined), 'and its assignment is delivered')
-        assert.equal(f.runtime.ownerDeliveryRelevant(mission, f.runtime.store.get('deliveries', naming.id)), true, 'the work the naming named is still unfinished, so the naming holds')
+        assert.equal(f.runtime.notices.ownerDeliveryRelevant(mission, f.runtime.store.get('deliveries', naming.id)), true, 'the work the naming named is still unfinished, so the naming holds')
       }
     } finally {
       wedge?.release.reject(new Error('Worker startup timed out (released by the test)'))
@@ -841,7 +841,7 @@ test('S1/R17-G5: the body stamps each delivery of its own pass-end outbox flush,
     await ticks(f, 30)
     workers.slowOwnerMs = 60
     const startedAt = clock.now()
-    for (const n of [1, 2, 3]) f.runtime.commit(f.mission.id, () => f.runtime.notify(f.mission.id, `Owner fact ${n}`, [`mission:${f.mission.id}`], { from: 'runtime', dedupKey: `flush-fact-${n}` }))
+    for (const n of [1, 2, 3]) f.runtime.commit(f.mission.id, () => f.runtime.notices.notify(f.mission.id, `Owner fact ${n}`, [`mission:${f.mission.id}`], { from: 'runtime', dedupKey: `flush-fact-${n}` }))
     f.runtime.kick(f.mission.id)
     await f.runtime.settle(f.mission.id)
     const last = f.runtime.store.list('deliveries', f.mission.id).find(item => item.content === 'Owner fact 3' && item.deliveredAt !== undefined)
@@ -937,7 +937,7 @@ test('S1/R17-G5: a worker turn the body woke inside an adapter call keeps commit
     const beatsAtNaming = workers.heartbeats
     await beating(100)
     assert.ok(workers.heartbeats > beatsAtNaming, 'the woken turn keeps committing its heartbeats during the wedge')
-    assert.deepEqual(f.runtime.passState(f.mission.id), { passLive: false, wedged: true }, 'yet the body publishes as wedged, not as a live pass')
+    assert.deepEqual(f.runtime.scheduling.passState(f.mission.id), { passLive: false, wedged: true }, 'yet the body publishes as wedged, not as a live pass')
     const z = f.propose({ title: 'Z work for idle I', assigneeId: i.id })
     const zQuestion = () => f.runtime.store.list('deliveries', f.mission.id)
       .find(item => item.to === 'owner' && item.notice?.dedupKey?.startsWith(`dispatch-question:${f.mission.id}:${z.id}@`))
@@ -1034,9 +1034,15 @@ test('S1: a body past its bound stops at the next member boundary, so lease reco
   }
 })
 
-/** Record every scheduling body as it closes, with the pass-end steps it ran, and count the outbox flushes. */
+/**
+ * Record every scheduling body as it closes, with the pass-end steps it ran, and
+ * count the bodies' outbox flushes. The notices also run both steps on their own
+ * (a publication judges the board with its branch, the pump flushes with no pass
+ * record), so only the body's calls count: its witness names no branch, and its
+ * flush hands its pass record.
+ */
 function watchBodies(f) {
-  const scheduling = f.runtime.scheduling
+  const scheduling = f.runtime.scheduling, notices = f.runtime.notices
   const bodies = []
   const ran = new WeakMap()
   const mark = (missionId, step) => { const pass = scheduling.passes.get(missionId); if (pass !== undefined) ran.set(pass, { ...ran.get(pass), [step]: true }) }
@@ -1046,10 +1052,10 @@ function watchBodies(f) {
     bodies.push({ stopped: pass.stoppedBefore !== undefined, sweepFrom: pass.sweepFrom, witnessed: ran.get(pass)?.witnessed === true, flushed: ran.get(pass)?.flushed === true })
     return closePass(missionId, pass)
   }
-  const ensureWitness = f.runtime.ensureWitness.bind(f.runtime)
-  f.runtime.ensureWitness = (missionId, ...rest) => { mark(missionId, 'witnessed'); return ensureWitness(missionId, ...rest) }
-  const flushOutbox = f.runtime.flushOutbox.bind(f.runtime)
-  f.runtime.flushOutbox = (missionId, ...rest) => { flushes += 1; mark(missionId, 'flushed'); return flushOutbox(missionId, ...rest) }
+  const ensureWitness = notices.ensureWitness.bind(notices)
+  notices.ensureWitness = (missionId, options) => { if (options === undefined) mark(missionId, 'witnessed'); return ensureWitness(missionId, options) }
+  const flushOutbox = notices.flushOutbox.bind(notices)
+  notices.flushOutbox = (missionId, pass, ...rest) => { if (pass !== undefined) { flushes += 1; mark(missionId, 'flushed') } return flushOutbox(missionId, pass, ...rest) }
   return { bodies, flushes: () => flushes }
 }
 

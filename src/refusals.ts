@@ -8,6 +8,7 @@
  */
 import { admissionRowId, decideAdmission, defaultLimitRules, scopeKeysOverlap, type AdmissionCandidate, type AdmissionDecision, type AdmissionRecord, type AdmissionUsage, type LimitRule } from './scheduler.ts'
 import { WriterBusyError } from './store.ts'
+import { openAttempt } from './task-graph.ts'
 import { PolicyError } from './policy-error.ts'
 import type { Kernel } from './kernel.ts'
 import type { Budget, Member, Mission, Task } from './types.ts'
@@ -89,11 +90,11 @@ export class RefusalRegistry {
 
   /** Concurrent slots in use, derived from live leases rather than a memory queue. */
   admissionUsage(missionId: string, candidate: AdmissionCandidate, member: Member): AdmissionUsage {
-    const running = this.k.store.list('tasks', missionId).filter(task => task.status === 'running')
+    const tasks = this.k.store.list('tasks', missionId), running = tasks.filter(task => task.status === 'running')
     return {
       scope: running.filter(task => scopeKeysOverlap(task.scope[0] ?? '**', candidate.scope)).length,
       taskClass: running.filter(task => task.kind === candidate.taskClass).length,
-      agent: running.filter(task => task.attempt?.ownerId === member.id).length,
+      agent: openAttempt(tasks, member.id) === undefined ? 0 : 1,
     }
   }
 

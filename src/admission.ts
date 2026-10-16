@@ -7,6 +7,7 @@ import { scopeSubset, validScope, withinScope } from './scope.ts'
 import { DEFAULT_VERIFICATION_DEPENDENCY_DIRS, SWARM_SCRATCH_DIRNAME } from './workspaces.ts'
 import { criterionId, type TaskCeiling, type TaskCeilingDimension, type TaskCeilingProvenance } from './types.ts'
 import { PolicyError, type PolicyErrorCategory } from './policy-error.ts'
+import { taskEdges } from './task-graph.ts'
 
 /** Accept equivalent notation without guessing a wider path or a repository root. */
 export function normalizeScopeSelectors(scopes: readonly string[]): string[] {
@@ -77,14 +78,12 @@ export interface TaskGraphDefect {
  * Every defect in `nodes`. `known` is the set of identities the caller can prove
  * exist — the mission's durable task ids at admission, the replayed ids on the
  * replay path; when it is omitted, the node ids are the known set. The edges of
- * a node are its `dependencies` plus its `reviewOf` source, which `prepareTask`
- * merges into the worktree like a dependency.
+ * a node are `taskEdges`.
  */
 export function taskGraphDefects(nodes: readonly TaskGraphNode[], known?: ReadonlySet<string>): TaskGraphDefect[] {
   const defects: TaskGraphDefect[] = []
   const knownIds = known ?? new Set(nodes.map(node => node.id))
   const seen = new Set<string>()
-  const edges = (node: TaskGraphNode): string[] => [...node.dependencies, ...(node.reviewOf === undefined ? [] : [node.reviewOf])]
   for (const node of nodes) {
     if (seen.has(node.id)) {
       defects.push({ code: 'task_graph_duplicate', taskId: node.id, target: node.id,
@@ -92,7 +91,7 @@ export function taskGraphDefects(nodes: readonly TaskGraphNode[], known?: Readon
     }
     seen.add(node.id)
   }
-  for (const node of nodes) for (const target of edges(node)) {
+  for (const node of nodes) for (const target of taskEdges(node)) {
     if (target === node.id) {
       defects.push({ code: 'task_graph_self_edge', taskId: node.id, target,
         message: `task ${JSON.stringify(node.id)} declares an edge to itself. Remove ${JSON.stringify(node.id)} from its own \`dependencies\` and re-propose it with \`swarm_propose\`, then retry the same task/request.` })
@@ -112,7 +111,7 @@ export function taskGraphDefects(nodes: readonly TaskGraphNode[], known?: Readon
     if (open.has(id) || done.has(id)) return
     open.add(id)
     const node = byId.get(id)
-    for (const target of node === undefined ? [] : edges(node)) {
+    for (const target of node === undefined ? [] : taskEdges(node)) {
       if (target === id || !byId.has(target)) continue
       if (open.has(target)) {
         defects.push({ code: 'task_graph_cycle', taskId: id, target,
@@ -325,14 +324,15 @@ export function reconcileTaskAdmission(task: DependencyAssumptionInput, location
   // half). It fires only when the caller supplies the task's dependency set, so
   // a call site that does not know the edges can never refuse a legitimate task.
   diagnostics.push(...dependencyAssumptions(task, location, context))
-  // DEAD, admission-time half: the same graph validator the replay path runs.
-  // It fires only when the caller supplies the mission's durable identities —
-  // without them, "unknown edge" cannot be distinguished from "not loaded yet",
-  // and the guard must never guess. The candidate's own id is not part of the
-  // admission input, so the self-edge and cycle checks are the replay path's
-  // (a brand-new node cannot close a cycle: nothing references it yet).
-  if (context.knownContents !== undefined) {
-    const candidate: TaskGraphNode = { id: `${location} candidate`, dependencies: context.dependencies ?? task.dependencies ?? [] }
+  // DEAD, admission-time half: the same graph validator the replay path runs,
+  // over the task's own edges as its node. It fires only when the caller
+  // supplies those edges and the mission's durable identities — without them,
+  // "unknown edge" cannot be distinguished from "not loaded yet", and the guard
+  // must never guess. The candidate's own id is not part of the admission
+  // input, so the self-edge and cycle checks are the replay path's (a
+  // brand-new node cannot close a cycle: nothing references it yet).
+  if (context.knownContents !== undefined && task.edges !== undefined) {
+    const candidate: TaskGraphNode = { id: `${location} candidate`, dependencies: task.edges.dependencies, reviewOf: task.edges.reviewOf }
     for (const defect of taskGraphDefects([candidate], context.knownContents)) diagnostics.push(taskGraphDiagnostic(defect, location))
   }
   return diagnostics
@@ -361,17 +361,21 @@ export function reconcileTaskAdmission(task: DependencyAssumptionInput, location
  * both exits.
  * ------------------------------------------------------------------------- */
 
+/** The task being admitted: its text, its edges and the tasks it replaces. */
 interface DependencyAssumptionInput {
   objective: string
   acceptance?: readonly string[]
-  dependencies?: readonly string[]
+  /**
+   * The task's edges, as the graph stores them: its dependencies and its
+   * review source, which `prepareTask` merges into the worktree like a
+   * dependency (`taskEdges`). Absent means unknown, never "none".
+   */
+  edges?: Pick<TaskGraphNode, 'dependencies' | 'reviewOf'>
   replaces?: readonly string[]
 }
 
+/** What the caller knows about the mission the task enters. */
 interface DependencyAssumptionContext {
-  /** The declared dependency set. Absent means unknown, never "empty". */
-  dependencies?: readonly string[]
-  replaces?: readonly string[]
   /** Identities this mission already holds; every caller passes its durable task ids. */
   knownContents?: ReadonlySet<string>
   /**
@@ -435,14 +439,13 @@ export function dependencyAssumptionDiagnostic(named: string, field: string, cla
 
 /**
  * The R12-F9 admission guard: diagnostics for every clause of the objective and
- * acceptance that assumes prior work while the declared dependency set is empty.
- * A call site that does not supply the dependency set gets an empty list — the
+ * acceptance that assumes prior work while the task has no edge (`taskEdges`).
+ * A call site that does not supply the task's edges gets an empty list — the
  * guard never guesses, because guessing would refuse a legitimate task.
  */
 export function dependencyAssumptions(task: DependencyAssumptionInput, location: string, context: DependencyAssumptionContext = {}): AdmissionDiagnostic[] {
-  const dependencies = context.dependencies ?? task.dependencies
-  if (dependencies === undefined || dependencies.length > 0) return []
-  const replaces = new Set(context.replaces ?? task.replaces ?? [])
+  if (task.edges === undefined || taskEdges(task.edges).length > 0) return []
+  const replaces = new Set(task.replaces ?? [])
   const fields: Array<[string, string]> = [['objective', task.objective], ...(task.acceptance ?? []).map((item, index) => [`acceptance[${index}]`, item] as [string, string])]
   const found: AdmissionDiagnostic[] = []
   const seen = new Set<string>()
