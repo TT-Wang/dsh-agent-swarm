@@ -408,8 +408,8 @@ test('R12: a deadline warning retries its same identity after failed flush and p
 test('R06: in-flight usage triggers durable mission review with a larger recommendation before settled exhaustion', async t => {
   const f = await fixture(t)
   const member = f.runtime.store.get('members', f.member.id)
-  // An average of 10000.5 tokens a request, which the estimate rounds up.
-  member.accountedTokens = 20001; member.usage = { requests: 2 }; member.activity = { id: 'model', kind: 'model', startedAt: Date.now(), updatedAt: Date.now() }
+  // An average of 10000.25 tokens a request, which the estimate rounds up, never to the nearest token.
+  member.accountedTokens = 40001; member.usage = { requests: 4 }; member.activity = { id: 'model', kind: 'model', startedAt: Date.now(), updatedAt: Date.now() }
   // The adapter reports that model request as live; the row itself is written directly, with no activity event.
   f.workers.activity = member.activity
   const mission = f.runtime.mission(f.mission.id); mission.usedTokens = 65000
