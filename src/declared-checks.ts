@@ -2,8 +2,9 @@
  * The declared-check execution path: the bounded timeout window, the host call
  * that runs the task's declared checks, the measured envelope record, the
  * pass/fail classification, the durable tool-run row per check and the rejection
- * text; and the check environment: the envelope an assignment delivers and its
- * reproduction by the host checks that support a verdict.
+ * text; and the check environment: the envelope an assignment delivers, its
+ * reproduction by the host checks that support a verdict and the refusal of an
+ * acceptance they do not reproduce.
  *
  * Check executions are outside the mission transaction; the verdict records
  * their exact outcomes and retains bounded retry evidence. Explicit execution
@@ -108,10 +109,20 @@ export function compareCheckEnvironments(envelope: CheckEnvironment, selfRun: Ch
   compare('checkCacheRoots', checkCacheRootsField(envelope.checkCacheRoots), checkCacheRootsField(selfRun.checkCacheRoots), advisory)
   return { blocking, advisory }
 }
-/** ENV: render a blocking mismatch as the refusal the member must act on. */
-export function checkEnvironmentMismatchMessage(comparison: CheckEnvironmentComparison, source: string): string {
-  const fields = comparison.blocking.map(item => `${item.field}: envelope ${item.envelope}, self-run ${item.selfRun}`).join('; ')
-  return `[check_environment_mismatch] This verification's self-run environment (${source}) cannot reproduce the declared-check envelope: ${fields}. Rerun the declared check in the envelope environment, then call \`swarm_verify\` with its \`verdict\` and \`reason\` again; the artifact is not accepted under a different environment.`
+/**
+ * ENV: a verification whose supporting host checks did not run under the
+ * declared-check envelope, rendered from the comparison's blocking fields as
+ * the refusal the member must act on. The verdict is refused rather than
+ * accepting an artifact that was only ever validated under a different
+ * environment.
+ */
+export class CheckEnvironmentMismatchError extends Error {
+  readonly code = 'check_environment_mismatch'
+  constructor(comparison: CheckEnvironmentComparison) {
+    const fields = comparison.blocking.map(item => `${item.field}: envelope ${item.envelope}, self-run ${item.selfRun}`).join('; ')
+    super(`[check_environment_mismatch] This verification's self-run environment (recorded on the declared host checks) cannot reproduce the declared-check envelope: ${fields}. Rerun the declared check in the envelope environment, then call \`swarm_verify\` with its \`verdict\` and \`reason\` again; the artifact is not accepted under a different environment.`)
+    this.name = 'CheckEnvironmentMismatchError'
+  }
 }
 /** ENV: the measured envelope plus the environment facts the adapter attaches. */
 type DeclaredCheckEnvelope = CheckEnvelope & {

@@ -17,7 +17,7 @@ import { deriveMemberStatus, memberPhaseOf, memberDeliveryHealth, type MissionBo
 export { emptyUsage, addUsage } from './gates.ts'
 export { missionFingerprint, type MissionFingerprintBoard } from './board.ts'
 import { RuntimeGates, emptyUsage, addUsage, BOARD_DELTA_POSTS, postView } from './gates.ts'
-import { DeclaredChecks, MAX_REPORTED_CHECK_FAILURES, checkEnvironmentMismatchMessage, excerpt, recoveryExit } from './declared-checks.ts'
+import { CheckEnvironmentMismatchError, DeclaredChecks, MAX_REPORTED_CHECK_FAILURES, excerpt, recoveryExit } from './declared-checks.ts'
 import { verdictRows } from './trace.ts'
 export { TEMP_RENDEZVOUS_WINDOW_MS, sharedTempPaths, tempRendezvousDecision, type TempMention } from './workspace-admission.ts'
 import { awaitsDelivery } from './arena.ts'
@@ -116,18 +116,6 @@ export class ObserveDetailRefusedError extends PolicyError {
   }
   /** Named before it was typed, so its recorded rendering keeps the name. */
   override toString(): string { return `${this.name}: ${this.message}` }
-}
-/**
- * ENV: a verification whose supporting host checks did not run under the
- * declared-check envelope. The verdict is refused rather than accepting an
- * artifact that was only ever validated under a different environment.
- */
-export class CheckEnvironmentMismatchError extends Error {
-  readonly code = 'check_environment_mismatch'
-  constructor(message: string) {
-    super(message)
-    this.name = 'CheckEnvironmentMismatchError'
-  }
 }
 /** The model-visible position already delivered to one member; the next default read starts after it. */
 interface DeliveredCursor { eventSeq: number; runSeq: number; postSeq: number; current?: string }
@@ -1408,7 +1396,7 @@ export class SwarmRuntime implements Kernel {
       // reproduce.
       if (passed && reproduction !== undefined && reproduction.comparison.blocking.length > 0) {
         this.commit(missionId, () => { this.declaredChecks.recordRuns(missionId, { memberId: member.id, taskId: task.id, attemptId: input.attemptId, commit: artifact.commit }, checks) })
-        throw new CheckEnvironmentMismatchError(checkEnvironmentMismatchMessage(reproduction.comparison, 'recorded on the declared host checks'))
+        throw new CheckEnvironmentMismatchError(reproduction.comparison)
       }
       // F3-A: a rejection must carry the real failure, not only the reviewer's
       // prose. A judgement rejection with no failing check keeps the prose.
