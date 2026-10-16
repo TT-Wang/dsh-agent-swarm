@@ -16,8 +16,7 @@ import { arenaView as projectArenaView, hasNotice, openAsks } from './arena.ts'
 import { TERMINAL_STATES, currentEvidenceIds, holdsAttempt, holdsOpenAttempt, subjectsOfTasks, terminal } from './task-graph.ts'
 import { excerpt, type DeclaredChecks } from './declared-checks.ts'
 import { executionElapsed } from './resource-time.ts'
-import { memberPhaseOf } from './projection.ts'
-import { dispatchable, inFlightEstimate } from './board.ts'
+import { dispatchable, inFlightEstimate, stepsInFlight } from './board.ts'
 import { noticeFamily, noticeIdentity, type Notices } from './notices.ts'
 import type { RefusalRegistry } from './refusals.ts'
 import type { Kernel } from './kernel.ts'
@@ -230,8 +229,7 @@ export class RuntimeGates {
       .filter(value => Number.isFinite(value) && value > 0 && value < 1).sort((a, b) => a - b)
     if (!thresholds.length) return
     const members = this.k.store.list('members', mission.id)
-    const inFlight = members.filter(member => memberPhaseOf(member) !== 'stopped'
-      && (this.k.workers.currentActivity(member.id) ?? member.activity)?.kind === 'model')
+    const inFlight = stepsInFlight(this.k.view, members)
     const tasks = this.k.store.list('tasks', mission.id)
     const pairedSources = new Set(tasks.filter(task => task.kind === 'verification' && task.status !== 'cancelled').map(task => task.reviewOf))
     const pendingReviewSlots = tasks.filter(task => task.kind !== 'verification' && !TERMINAL_STATES.has(task.status) && !pairedSources.has(task.id)).length

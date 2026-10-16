@@ -186,8 +186,9 @@ export function startBlocker(view: AdapterView, member: Member): 'handle-busy' |
 
 /**
  * The tokens `members` are spending in model requests that have reported no
- * usage yet, each estimated at its worker's average request: the budget gate's
- * and the owner's in-flight projection, read where they read it.
+ * usage yet, each estimated at its worker's average request, rounded up: the
+ * budget gate's and the owner's in-flight token projection, read where they
+ * read it. A request counts only while its worker reports it.
  */
 export function inFlightEstimate(view: AdapterView, members: readonly Member[]): number {
   let total = 0
@@ -198,6 +199,15 @@ export function inFlightEstimate(view: AdapterView, members: readonly Member[]):
     if (requests > 0) total += Math.ceil((member.accountedTokens ?? 0) / requests)
   }
   return total
+}
+
+/**
+ * The members the budget gate's step projection counts with a model request in
+ * flight, one step each: a live member whose worker reports a model operation
+ * or, when its worker reports none, whose durable activity records one (R06).
+ */
+export function stepsInFlight(view: AdapterView, members: readonly Member[]): Member[] {
+  return members.filter(member => memberPhaseOf(member) !== 'stopped' && (view.activity(member.id) ?? member.activity)?.kind === 'model')
 }
 
 export function ready(board: Board, task: Task, member: Member): boolean {
