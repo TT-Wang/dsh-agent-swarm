@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import { executionClock, executionElapsed } from '../lib/resource-time.js'
 import { guardTerminal } from '../lib/refusals.js'
 import { registerTools } from '../lib/tools.js'
-import { FakeWorkers, budget as sharedBudget, eventually, makeRuntime } from './faults/harness.mjs'
+import { FakeClock, FakeWorkers, budget as sharedBudget, eventually, makeRuntime, setup } from './faults/harness.mjs'
 
 const budget = { ...sharedBudget, maxTokens: 100000, maxSteps: 100, maxWorkers: 4, maxTasks: 20, maxExperiments: 2 }
 class Workers extends FakeWorkers {
@@ -212,4 +212,27 @@ test('a budget amendment omitting the fixed deadline preserves the prior user li
   const changed = f.rt.updateBudget(f.owner, f.mission.id, { ...budget, maxTokens: 200000 }, 'More tokens, same deadline')
   assert.equal(changed.deadlineAt, deadlineAt)
   assert.equal(f.rt.mission(f.mission.id).deadline, deadlineAt)
+})
+
+test('a budget resume hands the worker only the resume: the assignment the pause left unsent is settled with it, never sent after it', async t => {
+  const clock = new FakeClock(), f = await setup({ clock, budget: { maxTokens: 40, maxSteps: 100 } })
+  t.after(f.cleanup)
+  const task = f.propose()
+  const claimed = await f.runtime.claim(f.actor(f.author), f.mission.id, task.id)
+  const pass = async () => { await f.runtime.tick(); await f.runtime.settle(f.mission.id) }
+  const assignments = () => f.runtime.store.list('deliveries', f.mission.id).filter(delivery => delivery.kind === 'assignment' && delivery.taskId === task.id)
+  // The usage report exhausts maxTokens before any pass sent the claim's assignment, and the pause holds it.
+  await f.workers.callbacks.usage(f.author.id, 40)
+  await pass(); await pass()
+  assert.equal(f.runtime.mission(f.mission.id).budgetPause?.quiesced, true, 'the exhausted mission quiesced')
+  const [held] = assignments()
+  assert.deepEqual([assignments().length, held.attemptId, held.deliveredAt], [1, claimed.attempt.id, undefined], 'the claim\'s assignment is still unsent')
+  f.runtime.updateBudget(f.owner, f.mission.id, { ...sharedBudget, maxTokens: 100_000 }, 'Raise the exhausted ceiling')
+  f.runtime.control(f.owner, f.mission.id, 'resume', 'Budget raised')
+  await pass(); await pass()
+  const [settled, resumed, ...others] = assignments()
+  assert.deepEqual([settled.id, others], [held.id, []], 'the resume writes one assignment beside the held one')
+  assert.deepEqual([resumed.attemptId, JSON.parse(resumed.content).instructions.startsWith('Resume this same task and attempt')], [claimed.attempt.id, true])
+  assert.notEqual(settled.deliveredAt, undefined, 'the held assignment is settled, superseded by the resume')
+  assert.deepEqual(f.workers.deliveries.filter(delivery => delivery.kind === 'assignment').map(delivery => delivery.id), [resumed.id], 'the worker is handed only the resume')
 })
