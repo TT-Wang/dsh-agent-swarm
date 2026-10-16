@@ -673,18 +673,18 @@ export class Notices {
    * observed absence instant: one report per absence, a new one when time moves on.
    */
   absenceNet(missionId: string, options: { boundMs?: number } = {}): void {
-    const view = interpret(this.k.boardOf(missionId))
-    const mission = view.mission
-    this.followupObligations(view)
+    const board = this.k.boardOf(missionId), mission = board.mission
+    this.followupObligations(interpret(board))
     if (mission.status !== 'active' || mission.budgetPause !== undefined) return
-    const lastAt = view.lastTransitionAt
+    // The latest task, evidence or owner-decision progress; telemetry does not reset this clock.
+    const lastAt = board.records.progressAt(mission)
     const elapsed = Math.max(0, this.k.now() - lastAt)
     const bound = options.boundMs ?? this.absenceBoundMs
     if (elapsed < bound) return
     // One long operation owns its existing activity bound. Starting another
     // short operation after progress is already overdue cannot hide that gap.
-    if (view.members.some(member => member.activity !== undefined && member.activity.startedAt <= lastAt + bound)) return
-    this.tell(missionId, `No durable task, evidence or owner-decision progress recorded for ${elapsed}ms (declared bound ${bound}ms) on an active mission. The absence net reports the absence and the elapsed clock only; read the board for the state.`, [missionSubject(view.mission)],
+    if (board.members.some(member => member.activity !== undefined && member.activity.startedAt <= lastAt + bound)) return
+    this.tell(missionId, `No durable task, evidence or owner-decision progress recorded for ${elapsed}ms (declared bound ${bound}ms) on an active mission. The absence net reports the absence and the elapsed clock only; read the board for the state.`, [missionSubject(mission)],
       { dedupKey: `absence:${missionId}:${lastAt}`, trigger: 'absence-net', reason: `no durable progress for ${elapsed}ms` })
   }
 

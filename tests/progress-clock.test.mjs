@@ -11,7 +11,6 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { EVENTS } from '../lib/events.js'
 import { WriterBusyError } from '../lib/store.js'
-import { interpret } from '../lib/board.js'
 import { FakeClock, MISSION_ACCEPTANCE, makeRuntime, setup } from './faults/harness.mjs'
 
 /** The progress kinds: task, evidence and owner-decision transitions (one historical kind an old log may still hold). */
@@ -37,7 +36,7 @@ async function fixture(t, config = {}) {
     counter.transactions++
     return result
   }
-  const progressAt = () => interpret(runtime.boardOf(mission.id)).lastTransitionAt
+  const progressAt = () => runtime.store.progressAt(runtime.mission(mission.id))
   const absences = () => store.list('deliveries', mission.id).filter(row => row.notice?.dedupKey?.startsWith('absence:'))
   return { clock, runtime, store, owner, mission, counter, progressAt, absences }
 }
@@ -129,7 +128,7 @@ test('every real writer of a progress kind moves the clock to its own write; oth
   const f = await setup({ clock })
   t.after(f.cleanup)
   const { runtime, owner, mission } = f
-  const clockAt = () => interpret(runtime.boardOf(mission.id)).lastTransitionAt
+  const clockAt = () => runtime.store.progressAt(runtime.mission(mission.id))
   const written = kind => runtime.store.events(mission.id, 5_000).filter(event => event.type === kind && event.createdAt === clock.now())
   /** Run one real writer at a fresh instant and read the clock against the rows it wrote. */
   const step = async (kinds, run, { progress = true } = {}) => {

@@ -861,8 +861,6 @@ export interface Interpretation extends Board {
   unschedulable: Task[]
   /** The scheduler's stalled predicate for this board. */
   stalled: boolean
-  /** Latest task, evidence or owner-decision progress; telemetry does not reset this clock. */
-  lastTransitionAt: number
 }
 
 /**
@@ -891,6 +889,5 @@ export function interpret(board: Board): Interpretation {
     unreviewed: unreviewedSources(board),
     unschedulable: unschedulable(board),
     stalled: stalled(board),
-    lastTransitionAt: board.records.progressAt(board.mission),
   }
 }
