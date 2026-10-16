@@ -26,7 +26,7 @@ import { validScope, scopeSubset } from './scope.ts'
 import { AdmissionError, assertDeclaredOutputs, assertScopeSelectors, citedCovers, dependencyAssumptions, formatDiagnostic, isNoopCheck, loadPackageScripts, normalizeReviewDependencies, normalizeScopeSelectors, normalizeTaskCeilings, reconcileTaskAdmission, requireHostChecks, taskCeilingBlock, taskGraphDefects, TaskGraphAdmissionError, type TaskGraphNode } from './admission.ts'
 import { canBorrowTask, canOwnReview, strandedReview } from './assignment.ts'
 import { executionClock, executionElapsed } from './resource-time.ts'
-import { TERMINAL_STATES, blockCauses, currentEvidenceIds, missionSubject, pendingStopOwner, quiescencePending, selectAcceptedDelivery, stopPending, taskGraphIndex, taskSubject, terminal, uncoveredCriteria, type BlockCause } from './task-graph.ts'
+import { TERMINAL_STATES, blockCauses, currentEvidenceIds, missionSubject, pendingStopOwner, quiescencePending, selectAcceptedDelivery, stopPending, taskEdges, taskGraphIndex, taskSubject, terminal, uncoveredCriteria, type BlockCause } from './task-graph.ts'
 import { checkSyntaxDetail, declaredPlanChecks, orderedTasks, pairReviews, planAdvisories, validatePlan } from './plans.ts'
 import { OWNER_ONLY_TOOLS, type Actor, type AutoStart, BoardQuery, Budget, CheckAttribution, CheckEnvelope, CheckEnvironment, CreateMissionInput, CriticalPath, criterionId, Delivery, DraftPlan, Escalation, Evidence, EvidenceStatus, Member, MemberStatus, Mission, nextWorkerName, ObserveQuery, MessageInput, PlanInput, Post, PostInput, PostKind, ProposeTaskInput, ProviderOutage, PublishInput, RecoveryFallback, RequestStartInput, RuntimeConfig, Snapshot, Task, TaskAmendment, TaskRejection, TaskCeiling, ToolRun, UsageBuckets, UsageSnapshotSource, VerificationCleanupFailure, WorkerAdapter, WorkerActivity, Workstream } from './types.ts'
 import { requireArtifactChecks } from './artifact-policy.ts'
@@ -810,8 +810,9 @@ export class SwarmRuntime implements Kernel {
       const waiting = ['pending', 'running', 'submitted'].includes(task.status) || quiescencePending(task)
       const dependencies = waiting ? task.dependencies.map(dependency => index.effective(dependency)?.id ?? dependency) : []
       const reviewOf = waiting ? task.reviewOf : undefined
-      graph.push({ id: task.id, dependencies, ...(reviewOf === undefined ? {} : { reviewOf }) })
-      pending.push(...dependencies, ...(reviewOf === undefined ? [] : [reviewOf]))
+      const node: TaskGraphNode = { id: task.id, dependencies, ...(reviewOf === undefined ? {} : { reviewOf }) }
+      graph.push(node)
+      pending.push(...taskEdges(node))
     }
     const defects = taskGraphDefects(graph)
     if (defects.length) throw new TaskGraphAdmissionError(defects)
@@ -1119,7 +1120,7 @@ export class SwarmRuntime implements Kernel {
       // worktree like a dependency) and the durable identities this mission
       // already holds, so the diagnostic can say whether the named content exists
       // here (add the dependency that carries it) or must be obtained (state how).
-      dependencies: [...(input.dependencies ?? []), ...(input.reviewOf === undefined ? [] : [input.reviewOf])],
+      dependencies: taskEdges({ dependencies: input.dependencies ?? [], reviewOf: input.reviewOf }),
       replaces: input.replaces,
       knownContents: new Set(this.store.list('tasks', missionId).map(task => task.id)),
     })
@@ -3307,7 +3308,7 @@ export class SwarmRuntime implements Kernel {
       // into its worktree; this amendment would otherwise strip that edge from
       // an admitted task, so it is refused here, before anything is written.
       const assumed = dependencyAssumptions({ objective: task.objective, acceptance: task.acceptance }, `task ${JSON.stringify(task.id)}`, {
-        dependencies: [...next.dependencies, ...(task.reviewOf === undefined ? [] : [task.reviewOf])],
+        dependencies: taskEdges({ dependencies: next.dependencies, reviewOf: task.reviewOf }),
         replaces: task.replaces,
         knownContents: new Set(this.store.list('tasks', missionId).map(row => row.id)),
         amendment: true,

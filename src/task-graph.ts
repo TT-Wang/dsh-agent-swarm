@@ -9,6 +9,16 @@ import { criterionId, type EvidenceStatus, type Mission, type Task } from './typ
 
 const oldest = (tasks: readonly Task[]): Task | undefined => [...tasks].sort((a, b) => a.createdAt - b.createdAt || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))[0]
 
+/**
+ * The edges of one task: its dependencies, in order, then its review source,
+ * which `prepareTask` merges into the worktree like a dependency. The graph
+ * validator, the board's dangling-edge rule, the plan order and the runtime's
+ * admission checks all read a task's edges here.
+ */
+export function taskEdges(node: { readonly dependencies: readonly string[]; readonly reviewOf?: string | undefined }): string[] {
+  return [...node.dependencies, ...(node.reviewOf === undefined ? [] : [node.reviewOf])]
+}
+
 export function taskGraphIndex(tasks: readonly Task[]) {
   const byId = new Map(tasks.map(task => [task.id, task]))
   const replacements = new Map<string, Task[]>()
@@ -136,14 +146,13 @@ export function taskGraphIndex(tasks: readonly Task[]) {
   }
   const dependencyMet = (id: string): boolean => effective(id)?.status === 'accepted'
   /**
-   * The first id `task` holds that names no task of the mission: a dependency,
-   * in order, then its review source. No work can ever meet such an edge, so
-   * the board's readers share this one rule: readiness refuses the task naming
-   * it, `unschedulable` holds the pending task dead, and `waitsLegitimately`
-   * holds that it waits on nothing, whatever else it also waits on.
+   * The first edge of `task` (`taskEdges`) that names no task of the mission.
+   * No work can ever meet such an edge, so the board's readers share this one
+   * rule: readiness refuses the task naming it, `unschedulable` holds the
+   * pending task dead, and `waitsLegitimately` holds that it waits on nothing,
+   * whatever else it also waits on.
    */
-  const danglingReference = (task: Pick<Task, 'dependencies' | 'reviewOf'>): string | undefined =>
-    [...task.dependencies, ...(task.reviewOf === undefined ? [] : [task.reviewOf])].find(id => !byId.has(id))
+  const danglingReference = (task: Pick<Task, 'dependencies' | 'reviewOf'>): string | undefined => taskEdges(task).find(id => !byId.has(id))
   /**
    * The effective task of each dependency that names one, an accepted repair
    * covering several originals merged once: the prerequisites workspace

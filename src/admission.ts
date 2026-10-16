@@ -7,6 +7,7 @@ import { scopeSubset, validScope, withinScope } from './scope.ts'
 import { DEFAULT_VERIFICATION_DEPENDENCY_DIRS, SWARM_SCRATCH_DIRNAME } from './workspaces.ts'
 import { criterionId, type TaskCeiling, type TaskCeilingDimension, type TaskCeilingProvenance } from './types.ts'
 import { PolicyError, type PolicyErrorCategory } from './policy-error.ts'
+import { taskEdges } from './task-graph.ts'
 
 /** Accept equivalent notation without guessing a wider path or a repository root. */
 export function normalizeScopeSelectors(scopes: readonly string[]): string[] {
@@ -77,14 +78,12 @@ export interface TaskGraphDefect {
  * Every defect in `nodes`. `known` is the set of identities the caller can prove
  * exist — the mission's durable task ids at admission, the replayed ids on the
  * replay path; when it is omitted, the node ids are the known set. The edges of
- * a node are its `dependencies` plus its `reviewOf` source, which `prepareTask`
- * merges into the worktree like a dependency.
+ * a node are `taskEdges`.
  */
 export function taskGraphDefects(nodes: readonly TaskGraphNode[], known?: ReadonlySet<string>): TaskGraphDefect[] {
   const defects: TaskGraphDefect[] = []
   const knownIds = known ?? new Set(nodes.map(node => node.id))
   const seen = new Set<string>()
-  const edges = (node: TaskGraphNode): string[] => [...node.dependencies, ...(node.reviewOf === undefined ? [] : [node.reviewOf])]
   for (const node of nodes) {
     if (seen.has(node.id)) {
       defects.push({ code: 'task_graph_duplicate', taskId: node.id, target: node.id,
@@ -92,7 +91,7 @@ export function taskGraphDefects(nodes: readonly TaskGraphNode[], known?: Readon
     }
     seen.add(node.id)
   }
-  for (const node of nodes) for (const target of edges(node)) {
+  for (const node of nodes) for (const target of taskEdges(node)) {
     if (target === node.id) {
       defects.push({ code: 'task_graph_self_edge', taskId: node.id, target,
         message: `task ${JSON.stringify(node.id)} declares an edge to itself. Remove ${JSON.stringify(node.id)} from its own \`dependencies\` and re-propose it with \`swarm_propose\`, then retry the same task/request.` })
@@ -112,7 +111,7 @@ export function taskGraphDefects(nodes: readonly TaskGraphNode[], known?: Readon
     if (open.has(id) || done.has(id)) return
     open.add(id)
     const node = byId.get(id)
-    for (const target of node === undefined ? [] : edges(node)) {
+    for (const target of node === undefined ? [] : taskEdges(node)) {
       if (target === id || !byId.has(target)) continue
       if (open.has(target)) {
         defects.push({ code: 'task_graph_cycle', taskId: id, target,
