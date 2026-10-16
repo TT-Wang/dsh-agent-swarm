@@ -227,13 +227,15 @@ export function capable(board: Board, task: Task, member: Member): boolean {
 }
 
 function capabilityBlocker(board: Board, task: Task, member: Member): string | undefined {
-  const waiting = task.dependencies.find(dependency => !board.graph.dependencyMetOf(dependency))
+  const waiting = task.dependencies.find(dependency => !board.graph.dependencyMet(dependency))
   if (waiting !== undefined) {
-    const effective = board.graph.effectiveOf(waiting)
+    const effective = board.graph.effective(waiting)
+    if (effective === undefined) return `dependency ${waiting} names no task in this mission, so the task can never be ready; the owner can amend its dependencies with swarm_control(action: "amend", taskId, changes, reason) or withdraw it with swarm_cancel(taskId, reason)`
     return `dependency ${waiting}${effective.id === waiting ? '' : ` (effective replacement ${effective.id})`} is ${effective.status}, not accepted; inspect it or amend the dependency plan`
   }
   if (task.reviewOf) {
-    const source = board.graph.taskOf(task.reviewOf)
+    const source = board.graph.reviewSource(task)
+    if (source === undefined) return `review source ${task.reviewOf} names no task in this mission, so the review can never begin; the owner can withdraw it with swarm_cancel(taskId, reason)`
     if (source.status !== 'submitted') return `review source ${source.id} is ${source.status}; review begins only after its artifact is submitted`
     if (!canOwnReview(source, member.id)) return `member ${member.id} authored review source ${source.id}; assign an independent reviewer`
   }
@@ -242,7 +244,7 @@ function capabilityBlocker(board: Board, task: Task, member: Member): string | u
 
 /**
  * Tasks that cannot be dispatched under the current plan: pending work whose dependency
- * lineage or review source is dead, reviews assigned to their own author,
+ * lineage or review source is dead or names no task, reviews assigned to their own author,
  * pending work no live member may take (`assignmentAllows`: a source only its
  * own bound reviewer is left to take included), and blocked work. This is a
  * diagnostic for owner repair, not permission to
@@ -256,15 +258,16 @@ export function unschedulable(board: Board): Task[] {
   // `resumeAfterStop` only until `workers.stop()` resolves; treating it as
   // unschedulable lets `control complete` cancel recoverable work.
   const dead = new Set(tasks.filter(task => task.status === 'blocked' && !quiescencePending(task)).map(task => task.id))
-  // Fixpoint: work waiting on dead prerequisites or an unreachable review source is dead too.
+  // Fixpoint: work waiting on dead prerequisites or an unreachable review source
+  // is dead too, and so is work waiting on an id that names no task.
   for (let changed = true; changed;) {
     changed = false
     for (const task of tasks) {
       if (dead.has(task.id) || task.status !== 'pending') continue
-      const stuck = task.dependencies.some(dependency => { const effective = board.graph.effectiveOf(dependency); return effective.status === 'cancelled' || dead.has(effective.id) })
+      const stuck = task.dependencies.some(dependency => { const effective = board.graph.effective(dependency); return effective === undefined || effective.status === 'cancelled' || dead.has(effective.id) })
         || (task.reviewOf !== undefined && (() => {
-          const source = board.graph.taskOf(task.reviewOf)
-          return TERMINAL_STATES.has(source.status) || dead.has(source.id)
+          const source = board.graph.reviewSource(task)
+          return source === undefined || TERMINAL_STATES.has(source.status) || dead.has(source.id)
             || !live.some(member => assignmentAllows(task, member.id, tasks) && canOwnReview(source, member.id))
         })())
         || !live.some(member => assignmentAllows(task, member.id, tasks))

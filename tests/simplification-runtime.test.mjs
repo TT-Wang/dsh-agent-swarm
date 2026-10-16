@@ -71,5 +71,7 @@ test('synchronous graph reuse keeps repair deduplication and sees changed carrie
   assert.deepEqual(dispatchable(), [], 'a newly ambiguous carrier cannot satisfy a dependency')
   assert.deepEqual(f.runtime.boardOf(mission.id).graph.unfinishedDependencies(dependent).map(row => row.id), [original.id])
   assert.deepEqual(f.runtime.boardOf(mission.id).graph.unfinishedDependencies({ ...dependent, dependencies: ['missing'] }), [])
-  assert.throws(() => f.runtime.boardOf(mission.id).graph.effectiveDependencies({ ...dependent, dependencies: ['missing'] }), /not in this mission/)
+  // An id that names no task has no effective task: it is a prerequisite never met, so readiness holds its task back before any preparation asks.
+  assert.deepEqual(f.runtime.boardOf(mission.id).graph.effectiveDependencies({ ...dependent, dependencies: ['missing'] }), [])
+  assert.equal(f.runtime.boardOf(mission.id).graph.dependencyMet('missing'), false)
 })

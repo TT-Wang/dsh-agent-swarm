@@ -219,7 +219,7 @@ export class Attempts {
     const task = this.rt.task(missionId, taskId)
     if (!member || task.status !== 'running' || !task.attempt || task.attempt.id !== attemptId || task.attempt.ownerId !== member.id || task.attempt.leaseUntil < this.rt.now()) throw new PolicyError('task_attempt_stale', 'authorization_error', 'Stale or unauthorized task attempt; stop work and observe the current assignment')
     const board = this.rt.boardOf(missionId)
-    if (!task.dependencies.every(dep => board.graph.dependencyMetOf(dep))) throw new PolicyError('task_prerequisite_revoked', 'tool_error', 'A task prerequisite is no longer accepted; stop work')
+    if (!task.dependencies.every(dep => board.graph.dependencyMet(dep))) throw new PolicyError('task_prerequisite_revoked', 'tool_error', 'A task prerequisite is no longer accepted; stop work')
     return { task, member }
   }
   /**

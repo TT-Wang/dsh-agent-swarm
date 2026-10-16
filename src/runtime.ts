@@ -799,7 +799,7 @@ export class SwarmRuntime implements Kernel {
       const task = index.byId.get(taskId)
       if (task === undefined) continue // The shared validator reports the dangling edge.
       const waiting = ['pending', 'running', 'submitted'].includes(task.status) || quiescencePending(task)
-      const dependencies = waiting ? task.dependencies.map(dependency => index.effectiveOf(dependency).id) : []
+      const dependencies = waiting ? task.dependencies.map(dependency => index.effective(dependency)?.id ?? dependency) : []
       const reviewOf = waiting ? task.reviewOf : undefined
       graph.push({ id: task.id, dependencies, ...(reviewOf === undefined ? {} : { reviewOf }) })
       pending.push(...dependencies, ...(reviewOf === undefined ? [] : [reviewOf]))
@@ -1141,9 +1141,10 @@ export class SwarmRuntime implements Kernel {
     }
     const dependencies = [...new Set(normalizeReviewDependencies(input.kind, input.reviewOf, input.dependencies))]
     const graph = taskGraphIndex(tasks)
+    // The admission above refused every dependency that names no task.
     for (const dependency of dependencies) {
-      const effective = graph.effectiveOf(dependency)
-      if (effective.status === 'cancelled' || effective.status === 'blocked') throw new PolicyError('dependency_not_live', 'tool_error', `Dependency ${dependency} is ${effective.status} and has no live replacement; depend on an accepted or in-progress task, or propose a repair with replaces`)
+      const effective = graph.effective(dependency)
+      if (effective?.status === 'cancelled' || effective?.status === 'blocked') throw new PolicyError('dependency_not_live', 'tool_error', `Dependency ${dependency} is ${effective.status} and has no live replacement; depend on an accepted or in-progress task, or propose a repair with replaces`)
     }
     // An empty id passed the truthiness check below and bound the task to member
     // "", which no member can ever claim: the task wedged pending.
@@ -1986,7 +1987,7 @@ export class SwarmRuntime implements Kernel {
       // A dependent naming a replaced original effectively depends on its accepted
       // repair. The loop below fences these rows in place, so each ask reads the
       // graph over them as they stand.
-      const dependsOnInvalidated = (dependent: Task) => dependent.dependencies.some(dep => taskGraphIndex(tasks).lineageOf(dep).some(row => invalidated.has(row.id)))
+      const dependsOnInvalidated = (dependent: Task) => dependent.dependencies.some(dep => taskGraphIndex(tasks).lineage(dep).some(row => invalidated.has(row.id)))
       let changed = true
       while (changed) {
         changed = false
@@ -2302,8 +2303,8 @@ export class SwarmRuntime implements Kernel {
       const board = this.boardOf(missionId)
       for (const dependent of board.tasks) {
         if (dependent.id === task.id || dependent.status !== 'pending') continue
-        const references = dependent.dependencies.some(dependency => board.graph.lineageOf(dependency).some(row => row.id === task.id))
-        if (references && dependent.dependencies.some(dependency => !board.graph.dependencyMetOf(dependency))) strandedDependents.push(dependent.id)
+        const references = dependent.dependencies.some(dependency => board.graph.lineage(dependency).some(row => row.id === task.id))
+        if (references && dependent.dependencies.some(dependency => !board.graph.dependencyMet(dependency))) strandedDependents.push(dependent.id)
       }
       this.store.event(missionId, 'task/cancelled', key, { taskId: task.id, reason: input.reason, previousStatus,
         ...(attempt === undefined ? {} : { attemptId: attempt.id, ownerId: attempt.ownerId }),
@@ -2995,6 +2996,18 @@ export class SwarmRuntime implements Kernel {
       ...(task.recovery ? { recovery: task.recovery } : {}) })
     const taskRecord = (task: Task, outputLimit: number) => ({ ...(member ? this.memberTask(task, mission, graph) : task), ...(task.output !== undefined ? { output: excerpt(task.output, outputLimit) } : {}), ...(task.handoff !== undefined ? { handoff: excerpt(task.handoff, outputLimit) } : {}) })
     const evidenceOf = (task: Task, full = false) => task.evidenceIds.map(evidenceId => this.store.get('evidence', evidenceId)).filter((item): item is Evidence => item !== undefined).map(item => evidenceRef(item, full))
+    // A task's reference to another (a dependency, a review source) whose id
+    // names no task in this mission renders as `{ id, status: 'missing' }`, the
+    // reading the client board gives the same edge.
+    const missingRef = (id: string) => ({ id, status: 'missing' as const })
+    // Each dependency renders as the task its lineage reaches, naming the
+    // replaced ids it passed through (`replacementOf`); with `outputLimit`, with
+    // that task's output excerpt.
+    const dependencyRefs = (task: Task, outputLimit?: number) => task.dependencies.map(dependency => {
+      const chain = graph.lineage(dependency), endpoint = chain.at(-1)
+      if (endpoint === undefined) return missingRef(dependency)
+      return { ...taskRef(endpoint), ...(outputLimit === undefined ? {} : { output: excerpt(endpoint.output ?? '', outputLimit) }), ...(chain.length > 1 ? { replacementOf: chain.slice(0, -1).map(item => item.id) } : {}) }
+    })
     const runsWindow = (filter: { memberId?: string; taskId?: string; attemptId?: string }, limit: number, afterSeq?: number) => {
       const all = this.store.toolRuns(missionId, { ...filter, ...(afterSeq === undefined ? {} : { afterSeq }) })
       const shown = afterSeq === undefined ? all.slice(-limit) : all.slice(0, limit)
@@ -3020,10 +3033,10 @@ export class SwarmRuntime implements Kernel {
       return { evidence: { ...evidenceRef(evidence, true), workstreamId: evidence.workstreamId, artifact: evidence.artifact, createdAt: evidence.createdAt } }
     }
     if (query.taskId !== undefined) {
-      const task = this.task(missionId, query.taskId)
+      const task = this.task(missionId, query.taskId), source = graph.reviewSource(task)
       return { task: taskRecord(task, 6000), evidence: evidenceOf(task, true), reviews: tasks.filter(item => item.reviewOf === task.id).map(taskRef),
-        dependencies: task.dependencies.map(dep => board.graph.lineageOf(dep)).map(chain => ({ ...taskRef(chain.at(-1)!), ...(chain.length > 1 ? { replacementOf: chain.slice(0, -1).map(item => item.id) } : {}) })),
-        ...(task.reviewOf ? { reviewSource: taskRef(this.task(missionId, task.reviewOf)) } : {}), ...runsWindow({ taskId: task.id }, 40, query.afterRun) }
+        dependencies: dependencyRefs(task),
+        ...(task.reviewOf ? { reviewSource: source === undefined ? missingRef(task.reviewOf) : taskRef(source) } : {}), ...runsWindow({ taskId: task.id }, 40, query.afterRun) }
     }
     // A member's delivered position is the default cursor; an explicit
     // after/afterRun overrides it for one read and still advances it.
@@ -3045,7 +3058,12 @@ export class SwarmRuntime implements Kernel {
     if (member) {
       const current = tasks.find(task => task.status === 'running' && task.attempt?.ownerId === member.id)
       const currentKey = current === undefined ? undefined : `${current.id}:${current.attempt!.id}:${current.status}`
-      const source = current?.reviewOf ? this.task(missionId, current.reviewOf) : undefined
+      // The current assignment as both the focused view and a delta send it.
+      const currentView = (task: Task) => {
+        const source = graph.reviewSource(task)
+        return { task: taskRecord(task, 2400), attemptId: task.attempt!.id, dependencies: dependencyRefs(task, 600),
+          ...(task.reviewOf ? { reviewSource: source === undefined ? missingRef(task.reviewOf) : { ...taskRecord(source, 2400), evidence: evidenceOf(source) } } : {}) }
+      }
       const runs = runsWindow(current?.attempt ? { memberId: member.id, taskId: current.id, attemptId: current.attempt.id } : { memberId: member.id }, 20, afterRun)
       // Board traffic is part of the delta: counts plus the newest few posts,
       // so a worker learns about cross-task posts without a second poll.
@@ -3065,11 +3083,7 @@ export class SwarmRuntime implements Kernel {
       if (delivered !== undefined && query.after === undefined && query.afterRun === undefined) return {
         // A changed current assignment is new content the member must see; an
         // unchanged one stays in the cached prefix and is not re-sent.
-        ...(delivered.current === currentKey ? {} : { current: current === undefined ? null : {
-          task: taskRecord(current!, 2400), attemptId: current!.attempt!.id,
-          dependencies: current!.dependencies.map(dep => board.graph.lineageOf(dep)).map(chain => ({ ...taskRef(chain.at(-1)!), output: excerpt(chain.at(-1)!.output ?? '', 600), ...(chain.length > 1 ? { replacementOf: chain.slice(0, -1).map(item => item.id) } : {}) })),
-          ...(source ? { reviewSource: { ...taskRecord(source, 2400), evidence: evidenceOf(source) } } : {}),
-        } }),
+        ...(delivered.current === currentKey ? {} : { current: current === undefined ? null : currentView(current) }),
         events, ...eventCursor, ...runs,
         posts,
         delta: true,
@@ -3078,11 +3092,7 @@ export class SwarmRuntime implements Kernel {
       return {
         mission: { id: mission.id, title: mission.title, status: mission.status, ...budget },
         member: { id: member.id, name: member.name, role: member.role, status: member.status },
-        current: current ? {
-          task: taskRecord(current, 2400), attemptId: current.attempt!.id,
-          dependencies: current.dependencies.map(dep => board.graph.lineageOf(dep)).map(chain => ({ ...taskRef(chain.at(-1)!), output: excerpt(chain.at(-1)!.output ?? '', 600), ...(chain.length > 1 ? { replacementOf: chain.slice(0, -1).map(item => item.id) } : {}) })),
-          ...(source ? { reviewSource: { ...taskRecord(source, 2400), evidence: evidenceOf(source) } } : {}),
-        } : null,
+        current: current ? currentView(current) : null,
         evidence: current ? evidenceOf(current) : [],
         ...runs,
         events, ...eventCursor,
@@ -3489,8 +3499,8 @@ export class SwarmRuntime implements Kernel {
     const board = this.boardOf(member.missionId)
     const active = board.tasks.find(t => t.status === 'running' && t.attempt?.ownerId === memberId)
     // A sandbox Git refusal is diagnostic; reads, edits, and checks remain available.
-    if (active && !active.dependencies.every(dep => board.graph.dependencyMetOf(dep))) return 'A prerequisite was invalidated; stop work and inspect the challenge'
-    if (active?.reviewOf && this.task(member.missionId, active.reviewOf).status !== 'submitted') return 'The reviewed source is no longer submitted; await a fresh review assignment'
+    if (active && !active.dependencies.every(dep => board.graph.dependencyMet(dep))) return 'A prerequisite was invalidated; stop work and inspect the challenge'
+    if (active?.reviewOf && board.graph.reviewSource(active)?.status !== 'submitted') return 'The reviewed source is no longer submitted; await a fresh review assignment'
     if (active?.attempt && active.attempt.leaseUntil < this.now()) return 'Task lease expired; await reassignment'
     if (!active && !tool.startsWith('swarm_')) return 'Claim an assigned task before executing workspace tools'
     return undefined

@@ -48,7 +48,7 @@ export function guardBoard(runtime, missionId, mission) {
     },
     tasks: tasks.map(task => {
       const exhaustion = taskCeilingExhaustion(task)
-      const source = task.reviewOf === undefined ? undefined : runtime.task(missionId, task.reviewOf)
+      const source = board.graph.reviewSource(task)
       const reviewSourceLive = task.reviewOf === undefined
         ? (task.status === 'submitted' ? reviewable(board, task) : undefined)
         // A review whose named source is missing can never be dispatched: the
@@ -59,8 +59,9 @@ export function guardBoard(runtime, missionId, mission) {
         id: task.id, status: task.status,
         ...(task.attempt === undefined ? {} : { attempt: { leaseLive: task.attempt.leaseUntil >= now } }),
         ...(exhaustion === undefined ? {} : { ceilingExhausted: true }),
-        dependenciesSatisfied: task.dependencies.every(dependency => board.graph.dependencyMetOf(dependency)),
-        dependenciesDead: task.dependencies.some(dependency => board.graph.effectiveOf(dependency).status === 'cancelled'),
+        dependenciesSatisfied: task.dependencies.every(dependency => board.graph.dependencyMet(dependency)),
+        // The scheduler's `unschedulable`: an id that names no task is as dead as a cancelled lineage.
+        dependenciesDead: task.dependencies.some(dependency => [undefined, 'cancelled'].includes(board.graph.effective(dependency)?.status)),
         ...(task.reviewOf === undefined ? {} : { reviewOf: task.reviewOf }),
         // S4r-D4: `reviewSourceLive` is the SAME predicate the scheduler uses. A
         // review task is live exactly while its source is submitted (`capable`);

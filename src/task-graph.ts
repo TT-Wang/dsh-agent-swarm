@@ -1,5 +1,10 @@
-/** Pure functions of task and mission rows, shared by the runtime seams and the read-only projections. */
-import { PolicyError } from './policy-error.ts'
+/**
+ * Pure functions of task and mission rows, shared by the runtime seams and the
+ * read-only projections. Every read takes an id as the rows hold it: one that
+ * names no task of the mission reads as no task (no row, an empty lineage, no
+ * effective task, a prerequisite never met). An id a caller supplies is refused
+ * where it enters (`SwarmRuntime.task`, the admission graph check), never here.
+ */
 import { criterionId, type EvidenceStatus, type Mission, type Task } from './types.ts'
 
 const oldest = (tasks: readonly Task[]): Task | undefined => [...tasks].sort((a, b) => a.createdAt - b.createdAt || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))[0]
@@ -131,23 +136,13 @@ export function taskGraphIndex(tasks: readonly Task[]) {
   }
   const dependencyMet = (id: string): boolean => effective(id)?.status === 'accepted'
   /**
-   * The runtime's reads of an id it holds as one of this mission's tasks: the
-   * row, `lineage`, `effective` and `dependencyMet`, with one difference, an id
-   * that names no task of the mission is refused rather than read as no task.
-   * A projection, a classifier and a review source read the plain forms.
+   * Effective prerequisites for workspace preparation; one accepted repair
+   * covering several originals is merged once. Asked of ready work, every one
+   * of whose prerequisites is met, so each names a task.
    */
-  const taskOf = (id: string): Task => {
-    const task = byId.get(id)
-    if (task === undefined) throw new PolicyError('task_not_in_mission', 'validation_error', 'Task is not in this mission')
-    return task
-  }
-  const lineageOf = (id: string): Task[] => lineage(taskOf(id).id)
-  const effectiveOf = (id: string): Task => lineageOf(id).at(-1)!
-  const dependencyMetOf = (id: string): boolean => dependencyMet(taskOf(id).id)
-  /** Effective prerequisites for workspace preparation; one accepted repair covering several originals is merged once. */
   const effectiveDependencies = (task: Pick<Task, 'dependencies'>): Task[] => {
     const seen = new Set<string>()
-    return task.dependencies.map(dependency => effectiveOf(dependency)).filter(dependency => !seen.has(dependency.id) && seen.add(dependency.id))
+    return task.dependencies.flatMap(dependency => effective(dependency) ?? []).filter(dependency => !seen.has(dependency.id) && seen.add(dependency.id))
   }
   /**
    * R16-A: the EFFECTIVE unfinished prerequisites of one task, deduplicated in
@@ -206,7 +201,7 @@ export function taskGraphIndex(tasks: readonly Task[]) {
       return identities(id).has(sourceId) || covers(endpoint, sourceId, seen)
     })
   }
-  return { byId, lineage, effective, identities, dependencyMet, taskOf, lineageOf, effectiveOf, dependencyMetOf, effectiveDependencies, unfinishedDependencies,
+  return { byId, lineage, effective, identities, dependencyMet, effectiveDependencies, unfinishedDependencies,
     reviewSource, covers, replacementDescendants, liveReplacement, replacedLineage, criteriaOf, checklist }
 }
 
