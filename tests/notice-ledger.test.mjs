@@ -929,7 +929,7 @@ test('a start failure over unassigned work names the mission root, and the work 
   assert.deepEqual(ownerRows(f).filter(delivery => noticeFamily(delivery) === 'dispatch-question').map(delivery => delivery.subjects), [[`${task.id}@${taskOf(f.runtime, task.id).epoch}`]], 'the dispatch question about the work is asked, once')
 })
 
-test('P3: a start that adopts the member\'s running session ends its counted start failures; with the handle still busy, the dispatch question names the holder, once', async t => {
+test('P3: a start that adopts the member\'s running session ends its counted start failures, so the next failure counts from one; with the handle still busy, the dispatch question names the holder, once', async t => {
   const f = await setup({ clock: new FakeClock() })
   t.after(f.cleanup)
   // Only the reviewer's handle is idle. The author's first start fails; the next finds its session running and adopts it (the adapter resolves true), mid-turn.
@@ -952,6 +952,12 @@ test('P3: a start that adopts the member\'s running session ends its counted sta
   await f.runtime.settle(f.mission.id)
   assert.deepEqual([taskOf(f.runtime, task.id).status, subjectOf(f, task), f.runtime.store.get('members', f.author.id).startFailures], ['pending', subject, undefined], 'the adoption cleared the counted failures; the work waits at the epoch the failure named')
   assert.deepEqual(ownerRows(f).filter(delivery => noticeFamily(delivery) === 'dispatch-question').map(delivery => delivery.subjects), [[subject]], 'the dispatch question names it, once')
+  // The author's next start fails once more: the adoption ended the run, its in-process mirror included, so the count starts again.
+  failures = 1
+  await ticks(f, 1)
+  await f.runtime.settle(f.mission.id)
+  assert.deepEqual(events(f.runtime, f.mission.id, 'member/resume-failed').map(event => event.data.consecutiveFailures), [1, 1], 'the failure after the adoption is the first of a new run')
+  assert.deepEqual(ownerRows(f).filter(delivery => delivery.content.startsWith('Author could not start')).map(delivery => delivery.content.match(/failure \d of \d/)[0]), ['failure 1 of 3', 'failure 1 of 3'], 'and is told as one')
 })
 
 test('a cancellation that strands a dependent leaves it to the board classifier: one decision names it at its epoch, the fall-through beside running work and the W3 stall on a board with nothing else to do', async t => {
