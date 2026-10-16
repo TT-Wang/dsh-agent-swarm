@@ -8,13 +8,16 @@
  *    made outside the mission queue during the preparation (here a challenge of
  *    the prerequisite's claim) changes a row other than the task's own, and the
  *    fresh-row check reads it (the kept interleaving of scheduler-snapshot S1);
+ *  - dispatch alone also decides the isolation invariant again on the board
+ *    the preparation left: a worktree shared during the await is refused and
+ *    recorded there (S7's decide, record, skip), never assigned into;
  *  - one board asks the adapter about one member twice and gets two answers:
  *    the view is called through and never memoized, because asking whether a
  *    handle is idle can drain a stranded inbox item (R15-A5).
  */
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { ready } from '../lib/board.js'
+import { isolationViolation, ready } from '../lib/board.js'
 import { FakeClock, setup, taskOf } from './faults/harness.mjs'
 
 const deferred = () => { let resolve; return { promise: new Promise(r => { resolve = r }), resolve: value => resolve(value) } }
@@ -58,6 +61,28 @@ test('dispatch reads the board again after preparing: a prerequisite challenged 
   await f.runtime.settle(f.mission.id)
   const row = taskOf(f.runtime, f.dependent.id)
   assert.deepEqual([row.status, row.attempt, row.epoch], ['pending', undefined, f.dependent.epoch], 'the dispatcher did not assign work whose prerequisite is no longer accepted')
+})
+
+test('dispatch decides isolation again after preparing: a worktree lost during the preparation is refused and recorded, not assigned', async t => {
+  const f = await fixture(t)
+  f.workers.idle.add(f.author.id)
+  f.runtime.kick(f.mission.id)
+  await f.entered.promise
+  // Isolation is lost while the author's task is prepared: a commit outside
+  // the mission queue drops the author's provisioned worktree. The author's
+  // check before its start passed on the board before this, and the violation
+  // lists the author alone, so no later member's check can record it instead.
+  f.runtime.commit(f.mission.id, () => f.runtime.store.put('members', { ...f.runtime.store.get('members', f.author.id), workspace: '' }))
+  f.gate.resolve()
+  await f.runtime.settle(f.mission.id)
+  const row = taskOf(f.runtime, f.dependent.id)
+  assert.deepEqual([row.status, row.attempt, row.epoch], ['pending', undefined, f.dependent.epoch], 'the dispatcher did not assign work to a member without an isolated worktree')
+  const violation = isolationViolation(f.runtime.boardOf(f.mission.id), f.author)
+  assert.deepEqual(violation?.memberIds, [f.author.id], 'the board lists the author alone')
+  const refusals = f.runtime.store.list('deliveries', f.mission.id)
+    .filter(delivery => /^guard-terminal:workspace:workspace_terminal:isolation:[0-9a-f]{16}$/.test(delivery.notice?.dedupKey ?? ''))
+  assert.deepEqual(refusals.map(delivery => delivery.notice.reason), [`the isolation invariant refuses dispatch: ${violation.message}`],
+    'the refusal is recorded once, by the decision after the preparation, naming the violation its await left')
 })
 
 test('claim reads the board again after preparing: a prerequisite challenged during the preparation refuses the claim', async t => {
