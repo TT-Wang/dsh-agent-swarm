@@ -500,7 +500,6 @@ test('R15-B: the sidebar phase, recovery age and pending decision come from dura
   const blocked = sidebarState(snapshot([{ id: 't1', epoch: 2, status: 'blocked', kind: 'implementation', dependencies: [], output: 'Needs a repair', createdAt: 1 }]), 'connected', 2000)
   assert.equal(blocked.phase, 'waiting-for-owner')
   assert.equal(blocked.decision.subject, 't1@2')
-  assert.equal(blocked.decision.consumption, 'unknown')
 
   const stopping = sidebarState(snapshot([{ id: 't2', epoch: 3, status: 'blocked', kind: 'implementation', dependencies: [], createdAt: 1, resumeAfterStop: { epoch: 3, reason: 'handoff', at: 1500 } }]), 'connected', 2000)
   assert.equal(stopping.phase, 'recovering')

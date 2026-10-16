@@ -223,18 +223,13 @@ export function taskReasons(snapshot: Snapshot): Map<string, string> {
 
 type OwnerPhase = 'working' | 'recovering' | 'waiting-for-owner' | 'paused' | 'disconnected' | 'finished'
 
-/** One unresolved decision, with delivery state kept separate from consumption. */
+/** One unresolved decision, derived from the mission, task and event rows. */
 interface OwnerDecisionView {
   /** The decision's subject: `taskId@epoch` or `mission:<id>`. */
   subject: string
   content: string
   /** When the runtime recorded the decision durably. */
   queuedAt: number
-  /**
-   * Consumption is a separate fact from delivery, and the host exposes no
-   * reliable signal for it, so it is reported as unknown rather than relabelled.
-   */
-  consumption: 'unknown'
 }
 
 /** The recovery the runtime is currently performing for one subject. */
@@ -310,7 +305,7 @@ export function sidebarState(snapshot: Snapshot, connection: ConnectionState = '
   if (mission.status === 'staged') {
     return { ...base, phase: 'waiting-for-owner', label: 'Waiting for you',
       note: 'The plan is staged and has not been launched.',
-      decision: { subject: missionSubject(mission), content: mission.reason ?? 'Launch the staged plan or edit it.', queuedAt: mission.updatedAt, consumption: 'unknown' },
+      decision: { subject: missionSubject(mission), content: mission.reason ?? 'Launch the staged plan or edit it.', queuedAt: mission.updatedAt },
       evidence: 'mission.status=staged' }
   }
   // One pass over the durable task rows (F-34: the board render must not rescan
@@ -356,14 +351,14 @@ export function sidebarState(snapshot: Snapshot, connection: ConnectionState = '
   if (blocked !== undefined) {
     return { ...base, phase: 'waiting-for-owner', label: 'Waiting for your decision',
       note: blocked.output ?? 'Cannot make progress without a repair.',
-      decision: { subject: taskSubject(blocked), content: blocked.output ?? 'Repair the task or withdraw it.', queuedAt: lastEvent(snapshot, blocked.id, recoveryEventTypes)?.createdAt ?? mission.updatedAt, consumption: 'unknown' },
+      decision: { subject: taskSubject(blocked), content: blocked.output ?? 'Repair the task or withdraw it.', queuedAt: lastEvent(snapshot, blocked.id, recoveryEventTypes)?.createdAt ?? mission.updatedAt },
       evidence: `task ${blocked.id} status=blocked epoch ${blocked.epoch}` }
   }
   if (unreviewed !== undefined) {
     const latest = lastEvent(snapshot, unreviewed.id, reviewPathEventTypes), reason = latest?.type === 'task/review-blocked' ? record(latest.data).reason : undefined
     return { ...base, phase: 'waiting-for-owner', label: 'Waiting for your decision',
       note: 'A submitted artifact has no live independent review path.',
-      decision: { subject: taskSubject(unreviewed), content: typeof reason === 'string' && reason.trim() ? reason : 'No live independent review yet.', queuedAt: latest?.createdAt ?? mission.updatedAt, consumption: 'unknown' },
+      decision: { subject: taskSubject(unreviewed), content: typeof reason === 'string' && reason.trim() ? reason : 'No live independent review yet.', queuedAt: latest?.createdAt ?? mission.updatedAt },
       evidence: `task ${unreviewed.id} status=submitted without a live review` }
   }
   if (recovering !== undefined) {
@@ -388,7 +383,7 @@ export function sidebarState(snapshot: Snapshot, connection: ConnectionState = '
   }
   if (!tasks.length) {
     return { ...base, phase: 'waiting-for-owner', label: 'Waiting for you', note: 'No work has been admitted yet.',
-      decision: { subject: missionSubject(mission), content: 'Admit work with swarm_propose or inspect the plan.', queuedAt: mission.updatedAt, consumption: 'unknown' },
+      decision: { subject: missionSubject(mission), content: 'Admit work with swarm_propose or inspect the plan.', queuedAt: mission.updatedAt },
       evidence: 'no tasks admitted' }
   }
   return { ...base, phase: 'finished', label: 'No task can make further progress', note: mission.reason,
