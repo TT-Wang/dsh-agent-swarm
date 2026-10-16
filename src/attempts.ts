@@ -6,7 +6,7 @@
  * (`SwarmRuntime.ownAttempt`), not lease accounting.
  */
 import { id } from './store.ts'
-import { TERMINAL_STATES, blockCauses, openAttempt, stopPending, taskSubject, terminal, type BlockCause, type HeldTask } from './task-graph.ts'
+import { TERMINAL_STATES, blockCauses, holdsOpenAttempt, openAttempt, stopPending, taskSubject, terminal, type BlockCause, type HeldTask } from './task-graph.ts'
 import { stopFaultKey, type Notices } from './notices.ts'
 import { memberPhaseOf } from './projection.ts'
 import { PolicyError } from './policy-error.ts'
@@ -58,7 +58,7 @@ export function dropAttempt(task: Task): void {
  * over that transition.
  */
 const holdsAttempt = (row: Task | undefined, missionId: string, epoch: number, attemptId: string): row is HeldTask =>
-  row !== undefined && row.missionId === missionId && row.epoch === epoch && row.status === 'running' && row.attempt?.id === attemptId
+  row !== undefined && row.missionId === missionId && row.epoch === epoch && holdsOpenAttempt(row) && row.attempt.id === attemptId
 
 /** W6: bounded idle close-outs before the workspace is checkpointed and re-pended. */
 const DEFAULT_IDLE_CLOSEOUTS = 2
@@ -119,11 +119,11 @@ export class Attempts {
         // A legacy handoff can have lost the identity of its old handle. A
         // bounded scan stops every candidate without guessing its new target.
         // Fence other live attempts first, preserving their own checkpoint debt.
-        const peers = this.k.store.list('tasks', missionId).filter(peer => peer.id !== task.id && peer.status === 'running' && peer.attempt !== undefined)
+        const peers = this.k.store.list('tasks', missionId).filter(holdsOpenAttempt).filter(peer => peer.id !== task.id)
         const prior = this.k.store.latestTaskEvent(missionId, task.id, 'mission/stalled')?.data as { cause?: string; epoch?: number } | undefined
         if (peers.length > 0 || prior?.cause !== 'stop-owner-unresolved' || prior.epoch !== task.epoch) this.k.commit(missionId, () => {
           for (const peer of peers) {
-            const oldOwner = peer.attempt!.ownerId
+            const oldOwner = peer.attempt.ownerId
             peer.status = 'blocked'; peer.epoch++; dropAttempt(peer); delete peer.budgetResume
             peer.resumeAfterStop = { epoch: peer.epoch, memberId: oldOwner, reason: 'handoff', at: this.k.now() }
             this.k.store.put('tasks', peer)
@@ -545,7 +545,7 @@ export class Attempts {
             continue
           }
           this.stopRetries.delete(listed.id)
-          if (task === undefined || task.missionId !== missionId || task.status !== 'running' || !task.attempt) continue
+          if (task === undefined || task.missionId !== missionId || !holdsOpenAttempt(task)) continue
           const oldOwner = task.attempt.ownerId
           const attemptId = task.attempt.id
           // R10-15: a parked member holding a live attempt is a stall signal, not a

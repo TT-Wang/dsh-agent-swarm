@@ -21,7 +21,7 @@ import { assignmentAllows, authorIdsOf, canBorrowTask, canOwnReview, strandedRev
 import { memberPhaseOf } from './projection.ts'
 import { recoveryExit } from './declared-checks.ts'
 import { scopeKeysOverlap } from './scheduler.ts'
-import { TERMINAL_STATES, blockCauses, completionExempt, missionSubject, openAttempt, pendingStopOwner, quiescencePending, selectAcceptedDelivery, stopPending, subjectsOfTasks, taskGraphIndex, taskSubject, terminal, uncoveredCriteria, type TaskGraphIndex } from './task-graph.ts'
+import { TERMINAL_STATES, blockCauses, completionExempt, holdsOpenAttempt, missionSubject, openAttempt, pendingStopOwner, quiescencePending, selectAcceptedDelivery, stopPending, subjectsOfTasks, taskGraphIndex, taskSubject, terminal, uncoveredCriteria, type HeldTask, type TaskGraphIndex } from './task-graph.ts'
 import { providerQuiescent, type CheckResult, type Delivery, type Evidence, type Member, type Mission, type RuntimeConfig, type Task } from './types.ts'
 
 /**
@@ -383,19 +383,18 @@ export function isolationIssues(board: Pick<Board, 'members' | 'tasks'>): Isolat
   for (const [workspace, group] of byWorkspace) {
     if (group.length > 1) violations.push({ memberIds: group.map(member => member.id), message: `live workers ${group.map(member => member.id).join(', ')} share one provisioned worktree (${workspace}); live workers must never exceed provisioned worktrees` })
   }
-  const running = board.tasks.filter(task => task.status === 'running' && task.attempt !== undefined)
-  const byTaskWorkspace = new Map<string, Task[]>()
-  for (const task of running) {
-    const owner = board.members.find(member => member.id === task.attempt!.ownerId)
-    if (owner === undefined || owner.status === 'stopped') { violations.push({ memberIds: [task.attempt!.ownerId], message: `running task ${task.id} has no live owner (${task.attempt!.ownerId})` }); continue }
+  const byTaskWorkspace = new Map<string, HeldTask[]>()
+  for (const task of board.tasks.filter(holdsOpenAttempt)) {
+    const owner = board.members.find(member => member.id === task.attempt.ownerId)
+    if (owner === undefined || owner.status === 'stopped') { violations.push({ memberIds: [task.attempt.ownerId], message: `running task ${task.id} has no live owner (${task.attempt.ownerId})` }); continue }
     byTaskWorkspace.set(owner.workspace, [...(byTaskWorkspace.get(owner.workspace) ?? []), task])
   }
   for (const [workspace, group] of byTaskWorkspace) {
-    if (group.length > 1) violations.push({ memberIds: group.map(task => task.attempt!.ownerId), message: `concurrently running tasks ${group.map(task => task.id).join(', ')} share worktree ${workspace}` })
+    if (group.length > 1) violations.push({ memberIds: group.map(task => task.attempt.ownerId), message: `concurrently running tasks ${group.map(task => task.id).join(', ')} share worktree ${workspace}` })
     for (let left = 0; left < group.length; left++) {
       for (let right = left + 1; right < group.length; right++) {
         if (group[left]!.scope.some(a => group[right]!.scope.some(b => scopeKeysOverlap(a, b)))) {
-          violations.push({ memberIds: [group[left]!.attempt!.ownerId, group[right]!.attempt!.ownerId], message: `concurrently running tasks ${group[left]!.id} and ${group[right]!.id} declare overlapping scope in worktree ${workspace}` })
+          violations.push({ memberIds: [group[left]!.attempt.ownerId, group[right]!.attempt.ownerId], message: `concurrently running tasks ${group[left]!.id} and ${group[right]!.id} declare overlapping scope in worktree ${workspace}` })
         }
       }
     }
@@ -823,7 +822,7 @@ export interface Interpretation extends Board {
   /** The scheduler's stalled predicate for this board. */
   stalled: boolean
   /** Running tasks whose owning member is durably parked (the R10-15 holder family). */
-  parkedHolders: Array<{ task: Task; member: Member }>
+  parkedHolders: Array<{ task: HeldTask; member: Member }>
   implementations: Task[]
   /** Latest task, evidence or owner-decision progress; telemetry does not reset this clock. */
   lastTransitionAt: number
@@ -850,9 +849,10 @@ export function interpret(board: Board): Interpretation {
     unreviewed: unreviewedSources(board),
     unschedulable: unschedulable(board),
     stalled: stalled(board),
-    parkedHolders: tasks.filter(task => task.status === 'running' && task.attempt !== undefined
-      && members.some(member => member.id === task.attempt?.ownerId && memberPhaseOf(member) === 'parked'))
-      .map(task => ({ task, member: members.find(member => member.id === task.attempt?.ownerId)! })),
+    parkedHolders: tasks.filter(holdsOpenAttempt).flatMap(task => {
+      const member = members.find(candidate => candidate.id === task.attempt.ownerId)
+      return member !== undefined && memberPhaseOf(member) === 'parked' ? [{ task, member }] : []
+    }),
     implementations: tasks.filter(task => task.kind === 'implementation'),
     lastTransitionAt: board.records.progressAt(mission),
     subjectsOf: list => subjectsOfTasks(list, mission),

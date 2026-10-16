@@ -311,12 +311,17 @@ export function quiescencePending<T extends Pick<Task, 'status' | 'epoch' | 'res
 /** A task row that holds an attempt. */
 export type HeldTask = Task & { attempt: Attempt }
 
+/** The row holds an open attempt: it is running and carries its attempt. */
+export function holdsOpenAttempt(task: Task): task is HeldTask {
+  return task.status === 'running' && task.attempt !== undefined
+}
+
 /**
  * The task on which `memberId` holds its open attempt, the one running attempt
  * it owns: the attempt its tool calls, steps, activity and idle turns belong to.
  */
 export function openAttempt(tasks: readonly Task[], memberId: string): HeldTask | undefined {
-  return tasks.find((task): task is HeldTask => task.status === 'running' && task.attempt?.ownerId === memberId)
+  return tasks.find((task): task is HeldTask => holdsOpenAttempt(task) && task.attempt.ownerId === memberId)
 }
 
 /** A fenced handle must finish stopping before that member can own new work. */

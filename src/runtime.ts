@@ -26,7 +26,7 @@ import { validScope, scopeSubset } from './scope.ts'
 import { AdmissionError, assertDeclaredOutputs, assertScopeSelectors, citedCovers, dependencyAssumptions, formatDiagnostic, isNoopCheck, loadPackageScripts, normalizeReviewDependencies, normalizeScopeSelectors, normalizeTaskCeilings, reconcileTaskAdmission, requireHostChecks, taskCeilingBlock, taskGraphDefects, TaskGraphAdmissionError, type TaskGraphNode } from './admission.ts'
 import { canBorrowTask, canOwnReview, strandedReview } from './assignment.ts'
 import { executionClock, executionElapsed } from './resource-time.ts'
-import { TERMINAL_STATES, blockCauses, currentEvidenceIds, missionSubject, openAttempt, pendingStopOwner, quiescencePending, selectAcceptedDelivery, stopPending, taskEdges, taskGraphIndex, taskSubject, terminal, uncoveredCriteria, type BlockCause, type HeldTask } from './task-graph.ts'
+import { TERMINAL_STATES, blockCauses, currentEvidenceIds, holdsOpenAttempt, missionSubject, openAttempt, pendingStopOwner, quiescencePending, selectAcceptedDelivery, stopPending, taskEdges, taskGraphIndex, taskSubject, terminal, uncoveredCriteria, type BlockCause, type HeldTask } from './task-graph.ts'
 import { checkSyntaxDetail, declaredPlanChecks, orderedTasks, pairReviews, planAdvisories, validatePlan } from './plans.ts'
 import { OWNER_ONLY_TOOLS, type Actor, type AutoStart, BoardQuery, Budget, CheckAttribution, CheckEnvelope, CheckEnvironment, CreateMissionInput, CriticalPath, criterionId, Delivery, DraftPlan, Escalation, Evidence, EvidenceStatus, Member, MemberStatus, Mission, nextWorkerName, ObserveQuery, MessageInput, PlanInput, Post, PostInput, PostKind, PROVIDER_OUTAGE_WINDOW_MS, ProposeTaskInput, ProviderOutage, providerQuiescent, PublishInput, RecoveryFallback, RequestStartInput, RuntimeConfig, Snapshot, Task, TaskAmendment, TaskRejection, TaskCeiling, ToolRun, UsageBuckets, UsageSnapshotSource, VerificationCleanupFailure, WorkerAdapter, WorkerActivity, Workstream } from './types.ts'
 import { requireArtifactChecks } from './artifact-policy.ts'
@@ -678,7 +678,7 @@ export class SwarmRuntime implements Kernel {
       const clocked = this.store.get('missions', missionId)
       if (clocked?.executionTime !== undefined) {
         const running = clocked.status === 'active' && !clocked.budgetPause && this.store.list('tasks', missionId).some(task => {
-          if (task.status !== 'running' || task.attempt === undefined) return false
+          if (!holdsOpenAttempt(task)) return false
           const member = this.store.get('members', task.attempt.ownerId)
           return member?.activity !== undefined || this.workers.isIdle?.(task.attempt.ownerId) !== true
         })
@@ -770,7 +770,7 @@ export class SwarmRuntime implements Kernel {
   private ownAttempt(actor: Actor, missionId: string, taskId: string, attemptId: string): { task: Task; member: Member } {
     const { member } = this.active(actor, missionId)
     const task = this.task(missionId, taskId)
-    if (!member || task.status !== 'running' || !task.attempt || task.attempt.id !== attemptId || task.attempt.ownerId !== member.id || task.attempt.leaseUntil < this.now()) throw new PolicyError('task_attempt_stale', 'authorization_error', 'Stale or unauthorized task attempt; stop work and observe the current assignment')
+    if (!member || !holdsOpenAttempt(task) || task.attempt.id !== attemptId || task.attempt.ownerId !== member.id || task.attempt.leaseUntil < this.now()) throw new PolicyError('task_attempt_stale', 'authorization_error', 'Stale or unauthorized task attempt; stop work and observe the current assignment')
     if (!this.boardOf(missionId).graph.dependenciesMet(task)) throw new PolicyError('task_prerequisite_revoked', 'tool_error', 'A task prerequisite is no longer accepted; stop work')
     return { task, member }
   }

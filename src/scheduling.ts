@@ -6,7 +6,7 @@
  * board where it decides, after each of its awaits.
  */
 import { id } from './store.ts'
-import { TERMINAL_STATES, openAttempt, pendingStopOwner, quiescencePending, selectAcceptedDelivery, subjectsOfTasks, taskSubject, terminal } from './task-graph.ts'
+import { TERMINAL_STATES, holdsOpenAttempt, openAttempt, pendingStopOwner, quiescencePending, selectAcceptedDelivery, subjectsOfTasks, taskSubject, terminal } from './task-graph.ts'
 import { eligible, noticeSubjectsFor, overdueStop, ready, startBlocker, unschedulable } from './board.ts'
 import { factKey } from './notices.ts'
 import { AdmissionRefusedError } from './scheduler.ts'
@@ -258,7 +258,7 @@ export class Scheduling {
     const now = this.rt.now()
     const holders: Array<{ subject: string; memberId?: string }> = []
     for (const task of this.rt.store.list('tasks', missionId)) {
-      const live = quiescencePending(task) || (task.status === 'running' && task.attempt !== undefined && task.attempt.leaseUntil >= now)
+      const live = quiescencePending(task) || (holdsOpenAttempt(task) && task.attempt.leaseUntil >= now)
       if (!live) continue
       const memberId = task.attempt?.ownerId ?? task.assigneeId
       holders.push({ subject: taskSubject(task), ...(memberId === undefined ? {} : { memberId }) })
@@ -497,7 +497,7 @@ export class Scheduling {
     const now = this.rt.now()
     return this.rt.store.list('tasks', missionId).some(task =>
       quiescencePending(task)
-      || (task.status === 'running' && task.attempt !== undefined && task.attempt.leaseUntil >= now))
+      || (holdsOpenAttempt(task) && task.attempt.leaseUntil >= now))
   }
 
   /* ----------------------------------------------------------------------- *
@@ -542,8 +542,8 @@ export class Scheduling {
    * `subject` is the attempt's task@epoch, the identity the escalation carries.
    */
   silentAttempt(task: Task, mission: Mission, now = this.rt.now()): SilentAttempt | undefined {
+    if (!holdsOpenAttempt(task)) return undefined
     const attempt = task.attempt
-    if (attempt === undefined || task.status !== 'running') return undefined
     const boundMs = this.rt.bounds.attemptSilenceBoundMs
     if (boundMs <= 0) return undefined
     if (!Number.isSafeInteger(attempt.leaseUntil)) return undefined

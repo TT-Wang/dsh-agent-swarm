@@ -9,7 +9,7 @@ import { covered, hasNotice } from './arena.ts'
 import { hostContextOf } from './projection.ts'
 import { formatDiagnostic, missingReviewDiagnostic } from './admission.ts'
 import { guardTerminal, guardTerminalKey, type GuardChainId, type GuardTerminal, type GuardTerminalContext, type RefusalRegistry } from './refusals.ts'
-import { TERMINAL_STATES, missionSubject, stopPending, taskSubject, terminal } from './task-graph.ts'
+import { TERMINAL_STATES, holdsOpenAttempt, missionSubject, stopPending, taskSubject, terminal } from './task-graph.ts'
 import { WriterBusyError, id, type SwarmStore } from './store.ts'
 import { awaited, type Kernel, type PassState, type SchedulingPass } from './kernel.ts'
 import { completionError, dependentsOf, eligible, interpret, isolationIssues, newestReviewBlock, noticeSubjectsFor, overdueStop, reviewNeed, reviewPathBlocker, reviewPathStalled, stallRoots, startBlocker, unreviewedSources, waitsLegitimately, type Board, type Interpretation } from './board.ts'
@@ -169,7 +169,7 @@ function ownerDeliveryMoot(mission: Pick<Mission, 'status'>, delivery: Pick<Deli
  */
 export function assignmentCurrent(store: Pick<SwarmStore, 'get'>, delivery: Pick<Delivery, 'missionId' | 'to' | 'taskId' | 'attemptId'>): boolean {
   const task = delivery.taskId === undefined ? undefined : store.get('tasks', delivery.taskId)
-  return task?.missionId === delivery.missionId && task.status === 'running' && task.attempt?.id === delivery.attemptId && task.attempt?.ownerId === delivery.to
+  return task?.missionId === delivery.missionId && holdsOpenAttempt(task) && task.attempt.id === delivery.attemptId && task.attempt.ownerId === delivery.to
 }
 
 /** R17-G3: the stable digest of a recorded reason, so a fact key stays bounded. */
