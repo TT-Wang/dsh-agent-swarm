@@ -2,7 +2,7 @@
  * F1: one attempt fence. An attempt ends in one of two named operations, and
  * whatever is scoped to the attempt leaves the row with it:
  *
- *  - `Attempts.fenceRow`, when a handle may still be running the attempt: the
+ *  - `Attempts.fenceForStop`, when a handle may still be running the attempt: the
  *    attempt ends, the handle owes a stop, and `attempt/fenced` closes the
  *    attempt in the same transaction as the site's own closer event. Lease
  *    expiry, an idle close-out (checkpointed or not), a handoff, an owner

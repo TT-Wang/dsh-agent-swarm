@@ -2023,7 +2023,7 @@ export class SwarmRuntime implements Kernel {
     task.handoff = input.summary; task.assigneeId = input.to
     if (input.to !== undefined) task.plannedAssigneeId = input.to
     this.commit(missionId, () => {
-      this.attempts.fenceRow(task, { status: 'blocked', reason: 'handoff', memberId: member.id, cause: 'handoff' })
+      this.attempts.fenceForStop(task, { status: 'blocked', reason: 'handoff', cause: 'handoff' })
       this.store.put('tasks', task)
       this.store.event(missionId, 'task/handoff-started', member.id, { taskId: task.id, to: input.to ?? null, summary: input.summary })
     })
@@ -3348,6 +3348,9 @@ export class SwarmRuntime implements Kernel {
     if (resumes) { delete next.preparationFailure; delete next.verificationRecovery; clearCloseout(next) }
     if (rework !== undefined) this.reopenForRework(next, rework)
     // A rejected submission holds no live attempt: its author is not stopped.
+    // Any other attempt the row holds owes its owner's stop, a blocked row's
+    // too (a verification-deferred review), so the fence below names that
+    // owner itself instead of reading the open attempt as `fenceForStop` does.
     const activeOwner = rework === undefined ? task.attempt?.ownerId : undefined
     const fenced = activeOwner !== undefined && (structural || (resumes && task.status === 'blocked'))
     if (!fenced) {
@@ -3562,7 +3565,7 @@ export class SwarmRuntime implements Kernel {
     task.output = `${task.output ?? ''}\n${ceiling.reason}`.trim()
     if (member !== undefined && memberPhaseOf(member) !== 'stopped') delete member.activity
     this.commit(mission.id, () => {
-      this.attempts.fenceRow(task, { status: 'blocked', reason: 'resource', memberId: ownerId, cause: 'task-ceiling' })
+      this.attempts.fenceForStop(task, { status: 'blocked', reason: 'resource', cause: 'task-ceiling' })
       this.store.put('tasks', task)
       if (member !== undefined) this.store.put('members', member)
       this.store.event(mission.id, 'task/ceiling-exhausted', 'runtime', { taskId: task.id, dimension: ceiling.dimension, limit: ceiling.limit, used: ceiling.used, code: ceiling.code })
