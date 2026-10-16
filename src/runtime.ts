@@ -26,7 +26,7 @@ import { validScope, scopeSubset } from './scope.ts'
 import { AdmissionError, assertDeclaredOutputs, assertScopeSelectors, citedCovers, dependencyAssumptions, formatDiagnostic, isNoopCheck, loadPackageScripts, normalizeReviewDependencies, normalizeScopeSelectors, normalizeTaskCeilings, reconcileTaskAdmission, requireHostChecks, taskCeilingBlock, taskGraphDefects, TaskGraphAdmissionError, type TaskGraphNode } from './admission.ts'
 import { canBorrowTask, canOwnReview, strandedReview } from './assignment.ts'
 import { executionClock, executionElapsed } from './resource-time.ts'
-import { TERMINAL_STATES, blockCauses, currentEvidenceIds, missionSubject, pendingStopOwner, quiescencePending, selectAcceptedDelivery, stopPending, taskEdges, taskGraphIndex, taskSubject, terminal, uncoveredCriteria, type BlockCause } from './task-graph.ts'
+import { TERMINAL_STATES, blockCauses, currentEvidenceIds, missionSubject, openAttempt, pendingStopOwner, quiescencePending, selectAcceptedDelivery, stopPending, taskEdges, taskGraphIndex, taskSubject, terminal, uncoveredCriteria, type BlockCause, type HeldTask } from './task-graph.ts'
 import { checkSyntaxDetail, declaredPlanChecks, orderedTasks, pairReviews, planAdvisories, validatePlan } from './plans.ts'
 import { OWNER_ONLY_TOOLS, type Actor, type AutoStart, BoardQuery, Budget, CheckAttribution, CheckEnvelope, CheckEnvironment, CreateMissionInput, CriticalPath, criterionId, Delivery, DraftPlan, Escalation, Evidence, EvidenceStatus, Member, MemberStatus, Mission, nextWorkerName, ObserveQuery, MessageInput, PlanInput, Post, PostInput, PostKind, PROVIDER_OUTAGE_WINDOW_MS, ProposeTaskInput, ProviderOutage, providerQuiescent, PublishInput, RecoveryFallback, RequestStartInput, RuntimeConfig, Snapshot, Task, TaskAmendment, TaskRejection, TaskCeiling, ToolRun, UsageBuckets, UsageSnapshotSource, VerificationCleanupFailure, WorkerAdapter, WorkerActivity, Workstream } from './types.ts'
 import { requireArtifactChecks } from './artifact-policy.ts'
@@ -1791,10 +1791,10 @@ export class SwarmRuntime implements Kernel {
     // Provenance is host-derived: an omitted task/attempt resolves to the
     // caller's own running attempt, and a supplied one must be owned by the
     // caller. A member can never attach an escalation to another member's work.
-    const running = this.store.list('tasks', missionId).find(task => task.status === 'running' && task.attempt?.ownerId === member.id)
+    const running = openAttempt(this.store.list('tasks', missionId), member.id)
     let taskId = input.taskId
     let attemptId = input.attemptId
-    if (taskId === undefined && running !== undefined) { taskId = running.id; attemptId = running.attempt!.id }
+    if (taskId === undefined && running !== undefined) { taskId = running.id; attemptId = running.attempt.id }
     if (attemptId !== undefined && taskId === undefined) throw new Error('attemptId requires taskId')
     if (taskId !== undefined) {
       const task = this.task(missionId, taskId)
@@ -2341,8 +2341,8 @@ export class SwarmRuntime implements Kernel {
     // task running with a parked owner until lease expiry, which burns a
     // recovery credit and hides the stall behind a live-lease classification.
     // Refuse with the supported exits; an unowned member may still park.
-    const open = this.store.list('tasks', missionId).find(task => task.status === 'running' && task.attempt?.ownerId === member.id)
-    if (open?.attempt) throw new Error(`You still hold running attempt ${open.attempt.id} on task ${open.id} (${open.title}). swarm_wait cannot park a member that owns a running attempt: submit it with swarm_submit/swarm_verify, release it with swarm_handoff, or keep working. Parking it would leave the attempt running until lease expiry.`)
+    const open = openAttempt(this.store.list('tasks', missionId), member.id)
+    if (open !== undefined) throw new Error(`You still hold running attempt ${open.attempt.id} on task ${open.id} (${open.title}). swarm_wait cannot park a member that owns a running attempt: submit it with swarm_submit/swarm_verify, release it with swarm_handoff, or keep working. Parking it would leave the attempt running until lease expiry.`)
     member.phase = 'parked'
     this.commit(missionId, () => { this.store.put('members', member); this.store.event(missionId, 'member/waiting', member.id, {}) })
     return { waiting: true }
@@ -3068,15 +3068,15 @@ export class SwarmRuntime implements Kernel {
     const budget = { usedTokens: mission.usedTokens, maxTokens: mission.budget.maxTokens, usedSteps: mission.usedSteps, maxSteps: mission.budget.maxSteps, deadline: mission.deadline, inFlightTokensEstimate: this.inFlightEstimate(members) }
     const full = query.detail === 'full'
     if (member) {
-      const current = tasks.find(task => task.status === 'running' && task.attempt?.ownerId === member.id)
-      const currentKey = current === undefined ? undefined : `${current.id}:${current.attempt!.id}:${current.status}`
+      const current = openAttempt(tasks, member.id)
+      const currentKey = current === undefined ? undefined : `${current.id}:${current.attempt.id}:${current.status}`
       // The current assignment as both the focused view and a delta send it.
-      const currentView = (task: Task) => {
+      const currentView = (task: HeldTask) => {
         const source = graph.reviewSource(task)
-        return { task: taskRecord(task, 2400), attemptId: task.attempt!.id, dependencies: dependencyRefs(task, 600),
+        return { task: taskRecord(task, 2400), attemptId: task.attempt.id, dependencies: dependencyRefs(task, 600),
           ...(task.reviewOf ? { reviewSource: source === undefined ? missingRef(task.reviewOf) : { ...taskRecord(source, 2400), evidence: evidenceOf(source) } } : {}) }
       }
-      const runs = runsWindow(current?.attempt ? { memberId: member.id, taskId: current.id, attemptId: current.attempt.id } : { memberId: member.id }, 20, afterRun)
+      const runs = runsWindow(current !== undefined ? { memberId: member.id, taskId: current.id, attemptId: current.attempt.id } : { memberId: member.id }, 20, afterRun)
       // Board traffic is part of the delta: counts plus the newest few posts,
       // so a worker learns about cross-task posts without a second poll.
       const postAfter = delivered?.postSeq ?? 0
@@ -3511,11 +3511,11 @@ export class SwarmRuntime implements Kernel {
     if (mission.budgetPause) return 'Budget pause is waiting for worker quiescence and a fresh resume assignment'
     if (/^(?:subagent|spawn_agent|agent_teams|cordis|plugin|workflow|ralph)(?:$|_)/.test(tool) || ['send_message', 'interrupt_agent', ...OWNER_ONLY_TOOLS].includes(tool)) return 'Use the swarm work board; alternate delegation and runtime modification bypass mission authority'
     const board = this.boardOf(member.missionId)
-    const active = board.tasks.find(t => t.status === 'running' && t.attempt?.ownerId === memberId)
+    const active = openAttempt(board.tasks, memberId)
     // A sandbox Git refusal is diagnostic; reads, edits, and checks remain available.
     if (active && !board.graph.dependenciesMet(active)) return 'A prerequisite was invalidated; stop work and inspect the challenge'
     if (active?.reviewOf && board.graph.reviewSource(active)?.status !== 'submitted') return 'The reviewed source is no longer submitted; await a fresh review assignment'
-    if (active?.attempt && active.attempt.leaseUntil < this.now()) return 'Task lease expired; await reassignment'
+    if (active !== undefined && active.attempt.leaseUntil < this.now()) return 'Task lease expired; await reassignment'
     if (!active && !tool.startsWith('swarm_')) return 'Claim an assigned task before executing workspace tools'
     return undefined
   }
@@ -3538,7 +3538,7 @@ export class SwarmRuntime implements Kernel {
     if (memberPhaseOf(member) === 'parked' && !hasFreshInput) return false
     // D1: a task that exhausted its own step/finding ceiling blocks itself before
     // the next step is charged, so the mission budget is never drained by it.
-    const activeTask = this.store.list('tasks', mission.id).find(task => task.status === 'running' && task.attempt?.ownerId === memberId)
+    const activeTask = openAttempt(this.store.list('tasks', mission.id), memberId)
     if (activeTask !== undefined) {
       const ceiling = taskCeilingBlock(activeTask, this.now())
       if (ceiling !== undefined) { this.blockTaskCeiling(mission, activeTask, ceiling); return false }
@@ -3604,9 +3604,9 @@ export class SwarmRuntime implements Kernel {
     if (mission.status !== 'active' || memberPhaseOf(member) === 'stopped' || mission.budgetPause || this.now() >= mission.deadline) activity = undefined
     const previous = member.activity
     if (activity !== undefined) {
-      const task = this.store.list('tasks', mission.id).find(task => task.status === 'running' && task.attempt?.ownerId === memberId)
+      const task = openAttempt(this.store.list('tasks', mission.id), memberId)
       // One operation keeps the attempt it started under even if a later assignment races its end.
-      const attemptId = member.activity?.id === activity.id ? member.activity.attemptId : task?.attempt?.id
+      const attemptId = member.activity?.id === activity.id ? member.activity.attemptId : task?.attempt.id
       member.activity = { ...activity, attemptId }
     } else {
       if (member.activity === undefined) return
@@ -3625,8 +3625,8 @@ export class SwarmRuntime implements Kernel {
     if (this.closed || input.tool.startsWith('swarm_')) return undefined
     const member = this.store.get('members', memberId)
     if (!member) return undefined
-    const task = this.store.list('tasks', member.missionId).find(t => t.status === 'running' && t.attempt?.ownerId === memberId)
-    if (!task?.attempt) return undefined
+    const task = openAttempt(this.store.list('tasks', member.missionId), memberId)
+    if (task === undefined) return undefined
     const run: ToolRun = { ...input, id: id('run'), missionId: member.missionId, memberId, taskId: task.id, attemptId: task.attempt.id, createdAt: this.now() }
     // F8: a recorded run may extend the attempt lease, but a stored lease must
     // never outlive the mission deadline (the same clamp every other renewal uses).
@@ -3654,7 +3654,7 @@ export class SwarmRuntime implements Kernel {
       if (typed === undefined) return
       // Durable audit plus a typed delivery, so the worker learns the supported
       // host capture path without disabling unrelated workspace tools.
-      this.store.event(member.missionId, 'task/git-write-denied', memberId, { taskId: task.id, attemptId: task.attempt!.id, command: denied, runId: run.id })
+      this.store.event(member.missionId, 'task/git-write-denied', memberId, { taskId: task.id, attemptId: task.attempt.id, command: denied, runId: run.id })
       this.store.put('deliveries', { id: typed, missionId: member.missionId, from: 'runtime', to: memberId, kind: 'control', content: gitWriteDeniedMessage(denied!), createdAt: this.now() })
     })
     // The adapter awaits this record before it returns the failed result to the

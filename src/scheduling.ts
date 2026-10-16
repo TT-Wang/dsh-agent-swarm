@@ -6,7 +6,7 @@
  * board where it decides, after each of its awaits.
  */
 import { id } from './store.ts'
-import { TERMINAL_STATES, pendingStopOwner, quiescencePending, selectAcceptedDelivery, subjectsOfTasks, taskSubject, terminal } from './task-graph.ts'
+import { TERMINAL_STATES, openAttempt, pendingStopOwner, quiescencePending, selectAcceptedDelivery, subjectsOfTasks, taskSubject, terminal } from './task-graph.ts'
 import { eligible, noticeSubjectsFor, overdueStop, ready, startBlocker, unschedulable } from './board.ts'
 import { factKey } from './notices.ts'
 import { AdmissionRefusedError } from './scheduler.ts'
@@ -124,7 +124,7 @@ export class Scheduling {
           if (startBlocker(this.rt.view, member) !== undefined) continue
           const view = this.rt.notices.interpretation(missionId)
           if (pendingStopOwner(view.tasks, member.id)) continue
-          const open = view.tasks.find((t): t is Task & { attempt: Attempt } => t.status === 'running' && t.attempt?.ownerId === member.id)
+          const open = openAttempt(view.tasks, member.id)
           if (open !== undefined) {
             // W6: the worker ended its turn with an open attempt. Nudge within a
             // bounded retry, then checkpoint the workspace and re-pend the task

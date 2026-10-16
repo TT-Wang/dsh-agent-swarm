@@ -4,6 +4,7 @@ import type { JsonSchemaNode, ToolDefinition, ToolExecution } from '@deepseek-ai
 import { authorizeWorkspace, type WorkspaceAuthorized } from './authorization.ts'
 import { PolicyError } from './policy-error.ts'
 import { validatePlan } from './plans.ts'
+import { openAttempt } from './task-graph.ts'
 import type { SwarmRuntime } from './runtime.ts'
 import { TraceRecorder, eventSummary, eventVocabularyReport, errorTypeFor, readEventHistory, traceMetrics, type TraceStep } from './trace.ts'
 import { OWNER_ONLY_TOOLS, Actor, BoardQuery, Budget, CreateMissionInput, DraftPlan, ObserveQuery, PlanInput, PostInput, PostKind, ProposeTaskInput, PublishInput, Snapshot, TaskAmendment, type WorkspaceGrantSnapshot } from './types.ts'
@@ -255,10 +256,10 @@ function spanContext(runtime: SwarmRuntime, step: string, sessionId: string, arg
   let attemptId = typeof args.attemptId === 'string' ? args.attemptId : undefined
   if (step === 'swarm_propose' && typeof created?.id === 'string') taskId = created.id
   const member = store.list('members', missionId).find(candidate => candidate.sessionId === sessionId)
-  const running = member === undefined ? undefined : store.list('tasks', missionId).find(task => task.status === 'running' && task.attempt?.ownerId === member.id)
+  const running = member === undefined ? undefined : openAttempt(store.list('tasks', missionId), member.id)
   // A failed claim must not borrow the attempt of the task the member is
   // already working on: the span names the step's own target or nothing.
-  if (running?.attempt !== undefined && (step !== 'swarm_claim' || running.id === taskId)) { taskId ??= running.id; attemptId ??= running.attempt.id }
+  if (running !== undefined && (step !== 'swarm_claim' || running.id === taskId)) { taskId ??= running.id; attemptId ??= running.attempt.id }
   const reviewOfTaskId = step === 'swarm_verify' && taskId !== undefined ? store.get('tasks', taskId)?.reviewOf : undefined
   return { missionId, ...(taskId === undefined ? {} : { taskId }), ...(attemptId === undefined ? {} : { attemptId }), ...(reviewOfTaskId === undefined ? {} : { reviewOfTaskId }) }
 }

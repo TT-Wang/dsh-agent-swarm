@@ -21,7 +21,7 @@ import { assignmentAllows, authorIdsOf, canBorrowTask, canOwnReview, strandedRev
 import { memberPhaseOf } from './projection.ts'
 import { recoveryExit } from './declared-checks.ts'
 import { scopeKeysOverlap } from './scheduler.ts'
-import { TERMINAL_STATES, blockCauses, completionExempt, missionSubject, pendingStopOwner, quiescencePending, selectAcceptedDelivery, stopPending, subjectsOfTasks, taskGraphIndex, taskSubject, terminal, uncoveredCriteria, type TaskGraphIndex } from './task-graph.ts'
+import { TERMINAL_STATES, blockCauses, completionExempt, missionSubject, openAttempt, pendingStopOwner, quiescencePending, selectAcceptedDelivery, stopPending, subjectsOfTasks, taskGraphIndex, taskSubject, terminal, uncoveredCriteria, type TaskGraphIndex } from './task-graph.ts'
 import { providerQuiescent, type CheckResult, type Delivery, type Evidence, type Member, type Mission, type RuntimeConfig, type Task } from './types.ts'
 
 /**
@@ -210,7 +210,7 @@ export function readinessBlocker(board: Board, task: Task, member: Member): stri
   // an untouched task while another member is idle. This adds no reservation.
   const preferred = board.members.find(candidate => candidate.id === task.assigneeId)
   const availableForBorrowing = preferred === undefined || !eligible(board, task, preferred)
-    || all.some(candidate => candidate.status === 'running' && candidate.attempt?.ownerId === preferred.id)
+    || openAttempt(all, preferred.id) !== undefined
     || startBlocker(board.view, preferred) !== undefined
   return availableForBorrowing ? undefined : `preferred member ${task.assigneeId} is available for this task; the owner can amend assigneeId to change the preference`
 }

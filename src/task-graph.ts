@@ -5,7 +5,7 @@
  * effective task, a prerequisite never met). An id a caller supplies is refused
  * where it enters (`SwarmRuntime.task`, the admission graph check), never here.
  */
-import { criterionId, type EvidenceStatus, type Mission, type Task } from './types.ts'
+import { criterionId, type Attempt, type EvidenceStatus, type Mission, type Task } from './types.ts'
 
 const oldest = (tasks: readonly Task[]): Task | undefined => [...tasks].sort((a, b) => a.createdAt - b.createdAt || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))[0]
 
@@ -307,6 +307,17 @@ export function stopPending<T extends Pick<Task, 'epoch' | 'resumeAfterStop'>>(t
  * and completion decision treats it as live work.
  */
 export function quiescencePending<T extends Pick<Task, 'status' | 'epoch' | 'resumeAfterStop'>>(task: T): task is T & { resumeAfterStop: NonNullable<T['resumeAfterStop']> } { return task.status === 'blocked' && stopPending(task) }
+
+/** A task row that holds an attempt. */
+export type HeldTask = Task & { attempt: Attempt }
+
+/**
+ * The task on which `memberId` holds its open attempt, the one running attempt
+ * it owns: the attempt its tool calls, steps, activity and idle turns belong to.
+ */
+export function openAttempt(tasks: readonly Task[], memberId: string): HeldTask | undefined {
+  return tasks.find((task): task is HeldTask => task.status === 'running' && task.attempt?.ownerId === memberId)
+}
 
 /** A fenced handle must finish stopping before that member can own new work. */
 export function pendingStopOwner(tasks: readonly Task[], memberId: string): boolean {

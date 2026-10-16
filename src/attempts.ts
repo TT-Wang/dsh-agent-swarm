@@ -6,12 +6,12 @@
  * (`SwarmRuntime.ownAttempt`), not lease accounting.
  */
 import { id } from './store.ts'
-import { TERMINAL_STATES, blockCauses, stopPending, taskSubject, terminal, type BlockCause } from './task-graph.ts'
+import { TERMINAL_STATES, blockCauses, openAttempt, stopPending, taskSubject, terminal, type BlockCause, type HeldTask } from './task-graph.ts'
 import { stopFaultKey, type Notices } from './notices.ts'
 import { memberPhaseOf } from './projection.ts'
 import { PolicyError } from './policy-error.ts'
 import { awaited, formatSpan, type Kernel, type SchedulingPass } from './kernel.ts'
-import type { Artifact, Attempt, Member, Mission, Task, WorkerActivity } from './types.ts'
+import type { Artifact, Member, Mission, Task, WorkerActivity } from './types.ts'
 
 /**
  * The detail a terminal message embeds. A guard's own message may already carry
@@ -57,7 +57,7 @@ export function dropAttempt(task: Task): void {
  * fencing transition committed in between fails it, so the caller never writes
  * over that transition.
  */
-const holdsAttempt = (row: Task | undefined, missionId: string, epoch: number, attemptId: string): row is Task & { attempt: Attempt } =>
+const holdsAttempt = (row: Task | undefined, missionId: string, epoch: number, attemptId: string): row is HeldTask =>
   row !== undefined && row.missionId === missionId && row.epoch === epoch && row.status === 'running' && row.attempt?.id === attemptId
 
 /** W6: bounded idle close-outs before the workspace is checkpointed and re-pended. */
@@ -432,8 +432,8 @@ export class Attempts {
     // W6: remember that this member ended a turn while still owning an attempt,
     // so scheduling can nudge it and, when the bounded retry is exhausted,
     // checkpoint the workspace before any reassignment.
-    const open = this.k.store.list('tasks', member.missionId).find(task => task.status === 'running' && task.attempt?.ownerId === memberId)
-    if (open?.attempt) {
+    const open = openAttempt(this.k.store.list('tasks', member.missionId), memberId)
+    if (open !== undefined) {
       this.idleSignals.set(memberId, { attemptId: open.attempt.id, at: this.k.now() })
       // S5: the signal is durable on the task row the scheduling pass re-reads;
       // the map above is only a cache for a row write still in flight.
@@ -445,7 +445,7 @@ export class Attempts {
     delete member.activity
     this.k.commit(member.missionId, () => {
       this.k.store.put('members', member)
-      if (open?.attempt) this.k.store.put('tasks', open)
+      if (open !== undefined) this.k.store.put('tasks', open)
     })
     this.k.kick(member.missionId)
   }
@@ -456,7 +456,7 @@ export class Attempts {
    * task with the same member preferred so recovery resumes partial work.
    * `pass` is the dispatching body's record: its capture await is the body's own.
    */
-  async closeOutIdleAttempt(mission: Mission, member: Member, task: Task & { attempt: Attempt }, pass?: SchedulingPass): Promise<void> {
+  async closeOutIdleAttempt(mission: Mission, member: Member, task: HeldTask, pass?: SchedulingPass): Promise<void> {
     const attemptId = task.attempt.id
     const bound = this.k.config.maxIdleCloseouts ?? DEFAULT_IDLE_CLOSEOUTS
     const nudges = task.closeout?.nudges ?? 0
