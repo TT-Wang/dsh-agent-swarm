@@ -3552,9 +3552,9 @@ export class SwarmRuntime implements Kernel {
       // R17-G7: fresh input unparks the member; the derived status follows the attempt.
       if (memberPhaseOf(member) === 'parked') { member.phase = 'active'; this.store.put('members', member) }
       this.store.put('missions', mission)
-      for (const task of this.store.list('tasks', mission.id)) if (task.status === 'running' && task.attempt?.ownerId === memberId) {
-        task.usedSteps = (task.usedSteps ?? 0) + 1
-        task.attempt.leaseUntil = Math.min(mission.deadline, this.now() + this.config.leaseMs); this.store.put('tasks', task)
+      if (activeTask !== undefined) {
+        activeTask.usedSteps = (activeTask.usedSteps ?? 0) + 1
+        activeTask.attempt.leaseUntil = Math.min(mission.deadline, this.now() + this.config.leaseMs); this.store.put('tasks', activeTask)
       }
     })
     this.warnBudget(mission)
@@ -3681,15 +3681,15 @@ export class SwarmRuntime implements Kernel {
     this.store.put('members', member)
     // R17-G1: the member's open work comes from the shared interpretation.
     const view = this.notices.interpretation(member.missionId)
-    const open = view.tasks.filter(task => task.status === 'running' && task.attempt?.ownerId === member.id)
-    if (!duplicate) this.store.event(member.missionId, 'provider/outage', 'runtime', { memberId: member.id, class: outage.class, status: outage.status, message: outage.message, taskIds: open.map(task => task.id) })
+    const open = openAttempt(view.tasks, member.id)
+    if (!duplicate) this.store.event(member.missionId, 'provider/outage', 'runtime', { memberId: member.id, class: outage.class, status: outage.status, message: outage.message, taskIds: open === undefined ? [] : [open.id] })
     // The fact is the outage class on the member's open work, so a retry, or a
     // return to a class already told on that work, is that fact again.
     // R15-A1/A4: the subject is the task whose clock the outage holds, never the
     // whole board; the mission root only when the member owns no open task.
     this.notices.notify(member.missionId,
       `${member.name} provider ${outage.class} outage${outage.status === undefined ? '' : ` (HTTP ${outage.status})`}: ${outage.message}. Its attempt is preserved and no recovery credit is spent while the route is quiescent.`,
-      open.length ? view.subjectsOf(open) : [missionSubject(view.mission)], { from: member.id, trigger: 'provider/outage', reason: outage.class })
+      open === undefined ? [missionSubject(view.mission)] : view.subjectsOf([open]), { from: member.id, trigger: 'provider/outage', reason: outage.class })
   }
   /**
    * S5c: a start that leaves the member's session running, an adoption included,

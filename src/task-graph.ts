@@ -319,6 +319,8 @@ export function holdsOpenAttempt(task: Task): task is HeldTask {
 /**
  * The task on which `memberId` holds its open attempt, the one running attempt
  * it owns: the attempt its tool calls, steps, activity and idle turns belong to.
+ * A member never holds two: assignment is the only way a row starts running,
+ * and its admission refuses a member that holds one (`lease_conflict`).
  */
 export function openAttempt(tasks: readonly Task[], memberId: string): HeldTask | undefined {
   return tasks.find((task): task is HeldTask => holdsOpenAttempt(task) && task.attempt.ownerId === memberId)

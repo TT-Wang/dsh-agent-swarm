@@ -707,8 +707,8 @@ export function waitsLegitimately(board: Board, task: Task): boolean {
     if (stops.length > 0) return stops.every(marker => stopInBound(board, marker))
     // Once the stop settles, another live attempt may take the selected member
     // first. Its bounded lease provides the next chance to run this ready work.
-    return memberId !== undefined && tasks.some(candidate => candidate.status === 'running'
-      && candidate.attempt?.ownerId === memberId && candidate.attempt.leaseUntil >= board.clock())
+    const held = memberId === undefined ? undefined : openAttempt(tasks, memberId)
+    return held !== undefined && held.attempt.leaseUntil >= board.clock()
   }
   return false
 }
