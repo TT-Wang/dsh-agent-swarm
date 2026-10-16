@@ -24,7 +24,7 @@ import { awaited, formatSpan, type SchedulingPass } from './kernel.ts'
  */
 const terminalDetail = (text: string): string => text.replace(/\[[a-z][a-z0-9_]{2,63}\]\s*/g, '').trim()
 import type { SwarmRuntime } from './runtime.ts'
-import type { Actor, Artifact, Member, Mission, Task, WorkerActivity } from './types.ts'
+import type { Artifact, Member, Mission, Task, WorkerActivity } from './types.ts'
 
 /** Why a fenced task still owes a stop, as the durable marker records it. */
 type StopReason = NonNullable<Task['resumeAfterStop']>['reason']
@@ -214,14 +214,6 @@ export class Attempts {
       detail: `Stopping or preserving this attempt failed: ${message}. ${exit}` })
   }
 
-  ownAttempt(actor: Actor, missionId: string, taskId: string, attemptId: string): { task: Task; member: Member } {
-    const { member } = this.rt.active(actor, missionId)
-    const task = this.rt.task(missionId, taskId)
-    if (!member || task.status !== 'running' || !task.attempt || task.attempt.id !== attemptId || task.attempt.ownerId !== member.id || task.attempt.leaseUntil < this.rt.now()) throw new PolicyError('task_attempt_stale', 'authorization_error', 'Stale or unauthorized task attempt; stop work and observe the current assignment')
-    const board = this.rt.boardOf(missionId)
-    if (!task.dependencies.every(dep => board.graph.dependencyMet(dep))) throw new PolicyError('task_prerequisite_revoked', 'tool_error', 'A task prerequisite is no longer accepted; stop work')
-    return { task, member }
-  }
   /**
    * Extend the current attempt's lease before a long host operation. Bounded by
    * the mission deadline so a stored lease can never outlive the mission.

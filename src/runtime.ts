@@ -755,6 +755,21 @@ export class SwarmRuntime implements Kernel {
     return participant
   }
   /**
+   * A worker tool call's authority over the attempt it names: the caller is an
+   * active participant (`active`) and the live owner of that running attempt,
+   * whose lease has not run out, and every prerequisite of the task is still met
+   * on the board. A tool path asks it before it acts on the attempt, and again
+   * after an await during which the attempt could have moved.
+   */
+  private ownAttempt(actor: Actor, missionId: string, taskId: string, attemptId: string): { task: Task; member: Member } {
+    const { member } = this.active(actor, missionId)
+    const task = this.task(missionId, taskId)
+    if (!member || task.status !== 'running' || !task.attempt || task.attempt.id !== attemptId || task.attempt.ownerId !== member.id || task.attempt.leaseUntil < this.now()) throw new PolicyError('task_attempt_stale', 'authorization_error', 'Stale or unauthorized task attempt; stop work and observe the current assignment')
+    const board = this.boardOf(missionId)
+    if (!task.dependencies.every(dep => board.graph.dependencyMet(dep))) throw new PolicyError('task_prerequisite_revoked', 'tool_error', 'A task prerequisite is no longer accepted; stop work')
+    return { task, member }
+  }
+  /**
    * An id that must name a task of this mission, refused otherwise
    * (`task_not_in_mission`): a task id a caller supplies, where it enters (the
    * task of the evidence a challenge names included), and the re-read of a row
@@ -807,7 +822,6 @@ export class SwarmRuntime implements Kernel {
   }
   // M1a: lease/attempt accounting lives in src/attempts.ts; these forwarders keep
   // the call sites unchanged.
-  private ownAttempt(actor: Actor, missionId: string, taskId: string, attemptId: string): { task: Task; member: Member } { return this.attempts.ownAttempt(actor, missionId, taskId, attemptId) }
   private fenceAttempt(mission: Mission, task: Task, windowMs: number): void { return this.attempts.fenceAttempt(mission, task, windowMs) }
   dropAttempt(task: Task, ownerId?: string): void { return this.attempts.dropAttempt(task, ownerId) }
   private onIdle(memberId: string): void { return this.attempts.onIdle(memberId) }

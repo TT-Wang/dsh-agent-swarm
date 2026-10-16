@@ -87,7 +87,7 @@ test('R20-1: fencing a revoked workspace drops the attempt, records the owner an
   await barrierSettled(f, task)
   assert.equal(current(f, task).status, 'blocked', 'the settled barrier leaves the revoked task blocked')
   // The fenced attempt can never resume against the revoked root.
-  assert.throws(() => f.runtime.attempts.ownAttempt(f.actor(f.author), f.mission.id, task.id, claimed.attempt.id),
+  assert.throws(() => f.runtime.ownAttempt(f.actor(f.author), f.mission.id, task.id, claimed.attempt.id),
     /Stale or unauthorized/, 'the fenced attempt no longer owns the task')
 })
 
