@@ -687,6 +687,8 @@ export function orchestratorCommands(events: readonly SwarmEvent[]): ReplayResul
       continue
     }
     if (event.type === 'task/amended') {
+      // Logs older builds wrote: an owner amendment recorded the attempt it
+      // fenced only as `fencedAttemptId`. Every fence now writes `attempt/fenced`.
       const data = asObject(event.data, event.seq, event.type)
       if (typeof data.fencedAttemptId === 'string' && open.get(data.fencedAttemptId)?.taskId === data.taskId) open.delete(data.fencedAttemptId)
       continue

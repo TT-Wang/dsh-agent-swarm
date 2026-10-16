@@ -22,6 +22,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { FakeClock, FakeWorkers, SwarmRuntime, blockThroughReview, budget, events, setup, taskOf } from './faults/harness.mjs'
+import { orchestratorCommands } from '../lib/trace.js'
 
 const MARKERS = ['budgetResume', 'closeout', 'idleSignal', 'gitWriteDenied', 'leaseWarned']
 const markersOf = row => MARKERS.filter(key => row[key] !== undefined)
@@ -106,6 +107,10 @@ test('an owner amendment fences the running attempt: every marker goes and attem
   f.runtime.controlTask(f.owner, f.mission.id, task.id, 'amend', { checks: ['test -e .'] }, 'Tighten the host check')
   assert.equal(taskOf(f.runtime, task.id).resumeAfterStop?.memberId, f.author.id, 'the amended attempt owes its stop')
   assertFenced(f, task.id, attemptId, 'owner-amend', 'task/amended')
+  // attempt/fenced is the one record of the fenced attempt: the amendment does
+  // not repeat it, and the replay closes the attempt from the fence alone.
+  assert.equal(Object.hasOwn(events(f.runtime, f.mission.id, 'task/amended').at(-1).data, 'fencedAttemptId'), false)
+  assert.doesNotThrow(() => orchestratorCommands(f.runtime.store.events(f.mission.id, 5_000)), 'the replay finds no attempt left open')
 })
 
 test('a task ceiling fences its attempt: every marker goes and attempt/fenced precedes task/ceiling-exhausted', async t => {

@@ -3363,7 +3363,7 @@ export class SwarmRuntime implements Kernel {
     this.commit(missionId, () => {
       if (fenced) this.attempts.fenceRow(next, { status: 'blocked', reason: 'handoff', memberId: activeOwner, cause: `owner-${action}` })
       this.store.put('tasks', next)
-      this.store.event(missionId, 'task/amended', 'owner', { taskId, action, reason, changes, epoch: next.epoch, status: next.status, ...(fenced ? { fencedAttemptId: task.attempt!.id } : {}), previous: Object.fromEntries(Object.keys(changes).map(key => [key, task[key as keyof Task] ?? null])),
+      this.store.event(missionId, 'task/amended', 'owner', { taskId, action, reason, changes, epoch: next.epoch, status: next.status, previous: Object.fromEntries(Object.keys(changes).map(key => [key, task[key as keyof Task] ?? null])),
         ...(rework === undefined ? {} : { rework: next.rejections!.at(-1), reworkCount: next.reworkCount }) })
       if (rework !== undefined) this.reopenReviewForRework(next, rework, `${taskId} was re-opened for rework by the mission owner`)
     })
