@@ -84,12 +84,14 @@ export class Scheduling {
    * without one never stamps progress and never stops early.
    */
   async dispatch(mission: Mission, missionId: string, pass?: SchedulingPass): Promise<boolean> {
-        // R17-G1: the dispatcher reads the SAME shared interpretation every
-        // owner-facing generator consumes (`eligible`, `dispatchable`, the task and
-        // member rows), so no notice can describe a board the dispatcher would
-        // act on differently. The view is rebuilt after each await, so it is
-        // never staler than the per-step store reads it replaces.
-        const members = this.notices.interpretation(missionId).members
+        // R17-G1: the dispatcher reads the SAME board and asks the SAME
+        // predicates (`eligible`, `startBlocker`) every board classifier asks
+        // through the interpretation, so no notice can describe a board the
+        // dispatcher would act on differently. It reads only rows, so it reads
+        // the board, never the interpretation, and asks the adapter only where it
+        // decides. The board is read again after each await, so it is never
+        // staler than the per-step store reads it replaces.
+        const members = this.k.boardOf(missionId).members
         const from = pass?.sweepFrom === undefined ? -1 : members.findIndex(member => member.id === pass.sweepFrom)
         const rotation = from > 0 ? [...members.slice(from), ...members.slice(0, from)] : members
         const end = pass?.chainFrom === undefined ? -1 : rotation.findIndex((member, index) => index > 0 && member.id === pass.chainFrom)
@@ -138,9 +140,9 @@ export class Scheduling {
           // described to the owner with a cause the sweep did not test. The
           // parked-member hatch keeps priority: a parked member is dispatchable.
           if (startBlocker(this.k.view, member) !== undefined) continue
-          const view = this.notices.interpretation(missionId)
-          if (pendingStopOwner(view.tasks, member.id)) continue
-          const open = openAttempt(view.tasks, member.id)
+          const board = this.k.boardOf(missionId)
+          if (pendingStopOwner(board.tasks, member.id)) continue
+          const open = openAttempt(board.tasks, member.id)
           if (open !== undefined) {
             // W6: the worker ended its turn with an open attempt. Nudge within a
             // bounded retry, then checkpoint the workspace and re-pend the task
@@ -149,7 +151,7 @@ export class Scheduling {
             if (!parkedMember && this.attempts.turnEnded(open)) await this.attempts.closeOutIdleAttempt(mission, member, open, pass)
             continue
           }
-          const choices = view.tasks.filter(t => eligible(view, t, member)).sort((a, b) => b.priority - a.priority || a.createdAt - b.createdAt)
+          const choices = board.tasks.filter(t => eligible(board, t, member)).sort((a, b) => b.priority - a.priority || a.createdAt - b.createdAt)
           // R12-F9 (a task whose text assumes prior work no content-carrying edge
           // provides) is refused where a dependency set is written: plan
           // validation, propose() and the owner's `changes.dependencies`
@@ -208,7 +210,7 @@ export class Scheduling {
               this.k.store.event(missionId, 'task/preparation-failed', 'runtime', { taskId: fresh.id, epoch: fresh.epoch, reason, ...fresh.preparationFailure, status: fresh.status })
               if (retry) return
               this.k.store.event(missionId, 'task/blocked', 'runtime', { taskId: fresh.id, reason: fresh.output })
-              this.notices.notify(missionId, fresh.output!, this.notices.interpretation(missionId).subjectsOf([fresh]), { trigger: 'task/preparation-failed', reason })
+              this.notices.notify(missionId, fresh.output!, subjectsOfTasks([fresh], mission), { trigger: 'task/preparation-failed', reason })
             })
           }
           } catch (error) {

@@ -3,8 +3,9 @@
  *
  * Each claim is pinned by a test that fails on the pre-change tree:
  *
- * 1. ONE DERIVATION: every owner-facing notice generator consumes the shared
- *    interpretation (`Notices.interpretation`), and the enumeration below names
+ * 1. ONE DERIVATION: every board classifier consumes the shared
+ *    interpretation (`interpret` over the board), every other notice reads
+ *    the board itself, and the enumeration below names
  *    every `notify(` site in the source tree with its trigger and its reason for
  *    not passing an explicit fact marker, so a new site fails this file.
  * 2. FACT-ONLY TEMPLATES: every body of a reviewed family is built by the one
@@ -42,7 +43,7 @@ import { NOTICE_TEMPLATES, noticeTemplateKey } from '../lib/notices.js'
 import { OwnerReplyGuard } from '../lib/owner-reply.js'
 import { tempDirectory } from './temp-root.mjs'
 import { FakeClock, FakeWorkers, NO_GRANTS } from './faults/harness.mjs'
-import { completionError } from '../lib/board.js'
+import { completionError, interpret } from '../lib/board.js'
 
 const ROOT = dirname(dirname(fileURLToPath(import.meta.url)))
 const budget = { maxTokens: 100000, maxSteps: 100, maxWorkers: 3, maxDurationMs: 600000, maxTasks: 20, maxExperiments: 2 }
@@ -286,7 +287,7 @@ test('R17-G2a: the stall-root body replays from the blocked row alone', async t 
   const stranding = blockTask(f, f.propose('Blocked work', { assigneeId: member.id }))
   const lone = blockTask(f, f.propose('Blocked alone', { assigneeId: member.id }))
   dependOn(f, f.propose('Waits on the blocked work'), stranding)
-  f.runtime.notices.notifyStallRoots(f.runtime.notices.interpretation(f.mission.id))
+  f.runtime.notices.notifyStallRoots(interpret(f.runtime.boardOf(f.mission.id)))
   for (const task of [stranding, lone]) {
     const root = f.runtime.store.get('tasks', task.id)
     const notice = ownerNotice(f, `stall-root:${f.mission.id}:${subjectOf(root)}`)
@@ -313,7 +314,7 @@ test('R17-G2b: the W3 stall body replays from the unschedulable rows alone', asy
   dependOn(f, waiting, prerequisite)
   dependOn(f, prerequisite, waiting)
   const stall = () => {
-    const view = f.runtime.notices.interpretation(f.mission.id)
+    const view = interpret(f.runtime.boardOf(f.mission.id))
     f.runtime.notices.notifyBoard(view)
     return { view, reason: completionError(view), notice: f.ownerNotices().filter(delivery => delivery.notice.dedupKey.startsWith('board-stall:')).at(-1) }
   }
@@ -391,7 +392,7 @@ test('R17-G2d: the integration-gap and coverage-complete bodies replay from the 
     f.runtime.store.put('tasks', { ...accepted, status: 'accepted', covers: f.mission.acceptance.map((_, index) => `c${index + 1}`), artifact: { commit: 'c', baseCommit: 'b', workspace: '/isolated', changedPaths: [] } })
     f.runtime.store.put('tasks', { ...withdrawn, status: 'cancelled' })
   })
-  f.runtime.notices.notifyBoard(f.runtime.notices.interpretation(f.mission.id))
+  f.runtime.notices.notifyBoard(interpret(f.runtime.boardOf(f.mission.id)))
   const coverage = ownerNotice(f, 'coverage-complete:')
   assert.ok(coverage, 'the coverage-complete notice was reported')
   assert.deepEqual(coverage.notice.statement, { family: 'coverage-complete', counts: {} }, 'the body is the coverage-complete template and states no count')
@@ -493,7 +494,7 @@ test('R17-G2: every reviewed notice body replays from the rows it cites', async 
   const row = f.runtime.store.get('tasks', blocked.id)
   row.status = 'blocked'; row.epoch += 1; row.output = 'blocked for repair'
   f.runtime.store.put('tasks', row)
-  await f.runtime.notices.notifyStallRoots(f.runtime.notices.interpretation(f.mission.id))
+  await f.runtime.notices.notifyStallRoots(interpret(f.runtime.boardOf(f.mission.id)))
 
   const deliveries = f.ownerNotices().filter(delivery => noticeTemplateKey(delivery) !== undefined)
   assert.ok(deliveries.length >= 1, 'a reviewed template was emitted')

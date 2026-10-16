@@ -27,7 +27,7 @@ import { validScope, scopeSubset } from './scope.ts'
 import { AdmissionError, assertDeclaredOutputs, assertScopeSelectors, citedCovers, dependencyAssumptions, formatDiagnostic, isNoopCheck, loadPackageScripts, normalizeReviewDependencies, normalizeScopeSelectors, normalizeTaskCeilings, reconcileTaskAdmission, requireHostChecks, taskCeilingBlock, taskGraphDefects, TaskGraphAdmissionError, type TaskGraphNode } from './admission.ts'
 import { canBorrowTask, canOwnReview, strandedReview } from './assignment.ts'
 import { executionClock, executionElapsed, exhaustedDimensions } from './resource-time.ts'
-import { TERMINAL_STATES, blockCauses, currentEvidenceIds, holdsAttempt, holdsOpenAttempt, memberTask, missionSubject, openAttempt, pendingStopOwner, quiescencePending, selectAcceptedDelivery, stopPending, taskEdges, taskGraphIndex, taskSubject, terminal, uncoveredCriteria, type BlockCause, type HeldTask } from './task-graph.ts'
+import { TERMINAL_STATES, blockCauses, currentEvidenceIds, holdsAttempt, holdsOpenAttempt, memberTask, missionSubject, openAttempt, pendingStopOwner, quiescencePending, selectAcceptedDelivery, stopPending, subjectsOfTasks, taskEdges, taskGraphIndex, taskSubject, terminal, uncoveredCriteria, type BlockCause, type HeldTask } from './task-graph.ts'
 import { checkSyntaxDetail, declaredPlanChecks, orderedTasks, pairReviews, planAdvisories, validatePlan } from './plans.ts'
 import { OWNER_ONLY_TOOLS, type Actor, type AutoStart, BoardQuery, Budget, CheckAttribution, CreateMissionInput, CriticalPath, criterionId, Delivery, DraftPlan, Escalation, Evidence, EvidenceStatus, Member, Mission, nextWorkerName, ObserveQuery, MessageInput, PlanInput, Post, PostInput, PostKind, PROVIDER_OUTAGE_WINDOW_MS, ProposeTaskInput, ProviderOutage, providerQuiescent, PublishInput, RecoveryFallback, RequestStartInput, RuntimeConfig, Snapshot, Task, TaskAmendment, TaskRejection, TaskCeiling, ToolRun, VerificationCleanupFailure, WorkerAdapter, WorkerActivity, Workstream } from './types.ts'
 import { requireArtifactChecks } from './artifact-policy.ts'
@@ -1371,7 +1371,7 @@ export class SwarmRuntime implements Kernel {
           task.verificationRecovery = { sourceTaskId: source.id, commit: artifact.commit, reason, at: this.now() }
           this.store.put('tasks', task)
           this.store.event(missionId, 'task/verification-deferred', member.id, { sourceTaskId: source.id, verificationTaskId: task.id, commit: artifact.commit, reason, checks: runIds })
-          this.notices.notify(missionId, reason, this.notices.interpretation(missionId).subjectsOf([source, task]), { from: member.id, trigger: 'task/verification-deferred', reason })
+          this.notices.notify(missionId, reason, subjectsOfTasks([source, task], { id: missionId }), { from: member.id, trigger: 'task/verification-deferred', reason })
         })
         this.kick(missionId)
         return memberTask(this.boardOf(missionId), task)
@@ -1448,7 +1448,7 @@ export class SwarmRuntime implements Kernel {
         // Acceptance is routine progress; a rejection blocks work and needs a repair decision.
         if (!passed) {
           const repair = rejectionRepair(source, task.id)
-          this.notices.notify(missionId, `${source.title} (${source.id}) was blocked by independent verification: ${rejection}. ${repair.owner}`, this.notices.interpretation(missionId).subjectsOf([source]), { from: member.id, trigger: REJECTION_DECISION_TRIGGER, reason: rejection })
+          this.notices.notify(missionId, `${source.title} (${source.id}) was blocked by independent verification: ${rejection}. ${repair.owner}`, subjectsOfTasks([source], { id: missionId }), { from: member.id, trigger: REJECTION_DECISION_TRIGGER, reason: rejection })
           // R11-18: the rejection reason and the repair path must reach the
           // source author, not only the owner. The author's re-claim is refused
           // (the task is blocked), so without this delivery the only exit is
@@ -1829,7 +1829,7 @@ export class SwarmRuntime implements Kernel {
       const challenge = this.store.event(missionId, 'evidence/challenged', key, input)
       // The challenged claim's own task is the subject and this challenge's event
       // the fact; the dependents it invalidated are named by `task/invalidated`.
-      this.notices.notify(missionId, `Evidence ${evidence.id} challenged: ${input.reason}`, this.notices.interpretation(missionId).subjectsOf([source]), { from: key, trigger: 'evidence/challenged', reason: `${evidence.id} challenge ${challenge}` })
+      this.notices.notify(missionId, `Evidence ${evidence.id} challenged: ${input.reason}`, subjectsOfTasks([source], { id: missionId }), { from: key, trigger: 'evidence/challenged', reason: `${evidence.id} challenge ${challenge}` })
     })
     for (const dependent of interrupted) this.attempts.resumeStoppedAttempt(missionId, dependent)
     this.kick(missionId)
@@ -2008,7 +2008,7 @@ export class SwarmRuntime implements Kernel {
     if (duplicates.length > 0) {
       for (const row of duplicates) this.store.event(missionId, 'task/duplicate-carrier', 'runtime', { taskId: row.id, carriedBy: accepted.id, status: row.status, code: 'lineage_duplicate_carrier' })
       const { content, statement } = renderNotice('duplicate-carrier', { acceptedId: accepted.id, duplicates })
-      this.notices.notify(missionId, content, this.notices.interpretation(missionId).subjectsOf([...duplicates, accepted]), { trigger: NOTICE_TEMPLATES['duplicate-carrier'].trigger, reason: `${accepted.id} accepted`, statement })
+      this.notices.notify(missionId, content, subjectsOfTasks([...duplicates, accepted], { id: missionId }), { trigger: NOTICE_TEMPLATES['duplicate-carrier'].trigger, reason: `${accepted.id} accepted`, statement })
     }
     return { retired, released }
   }
@@ -3032,8 +3032,8 @@ export class SwarmRuntime implements Kernel {
       this.store.event(missionId, 'automatic/completed', 'runtime', {})
       // R15-A1: the completion notice names every accepted deliverable (the
       // mission's lineage roots), so the final decision is attributable too.
-      const view = this.notices.interpretation(missionId)
-      this.notices.notify(missionId, `Completed ${mission.title}: all required deliverables were independently accepted. Review the evidence and final artifact in Agent Swarm.`, view.subjectsOf(view.tasks.filter(task => task.status === 'accepted')), { noticeClass: 'completion', trigger: 'automatic/completed' })
+      const accepted = this.boardOf(missionId).tasks.filter(task => task.status === 'accepted')
+      this.notices.notify(missionId, `Completed ${mission.title}: all required deliverables were independently accepted. Review the evidence and final artifact in Agent Swarm.`, subjectsOfTasks(accepted, mission), { noticeClass: 'completion', trigger: 'automatic/completed' })
     })
     return true
   }
@@ -3492,9 +3492,9 @@ export class SwarmRuntime implements Kernel {
     const duplicate = previous !== undefined && previous.class === outage.class && this.now() - previous.at < PROVIDER_OUTAGE_EVENT_WINDOW_MS
     member.providerOutage = { ...outage, at: this.now() }
     this.store.put('members', member)
-    // R17-G1: the member's open work comes from the shared interpretation.
-    const view = this.notices.interpretation(member.missionId)
-    const open = openAttempt(view.tasks, member.id)
+    // R17-G1: the member's open work comes from the board.
+    const board = this.boardOf(member.missionId)
+    const open = openAttempt(board.tasks, member.id)
     if (!duplicate) this.store.event(member.missionId, 'provider/outage', 'runtime', { memberId: member.id, class: outage.class, status: outage.status, message: outage.message, taskIds: open === undefined ? [] : [open.id] })
     // The fact is the outage class on the member's open work, so a retry, or a
     // return to a class already told on that work, is that fact again.
@@ -3502,7 +3502,7 @@ export class SwarmRuntime implements Kernel {
     // whole board; the mission root only when the member owns no open task.
     this.notices.notify(member.missionId,
       `${member.name} provider ${outage.class} outage${outage.status === undefined ? '' : ` (HTTP ${outage.status})`}: ${outage.message}. Its attempt is preserved and no recovery credit is spent while the route is quiescent.`,
-      open === undefined ? [missionSubject(view.mission)] : view.subjectsOf([open]), { from: member.id, trigger: 'provider/outage', reason: outage.class })
+      subjectsOfTasks(open === undefined ? [] : [open], board.mission), { from: member.id, trigger: 'provider/outage', reason: outage.class })
   }
   /**
    * S5c: a start that leaves the member's session running, an adoption included,
@@ -3698,7 +3698,7 @@ export class SwarmRuntime implements Kernel {
       }
       const routes = retired.map(candidate => `${candidate.name} (${candidate.id}): ${candidate.startFailures} consecutive start failures, last error: ${candidate.startError ?? 'not recorded'}`)
       this.notices.notify(missionId, `No live member can start ${stranded.map(task => `${task.id} (${task.title})`).join(', ')}: every route that could was retired for start failures. ${routes.join('; ')}. The work stays pending with its recovery allowance preserved and nothing retries it. Admit a working route with swarm_add_member (it claims unpinned work), move pinned work to it with swarm_control(taskId, action: "amend", changes: { assigneeId: "member id" }, reason: "reassign"), or withdraw work that is no longer required with swarm_cancel.`,
-        this.notices.interpretation(missionId).subjectsOf(stranded), options)
+        subjectsOfTasks(stranded, board.mission), options)
     })
   }
   defer(fn: () => Promise<void>): void {

@@ -8,7 +8,7 @@ import { HarnessWorkers } from '../lib/harness-workers.js'
 import { registerAutomaticStart } from '../lib/planner.js'
 import { hasNotice, openAsks } from '../lib/arena.js'
 import { FakeWorkers, SwarmRuntime, makeRuntime, makeRuntimeStub } from './faults/harness.mjs'
-import { reviewNeed, reviewPathBlocker, reviewable, waitsLegitimately } from '../lib/board.js'
+import { interpret, reviewNeed, reviewPathBlocker, reviewable, waitsLegitimately } from '../lib/board.js'
 
 async function fixture(t) {
   let runtime
@@ -370,7 +370,7 @@ test('Q02: empty scheduling passes and repeated failed tools cannot conceal a la
 test('Q02: one long in-flight operation remains quiet beyond the progress bound', async t => {
   const f = await fixture(t)
   f.runtime.notices.absenceBoundMs = 0
-  const member = f.runtime.store.get('members', f.member.id); member.activity = { kind: 'check', startedAt: f.runtime.notices.interpretation(f.mission.id).lastTransitionAt }
+  const member = f.runtime.store.get('members', f.member.id); member.activity = { kind: 'check', startedAt: interpret(f.runtime.boardOf(f.mission.id)).lastTransitionAt }
   f.runtime.store.put('members', member)
   f.runtime.notices.absenceNet(f.mission.id)
   assert.equal(f.rows().filter(row => row.notice?.dedupKey.startsWith('absence:')).length, 0)

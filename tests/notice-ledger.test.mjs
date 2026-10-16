@@ -15,7 +15,7 @@ import { createHash } from 'node:crypto'
 import { writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { FakeClock, FakeWorkers, MISSION_ACCEPTANCE, acceptThroughReview, blockThroughReview, eventually, events, setup, taskOf } from './faults/harness.mjs'
-import { BOARD_RUNNING, completionError, isolationIssues, reviewNeed } from '../lib/board.js'
+import { BOARD_RUNNING, completionError, interpret, isolationIssues, reviewNeed } from '../lib/board.js'
 import { assertNamedCalls, ownerTools } from './refusal-inventory.mjs'
 import { NOTICE_TEMPLATES, factKey, noticeFamily, noticeTemplateKey } from '../lib/notices.js'
 
@@ -438,7 +438,7 @@ test('D3: a submission whose review need ripened, beside a dependent that waits 
     await f.runtime.settle(f.mission.id)
     f.clock.advance(grace(f))
     const need = reviewNeed(f.runtime.boardOf(f.mission.id), taskOf(f.runtime, source.id))
-    assert.deepEqual([need.ripe, need.recorded, f.runtime.notices.interpretation(f.mission.id).stalled], [true, false, false], `deliverable ${index}: before the next pass the need is ripe, the admission has yet to process it, and the board is not stalled by it`)
+    assert.deepEqual([need.ripe, need.recorded, interpret(f.runtime.boardOf(f.mission.id)).stalled], [true, false, false], `deliverable ${index}: before the next pass the need is ripe, the admission has yet to process it, and the board is not stalled by it`)
     return { source, dependent }
   }
   const admitted = (f, source) => f.runtime.store.list('tasks', f.mission.id).find(task => task.reviewOf === source.id)
@@ -544,7 +544,7 @@ test('coverage-complete is told whenever completion is allowed, whatever the sta
   await eventually(() => !f.runtime.scheduling.passState(f.mission.id).passLive, 'the last pass ends')
   await ticks(f, 1)
   await eventually(() => !f.runtime.scheduling.passState(f.mission.id).passLive, 'the tick\'s pass ends')
-  const view = f.runtime.notices.interpretation(f.mission.id)
+  const view = interpret(f.runtime.boardOf(f.mission.id))
   assert.deepEqual([completionError(view), view.stalled, taskOf(f.runtime, experiment.id).status], [undefined, false, 'blocked'], 'completion is allowed on a board the stall predicate calls live')
   assert.equal(ownerRows(f).filter(delivery => noticeFamily(delivery) === 'coverage-complete').length, 1, 'coverage-complete is told')
 })
@@ -657,7 +657,7 @@ test('a board whose only unfinished work is a submission and its dead host revie
   f.runtime.control(f.owner, f.mission.id, 'resume', 'Carry on')
   await f.runtime.settle(f.mission.id)
   await ticks(f, 150)
-  assert.equal(f.runtime.notices.interpretation(f.mission.id).stalled, true, 'the board is stalled on the submission and its dead review')
+  assert.equal(interpret(f.runtime.boardOf(f.mission.id)).stalled, true, 'the board is stalled on the submission and its dead review')
   const told = ownerRows(f).filter(delivery => !before.includes(delivery.id))
   assert.deepEqual(told.map(delivery => noticeFamily(delivery)).sort(), ['board-stall', 'review-blocked'], 'the owner is told by the admission, and by the W3 stall of that board beside it: one more wording of the open item R20')
   const [decision] = told.filter(delivery => noticeFamily(delivery) === 'review-blocked')
@@ -719,7 +719,7 @@ test('D1: an unreviewable source, its review pending for a stopped reviewer and 
   f.runtime.cancel(f.owner, f.mission.id, { taskId: source.id, reason: 'Not needed' })
   await f.runtime.settle(f.mission.id)
   await ticks(f, 2)
-  const view = f.runtime.notices.interpretation(f.mission.id)
+  const view = interpret(f.runtime.boardOf(f.mission.id))
   const reason = completionError(view)
   const subjects = [subjectOf(f, dead)]
   assert.deepEqual(view.unschedulable.map(task => task.id), [dead.id], 'the dispatcher counts the dead dependent alone')
@@ -1103,7 +1103,7 @@ test('the dispatch question is one emitter among the board\'s: a dependent a can
     f.runtime.cancel(f.owner, f.mission.id, { taskId: prerequisite.id, reason: 'Not needed' })
     await quiet(f)
     await ticks(f, 10)
-    assert.deepEqual([taskOf(f.runtime, ready.id).status, f.runtime.notices.interpretation(f.mission.id).dispatchable.map(task => task.id)], ['pending', [ready.id]], `${board}: the ready work is dispatchable and was not dispatched`)
+    assert.deepEqual([taskOf(f.runtime, ready.id).status, interpret(f.runtime.boardOf(f.mission.id)).dispatchable.map(task => task.id)], ['pending', [ready.id]], `${board}: the ready work is dispatchable and was not dispatched`)
     const namings = task => ownerRows(f).filter(delivery => (delivery.subjects ?? []).includes(subjectOf(f, task)) && delivery.notice.trigger !== 'owner-decision-unresolved' && !delivery.notice.dedupKey.startsWith('guard-terminal:'))
     assert.deepEqual(namings(dependent).map(delivery => noticeFamily(delivery)), ['fallthrough'], `${board}: the fall-through names the stranded dependent, once`)
     assert.deepEqual([namings(dependent)[0].subjects, relevant(f, namings(dependent)[0])], [[subjectOf(f, dependent)], true], `${board}: it names the dependent alone, and is outstanding`)
