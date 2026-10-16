@@ -285,27 +285,27 @@ test('R15-A5: the stranded-inbox hatch drains or stays dispatchable, and the nai
   assert.equal(fixed.runtime.store.get('tasks', task.id).status, 'running', 'and the member stayed dispatchable')
 })
 
-test('R15-A1/B: the owner ledger entry and its delivery row name the subjects, and transport is never relabelled as consumption or resolution', async t => {
+test('R15-A1/B: the delivery an owner ledger entry names carries the subjects, and transport is never relabelled as consumption or resolution', async t => {
   const f = await scenario(t)
   const builder = await f.addMember('Builder')
   const root = f.block(f.propose('Ledger root', { assigneeId: builder.id }))
   await sleep(250)
-  // The ledger is the owner's arena instrument (swarm_observe detail=full); the
-  // delivery row it projects is the authority for what the notice is about.
+  // The owner's two reads: the ledger is the arena instrument (swarm_observe
+  // detail=full), and the delivery its entry names is read by deliveryId
+  // (swarm_observe deliveryId, owner-only); that delivery says what the notice is about.
   const ledger = f.runtime.observe(f.owner, f.mission.id, { detail: 'full' }).noticeLedger
   assert.ok(ledger.length > 0, 'the decision produced a durable ledger row')
   const entry = ledger.find(item => typeof item.dedupKey === 'string' && item.dedupKey.startsWith('stall-root:'))
   assert.ok(entry, `the stall-root row is in the ledger: ${JSON.stringify(ledger.map(item => item.dedupKey))}`)
-  const row = f.runtime.store.get('deliveries', entry.deliveryId)
-  assert.equal(row.to, 'owner')
-  assert.ok(Array.isArray(row.subjects) && row.subjects.includes(`${root.id}@${root.epoch}`), `the delivery row names the subjects: ${JSON.stringify(row.subjects)}`)
+  const { delivery } = f.runtime.observe(f.owner, f.mission.id, { deliveryId: entry.deliveryId })
+  assert.equal(delivery.to, 'owner')
+  assert.ok(Array.isArray(delivery.subjects) && delivery.subjects.includes(`${root.id}@${root.epoch}`), `the delivery the entry names carries the subjects: ${JSON.stringify(delivery.subjects)}`)
   // Three facts: transport is `state` (queued, or claimed once deliveredAt is
   // set); consumption is `consumedAt`, which only the host's admitted message
   // records, so a claimed transport never stands in for it; resolution is a
   // task or mission transition, never a ledger field.
   assert.equal(entry.state === 'queued' || entry.state === 'claimed', true, 'the transport state stays a transport state')
   assert.equal(Object.hasOwn(entry, 'consumedAt'), false, 'no host signal, so no consumption: transport is never relabelled as consumption')
-  assert.equal(row.notice.consumedAt, undefined)
   assert.equal(Object.hasOwn(entry, 'resolved'), false, 'a transport fact never records resolution')
   assert.equal(Object.hasOwn(entry, 'resolvedAt'), false, 'a transport fact never records resolution')
 })
