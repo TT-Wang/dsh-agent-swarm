@@ -689,7 +689,11 @@ export interface Delivery {
   topic?: string
   createdAt: number
   deliveredAt?: number
-  /** Actual host message consumption, independent of transport acknowledgement timing. */
+  /**
+   * When the owner session admitted this owner-addressed delivery, a notice or
+   * a question alike: actual host message consumption, independent of transport
+   * acknowledgement timing. Written once, only by `Notices.recordConsumption`.
+   */
   consumedAt?: number
   deliveryFailure?: { reason: string; at: number }
   taskId?: string

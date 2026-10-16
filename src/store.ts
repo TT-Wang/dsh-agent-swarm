@@ -54,8 +54,8 @@ export interface PostFilter {
   newest?: boolean
   limit?: number
 }
-/** v3 adds the append-only `posts` board table; v4 cites mission criteria by id (`citeCriteria`). Older versions are upgraded at open. */
-const SCHEMA_VERSION = 4
+/** v3 adds the append-only `posts` board table; v4 cites mission criteria by id (`citeCriteria`); v5 records an owner notice's consumption on its delivery (`consumptionOnDelivery`). Older versions are upgraded at open. */
+const SCHEMA_VERSION = 5
 const CHANGE_HISTORY = 1024
 const DEFAULT_BUSY_TIMEOUT_MS = 5000
 const DEFAULT_WRITER_ATTEMPTS = 3
@@ -364,7 +364,9 @@ export class SwarmStore {
         this.db.exec("CREATE INDEX IF NOT EXISTS events_task_fact ON events(mission_id, type, json_extract(data,'$.taskId'), seq); CREATE INDEX IF NOT EXISTS events_type ON events(mission_id, type, seq);")
         this.db.exec("CREATE INDEX IF NOT EXISTS events_trace_attempt ON events(mission_id, json_extract(data,'$.attemptId'), json_extract(data,'$.step'), seq) WHERE type='trace/span';")
         this.db.exec('CREATE TABLE IF NOT EXISTS state_revision (id INTEGER PRIMARY KEY CHECK (id=1), revision INTEGER NOT NULL); INSERT OR IGNORE INTO state_revision(id,revision) VALUES(1,0); CREATE TABLE IF NOT EXISTS state_changes (revision INTEGER PRIMARY KEY, scopes TEXT NOT NULL);')
-        if (version < SCHEMA_VERSION) this.citeCriteria()
+        // Each upgrade runs once: for a store older than the version that introduced it.
+        if (version < 4) this.citeCriteria()
+        if (version < 5) this.consumptionOnDelivery()
         this.db.exec(`PRAGMA user_version=${SCHEMA_VERSION}`)
       })
     } catch (error) {
@@ -468,6 +470,14 @@ export class SwarmStore {
       if (draft.input.tasks.map(task => cite(task, draft.input.acceptance, held.get(task.reviewOf ?? '') ?? [])).includes(true)) this.upsert('drafts', { ...draft, revision: draft.revision + 1, updatedAt: this.now() })
     }
     for (const mission of this.list('missions')) this.list('tasks', mission.id).forEach((task, _at, rows) => { if (cite(task, mission.acceptance, taskGraphIndex(rows.map(row => row === task ? { ...row, acceptance: [] } : row)).checklist(task.id, mission.acceptance))) this.upsert('tasks', task) })
+  }
+  /** The v5 upgrade, once, in the opening transaction like any other change. A build before v5 recorded an owner notice's consumption on its notice envelope, beside the signal that recorded it (`consumptionSource`); it moves to the delivery's own `consumedAt`, where this version records it for every owner-addressed delivery, and the signal is dropped. No row held both: those builds wrote a delivery's `consumedAt` only on an owner question, which never carries a notice envelope. */
+  private consumptionOnDelivery(): void {
+    for (const delivery of this.list('deliveries')) {
+      if (delivery.notice === undefined) continue
+      const { consumedAt, consumptionSource: _signal, ...notice } = delivery.notice as NonNullable<Delivery['notice']> & { consumedAt?: number; consumptionSource?: string }
+      if (consumedAt !== undefined) this.upsert('deliveries', { ...delivery, notice, consumedAt })
+    }
   }
   /** Read a mission's records, or all records for host recovery. */
   list<T extends Table>(table: T, missionId?: string): Tables[T][] {

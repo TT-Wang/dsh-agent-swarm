@@ -12,7 +12,6 @@ interface Booking {
   taskId?: string
   content: string
   deliveredAt?: number
-  consumedAt?: number
 }
 
 /** The nudge body: the question, the exact call, and the rule the owner must know. */
@@ -93,7 +92,11 @@ export class OwnerReplyGuard {
    * started and still open. A turn with no such question books nothing, so an
    * ordinary owner turn is never nudged. The turn starts when its message is
    * observed, on the runtime clock that stamps `deliveredAt`, never on the
-   * host's message `createdAt`: two clocks cannot order one question.
+   * host's message `createdAt`: two clocks cannot order one question. The
+   * question this message carries is seen now; recording that the owner
+   * consumed it is the notices' own subscription to the same message
+   * (`Notices.recordConsumption`, the one writer of `consumedAt`), which this
+   * guard only reads.
    */
   private startTurn(sessionId: string, data?: unknown): void {
     const at = this.rt.now()
@@ -105,20 +108,10 @@ export class OwnerReplyGuard {
     const booked = this.bookings.get(sessionId) ?? new Map<string, Booking>()
     for (const mission of this.ownerMissions(sessionId)) {
       for (const delivery of openAsks(this.rt.store.list('deliveries', mission.id), 'owner')) {
-        const consumedNow = delivery.id === consumedId
-        if (consumedNow && delivery.consumedAt === undefined) {
-          this.rt.commit(mission.id, () => {
-            const current = this.rt.store.get('deliveries', delivery.id)
-            if (current === undefined || current.consumedAt !== undefined) return
-            current.consumedAt = at
-            this.rt.store.put('deliveries', current)
-          })
-        }
-        const seenAt = consumedNow ? at : delivery.consumedAt ?? delivery.deliveredAt
+        const seenAt = delivery.id === consumedId ? at : delivery.consumedAt ?? delivery.deliveredAt
         if (seenAt === undefined || seenAt > at) continue
         booked.set(delivery.id, {
           missionId: mission.id, from: delivery.from, content: delivery.content, deliveredAt: delivery.deliveredAt,
-          consumedAt: consumedNow ? at : delivery.consumedAt,
           ...(delivery.taskId === undefined ? {} : { taskId: delivery.taskId }),
         })
       }
@@ -165,7 +158,7 @@ export class OwnerReplyGuard {
     this.rt.commit(booking.missionId, () => {
       this.rt.store.event(booking.missionId, 'owner/reply-missing', 'runtime', {
         deliveryId, memberId: booking.from, taskId: booking.taskId ?? null,
-        deliveredAt: delivery.deliveredAt ?? booking.deliveredAt ?? null, consumedAt: delivery.consumedAt ?? booking.consumedAt ?? null,
+        deliveredAt: delivery.deliveredAt ?? booking.deliveredAt ?? null, consumedAt: delivery.consumedAt ?? null,
         nudges: spent, question: booking.content.replace(/\s+/g, ' ').slice(0, 200),
       })
       delivery.replyNudges = spent + 1

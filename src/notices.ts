@@ -105,11 +105,12 @@ interface NoticeStatement {
 export const REJECTION_DECISION_TRIGGER = 'task/rejected'
 
 /**
- * R17-G3/G8: the durable fact fields a notice row carries. The declared
+ * R17-G3: the durable fact fields a notice row carries. The declared
  * `Delivery` type predates them (and src/types.ts is outside this branch's
  * scope), so the fields travel on the same durable row as plain JSON and are
  * read through this view. `claimedAt` is deliberately absent: it was stamped
- * from `deliveredAt` and carried no information beyond the transport.
+ * from `deliveredAt` and carried no information beyond the transport. So is
+ * consumption, which is the delivery's own `consumedAt` (`recordConsumption`).
  */
 interface NoticeFactRecord {
   subjects: string[]
@@ -117,9 +118,6 @@ interface NoticeFactRecord {
   reason: string
   questionId?: string
   deliveryFailureId?: string
-  /** R17-G8: the host's claimed signal, recorded once (CAS) per delivery. */
-  consumedAt?: number
-  consumptionSource?: string
   /** Bounded reminders for an unresolved fact; transport/turn end never resolves it. */
   followupCount?: number
   followupAt?: number
@@ -653,9 +651,7 @@ export class Notices {
         if (event.type !== 'user/message') return
         const source = (event.data as { source?: { kind?: unknown; deliveryId?: unknown } } | undefined)?.source
         if (source === undefined || source.kind !== 'swarm' || typeof source.deliveryId !== 'string') return
-        const delivery = this.k.store.get('deliveries', source.deliveryId)
-        if (delivery?.to !== 'owner' || this.k.store.get('missions', delivery.missionId)?.ownerSessionId !== String(session.header.id)) return
-        this.recordConsumption(source.deliveryId, { source: 'user/message' })
+        this.recordConsumption(String(session.header.id), source.deliveryId)
       })
     } catch { this.unsubscribeClaimed = undefined }
   }
@@ -667,24 +663,24 @@ export class Notices {
   }
 
   /**
-   * R17-G8: record real consumption from the host's admitted message. The write is
-   * a compare-and-swap inside the mission transaction: a delivery is consumed
-   * once, and a second signal (a replay, a second pump) cannot move the
-   * timestamp. Delivered, consumed and resolved stay three separate facts.
+   * R17-G8: record that the owner session admitted an owner-addressed delivery,
+   * a notice or a question alike, from the host's admitted message. The one
+   * writer of `Delivery.consumedAt`: a compare-and-swap inside the mission
+   * transaction on the runtime clock, so a delivery is consumed once and a
+   * second signal (a replay, a second pump) cannot move the timestamp. A
+   * message admitted into another session, or a delivery addressed to a
+   * member, records nothing. Delivered, consumed and resolved stay three
+   * separate facts.
    */
-  recordConsumption(deliveryId: string, options: { at?: number; source?: string } = {}): boolean {
+  recordConsumption(sessionId: string, deliveryId: string): boolean {
     const delivery = this.k.store.get('deliveries', deliveryId)
-    if (delivery === undefined || delivery.notice === undefined) return false
-    const at = options.at ?? this.k.now()
-    const source = options.source ?? 'user/message'
+    if (delivery?.to !== 'owner' || this.k.store.get('missions', delivery.missionId)?.ownerSessionId !== sessionId) return false
+    const at = this.k.now()
     let recorded = false
     this.k.commit(delivery.missionId, () => {
       const fresh = this.k.store.get('deliveries', deliveryId)
-      if (fresh === undefined || fresh.notice === undefined) return
-      const row = noticeRow(fresh)!
-      if (row.consumedAt !== undefined) return
-      row.consumedAt = at
-      row.consumptionSource = source
+      if (fresh === undefined || fresh.consumedAt !== undefined) return
+      fresh.consumedAt = at
       this.k.store.put('deliveries', fresh)
       recorded = true
     })

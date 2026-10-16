@@ -97,18 +97,20 @@ for (const differentDelivery of [false, true]) {
 test('outbox acknowledgement preserves consumption and reply counters written during transport', async t => {
   const f = await fixture(t)
   const notice = f.emit('consumption')
+  let consumedAt
   f.workers.intercept = async (_member, delivery) => {
     if (delivery.id !== notice.id) return
-    assert.equal(f.runtime.notices.recordConsumption(notice.id, { at: 123456, source: 'agent/inbox/claimed' }), true)
+    assert.equal(f.runtime.notices.recordConsumption(f.owner.sessionId, notice.id), true)
     const current = f.runtime.store.get('deliveries', notice.id)
+    consumedAt = current.consumedAt
     current.replyNudges = 2
     f.runtime.store.put('deliveries', current)
   }
   await f.runtime.notices.flushOutbox(f.mission.id)
   const current = f.runtime.store.get('deliveries', notice.id)
   assert.ok(current.deliveredAt)
-  assert.equal(current.notice.consumedAt, 123456)
-  assert.equal(current.notice.consumptionSource, 'agent/inbox/claimed')
+  assert.ok(Number.isSafeInteger(consumedAt))
+  assert.equal(current.consumedAt, consumedAt)
   assert.equal(current.replyNudges, 2)
 })
 

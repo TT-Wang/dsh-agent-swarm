@@ -18,6 +18,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { join } from 'node:path'
+import { Context } from '@deepseek-ai/cordis'
 import { OwnerReplyGuard } from '../lib/owner-reply.js'
 import { FakeClock, FakeWorkers, makeRuntime } from './faults/harness.mjs'
 import { openAsks } from '../lib/arena.js'
@@ -25,12 +26,14 @@ import { openAsks } from '../lib/arena.js'
 /** A context stub: the guard only reads `on` (events) and `agents` (block mode). */
 const fakeContext = () => ({ on: () => () => {}, agents: { get: () => undefined }, get: () => undefined })
 
-async function fixture(t, config = {}) {
+async function fixture(t, config = {}, host) {
   const { dir: directory, runtime, workers, budget } = await makeRuntime(t, {
-    workers: new FakeWorkers({ async prepareWorkspace(mission, memberId) { return join(mission.workspace, memberId) } }),
+    workers: new FakeWorkers({ ctx: host, async prepareWorkspace(mission, memberId) { return join(mission.workspace, memberId) } }),
     config: { tickMs: 60000, maxMessageChars: 10000, maxEvents: 500, maxTasksPerMember: 100, checkTimeoutMs: undefined, ...config },
     budget: { maxTokens: 100000, maxSteps: 1000, maxWorkers: 4, maxDurationMs: 3600000, maxTasks: 100 },
   })
+  // A hosted runtime subscribes its notices to the host context at start, as the plugin's does.
+  if (host !== undefined) await runtime.start()
   const owner = { sessionId: 'reply-owner' }
   const mission = runtime.create(owner, { title: 'Reply protocol', objective: 'Answer questions', workspace: directory,
     scope: ['src/'], acceptance: ['works'], budget: { ...budget } }, { grantRoot: directory, source: 'session' })
@@ -50,6 +53,20 @@ async function fixture(t, config = {}) {
     return delivery
   }
   return { directory, runtime, workers, owner, mission, member, asker, events, deliveries, ask }
+}
+
+/**
+ * The production wiring of the owner session's events: one host context, which
+ * the notices subscribe to at start (they record that the owner consumed a
+ * delivery) and the guard listens on (it books and ends the turn).
+ */
+async function hosted(t, config = {}, maxNudges = 2) {
+  const host = new Context()
+  const f = await fixture(t, config, host)
+  const guard = new OwnerReplyGuard(host, f.runtime, { maxNudges })
+  t.after(() => guard.dispose())
+  const event = (type, data) => host.emit('session/event', { header: { id: f.owner.sessionId } }, { type, data })
+  return { ...f, guard, admit: data => event('user/message', data), endTurn: () => event('turn/end', { reason: { kind: 'completed' } }) }
 }
 
 test('L0/L1: a question stays open until its recipient binds an answer, once', async t => {
@@ -191,18 +208,16 @@ test('L2: the turn boundary and the consumption stamp are on the runtime clock, 
   // host time. With the runtime clock ten minutes ahead of the host, an
   // unanswered owner question was never booked, so it was never nudged.
   const clock = new FakeClock(Date.now() + 600_000)
-  const f = await fixture(t, { now: clock.now })
+  const f = await hosted(t, { now: clock.now })
   const ask = await f.ask()
-  const guard = new OwnerReplyGuard(fakeContext(), f.runtime, { maxNudges: 2 })
-  t.after(() => guard.dispose())
   clock.advance(1_000)
-  guard.observe(f.owner.sessionId, 'user/message', { createdAt: Date.now() })
-  guard.observe(f.owner.sessionId, 'turn/end', { reason: { kind: 'completed' } })
+  f.admit({ createdAt: Date.now() })
+  f.endTurn()
   assert.deepEqual(f.events('owner/reply-missing').map(event => event.data.deliveryId), [ask.id], 'the unanswered question is booked and recorded')
   f.runtime.notices.pumpOutbox = () => {}
   f.runtime.message(f.asker, f.mission.id, { to: 'owner', kind: 'question', content: 'And the schema version?' })
   const consumed = f.deliveries().filter(row => row.replyExpected && row.id !== ask.id).at(-1)
-  guard.observe(f.owner.sessionId, 'user/message', { createdAt: Date.now(), source: { kind: 'swarm', deliveryId: consumed.id } })
+  f.admit({ createdAt: Date.now(), source: { kind: 'swarm', deliveryId: consumed.id } })
   assert.equal(f.runtime.store.get('deliveries', consumed.id).consumedAt, clock.now(), 'consumption is stamped on the runtime clock')
 })
 
@@ -287,16 +302,14 @@ test('L2/L3: a stopped asker does not hide the open receipt the owner still owes
 
 
 test('owner receipt books actual consumption before transport acknowledgement and survives context messages', async t => {
-  const f = await fixture(t)
+  const f = await hosted(t, {}, 1)
   f.runtime.notices.pumpOutbox = () => {}
   f.runtime.message(f.asker, f.mission.id, { to: 'owner', kind: 'question', content: 'Which version?' })
   const question = f.deliveries().find(row => row.replyExpected)
-  const guard = new OwnerReplyGuard(fakeContext(), f.runtime, { maxNudges: 1 })
-  t.after(() => guard.dispose())
   assert.equal(question.deliveredAt, undefined)
-  guard.observe(f.owner.sessionId, 'user/message', { source: { kind: 'swarm', deliveryId: question.id } })
-  guard.observe(f.owner.sessionId, 'user/message', { source: { kind: 'plugin', plugin: '@deepseek-ai/dsh-system-prompt' } })
-  guard.observe(f.owner.sessionId, 'turn/end', { reason: { kind: 'completed' } })
+  f.admit({ source: { kind: 'swarm', deliveryId: question.id } })
+  f.admit({ source: { kind: 'plugin', plugin: '@deepseek-ai/dsh-system-prompt' } })
+  f.endTurn()
   assert.equal(f.events('owner/reply-missing').length, 1)
   assert.equal(f.events('owner/reply-missing')[0].data.deliveredAt, null)
   assert.ok(f.events('owner/reply-missing')[0].data.consumedAt)

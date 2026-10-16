@@ -188,23 +188,24 @@ test('R17-G5: the sampling path is an absence net — absence and elapsed clock 
   assert.ok(lastAt > 0)
 })
 
-test('R17-G8: consumption is recorded from the host claimed signal with a CAS; delivered and consumed stay separate', async t => {
-  const f = await fixture(t)
+test('R17-G8: consumption is recorded from the owner session\'s admission with a CAS; delivered and consumed stay separate', async t => {
+  const f = await clockedFixture(t)
   f.emit('ledger probe', [`mission:${f.mission.id}`], { trigger: 'test/consumption', reason: 'probe' })
   const notice = f.ownerNotices().find(delivery => delivery.notice.dedupKey.startsWith('test/consumption:'))
   assert.ok(notice)
   assert.equal(notice.deliveredAt, undefined)
-  // The host can claim the item while the adapter call is still in flight, so
-  // consumption is not gated on our transported timestamp; delivery follows.
-  await eventually(() => f.runtime.store.get('deliveries', notice.id).deliveredAt !== undefined ? true : undefined, 'the outbox delivers the notice')
-  assert.equal(f.runtime.notices.recordConsumption(notice.id, { at: 1_700_000_000_000, source: 'agent/inbox/claimed' }), true)
-  assert.equal(f.runtime.notices.recordConsumption(notice.id), false, 'the compare-and-swap refuses a second signal')
+  await f.runtime.notices.flushOutbox(f.mission.id)
+  f.clock.advance(1_000)
+  assert.equal(f.runtime.notices.recordConsumption('another-session', notice.id), false, 'only the owner session consumes an owner notice')
+  assert.equal(f.runtime.notices.recordConsumption(f.owner.sessionId, notice.id), true)
+  const consumedAt = f.clock.now()
+  f.clock.advance(1_000)
+  assert.equal(f.runtime.notices.recordConsumption(f.owner.sessionId, notice.id), false, 'the compare-and-swap refuses a second signal')
   const row = f.runtime.store.get('deliveries', notice.id)
-  assert.equal(row.notice.consumedAt, 1_700_000_000_000, 'the recorded instant is the host signal, not the delivery time')
-  assert.equal(row.notice.consumptionSource, 'agent/inbox/claimed')
-  assert.notEqual(row.notice.consumedAt, row.deliveredAt, 'consumed is its own fact, never the transport timestamp')
+  assert.equal(row.consumedAt, consumedAt, 'the recorded instant is the admission on the runtime clock, not the delivery time')
+  assert.notEqual(row.consumedAt, row.deliveredAt, 'consumed is its own fact, never the transport timestamp')
   const entry = f.runtime.observe(f.owner, f.mission.id, { detail: 'full' }).noticeLedger.find(item => item.deliveryId === notice.id)
-  assert.equal(entry.consumedAt, 1_700_000_000_000)
+  assert.equal(entry.consumedAt, consumedAt)
   assert.equal(entry.deliveredAt, row.deliveredAt)
   assert.equal('claimedAt' in entry, false, 'the claimedAt placeholder is gone from the ledger')
   assert.equal('claimedAt' in row.notice, false, 'and gone from the durable row')
@@ -218,15 +219,14 @@ test('R17-G8: the admitted owner message records consumption after inbox claim',
   await eventually(() => f.runtime.store.get('deliveries', notice.id).deliveredAt !== undefined ? true : undefined, 'the outbox delivers the notice')
   const message = { source: { kind: 'swarm', form: 'relay', missionId: f.mission.id, senderMemberId: 'runtime', deliveryId: notice.id, deliveryKind: 'control' } }
   f.ctx.emit('agent/inbox/claimed', { message, turn: 1 })
-  assert.equal(f.runtime.store.get('deliveries', notice.id).notice.consumedAt, undefined, 'claim can still be rejected before model admission')
+  assert.equal(f.runtime.store.get('deliveries', notice.id).consumedAt, undefined, 'claim can still be rejected before model admission')
   f.ctx.emit('session/event', { header: { id: f.owner.sessionId } }, { type: 'user/message', data: message })
   const row = f.runtime.store.get('deliveries', notice.id)
-  assert.ok(Number.isSafeInteger(row.notice.consumedAt), 'the host signal recorded consumption')
-  assert.equal(row.notice.consumptionSource, 'user/message')
+  assert.ok(Number.isSafeInteger(row.consumedAt), 'the host signal recorded consumption')
   // A replayed signal cannot move it (compare-and-swap).
-  const recorded = row.notice.consumedAt
+  const recorded = row.consumedAt
   f.ctx.emit('session/event', { header: { id: f.owner.sessionId } }, { type: 'user/message', data: message })
-  assert.equal(f.runtime.store.get('deliveries', notice.id).notice.consumedAt, recorded)
+  assert.equal(f.runtime.store.get('deliveries', notice.id).consumedAt, recorded)
 })
 
 /**
@@ -455,25 +455,6 @@ test('R17-G2f: the review-blocked body replays from the submitted source row and
   assert.equal(notice.content, NOTICE_TEMPLATES['review-blocked'].build({ sourceId: source.id, reason: recorded.data.reason }), 'the body is the template rebuilt from the source row and the recorded reason')
   assert.ok(notice.content.startsWith(`[review_path_missing] task ${JSON.stringify(source.id)}: `), 'the body carries the typed diagnostic code and names the source task')
   assertDecision(notice, 'review-blocked')
-})
-
-test('R17-G8: the admitted owner message records consumption after inbox claim', async t => {
-  const f = await fixture(t)
-  f.emit('host signal probe', [`mission:${f.mission.id}`], { trigger: 'test/host-signal', reason: 'probe' })
-  const notice = f.ownerNotices().find(delivery => delivery.notice.dedupKey.startsWith('test/host-signal:'))
-  assert.ok(notice)
-  await eventually(() => f.runtime.store.get('deliveries', notice.id).deliveredAt !== undefined ? true : undefined, 'the outbox delivers the notice')
-  const message = { source: { kind: 'swarm', form: 'relay', missionId: f.mission.id, senderMemberId: 'runtime', deliveryId: notice.id, deliveryKind: 'control' } }
-  f.ctx.emit('agent/inbox/claimed', { message, turn: 1 })
-  assert.equal(f.runtime.store.get('deliveries', notice.id).notice.consumedAt, undefined, 'claim can still be rejected before model admission')
-  f.ctx.emit('session/event', { header: { id: f.owner.sessionId } }, { type: 'user/message', data: message })
-  const row = f.runtime.store.get('deliveries', notice.id)
-  assert.ok(Number.isSafeInteger(row.notice.consumedAt), 'the host signal recorded consumption')
-  assert.equal(row.notice.consumptionSource, 'user/message')
-  // A replayed signal cannot move it (compare-and-swap).
-  const recorded = row.notice.consumedAt
-  f.ctx.emit('session/event', { header: { id: f.owner.sessionId } }, { type: 'user/message', data: message })
-  assert.equal(f.runtime.store.get('deliveries', notice.id).notice.consumedAt, recorded)
 })
 
 test('R17-G2g: the review-blocked notice beside running work is the template too, with its statement and recorded reason', async t => {

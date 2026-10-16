@@ -73,7 +73,7 @@ function noticeEntry(delivery: Delivery): NoticeLedgerEntry | undefined {
     from: delivery.from, content: delivery.content,
     sentAt: delivery.notice.sentAt, queuedAt: delivery.notice.queuedAt,
     ...(delivery.deliveredAt === undefined ? {} : { deliveredAt: delivery.deliveredAt }),
-    ...((delivery.notice as { consumedAt?: number }).consumedAt === undefined ? {} : { consumedAt: (delivery.notice as { consumedAt?: number }).consumedAt }),
+    ...(delivery.consumedAt === undefined ? {} : { consumedAt: delivery.consumedAt }),
     state: delivery.deliveredAt === undefined ? 'queued' : 'claimed',
     deliveryId: delivery.id,
     ...(delivery.escalation === undefined ? {} : { escalation: delivery.escalation }),
