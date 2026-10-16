@@ -844,12 +844,9 @@ export function fingerprintBoard(board: Board): MissionFingerprintBoard {
  * alone reads the board.
  * ----------------------------------------------------------------------- */
 
-/** Running tasks whose owning member is durably parked (the R10-15 holder family): rows of the board alone, so asking asks the adapter nothing. */
-export function parkedHolders(board: Board): Array<{ task: HeldTask; member: Member }> {
-  return board.tasks.filter(holdsOpenAttempt).flatMap(task => {
-    const member = board.members.find(candidate => candidate.id === task.attempt.ownerId)
-    return member !== undefined && memberPhaseOf(member) === 'parked' ? [{ task, member }] : []
-  })
+/** Whether a durably parked member holds this task's open attempt (the R10-15 holder family): rows alone, so asking asks the adapter nothing. */
+export function heldByParkedMember(members: readonly Member[], task: Task): task is HeldTask {
+  return holdsOpenAttempt(task) && members.some(member => member.id === task.attempt.ownerId && memberPhaseOf(member) === 'parked')
 }
 
 /** One board, and what the dispatcher's predicates answer over it. */

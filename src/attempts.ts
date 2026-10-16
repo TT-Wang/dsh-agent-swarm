@@ -8,6 +8,7 @@
 import { id } from './store.ts'
 import { TERMINAL_STATES, blockCauses, dropForeignMarkers, holdsAttempt, holdsOpenAttempt, openAttempt, stopPending, taskSubject, terminal, type BlockCause, type HeldTask } from './task-graph.ts'
 import { stopFaultKey, type Notices } from './notices.ts'
+import { heldByParkedMember } from './board.ts'
 import { memberPhaseOf } from './projection.ts'
 import { PolicyError } from './policy-error.ts'
 import { awaited, formatSpan, type Kernel, type SchedulingPass } from './kernel.ts'
@@ -595,8 +596,7 @@ export class Attempts {
           const attemptId = task.attempt.id
           // R10-15: a parked member holding a live attempt is a stall signal, not a
           // silent board. Record it durably and wake the owner once per attempt.
-          const ownerMember = this.k.store.get('members', oldOwner)
-          const parked = ownerMember?.status === 'waiting'
+          const parked = heldByParkedMember(this.k.store.list('members', missionId), task)
           if (parked) this.notices.notifyParkedHolder(mission, task)
           // F1: an in-flight operation that has recorded nothing past its
           // declared bound is named to the owner once, and stops renewing the

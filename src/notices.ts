@@ -11,7 +11,7 @@ import { guardTerminal, guardTerminalKey, type GuardChainId, type GuardTerminal,
 import { TERMINAL_STATES, holdsAttempt, missionSubject, stopPending, subjectsOfTasks, taskSubject, terminal } from './task-graph.ts'
 import { WriterBusyError, id, type SwarmStore } from './store.ts'
 import { awaited, type Kernel, type PassState, type SchedulingPass } from './kernel.ts'
-import { completionError, dependentsOf, eligible, interpret, isolationIssues, newestReviewBlock, noticeSubjectsFor, overdueStop, parkedHolders, reviewNeed, reviewPathBlocker, reviewPathStalled, stallRoots, startBlocker, unreviewedSources, waitsLegitimately, type Board, type Interpretation } from './board.ts'
+import { completionError, dependentsOf, eligible, heldByParkedMember, interpret, isolationIssues, newestReviewBlock, noticeSubjectsFor, overdueStop, reviewNeed, reviewPathBlocker, reviewPathStalled, stallRoots, startBlocker, unreviewedSources, waitsLegitimately, type Board, type Interpretation } from './board.ts'
 import type { Delivery, Escalation, Member, Mission, NoticeClass, Task } from './types.ts'
 
 /**
@@ -820,7 +820,7 @@ export class Notices {
         if (task === undefined) return false
         if (family === 'fallthrough') return !waitsLegitimately(board, task)
         if (family === 'dispatch-question') return task.status === 'pending'
-        return parkedHolders(board).some(holder => holder.task.id === task.id)
+        return heldByParkedMember(board.members, task)
       })
     }
     return true
