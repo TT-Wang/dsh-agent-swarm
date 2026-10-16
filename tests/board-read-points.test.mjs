@@ -11,8 +11,11 @@
  *  - dispatch alone also decides the isolation invariant again on the board
  *    the preparation left: a worktree shared during the await is refused and
  *    recorded there (S7's decide, record, skip), never assigned into;
- *  - the assignment asserts the admission again (`RefusalRegistry.assertAdmission`):
- *    a stop the member came to owe during a claim's preparation refuses it;
+ *  - the dispatch sweep asserts the admission before it prepares anything
+ *    (`RefusalRegistry.assertAdmission`): a refused admission is recorded and no
+ *    workspace is prepared for the work it refused;
+ *  - the assignment asserts the admission again: a stop the member came to owe
+ *    during a claim's preparation refuses it;
  *  - one board asks the adapter about one member twice and gets two answers:
  *    the view is called through and never memoized, because asking whether a
  *    handle is idle can drain a stranded inbox item (R15-A5).
@@ -96,6 +99,27 @@ test('claim reads the board again after preparing: a prerequisite challenged dur
   await assert.rejects(claim, error => error.code === 'task_changed_during_preparation', 'the claim is refused by the board read after the await')
   const row = taskOf(f.runtime, f.dependent.id)
   assert.deepEqual([row.status, row.attempt, row.epoch], ['pending', undefined, f.dependent.epoch])
+})
+
+test('dispatch asserts admission before preparing: a refused admission is recorded and no workspace is prepared for it', async t => {
+  const f = await setup({ clock: new FakeClock() })
+  t.after(() => f.cleanup())
+  // A third member holds the one running lease a scope limit on '**' admits.
+  const holder = await f.runtime.addMember(f.owner, f.mission.id, { name: 'Holder', role: 'implementation', maxOutputTokens: 5_000 })
+  await f.runtime.settle(f.mission.id)
+  const held = f.propose({ title: 'Held', assigneeId: holder.id })
+  await f.runtime.claim(f.actor(holder), f.mission.id, held.id)
+  f.runtime.setAdmissionLimit(f.owner, f.mission.id, { level: 'scope', key: '**', limit: 1 }, 'one running lease')
+  const waiting = f.propose({ title: 'Waiting' })
+  await f.runtime.settle(f.mission.id)
+  f.workers.idle.add(f.author.id)
+  f.runtime.kick(f.mission.id)
+  await f.runtime.settle(f.mission.id)
+  const refusals = f.runtime.admissionLedger(f.owner, f.mission.id, { reason: 'queue_full' })
+  assert.deepEqual(refusals.map(row => [row.taskId, row.memberId, row.level, row.key]), [[waiting.id, f.author.id, 'scope', '**']], 'the sweep recorded the refused admission')
+  assert.deepEqual(f.workers.prepared.filter(row => row.taskId === waiting.id), [], 'and prepared no workspace for the work it refused')
+  const row = taskOf(f.runtime, waiting.id)
+  assert.deepEqual([row.status, row.attempt, row.epoch], ['pending', undefined, waiting.epoch], 'the refused task stays pending')
 })
 
 test('the assignment asserts admission again after preparing: a stop the member came to owe during the preparation refuses the claim', async t => {
