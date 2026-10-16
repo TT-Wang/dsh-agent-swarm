@@ -73,7 +73,7 @@ test('R20-1: fencing a revoked workspace drops the attempt, records the owner an
   const claimed = await f.runtime.claim(f.actor(f.author), f.mission.id, task.id)
   const epoch = current(f, task).epoch
 
-  f.runtime.fenceWorkspace(f.mission.id, 'workspace_revoked: the authorized grant root was removed')
+  f.runtime.workspaceAdmission.fenceWorkspace(f.mission.id, 'workspace_revoked: the authorized grant root was removed')
 
   const row = current(f, task)
   assert.equal(row.status, 'blocked', 'the task is blocked with the revocation reason')

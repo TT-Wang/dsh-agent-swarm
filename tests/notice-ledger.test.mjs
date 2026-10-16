@@ -1211,6 +1211,19 @@ test('a wedged pass\'s naming is outstanding while the work it named is unfinish
 const terminalRows = (f, chain) => ownerRows(f).filter(delivery => delivery.notice.dedupKey.startsWith(`guard-terminal:${chain}:`))
 /** Each told fact's stall event names its row: the events of one cause, as the keys of the rows they were written with. */
 const stallEventKeys = (f, cause) => events(f.runtime, f.mission.id, 'mission/stalled').filter(event => event.data.cause === cause).map(event => event.data.noticeKey)
+/**
+ * A guard of one member's dispatch chain that throws on every pass: the member holds no isolated worktree, so the
+ * sweep's isolation decision refuses it, and recording that refusal throws `failure()`; the sweep's own guard
+ * terminal is then the throw's one record. `repair` gives the member its worktree back, and its chain passes.
+ */
+const failingDispatch = (f, member, failure) => {
+  const workspace = f.runtime.store.get('members', member.id).workspace
+  const provision = path => f.runtime.store.transaction(() => f.runtime.store.put('members', { ...f.runtime.store.get('members', member.id), workspace: path }))
+  const recordIsolation = f.runtime.workspaceAdmission.recordIsolation.bind(f.runtime.workspaceAdmission)
+  f.runtime.workspaceAdmission.recordIsolation = (board, violation) => { if (violation.memberIds.includes(member.id)) throw new Error(failure()); return recordIsolation(board, violation) }
+  provision('')
+  return { repair: () => provision(workspace) }
+}
 
 test('L-25: a guard terminal is one request per fact that opened it: the task budget and the experiment budget refused on one board are two, and a repeat on another board is none', async t => {
   const f = await setup({ clock: new FakeClock(), budget: { maxTasks: 1, maxExperiments: 0 } })
@@ -1248,8 +1261,7 @@ test('L-25: a failed dispatch is one request per member, the work it names and t
   t.after(f.cleanup)
   // A guard of the author's dispatch chain throws on every pass.
   let failure = 'worktree probe failed: EIO'
-  const isolationAllows = f.runtime.isolationAllows.bind(f.runtime)
-  f.runtime.isolationAllows = (missionId, member) => { if (member.id === f.author.id) throw new Error(failure); return isolationAllows(missionId, member) }
+  failingDispatch(f, f.author, () => failure)
   const task = f.propose({ title: 'Work for the author' })
   await f.runtime.settle(f.mission.id)
   await ticks(f, 2)
@@ -1630,8 +1642,7 @@ test('L-25: a failed dispatch\'s request is the failure of the work it names: th
   const tool = await ownerTools(f)
   // A guard of the author's dispatch chain throws on every pass, whatever work the author holds.
   const failure = 'Member has uncommitted commits'
-  const isolationAllows = f.runtime.isolationAllows.bind(f.runtime)
-  f.runtime.isolationAllows = (missionId, member) => { if (member.id === f.author.id) throw new Error(failure); return isolationAllows(missionId, member) }
+  failingDispatch(f, f.author, () => failure)
   const opener = subjects => factKey(f.mission.id, { trigger: `dispatch-failed:${f.author.id}`, reason: `Error: ${failure}`, subjects })
   const told = () => terminalRows(f, 'attempt_lease').map(delivery => [delivery.notice.dedupKey.split(':').slice(3).join(':'), delivery.subjects, delivery.notice.reason])
   const request = subjects => [opener(subjects), subjects, `Error: ${failure}`]
@@ -1661,13 +1672,11 @@ test('L-25: a failed dispatch\'s request is the failure of the work it names: th
 })
 
 test('every exit a failed dispatch\'s request names, performed through the owner\'s registered tools: each lets the task it names run, the request is never told twice over that work, and its reminders follow the task', async t => {
-  /** The author's dispatch chain throws on every pass while `fault.on`; its task stays pending and the chain's request names it. */
+  /** The author's dispatch chain throws on every pass until `fault.repair()`; its task stays pending and the chain's request names it. */
   const board = async () => {
     const f = await setup({ clock: new FakeClock(), workers: new FakeWorkers({ autoIdle: true }), budget: LONG })
     t.after(f.cleanup)
-    const fault = { on: true }
-    const isolationAllows = f.runtime.isolationAllows.bind(f.runtime)
-    f.runtime.isolationAllows = (missionId, member) => { if (fault.on && member.id === f.author.id) throw new Error('worktree probe failed: EIO'); return isolationAllows(missionId, member) }
+    const fault = failingDispatch(f, f.author, () => 'worktree probe failed: EIO')
     const task = f.propose({ title: 'Work for the author' })
     await quiet(f)
     const [request] = terminalRows(f, 'attempt_lease')
@@ -1676,7 +1685,7 @@ test('every exit a failed dispatch\'s request names, performed through the owner
   }
   // The reassignment moves the task off the failing member without repairing it: that member then fails holding no work, which is told once at the mission root.
   const exits = {
-    '`action: resume` after repair': { then: [], perform: async ({ task, fault, tool }) => { fault.on = false; await tool('swarm_control', { taskId: task.id, action: 'resume', reason: 'Repaired' }) } },
+    '`action: resume` after repair': { then: [], perform: async ({ task, fault, tool }) => { fault.repair(); await tool('swarm_control', { taskId: task.id, action: 'resume', reason: 'Repaired' }) } },
     '`action: amend`, `changes.assigneeId` and `reason` to fence and reassign it': { then: [f => [`mission:${f.mission.id}`]], perform: ({ f, task, tool }) => tool('swarm_control', { taskId: task.id, action: 'amend', changes: { assigneeId: f.reviewer.id }, reason: 'Reassign' }) },
   }
   for (const [exit, { then, perform }] of Object.entries(exits)) {
@@ -1851,10 +1860,7 @@ test('the fall-through names stuck work at its epoch, once, beside an open reque
 
 test('P1d: a member\'s blocked task is named by its stall root beside an open member-scoped request: a real handoff whose old owner never stops, beside the new assignee\'s failing dispatch; a dead end beside a failing dispatch; a dead end beside an isolation request', async t => {
   /** The author's dispatch chain throws on every pass: its request names all of the author's unfinished work. */
-  const failDispatch = f => {
-    const isolationAllows = f.runtime.isolationAllows.bind(f.runtime)
-    f.runtime.isolationAllows = (missionId, member) => { if (member.id === f.author.id) throw new Error('worktree probe failed: EIO'); return isolationAllows(missionId, member) }
-  }
+  const failDispatch = f => failingDispatch(f, f.author, () => 'worktree probe failed: EIO')
   const deadEnd = (f, assigneeId) => {
     const dead = f.propose({ title: 'Dead end', assigneeId, kind: 'research', checks: [] })
     f.runtime.commit(f.mission.id, () => f.runtime.store.put('tasks', { ...taskOf(f.runtime, dead.id), status: 'blocked', epoch: taskOf(f.runtime, dead.id).epoch + 1, output: 'blocked for repair' }))

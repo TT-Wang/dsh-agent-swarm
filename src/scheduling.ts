@@ -7,7 +7,7 @@
  */
 import { id } from './store.ts'
 import { TERMINAL_STATES, holdsOpenAttempt, openAttempt, pendingStopOwner, quiescencePending, selectAcceptedDelivery, subjectsOfTasks, taskSubject, terminal } from './task-graph.ts'
-import { eligible, noticeSubjectsFor, overdueStop, ready, startBlocker, unschedulable } from './board.ts'
+import { eligible, isolationViolation, noticeSubjectsFor, overdueStop, ready, startBlocker, unschedulable } from './board.ts'
 import { factKey } from './notices.ts'
 import { AdmissionRefusedError } from './scheduler.ts'
 import { awaited, formatSpan, progressed, type PassState, type SchedulingPass } from './kernel.ts'
@@ -103,7 +103,10 @@ export class Scheduling {
           // element's input: escalate with a coded decision request, then keep
           // dispatching the other members.
           try {
-          if (!this.rt.isolationAllows(missionId, member)) continue
+          // The isolation invariant is decided on the board, a refusal is
+          // recorded, and only then is the member skipped or started.
+          const beforeStart = this.rt.boardOf(missionId), refused = isolationViolation(beforeStart, member)
+          if (refused !== undefined) { this.rt.workspaceAdmission.recordIsolation(beforeStart, refused); continue }
           try { await awaited(pass, this.rt.startWorker(mission, member, { pass }), this.rt.now) }
           catch (error) {
             // Disposing the adapter cancels in-flight starts. This is recoverable host
@@ -148,7 +151,7 @@ export class Scheduling {
             // Revocation fencing: a mission whose human authorization was withdrawn
             // is blocked here, before any adapter prepares a workspace or checkout.
             this.rt.assertAdmission(task, member)
-            await awaited(pass, this.rt.assertWorkspaceAuthorized(this.rt.mission(missionId), pass), this.rt.now)
+            await awaited(pass, this.rt.workspaceAdmission.assertWorkspaceAuthorized(this.rt.mission(missionId), pass), this.rt.now)
             // The adapter reports a recovery fallback from inside this call
             // (`SwarmRuntime.onRecoveryFallback`), which stamps the body that
             // marked the member it prepares before it commits the report.
@@ -160,10 +163,12 @@ export class Scheduling {
             const fresh = this.rt.task(missionId, task.id)
             if (fresh.epoch !== task.epoch || fresh.assigneeId !== task.assigneeId || fresh.plannedAssigneeId !== task.plannedAssigneeId
               || fresh.assignmentMode !== task.assignmentMode || !ready(this.rt.boardOf(missionId), fresh, member)) continue
-            // S7: re-read the isolation invariant after the external preparation
-            // await. A state change during it (a member added into this worktree, a
-            // second running task admitted) is refused here, never dispatched.
-            if (!this.rt.isolationAllows(missionId, member)) continue
+            // S7: decide the isolation invariant again on the board the external
+            // preparation await left. A state change during it (a member added into
+            // this worktree, a second running task admitted) is refused and
+            // recorded here, never dispatched.
+            const prepared = this.rt.boardOf(missionId), violation = isolationViolation(prepared, member)
+            if (violation !== undefined) { this.rt.workspaceAdmission.recordIsolation(prepared, violation); continue }
             this.rt.assign(fresh, member)
           } catch (error) {
             // Admission control already wrote the durable refusal; the task stays

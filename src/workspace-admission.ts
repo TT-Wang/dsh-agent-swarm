@@ -1,24 +1,22 @@
 /**
- * Workspace and admission surface: the worker git-write refusal, the shared-temp
- * rendezvous detector, the human-authorized workspace roots and dispatch
- * admission by the isolation invariant (`isolationIssues`, a board function).
- * M1a seam 6/7.
- *
- * Everything here is behaviour-identical to the code it was moved from
- * src/runtime.ts. The runtime keeps thin forwarding methods for the method group,
- * so no call site changed; the pure helpers are imported by name.
+ * Workspace and admission surface: the human-authorized workspace roots and
+ * their fence, the shared-temp rendezvous detector, the record of an isolation
+ * refusal, and the worker git-write classifier (`deniedGitWrite`, a pure
+ * function of one host-recorded tool call). Whether the isolation invariant
+ * refuses a member's dispatch is a board function (`isolationViolation`); this
+ * seam only records a refusal the dispatch decided.
  */
 import { tmpdir } from 'node:os'
 import { stopPending, subjectsOfTasks, terminal } from './task-graph.ts'
 import { claimFor, isContained, reauthorizeWorkspace, WorkspaceRevokedError, WORKSPACE_AUTHORIZATION_CODE, type WorkspaceClaim } from './authorization.ts'
 import { hasNotice } from './arena.ts'
-import { isolationOpener, noticeIdentity } from './notices.ts'
-import { isolationIssues, noticeSubjectsFor } from './board.ts'
+import { isolationOpener, noticeIdentity, type Notices } from './notices.ts'
+import { noticeSubjectsFor, type Board, type IsolationIssue } from './board.ts'
 import { guardTerminalKey } from './refusals.ts'
-import type { SwarmRuntime } from './runtime.ts'
-import { progressed, type SchedulingPass } from './kernel.ts'
+import type { Attempts } from './attempts.ts'
+import { progressed, type Kernel, type SchedulingPass } from './kernel.ts'
 import { absoluteCheckPaths, shellSegments } from './admission.ts'
-import type { Member, Mission } from './types.ts'
+import type { Mission } from './types.ts'
 
 /**
  * R11-15: the shared temp roots every workspace-write execution may write
@@ -363,12 +361,34 @@ function gitWriteSubcommand(command: string): string | undefined {
  */
 const GIT_WRITE = /\bgit\b[^\n]{0,200}?\b(commit|add|merge|rebase|cherry-pick|revert|reset|switch|checkout|update-ref|rm|mv|am|push|init|gc|repack)\b/
 
+/**
+ * A worker-side git write that the sandbox refused (index.lock EPERM). Only a
+ * shell-executing tool runs a command line, so only its executed command is
+ * inspected; a quoted span that merely names a git-write phrase (a search
+ * pattern, an edit body, a message) is data, never a denial and never a latch,
+ * and a successful command is never a denial. R6-01: the result text is not
+ * sufficient by itself: the command must execute a metadata write, fail,
+ * and report an explicit permission failure. This is a diagnostic, never
+ * authority to disable unrelated tools. R6-02: the subcommand must sit at command position
+ * in one shell segment, so a write word mentioned in a pattern or path is data
+ * even when the command fails. A command hidden inside a nested shell string
+ * is not seen: the sandbox still blocks it and the worker sees the raw refusal.
+ */
+export function deniedGitWrite(input: { tool: string; arguments: unknown; result: unknown; isError: boolean }): string | undefined {
+  const command = executedShellCommand(input.tool, input.arguments)
+  if (command === undefined || !input.isError || gitWriteSubcommand(unquotedShellText(command)) === undefined) return undefined
+  // A Git error may be an assertion, conflict, or empty commit. Only an
+  // explicit permission failure is described as a sandbox refusal.
+  if (!/(?:EPERM|EACCES|[Oo]peration not permitted|[Pp]ermission denied)/.test(JSON.stringify(input.result))) return undefined
+  return command.length > 200 ? `${command.slice(0, 200)}…` : command
+}
+
 export class WorkspaceAdmission {
   /** R11-15: bounded per-path mention history and reported-pair bookkeeping. */
   private readonly tempMentions = new Map<string, TempMention[]>()
   private readonly tempRendezvousReported = new Map<string, number>()
 
-  constructor(private readonly rt: SwarmRuntime) {}
+  constructor(private readonly k: Kernel, private readonly attempts: Attempts, private readonly notices: Notices) {}
 
   /**
    * The runtime-side half of the workspace authorization boundary. `create` is
@@ -381,7 +401,7 @@ export class WorkspaceAdmission {
    */
   assertAuthorizedRoot(workspace: string, claim: WorkspaceClaim): WorkspaceClaim {
     if (!isContained(claim.grantRoot, workspace)) throw new Error(`Mission workspace ${workspace} is not inside its reported authorized root ${claim.grantRoot} [${WORKSPACE_AUTHORIZATION_CODE}]`)
-    const authorized = claimFor(workspace, claim.source === 'session' ? claim.grantRoot : undefined, this.rt.config.grants, this.rt.now())
+    const authorized = claimFor(workspace, claim.source === 'session' ? claim.grantRoot : undefined, this.k.config.grants, this.k.now())
     if (authorized !== undefined) return authorized
     throw new Error(`Mission workspace ${workspace} is not inside a currently authorizedWorkspaces root [${WORKSPACE_AUTHORIZATION_CODE}]`)
   }
@@ -393,11 +413,11 @@ export class WorkspaceAdmission {
    * `WorkspaceRevokedError`.
    */
   async assertWorkspaceAuthorized(mission: Pick<Mission, 'id' | 'workspace' | 'workspaceGrantRoot' | 'workspaceAuthorizationSource'>, pass?: SchedulingPass): Promise<void> {
-    const authorization = await reauthorizeWorkspace(mission, this.rt.config.grants, this.rt.now())
+    const authorization = await reauthorizeWorkspace(mission, this.k.config.grants, this.k.now())
     if (authorization.ok) return
     // The scheduling body awaiting this check (`pass`) stamps its progress
     // before the fence commits, so the fence publishes as its own commit.
-    progressed(pass, this.rt.now())
+    progressed(pass, this.k.now())
     this.fenceWorkspace(mission.id, authorization.diagnostic)
     throw new WorkspaceRevokedError(authorization.diagnostic)
   }
@@ -410,15 +430,15 @@ export class WorkspaceAdmission {
    * not spend recovery credit the way a transient preparation failure does.
    */
   fenceWorkspace(missionId: string, reason: string): void {
-    const mission = this.rt.store.get('missions', missionId)
+    const mission = this.k.store.get('missions', missionId)
     if (mission === undefined || terminal(mission)) return
-    const blocked = this.rt.store.list('tasks', missionId).filter(task => task.status === 'pending' || task.status === 'running')
+    const blocked = this.k.store.list('tasks', missionId).filter(task => task.status === 'pending' || task.status === 'running')
     // A revocation lasts this process (above), so its decision is keyed on it.
-    const revocation = `workspace-revoked:${this.rt.instanceId}`
+    const revocation = `workspace-revoked:${this.k.instanceId}`
     // Idempotent from mission state: nothing left to block, and the owner already
     // holds this revocation's request, under the identity it is told with, means the mission is fenced.
-    if (blocked.length === 0 && hasNotice(this.rt.store.list('deliveries', missionId), noticeIdentity(missionId, subjectsOfTasks(blocked, mission), { dedupKey: guardTerminalKey('workspace', { localKey: revocation }) }).identity)) return
-    this.rt.commit(missionId, () => {
+    if (blocked.length === 0 && hasNotice(this.k.store.list('deliveries', missionId), noticeIdentity(missionId, subjectsOfTasks(blocked, mission), { dedupKey: guardTerminalKey('workspace', { localKey: revocation }) }).identity)) return
+    this.k.commit(missionId, () => {
       for (const task of blocked) {
         // A running task here holds a live attempt and a live handle. Setting the
         // status and bumping the epoch by hand left the attempt on the row, left
@@ -426,41 +446,19 @@ export class WorkspaceAdmission {
         // stopped the worker: the shared fence does all four. `invalidated`,
         // because revocation is terminal for this host process and the barrier
         // re-pends every other reason.
-        this.rt.attempts.fenceForStop(task, { status: 'blocked', reason: 'invalidated', cause: 'workspace-revoked' })
-        task.output = reason; this.rt.store.put('tasks', task)
-        this.rt.store.event(missionId, 'task/blocked', 'runtime', { taskId: task.id, reason })
+        this.attempts.fenceForStop(task, { status: 'blocked', reason: 'invalidated', cause: 'workspace-revoked' })
+        task.output = reason; this.k.store.put('tasks', task)
+        this.k.store.event(missionId, 'task/blocked', 'runtime', { taskId: task.id, reason })
       }
-      this.rt.store.event(missionId, 'mission/workspace-revoked', 'runtime', { workspace: mission.workspace, grantRoot: mission.workspaceGrantRoot, reason, blockedTasks: blocked.map(task => task.id) })
+      this.k.store.event(missionId, 'mission/workspace-revoked', 'runtime', { workspace: mission.workspace, grantRoot: mission.workspaceGrantRoot, reason, blockedTasks: blocked.map(task => task.id) })
     })
     // The marker is an obligation, not a record: without this poke the fenced
     // handle keeps running against a workspace the human withdrew.
-    for (const task of blocked) if (stopPending(task)) this.rt.attempts.resumeStoppedAttempt(missionId, task)
+    for (const task of blocked) if (stopPending(task)) this.attempts.resumeStoppedAttempt(missionId, task)
     // S4b: the fence reaches the shared coded workspace terminal. A revocation
     // is a local fault, not a board state, so the decision is keyed by it and
     // the owner is woken once per revocation however the board moves afterwards.
-    this.rt.notices.emitGuardTerminal(missionId, 'workspace', { detail: reason, localKey: revocation, subjects: subjectsOfTasks(blocked, mission) })
-  }
-
-  /**
-   * A worker-side git write that the sandbox refused (index.lock EPERM). Only a
-   * shell-executing tool runs a command line, so only its executed command is
-   * inspected; a quoted span that merely names a git-write phrase (a search
-   * pattern, an edit body, a message) is data, never a denial and never a latch,
-   * and a successful command is never a denial. R6-01: the result text is not
-   * sufficient by itself: the command must execute a metadata write, fail,
-   * and report an explicit permission failure. This is a diagnostic, never
-   * authority to disable unrelated tools. R6-02: the subcommand must sit at command position
-   * in one shell segment, so a write word mentioned in a pattern or path is data
-   * even when the command fails. A command hidden inside a nested shell string
-   * is not seen: the sandbox still blocks it and the worker sees the raw refusal.
-   */
-  deniedGitWrite(input: { tool: string; arguments: unknown; result: unknown; isError: boolean }): string | undefined {
-    const command = executedShellCommand(input.tool, input.arguments)
-    if (command === undefined || !input.isError || gitWriteSubcommand(unquotedShellText(command)) === undefined) return undefined
-    // A Git error may be an assertion, conflict, or empty commit. Only an
-    // explicit permission failure is described as a sandbox refusal.
-    if (!/(?:EPERM|EACCES|[Oo]peration not permitted|[Pp]ermission denied)/.test(JSON.stringify(input.result))) return undefined
-    return command.length > 200 ? `${command.slice(0, 200)}…` : command
+    this.notices.emitGuardTerminal(missionId, 'workspace', { detail: reason, localKey: revocation, subjects: subjectsOfTasks(blocked, mission) })
   }
 
   /**
@@ -472,7 +470,7 @@ export class WorkspaceAdmission {
   tempRendezvous(memberId: string, taskId: string, input: { tool: string; arguments: unknown }): { path: string; first: TempMention; second: TempMention } | undefined {
     const paths = sharedTempPaths(input)
     if (!paths.length) return undefined
-    const now = this.rt.now()
+    const now = this.k.now()
     let report: { path: string; first: TempMention; second: TempMention } | undefined
     for (const path of paths) {
       const fresh = (this.tempMentions.get(path) ?? []).filter(mention => now - mention.at <= TEMP_RENDEZVOUS_WINDOW_MS)
@@ -498,21 +496,18 @@ export class WorkspaceAdmission {
   }
 
   /**
-   * The isolation precondition for one dispatch. A member a violation lists is
-   * refused, durably: the workspace chain's terminal, the one emitter of
+   * The record of an isolation refusal the dispatch decided on `board`
+   * (`isolationViolation`): the workspace chain's terminal, the one emitter of
    * "isolation blocks dispatch", names the violation and its executable exit
    * (each live member needs its own isolated worktree). The request is the
    * violation's (`isolationOpener`), naming the unfinished work of every member
-   * it lists: one decision per distinct violation however many members it
-   * refuses and however often, outstanding while the invariant still lists it
-   * (`Notices.openGuardTerminal`), and a changed violation is a new one.
+   * it lists on that board: one decision per distinct violation however many
+   * members it refuses and however often, outstanding while the invariant
+   * still lists it (`Notices.openGuardTerminal`), and a changed violation is a
+   * new one.
    */
-  isolationAllows(missionId: string, member: Member): boolean {
-    const board = this.rt.boardOf(missionId)
-    const violation = isolationIssues(board).find(entry => entry.memberIds.includes(member.id))
-    if (violation === undefined) return true
-    this.rt.notices.emitGuardTerminal(missionId, 'workspace', { subjects: violation.memberIds.flatMap(id => noticeSubjectsFor(board, { memberId: id })), localKey: isolationOpener(violation.message),
+  recordIsolation(board: Board, violation: IsolationIssue): void {
+    this.notices.emitGuardTerminal(board.missionId, 'workspace', { subjects: violation.memberIds.flatMap(id => noticeSubjectsFor(board, { memberId: id })), localKey: isolationOpener(violation.message),
       detail: `the isolation invariant refuses dispatch: ${violation.message}` })
-    return false
   }
 }

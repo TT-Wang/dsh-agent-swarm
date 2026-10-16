@@ -368,9 +368,10 @@ export interface IsolationIssue { memberIds: string[]; message: string }
  *    per worktree and refuses a second whose scope overlaps.
  * It asserts the isolation the runtime already has; it never weakens
  * per-member worktrees, it refuses a dispatch that would lose them. Dispatch
- * admission refuses a listed member (`WorkspaceAdmission.isolationAllows`), and
- * the workspace terminal a breach raised is outstanding while the invariant
- * still lists it (`Notices.openGuardTerminal`).
+ * refuses a listed member (`isolationViolation`) and records the refusal
+ * (`WorkspaceAdmission.recordIsolation`), and the workspace terminal a breach
+ * raised is outstanding while the invariant still lists it
+ * (`Notices.openGuardTerminal`).
  */
 export function isolationIssues(board: Pick<Board, 'members' | 'tasks'>): IsolationIssue[] {
   const violations: IsolationIssue[] = []
@@ -400,6 +401,11 @@ export function isolationIssues(board: Pick<Board, 'members' | 'tasks'>): Isolat
     }
   }
   return violations
+}
+
+/** The dispatch's isolation decision for one member: the first breach on the board that lists it, or undefined when the invariant admits its dispatch. */
+export function isolationViolation(board: Pick<Board, 'members' | 'tasks'>, member: Pick<Member, 'id'>): IsolationIssue | undefined {
+  return isolationIssues(board).find(issue => issue.memberIds.includes(member.id))
 }
 
 /* ----------------------------------------------------------------------- *

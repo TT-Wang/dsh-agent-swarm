@@ -6,7 +6,7 @@ import { Attempts, clearCloseout, endAttempt } from './attempts.ts'
 import { PolicyError } from './policy-error.ts'
 export { WorkspaceRevokedError } from './authorization.ts'
 import { recordedClaim, type WorkspaceClaim } from './authorization.ts'
-import { WorkspaceAdmission, gitWriteDeniedMessage, TEMP_RENDEZVOUS_WINDOW_MS, type TempMention } from './workspace-admission.ts'
+import { WorkspaceAdmission, deniedGitWrite, gitWriteDeniedMessage, TEMP_RENDEZVOUS_WINDOW_MS } from './workspace-admission.ts'
 import { Notices, NOTICE_TEMPLATES, REJECTION_DECISION_TRIGGER, assignmentCurrent, renderNotice } from './notices.ts'
 import { RefusalRegistry, requireStrings, requireText, sameChecks, unsupportedEffort, validatedBudget } from './refusals.ts'
 import { Scheduling } from './scheduling.ts'
@@ -292,16 +292,6 @@ export class SwarmRuntime implements Kernel {
    */
   readonly instanceId = id('runtime')
 
-  /** M1a seam 6/7: workspace and admission surface. */
-  private readonly workspaceAdmission = new WorkspaceAdmission(this)
-  // M1a seam 6/7: the workspace/admission surface lives in src/workspace-admission.ts.
-  assertAuthorizedRoot(workspace: string, claim: WorkspaceClaim): WorkspaceClaim { return this.workspaceAdmission.assertAuthorizedRoot(workspace, claim) }
-  async assertWorkspaceAuthorized(mission: Pick<Mission, 'id' | 'workspace' | 'workspaceGrantRoot' | 'workspaceAuthorizationSource'>, pass?: SchedulingPass): Promise<void> { return this.workspaceAdmission.assertWorkspaceAuthorized(mission, pass) }
-  fenceWorkspace(missionId: string, reason: string): void { return this.workspaceAdmission.fenceWorkspace(missionId, reason) }
-  deniedGitWrite(input: { tool: string; arguments: unknown; result: unknown; isError: boolean }): string | undefined { return this.workspaceAdmission.deniedGitWrite(input) }
-  tempRendezvous(memberId: string, taskId: string, input: { tool: string; arguments: unknown }): { path: string; first: TempMention; second: TempMention } | undefined { return this.workspaceAdmission.tempRendezvous(memberId, taskId, input) }
-  isolationAllows(missionId: string, member: Member): boolean { return this.workspaceAdmission.isolationAllows(missionId, member) }
-
   /** M1a seam 4/7: the durable refusal registry and its writer-busy recovery, on the kernel alone. */
   readonly refusals = new RefusalRegistry(this)
 
@@ -321,6 +311,13 @@ export class SwarmRuntime implements Kernel {
    * paths, the adapter's idle callback, the seams and the tests.
    */
   readonly attempts = new Attempts(this, this.notices)
+
+  /**
+   * M1a seam 6/7: the authorized workspace roots and their fence, the temp
+   * rendezvous detector and the isolation refusal record, on the kernel, the
+   * attempts its fence stops and the notices. Every caller reaches it as `workspaceAdmission`.
+   */
+  readonly workspaceAdmission = new WorkspaceAdmission(this, this.attempts, this.notices)
 
   /** M1a seam 7/7: pass bookkeeping, the dispatch sweep and the attempt reporting bound; its predicates are the board's. */
   private readonly scheduling = new Scheduling(this)
@@ -862,7 +859,7 @@ export class SwarmRuntime implements Kernel {
     requireText(input.title, 'title'); requireText(input.objective, 'objective')
     if (!isAbsolute(input.workspace)) throw new PolicyError('workspace_not_absolute', 'validation_error', 'workspace must be an absolute path')
     requireStrings(input.scope, 'scope'); requireStrings(input.acceptance, 'acceptance')
-    const authorized = this.assertAuthorizedRoot(input.workspace, claim)
+    const authorized = this.workspaceAdmission.assertAuthorizedRoot(input.workspace, claim)
     input = { ...input, scope: normalizeScopeSelectors(input.scope) }
     assertScopeSelectors(input.scope, 'scope')
     const budget = validatedBudget(input.budget)
@@ -927,7 +924,7 @@ export class SwarmRuntime implements Kernel {
       if (members.some(m => m.name === name)) throw new PolicyError('worker_name_conflict', 'conflict_error', 'Worker name already exists')
       const memberId = admittedId ?? id('member')
       // Re-validate before the first filesystem effect of this mission.
-      await this.assertWorkspaceAuthorized(mission)
+      await this.workspaceAdmission.assertWorkspaceAuthorized(mission)
       assertAdmissionCurrent()
       if (!mission.baseline && this.workers.prepareBaseline) {
         const baseline = await this.workers.prepareBaseline(mission, actor.signal)
@@ -1342,7 +1339,7 @@ export class SwarmRuntime implements Kernel {
       const blocker = readinessBlocker(this.boardOf(missionId), task, member)
       if (blocker !== undefined) throw new PolicyError('task_not_ready', 'conflict_error', `Task is not ready for this member: ${blocker}`)
       this.assertAdmission(task, member)
-      await this.assertWorkspaceAuthorized(this.mission(missionId))
+      await this.workspaceAdmission.assertWorkspaceAuthorized(this.mission(missionId))
       const { graph } = this.boardOf(missionId)
       await this.workers.prepareTask(member, { ...task, epoch: task.epoch + 1 }, graph.effectiveDependencies(task), graph.reviewSource(task))
       this.active(actor, missionId)
@@ -2363,7 +2360,7 @@ export class SwarmRuntime implements Kernel {
     if (this.starts(actor).some(request => ['planning', 'launching', 'running'].includes(request.status))) throw new PolicyError('automatic_request_in_progress', 'conflict_error', 'This session already has an automatic swarm request in progress')
     if (this.starts(actor).filter(request => request.status === 'failed').length >= 32) throw new Error('Too many failed automatic requests; retry a saved request')
     const now = this.now()
-    const authorized = this.assertAuthorizedRoot(input.workspace, claim)
+    const authorized = this.workspaceAdmission.assertAuthorizedRoot(input.workspace, claim)
     const request: AutoStart = { id: id('start'), ownerSessionId: actor.sessionId, commandId: input.commandId, goal, workspace: input.workspace, workspaceGrantRoot: authorized.grantRoot, workspaceAuthorizationSource: authorized.source,
       budget, status: 'planning', planningEpoch: 1, planningDeadlineAt: now + (this.config.planningTimeoutMs ?? 600000), createdAt: now, updatedAt: now }
     this.commit(request.id, () => {
@@ -2380,7 +2377,7 @@ export class SwarmRuntime implements Kernel {
       if (!['planning', 'failed'].includes(request.status) || request.planningFenced || (request.planningEpoch ?? 1) !== admittedEpoch) throw new Error('Request is no longer awaiting planning; inspect the saved request and retry through swarm_control')
       if (request.baseline) return request
       if (!this.workers.prepareBaseline) throw new Error('This worker adapter cannot snapshot a project for automatic planning')
-      await this.assertWorkspaceAuthorized(request)
+      await this.workspaceAdmission.assertWorkspaceAuthorized(request)
       const controller = new AbortController()
       this.startControllers.set(requestId, controller)
       const signal = actor.signal ? AbortSignal.any([actor.signal, controller.signal]) : controller.signal
@@ -2713,7 +2710,7 @@ export class SwarmRuntime implements Kernel {
   private prepareDraftInput(input: PlanInput, claim: WorkspaceClaim) {
     // The saved draft already shows the review the host adds for each deliverable.
     const admitted = pairReviews(validatePlan(input, { dependencyDirs: this.config.verificationDependencyDirs }))
-    return { admitted, authorized: this.assertAuthorizedRoot(admitted.workspace, claim) }
+    return { admitted, authorized: this.workspaceAdmission.assertAuthorizedRoot(admitted.workspace, claim) }
   }
   /** Saving a plan creates no workers, worktrees or model calls; the claim is recorded beside it. */
   createDraft(actor: Actor, input: PlanInput, claim: WorkspaceClaim, admittedId?: string): DraftPlan {
@@ -2781,7 +2778,7 @@ export class SwarmRuntime implements Kernel {
       if (this.mission(draft.missionId!).status !== 'staged' || this.store.get('drafts', draft.id)?.revision !== draft.revision) throw new PolicyError('plan_repair_interrupted', 'conflict_error', 'Plan repair was interrupted')
     }
     assertStaged()
-    await this.assertWorkspaceAuthorized(mission)
+    await this.workspaceAdmission.assertWorkspaceAuthorized(mission)
     assertStaged()
     const members = new Map(input.members.map(member => [`member_${draft.id}_${member.key}`, member]))
     for (const member of this.store.list('members', mission.id)) {
@@ -2860,7 +2857,7 @@ export class SwarmRuntime implements Kernel {
       if (!['draft', 'failed'].includes(draft.status)) throw new PolicyError('draft_not_launchable', 'conflict_error', 'Draft cannot be launched in its current state')
       // A launch runs under the claim its draft recorded: re-validated before the preflight reaches the
       // workspace, and a refusal leaves the draft, and any staged mission, as they were.
-      await this.assertWorkspaceAuthorized({ ...draft, workspace: draft.input.workspace })
+      await this.workspaceAdmission.assertWorkspaceAuthorized({ ...draft, workspace: draft.input.workspace })
       const automatic = this.store.list('starts').find(request => request.draftId === draft.id)
       const assertCurrent = () => {
         actor.signal?.throwIfAborted()
@@ -3162,7 +3159,7 @@ export class SwarmRuntime implements Kernel {
 
   async inspectDelivery(actor: Actor, missionId: string) {
     const { mission, task } = this.deliveryTarget(actor, missionId)
-    await this.assertWorkspaceAuthorized(mission)
+    await this.workspaceAdmission.assertWorkspaceAuthorized(mission)
     return this.workers.inspectDelivery(mission, task.artifact!.commit, actor.signal)
   }
   async applyDelivery(actor: Actor, missionId: string) {
@@ -3170,7 +3167,7 @@ export class SwarmRuntime implements Kernel {
     // Different completed missions for one source must not apply concurrently.
     return this.exclusive(`delivery:${target.mission.workspace}`, async () => {
       const { mission, task } = this.deliveryTarget(actor, missionId)
-      await this.assertWorkspaceAuthorized(mission)
+      await this.workspaceAdmission.assertWorkspaceAuthorized(mission)
       const result = await this.workers.applyDelivery(mission, task.artifact!.commit, actor.signal)
       this.commit(missionId, () => {
         // The projection states what is currently in effect, so a conflicts result
@@ -3611,12 +3608,12 @@ export class SwarmRuntime implements Kernel {
     // F8: a recorded run may extend the attempt lease, but a stored lease must
     // never outlive the mission deadline (the same clamp every other renewal uses).
     task.attempt.leaseUntil = Math.min(this.mission(member.missionId).deadline, this.now() + this.config.leaseMs)
-    const denied = this.deniedGitWrite(input)
+    const denied = deniedGitWrite(input)
     const firstDenial = denied !== undefined && task.gitWriteDenied === undefined
     if (firstDenial) task.gitWriteDenied = { command: denied, runId: run.id, at: this.now() }
     // R11-15: a shared-temp rendezvous is decided before the transaction and
     // recorded atomically with the run.
-    const rendezvous = this.tempRendezvous(memberId, task.id, input)
+    const rendezvous = this.workspaceAdmission.tempRendezvous(memberId, task.id, input)
     const typed = firstDenial ? id('msg') : undefined
     this.commit(member.missionId, () => {
       run.seq = this.store.countToolRuns(member.missionId) + 1
@@ -3955,7 +3952,7 @@ export class SwarmRuntime implements Kernel {
         // A start may adopt the member worktree, so it is re-validated first,
         // outside the start failure boundary: a revocation fences the mission,
         // not this member. What follows re-reads the state after the await.
-        await this.assertWorkspaceAuthorized(mission, options.pass)
+        await this.workspaceAdmission.assertWorkspaceAuthorized(mission, options.pass)
         controller.signal.throwIfAborted()
         const current = this.store.get('missions', mission.id)
         const latest = this.store.get('members', member.id)

@@ -656,12 +656,12 @@ const GATE_TESTS = {
     try {
       const durableBefore = f.runtime.store.events(f.mission.id, 500).length
       const probe = { tool: 'bash', arguments: { command: 'cat /tmp/s5-inventory-rendezvous' } }
-      assert.equal(f.runtime.tempRendezvous(f.author.id, 'task_a', probe), undefined, 'a single mention is not a rendezvous')
-      const report = f.runtime.tempRendezvous(f.reviewer.id, 'task_b', probe)
+      assert.equal(f.runtime.workspaceAdmission.tempRendezvous(f.author.id, 'task_a', probe), undefined, 'a single mention is not a rendezvous')
+      const report = f.runtime.workspaceAdmission.tempRendezvous(f.reviewer.id, 'task_b', probe)
       assert.ok(report, 'two members naming the same shared temp path are reported')
       assert.ok(f.runtime.workspaceAdmission.tempMentions.size > 0, 'the loss must be exercised on a non-empty collection')
       f.runtime.workspaceAdmission.tempMentions.clear()   // the loss
-      const again = f.runtime.tempRendezvous(f.reviewer.id, 'task_b', probe)
+      const again = f.runtime.workspaceAdmission.tempRendezvous(f.reviewer.id, 'task_b', probe)
       assert.equal(again, undefined, 'with the bounded mention window lost there is nothing left to compare, so no advisory warning is raised')
       assert.equal(f.runtime.store.events(f.mission.id, 500).length, durableBefore,
         'and no durable outcome changed: the window is an advisory cache over wall-clock mentions')
@@ -672,14 +672,14 @@ const GATE_TESTS = {
     try {
       const durableBefore = f.runtime.store.events(f.mission.id, 500).length
       const probe = { tool: 'bash', arguments: { command: 'cat /tmp/s5-inventory-rendezvous-dedup' } }
-      f.runtime.tempRendezvous(f.author.id, 'task_a', probe)
-      const first = f.runtime.tempRendezvous(f.reviewer.id, 'task_b', probe)
+      f.runtime.workspaceAdmission.tempRendezvous(f.author.id, 'task_a', probe)
+      const first = f.runtime.workspaceAdmission.tempRendezvous(f.reviewer.id, 'task_b', probe)
       assert.ok(first, 'the first rendezvous is reported')
-      const suppressed = f.runtime.tempRendezvous(f.reviewer.id, 'task_b', probe)
+      const suppressed = f.runtime.workspaceAdmission.tempRendezvous(f.reviewer.id, 'task_b', probe)
       assert.equal(suppressed, undefined, 'the reported-pair window suppresses a repeat inside the window')
       assert.ok(f.runtime.workspaceAdmission.tempRendezvousReported.size > 0, 'the loss must be exercised on a non-empty collection')
       f.runtime.workspaceAdmission.tempRendezvousReported.clear()   // the loss
-      const rearmed = f.runtime.tempRendezvous(f.reviewer.id, 'task_b', probe)
+      const rearmed = f.runtime.workspaceAdmission.tempRendezvous(f.reviewer.id, 'task_b', probe)
       assert.ok(rearmed, 'losing the dedup window re-arms the advisory warning instead of changing a durable outcome')
       assert.equal(f.runtime.store.events(f.mission.id, 500).length, durableBefore, 'the durable record is unchanged either way')
     } finally { await f.cleanup() }

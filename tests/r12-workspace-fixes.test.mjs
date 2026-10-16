@@ -13,11 +13,11 @@ const sourceMode = process.env.SWARM_TEST_SOURCE === '1'
 const moduleOf = name => import(new URL(`../${sourceMode ? 'src' : 'lib'}/${name}.${sourceMode ? 'ts' : 'js'}`, import.meta.url))
 const { Scheduling } = await moduleOf('scheduling')
 const { Notices, dispatchQuestion } = await moduleOf('notices')
-const { isolationIssues, reviewNeed } = await moduleOf('board')
+const { isolationIssues, isolationViolation, reviewNeed } = await moduleOf('board')
 const { taskGraphIndex } = await moduleOf('task-graph')
 const { RefusalRegistry } = await moduleOf('refusals')
 const { Workspaces, runProcess } = await moduleOf('workspaces')
-const { WorkspaceAdmission } = await moduleOf('workspace-admission')
+const { deniedGitWrite } = await moduleOf('workspace-admission')
 const { SwarmStore } = await moduleOf('store')
 const { captureGitSnapshot } = await moduleOf('git-snapshot')
 const git = (cwd, args, env) => execFileSync('git', ['-c', 'user.name=R12 Test', '-c', 'user.email=r12@example.invalid', ...args], {
@@ -267,17 +267,15 @@ test('M2-9: external executables are frozen files; external directory/data and c
 })
 
 test('M2-10: inline # remains word data, while actual shell comments remain ignored', () => {
-  const admission = new WorkspaceAdmission(makeRuntimeStub())
-  const classify = command => admission.deniedGitWrite({ tool: 'bash', arguments: { command }, result: 'Operation not permitted', isError: true })
+  const classify = command => deniedGitWrite({ tool: 'bash', arguments: { command }, result: 'Operation not permitted', isError: true })
   for (const command of ['echo foo#bar; git add .', 'curl http://h/p#frag && git commit -m x', 'echo foo\\ #bar; git add .', 'echo foo\\\n#bar; git add .']) assert.equal(classify(command), command)
   for (const command of ['echo foo # git add .', 'echo "# git add ."', '# git add .']) assert.equal(classify(command), undefined)
 })
 
 test('M2-11: isolation uses explicit member IDs including task workspace conflicts', () => {
   const members = [{ id: 'bad', name: 'victim', workspace: '', status: 'idle' }, { id: 'victim', name: 'Safe', workspace: '/safe', status: 'idle' }]
-  const admission = new WorkspaceAdmission(makeRuntimeStub({ boardOf: missionId => ({ missionId, members, tasks: [] }), notices: { emitGuardTerminal() {} } }))
-  assert.equal(admission.isolationAllows('m', members[1]), true)
-  assert.equal(admission.isolationAllows('m', members[0]), false)
+  assert.equal(isolationViolation({ members, tasks: [] }, members[1]), undefined)
+  assert.deepEqual(isolationViolation({ members, tasks: [] }, members[0])?.memberIds, ['bad'])
   const tasks = ['a', 'b'].map(id => ({ id, status: 'running', scope: ['**'], attempt: { ownerId: 'victim' } }))
   const issues = isolationIssues({ members, tasks })
   assert.ok(issues.some(issue => issue.memberIds.includes('victim') && issue.message.includes('concurrently running tasks')))
