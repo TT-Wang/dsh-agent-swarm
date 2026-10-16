@@ -419,31 +419,42 @@ test('ENV: the supporting host checks are the environment the envelope is compar
   assert.equal(review.status, 'accepted', 'the review is decided by its supporting host checks')
 })
 
-test('ENV: a verdict compares the envelope delivered with its attempt, not the one the adapter reports when it verifies', async t => {
+test('ENV: a verdict compares the envelope delivered with its own attempt, not an earlier attempt\'s or the one the adapter reports when it verifies', async t => {
   const f = await setup({ clock: new FakeClock() })
   t.after(() => f.cleanup())
   const environment = home => ({ home, userCacheDir: `${home}/.cache`, huggingfaceCacheDir: `${home}/.cache/huggingface`,
     userCacheDirExists: false, huggingfaceCacheDirExists: false, xdgCacheHome: '/check/.cache',
     sandboxPolicy: { mode: 'workspace-write', enforcement: 'full', workspaceRoot: '/check' },
     dependencyLinks: { mode: 'copy', dirs: [] }, checkCacheRoot: '/check/.cache', checkCacheRoots: {} })
-  const delivered = environment('/delivered'), current = environment('/current')
+  const earlier = environment('/earlier'), delivered = environment('/delivered'), current = environment('/current')
   const reports = env => () => ({ environment: env, selfRunEnvironment: env })
-  f.workers.checkEnvelope = reports(delivered)
+  const assignedHome = attemptId => JSON.parse(f.runtime.store.list('deliveries', f.mission.id)
+    .find(delivery => delivery.kind === 'assignment' && delivery.attemptId === attemptId).content).checkEnvironment.environment.home
   const source = f.propose()
   const sourceClaim = await f.runtime.claim(f.actor(f.author), f.mission.id, source.id)
   await f.runtime.submit(f.actor(f.author), f.mission.id, { taskId: source.id, attemptId: sourceClaim.attempt.id, output: 'ready for review' })
   const review = f.propose({ title: 'Review', kind: 'verification', reviewOf: source.id, assigneeId: f.reviewer.id })
+  // The review's first attempt is assigned under one envelope and handed back,
+  // so its assignment stays in the deliveries ledger beside the next one.
+  f.workers.checkEnvelope = reports(earlier)
+  const first = (await f.runtime.claim(f.actor(f.reviewer), f.mission.id, review.id)).attempt
+  assert.equal(assignedHome(first.id), '/earlier', 'the first attempt was assigned under the earlier envelope')
+  f.runtime.handoff(f.actor(f.reviewer), f.mission.id, { taskId: review.id, attemptId: first.id, to: f.reviewer.id, summary: 'Resume this review in a fresh attempt' })
+  await f.runtime.settle(f.mission.id)
+  f.workers.checkEnvelope = reports(delivered)
   const { attempt } = await f.runtime.claim(f.actor(f.reviewer), f.mission.id, review.id)
-  const assignment = f.runtime.store.list('deliveries', f.mission.id).find(delivery => delivery.kind === 'assignment' && delivery.attemptId === attempt.id)
-  assert.equal(JSON.parse(assignment.content).checkEnvironment.environment.home, '/delivered', 'the attempt was assigned under the delivered envelope')
+  assert.notEqual(attempt.id, first.id, 'the same review runs a second attempt')
+  assert.equal(assignedHome(attempt.id), '/delivered', 'the second attempt was assigned under the delivered envelope')
   // The adapter's envelope changes after the delivery and before the verdict.
   f.workers.checkEnvelope = reports(current)
   const verify = () => f.runtime.verify(f.actor(f.reviewer), f.mission.id, { taskId: review.id, attemptId: attempt.id, verdict: 'accept', reason: 'Independent review' })
-  f.workers.checks = [{ command: 'test -d .', exitCode: 0, output: 'ok', environment: current }]
-  await assert.rejects(verify(), error => error.code === 'check_environment_mismatch' && error.message.includes('home: envelope /delivered, self-run /current'),
-    'host checks under the envelope the adapter reports now do not reproduce the one this attempt was given')
+  for (const [under, which] of [[current, 'the envelope the adapter reports now'], [earlier, 'the envelope the review\'s earlier attempt was given']]) {
+    f.workers.checks = [{ command: 'test -d .', exitCode: 0, output: 'ok', environment: under }]
+    await assert.rejects(verify(), error => error.code === 'check_environment_mismatch' && error.message.includes(`home: envelope /delivered, self-run ${under.home}`),
+      `host checks under ${which} do not reproduce the one this attempt was given`)
+  }
   f.workers.checks = [{ command: 'test -d .', exitCode: 0, output: 'ok', environment: delivered }]
-  assert.equal((await verify()).status, 'accepted', 'host checks under the delivered envelope reproduce it, whatever the adapter reports now')
+  assert.equal((await verify()).status, 'accepted', 'host checks under the delivered envelope reproduce it, whatever the adapter reports now or an earlier attempt was given')
 })
 
 test('ENV: the environment report is best-effort: an adapter whose report throws still gets its assignment, without an envelope', async t => {
