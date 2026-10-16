@@ -248,7 +248,6 @@ export class SwarmRuntime implements Kernel {
 
   /** M1a seam 7/7: pass bookkeeping, the dispatch sweep and the attempt reporting bound; its predicates are the board's. */
   private readonly scheduling = new Scheduling(this)
-  private deliveryTarget(actor: Actor, missionId: string): { mission: Mission; task: Task } { return this.scheduling.deliveryTarget(actor, missionId) }
   private openPass(missionId: string): SchedulingPass | undefined { return this.scheduling.openPass(missionId) }
   private closePass(missionId: string, pass: SchedulingPass): void { return this.scheduling.closePass(missionId, pass) }
   private checkSchedulingPasses(): void { return this.scheduling.checkSchedulingPasses() }
@@ -2976,7 +2975,21 @@ export class SwarmRuntime implements Kernel {
       ...(owner ? {} : { note: 'Non-member observer' }),
     }
   }
-  
+
+  /**
+   * The accepted delivery a completed mission's owner may inspect and apply:
+   * only the owner session, never a worker's, and only once independent
+   * acceptance completed the mission over a saved baseline.
+   */
+  private deliveryTarget(actor: Actor, missionId: string): { mission: Mission; task: Task } {
+    actor.signal?.throwIfAborted()
+    if (this.shuttingDown) throw new PolicyError('runtime_shutting_down', 'conflict_error', 'Swarm runtime is shutting down')
+    const mission = this.mission(missionId)
+    if (mission.ownerSessionId !== actor.sessionId || this.isWorkerSession(actor.sessionId)) throw new PolicyError('delivery_owner_required', 'authorization_error', 'Only the mission owner can access deliverables')
+    if (mission.status !== 'completed') throw new PolicyError('delivery_acceptance_required', 'tool_error', 'Complete independent acceptance before applying results')
+    if (!mission.baseline) throw new PolicyError('delivery_baseline_missing', 'tool_error', 'This historical mission has no saved delivery baseline; inspect its retained artifact')
+    return { mission, task: selectAcceptedDelivery(this.store.list('tasks', missionId)) }
+  }
   async inspectDelivery(actor: Actor, missionId: string) {
     const { mission, task } = this.deliveryTarget(actor, missionId)
     await this.workspaceAdmission.assertWorkspaceAuthorized(mission)

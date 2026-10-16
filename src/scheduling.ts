@@ -6,16 +6,15 @@
  * board where it decides, after each of its awaits.
  */
 import { id } from './store.ts'
-import { TERMINAL_STATES, holdsOpenAttempt, openAttempt, pendingStopOwner, quiescencePending, selectAcceptedDelivery, subjectsOfTasks, taskSubject, terminal } from './task-graph.ts'
+import { TERMINAL_STATES, holdsOpenAttempt, openAttempt, pendingStopOwner, quiescencePending, subjectsOfTasks, taskSubject, terminal } from './task-graph.ts'
 import { eligible, isolationViolation, noticeSubjectsFor, overdueStop, ready, startBlocker, unschedulable } from './board.ts'
 import { factKey } from './notices.ts'
 import { AdmissionRefusedError } from './scheduler.ts'
 import { awaited, formatSpan, progressed, type PassState, type SchedulingPass } from './kernel.ts'
 // R17-G6/G7: the one derivation of the derived member status.
 import { memberPhaseOf } from './projection.ts'
-import { PolicyError } from './policy-error.ts'
 import type { SwarmRuntime } from './runtime.ts'
-import { type Actor, type Attempt, type Mission, type Task } from './types.ts'
+import { type Attempt, type Mission, type Task } from './types.ts'
 
 /** R16-D: the dedup-key family of the attempt reporting-bound escalation. */
 const ATTEMPT_SILENCE_PREFIX = 'attempt-silent:'
@@ -213,17 +212,6 @@ export class Scheduling {
           }
         }
     return true
-  }
-
-  /** One completion policy is shared by manual controls and automatic requests. */
-  deliveryTarget(actor: Actor, missionId: string): { mission: Mission; task: Task } {
-    actor.signal?.throwIfAborted()
-    if (this.rt.shuttingDown) throw new PolicyError('runtime_shutting_down', 'conflict_error', 'Swarm runtime is shutting down')
-    const mission = this.rt.mission(missionId)
-    if (mission.ownerSessionId !== actor.sessionId || this.rt.isWorkerSession(actor.sessionId)) throw new PolicyError('delivery_owner_required', 'authorization_error', 'Only the mission owner can access deliverables')
-    if (mission.status !== 'completed') throw new PolicyError('delivery_acceptance_required', 'tool_error', 'Complete independent acceptance before applying results')
-    if (!mission.baseline) throw new PolicyError('delivery_baseline_missing', 'tool_error', 'This historical mission has no saved delivery baseline; inspect its retained artifact')
-    return { mission, task: selectAcceptedDelivery(this.rt.store.list('tasks', missionId)) }
   }
 
   /** The mission's stable pass name, carried by the stall event (`passId`) and the owner notice. */
