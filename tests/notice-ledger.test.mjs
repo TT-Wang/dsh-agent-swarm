@@ -35,7 +35,31 @@ const deadAssigneeBoard = async t => {
   await ticks(f, 1)
   return { f, dead }
 }
+/** A dependent a cancellation stranded, beside the reviewer's running work or on a board with nothing else to do. */
+const strandedBoard = async (t, running) => {
+  const f = await setup({ clock: new FakeClock() })
+  t.after(f.cleanup)
+  if (running) await f.runtime.claim(f.actor(f.reviewer), f.mission.id, f.propose({ title: 'Unrelated work', kind: 'research', checks: [], assigneeId: f.reviewer.id }).id)
+  const prerequisite = f.propose({ title: 'Prerequisite', kind: 'research', checks: [] })
+  const dependent = f.propose({ title: 'Dependent', kind: 'research', checks: [], dependencies: [prerequisite.id] })
+  const cancelled = f.runtime.cancel(f.owner, f.mission.id, { taskId: prerequisite.id, reason: 'Not needed' })
+  await f.runtime.settle(f.mission.id)
+  await ticks(f, 1)
+  return { f, prerequisite, dependent, cancelled }
+}
+/** An owner-assembled mission whose one task is accepted: coverage-complete, and the owner's to complete. */
+const coverageBoard = async t => {
+  const f = await setup({ clock: new FakeClock() })
+  t.after(f.cleanup)
+  const task = f.propose()
+  await acceptThroughReview(f, task)
+  await f.runtime.settle(f.mission.id)
+  await ticks(f, 1)
+  return { f, task }
+}
 const relevant = (f, delivery) => f.runtime.notices.ownerDeliveryRelevant(f.runtime.mission(f.mission.id), f.runtime.store.get('deliveries', delivery.id))
+/** The swarm_* tools a text names, once each. */
+const namedTools = text => [...new Set(text.match(/\bswarm_\w+/g))].sort()
 /** The one field: key prefix, family and, for a templated body, its template and statement. */
 const names = delivery => ({ prefix: delivery.notice.dedupKey.split(':')[0], family: noticeFamily(delivery),
   template: noticeTemplateKey(delivery), statement: delivery.notice.statement?.family })
@@ -231,11 +255,7 @@ test('a board fact is told under its own identity: the W3 stall\'s stuck work at
   assert.deepEqual([relevant(f, fenced), relevant(f, diagnosed)], [false, true])
   assert.deepEqual(boardStallEvents(f).map(event => event.data.noticeKey), stalls().map(delivery => delivery.notice.dedupKey), 'each stall has its one event')
 
-  const c = await setup({ clock: new FakeClock() })
-  t.after(c.cleanup)
-  await acceptThroughReview(c, c.propose())
-  await c.runtime.settle(c.mission.id)
-  await ticks(c, 1)
+  const { f: c } = await coverageBoard(t)
   const coverages = () => ownerRows(c).filter(delivery => noticeFamily(delivery) === 'coverage-complete')
   const [covered] = coverages()
   assert.ok(covered, 'the coverage-complete board told the owner')
@@ -249,41 +269,38 @@ test('a board fact is told under its own identity: the W3 stall\'s stuck work at
   assert.deepEqual([relevant(c, covered), relevant(c, recovered)], [false, true])
 })
 
-test('every exit a W3 stall and a coverage-complete decision name, performed through the owner\'s registered tools, retires that decision', async t => {
-  const toolsNamed = text => [...new Set(text.match(/\bswarm_\w+/g))].sort()
+test('every exit a board decision names, performed through the owner\'s registered tools, retires it: the W3 stall\'s, the fall-through\'s for a dependent a cancellation stranded beside running work (withdrawing it with swarm_cancel(taskId, reason) among them), and coverage-complete\'s', async t => {
   const proposal = f => ({ workstreamId: f.stream.id, title: 'More work', objective: 'Do the work the decision asks for', kind: 'research', scope: ['**'], outputs: [], acceptance: MISSION_ACCEPTANCE, checks: [] })
-  // The stall names the stuck work's amendment, a repair, a withdrawal and the mission stop (and a budget change, which names no tool).
-  const stallExits = {
-    'amend the existing task dependencies or assignee with swarm_control': ({ f, dead, tool }) => tool('swarm_control', { taskId: dead.id, action: 'amend', changes: { assigneeId: f.author.id }, reason: 'Reassign to a live member' }),
-    'admit a repair or review with swarm_propose': ({ f, tool }) => tool('swarm_propose', proposal(f)),
-    'withdraw it explicitly with swarm_cancel': ({ dead, tool }) => tool('swarm_cancel', { taskId: dead.id, reason: 'No longer required' }),
-    'Use swarm_control stop': ({ tool }) => tool('swarm_control', { action: 'stop', reason: 'Stop the mission' }),
+  /** Each family's board, and every exit its decision names, keyed by the words that name it. */
+  const decisions = {
+    // The stall names the stuck work's amendment, a repair, a withdrawal and the mission stop (and a budget change, which names no tool).
+    'board-stall': [deadAssigneeBoard, {
+      'amend the existing task dependencies or assignee with swarm_control': ({ f, dead, tool }) => tool('swarm_control', { taskId: dead.id, action: 'amend', changes: { assigneeId: f.author.id }, reason: 'Reassign to a live member' }),
+      'admit a repair or review with swarm_propose': ({ f, tool }) => tool('swarm_propose', proposal(f)),
+      'withdraw it explicitly with swarm_cancel': ({ dead, tool }) => tool('swarm_cancel', { taskId: dead.id, reason: 'No longer required' }),
+      'Use swarm_control stop': ({ tool }) => tool('swarm_control', { action: 'stop', reason: 'Stop the mission' }),
+    }],
+    // The fall-through names a repair of the withdrawn prerequisite, the dependent's amendment and its withdrawal.
+    fallthrough: [t => strandedBoard(t, true), {
+      'admit a repair or review with swarm_propose': ({ f, prerequisite, tool }) => tool('swarm_propose', { ...proposal(f), replaces: [prerequisite.id] }),
+      'decide with swarm_control': ({ dependent, tool }) => tool('swarm_control', { action: 'amend', taskId: dependent.id, changes: { dependencies: [] }, reason: 'The prerequisite is not needed' }),
+      'withdraw the stuck work with swarm_cancel(taskId, reason)': ({ dependent, tool }) => tool('swarm_cancel', { taskId: dependent.id, reason: 'No longer required' }),
+    }],
+    'coverage-complete': [coverageBoard, {
+      'Use swarm_control complete': ({ tool }) => tool('swarm_control', { action: 'complete', reason: 'The deliverable is accepted' }),
+      'admit more work with swarm_propose': ({ f, tool }) => tool('swarm_propose', proposal(f)),
+    }],
   }
-  for (const [exit, perform] of Object.entries(stallExits)) {
-    const { f, dead } = await deadAssigneeBoard(t)
-    const stall = ownerRows(f).find(delivery => noticeFamily(delivery) === 'board-stall')
-    assert.deepEqual(toolsNamed(stall.content), ['swarm_cancel', 'swarm_control', 'swarm_propose'], 'the stall names these tools')
-    assert.ok(stall.content.includes(exit), `the stall names: ${exit}`)
-    assert.equal(relevant(f, stall), true)
-    await perform({ f, dead, tool: await ownerTools(f) })
-    assert.equal(relevant(f, stall), false, `${exit} retires the stall`)
-  }
-  const coverageExits = {
-    'Use swarm_control complete': ({ tool }) => tool('swarm_control', { action: 'complete', reason: 'The deliverable is accepted' }),
-    'admit more work with swarm_propose': ({ f, tool }) => tool('swarm_propose', proposal(f)),
-  }
-  for (const [exit, perform] of Object.entries(coverageExits)) {
-    const f = await setup({ clock: new FakeClock() })
-    t.after(f.cleanup)
-    await acceptThroughReview(f, f.propose())
-    await f.runtime.settle(f.mission.id)
-    await ticks(f, 1)
-    const coverage = coverageRow(f)
-    assert.deepEqual(toolsNamed(coverage.content), ['swarm_control', 'swarm_propose'], 'coverage-complete names these tools')
-    assert.ok(coverage.content.includes(exit), `coverage-complete names: ${exit}`)
-    assert.equal(relevant(f, coverage), true)
-    await perform({ f, tool: await ownerTools(f) })
-    assert.equal(relevant(f, coverage), false, `${exit} retires coverage-complete`)
+  for (const [family, [build, exits]] of Object.entries(decisions)) {
+    for (const [exit, perform] of Object.entries(exits)) {
+      const { f, ...board } = await build(t)
+      const decision = ownerRows(f).find(delivery => noticeFamily(delivery) === family)
+      assert.deepEqual(namedTools(decision.content), namedTools(Object.keys(exits).join(' ')), `${family}: every tool it names is an exit performed here`)
+      assert.ok(decision.content.includes(exit), `${family} names: ${exit}`)
+      assert.equal(relevant(f, decision), true)
+      await perform({ f, ...board, tool: await ownerTools(f) })
+      assert.equal(relevant(f, decision), false, `${exit} retires ${family}`)
+    }
   }
 })
 
@@ -722,12 +739,7 @@ test('a queued W3 stall is withheld once its board can progress, and coverage-co
   stalled.runtime.notices.absenceNet(stalled.mission.id)
   assert.equal(stallReminder(2), undefined, 'and its reminders end with it')
 
-  const f = await setup({ clock: new FakeClock() })
-  t.after(f.cleanup)
-  const task = f.propose()
-  await acceptThroughReview(f, task)
-  await f.runtime.settle(f.mission.id)
-  await ticks(f, 1)
+  const { f, task } = await coverageBoard(t)
   const coverage = coverageRow(f)
   assert.ok(coverage, 'the coverage-complete board told the owner')
   await f.runtime.notices.flushOutbox(f.mission.id)
@@ -778,11 +790,7 @@ test('a mission blocked on its budget keeps its board decision: a told W3 stall 
   await ticks(stalled, 3)
   assert.deepEqual([relevant(stalled, stall), told()], [false, 1], 'the stall under its new identity is not told while the mission is blocked')
 
-  const covered = await setup({ clock: new FakeClock() })
-  t.after(covered.cleanup)
-  await acceptThroughReview(covered, covered.propose())
-  await covered.runtime.settle(covered.mission.id)
-  await ticks(covered, 1)
+  const { f: covered } = await coverageBoard(t)
   const coverage = coverageRow(covered)
   assert.ok(coverage, 'the coverage-complete board told the owner')
   await block(covered)
@@ -962,51 +970,13 @@ test('P3: a start that adopts the member\'s running session ends its counted sta
 
 test('a cancellation that strands a dependent leaves it to the board classifier: one decision names it at its epoch, the fall-through beside running work and the W3 stall on a board with nothing else to do', async t => {
   for (const running of [true, false]) {
-    const f = await setup({ clock: new FakeClock() })
-    t.after(f.cleanup)
-    if (running) await f.runtime.claim(f.actor(f.reviewer), f.mission.id, f.propose({ title: 'Unrelated work', kind: 'research', checks: [], assigneeId: f.reviewer.id }).id)
-    const prerequisite = f.propose({ title: 'Prerequisite', kind: 'research', checks: [] })
-    const dependent = f.propose({ title: 'Dependent', kind: 'research', checks: [], dependencies: [prerequisite.id] })
-    const cancelled = f.runtime.cancel(f.owner, f.mission.id, { taskId: prerequisite.id, reason: 'Not needed' })
+    const { f, dependent, cancelled } = await strandedBoard(t, running)
     assert.deepEqual(cancelled.strandedDependents, [dependent.id], `running=${running}: the cancellation reports the dependent it strands`)
-    await f.runtime.settle(f.mission.id)
     await ticks(f, 20)
     const subject = `${dependent.id}@${taskOf(f.runtime, dependent.id).epoch}`
     const decisions = ownerRows(f).filter(delivery => (delivery.subjects ?? []).includes(subject) && delivery.notice.trigger !== 'owner-decision-unresolved')
     assert.deepEqual(decisions.map(delivery => noticeFamily(delivery)), [running ? 'fallthrough' : 'board-stall'], `running=${running}: one decision names the stranded dependent, the board's own`)
     assert.equal(relevant(f, decisions[0]), true, `running=${running}: and it is outstanding`)
-  }
-})
-
-test('every exit the fall-through names, performed through the owner\'s registered tools, retires it: for a dependent a cancellation stranded beside running work, a repair of the withdrawn prerequisite, an amendment of the dependent and its withdrawal with swarm_cancel(taskId, reason)', async t => {
-  const toolsNamed = text => [...new Set(text.match(/\bswarm_\w+/g))].sort()
-  /** The fall-through's board: a dependent a cancellation stranded while the reviewer's work runs. */
-  const strandedBoard = async () => {
-    const f = await setup({ clock: new FakeClock() })
-    t.after(f.cleanup)
-    await f.runtime.claim(f.actor(f.reviewer), f.mission.id, f.propose({ title: 'Unrelated work', kind: 'research', checks: [], assigneeId: f.reviewer.id }).id)
-    const prerequisite = f.propose({ title: 'Prerequisite', kind: 'research', checks: [] })
-    const dependent = f.propose({ title: 'Dependent', kind: 'research', checks: [], dependencies: [prerequisite.id] })
-    f.runtime.cancel(f.owner, f.mission.id, { taskId: prerequisite.id, reason: 'Not needed' })
-    await f.runtime.settle(f.mission.id)
-    await ticks(f, 1)
-    const fallthrough = ownerRows(f).find(delivery => noticeFamily(delivery) === 'fallthrough')
-    assert.deepEqual(fallthrough?.subjects, [`${dependent.id}@${taskOf(f.runtime, dependent.id).epoch}`], 'the fall-through names the stranded dependent')
-    return { f, prerequisite, dependent, fallthrough }
-  }
-  const exits = {
-    'admit a repair or review with swarm_propose': ({ f, prerequisite, tool }) => tool('swarm_propose', { workstreamId: f.stream.id, title: 'Repair the prerequisite', objective: 'Do the withdrawn work again',
-      kind: 'research', scope: ['**'], outputs: [], checks: [], replaces: [prerequisite.id] }),
-    'decide with swarm_control': ({ dependent, tool }) => tool('swarm_control', { action: 'amend', taskId: dependent.id, changes: { dependencies: [] }, reason: 'The prerequisite is not needed' }),
-    'withdraw the stuck work with swarm_cancel(taskId, reason)': ({ dependent, tool }) => tool('swarm_cancel', { taskId: dependent.id, reason: 'No longer required' }),
-  }
-  for (const [exit, perform] of Object.entries(exits)) {
-    const { f, ...board } = await strandedBoard()
-    assert.deepEqual(toolsNamed(board.fallthrough.content), ['swarm_cancel', 'swarm_control', 'swarm_propose'], 'the fall-through names these tools')
-    assert.ok(board.fallthrough.content.includes(exit), `the fall-through names: ${exit}`)
-    assert.equal(relevant(f, board.fallthrough), true)
-    await perform({ f, ...board, tool: await ownerTools(f) })
-    assert.equal(relevant(f, board.fallthrough), false, `${exit} retires the fall-through`)
   }
 })
 
@@ -1227,7 +1197,6 @@ const remind = async (f, row) => {
   f.runtime.notices.absenceNet(f.mission.id)
   return reminders(f, row).slice(before)
 }
-const namedTools = text => [...new Set(text.match(/\bswarm_\w+/g))].sort()
 /** A mission long enough for a test that keeps scheduling after a reminder interval. */
 const LONG = { maxDurationMs: 86_400_000 }
 
