@@ -21,7 +21,7 @@ import { CheckEnvironmentMismatchError, DeclaredChecks, MAX_REPORTED_CHECK_FAILU
 import { verdictRows } from './trace.ts'
 export { TEMP_RENDEZVOUS_WINDOW_MS, sharedTempPaths, tempRendezvousDecision, type TempMention } from './workspace-admission.ts'
 import { awaitsDelivery } from './arena.ts'
-import { AdmissionRefusedError, classifyProviderOutage, LIMIT_LEVELS, TASK_CLASSES, type AdmissionCandidate, type AdmissionDecision, type AdmissionReason, type AdmissionRecord, type LimitLevel, type LimitRule } from './scheduler.ts'
+import { AdmissionRefusedError, classifyProviderOutage, LIMIT_LEVELS, TASK_CLASSES, type AdmissionReason, type AdmissionRecord, type LimitLevel, type LimitRule } from './scheduler.ts'
 import { validScope, scopeSubset } from './scope.ts'
 import { AdmissionError, assertDeclaredOutputs, assertScopeSelectors, citedCovers, dependencyAssumptions, formatDiagnostic, isNoopCheck, loadPackageScripts, normalizeReviewDependencies, normalizeScopeSelectors, normalizeTaskCeilings, reconcileTaskAdmission, requireHostChecks, taskCeilingBlock, taskGraphDefects, TaskGraphAdmissionError, type TaskGraphNode } from './admission.ts'
 import { canBorrowTask, canOwnReview, strandedReview } from './assignment.ts'
@@ -1137,25 +1137,10 @@ export class SwarmRuntime implements Kernel {
     return owner ? task : memberTask(this.boardOf(missionId), task)
   }
 
-  /** Check before any workspace mutation, and again immediately before assignment. */
-  assertAdmission(task: Task, member: Member): { candidate: AdmissionCandidate; decision: AdmissionDecision; latencyMs: number } {
-    if (pendingStopOwner(this.store.list('tasks', task.missionId), member.id)) throw new Error('Worker is waiting for its previous attempt to stop')
-    member = this.store.get('members', member.id) ?? member
-    const mission = this.mission(task.missionId)
-    this.refusals.recordWriterBusyRecovery(mission)
-    const started = performance.now()
-    const { candidate, decision } = this.refusals.admissionDecision(mission, member, task)
-    const latencyMs = Math.max(0, Math.round((performance.now() - started) * 1000) / 1000)
-    if (!decision.admitted) {
-      this.refusals.recordRefusal(candidate, decision, latencyMs)
-      throw new AdmissionRefusedError(decision)
-    }
-    return { candidate, decision, latencyMs }
-  }
   assign(task: Task, member: Member): Task {
     member = this.store.get('members', member.id) ?? member
     const mission = this.mission(task.missionId)
-    const { candidate, decision, latencyMs } = this.assertAdmission(task, member)
+    const { candidate, decision, latencyMs } = this.refusals.assertAdmission(task, member)
     if (canBorrowTask(task)) task.plannedAssigneeId = member.id
     task.epoch++
     task.attempt = { id: id('attempt'), epoch: task.epoch, ownerId: member.id, leaseUntil: Math.min(this.now() + this.config.leaseMs, mission.deadline) }
@@ -1197,7 +1182,7 @@ export class SwarmRuntime implements Kernel {
       if (pendingStopOwner(this.store.list('tasks', missionId), member.id)) throw new Error('Worker is waiting for its previous attempt to stop')
       const blocker = readinessBlocker(this.boardOf(missionId), task, member)
       if (blocker !== undefined) throw new PolicyError('task_not_ready', 'conflict_error', `Task is not ready for this member: ${blocker}`)
-      this.assertAdmission(task, member)
+      this.refusals.assertAdmission(task, member)
       await this.workspaceAdmission.assertWorkspaceAuthorized(this.mission(missionId))
       const { graph } = this.boardOf(missionId)
       await this.workers.prepareTask(member, { ...task, epoch: task.epoch + 1 }, graph.effectiveDependencies(task), graph.reviewSource(task))

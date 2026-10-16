@@ -150,7 +150,7 @@ export class Scheduling {
           try {
             // Revocation fencing: a mission whose human authorization was withdrawn
             // is blocked here, before any adapter prepares a workspace or checkout.
-            this.rt.assertAdmission(task, member)
+            this.rt.refusals.assertAdmission(task, member)
             await awaited(pass, this.rt.workspaceAdmission.assertWorkspaceAuthorized(this.rt.mission(missionId), pass), this.rt.now)
             // The adapter reports a recovery fallback from inside this call
             // (`SwarmRuntime.onRecoveryFallback`), which stamps the body that
