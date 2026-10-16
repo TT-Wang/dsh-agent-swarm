@@ -24,7 +24,7 @@ await runScenario({
       assert.equal(f.runtime.store.get('members', f.author.id).status, 'idle', 'the author is idle before the withdrawal')
       const liveBefore = f.runtime.snapshot(f.owner, f.mission.id).tasks.filter(item => item.replaces?.includes(task.id) && item.status !== 'cancelled')
       assert.equal(liveBefore.length, 2, 'the injected duplicate replacement exists')
-      assert.deepEqual(f.runtime.lineage(f.mission.id, task.id).map(item => item.id), [task.id, survivor.id], 'lineage is deterministic even with imported duplicates')
+      assert.deepEqual(f.runtime.boardOf(f.mission.id).graph.lineageOf(task.id).map(item => item.id), [task.id, survivor.id], 'lineage is deterministic even with imported duplicates')
       // Cancel the pending duplicate.
       const cancelledPending = f.runtime.cancel(f.owner, f.mission.id, { taskId: duplicate.id, reason: 'F11: withdraw the duplicate pending replacement' })
       assert.equal(cancelledPending.status, 'cancelled')
@@ -32,7 +32,7 @@ await runScenario({
       assert.equal(pendingEvent.data.taskId, duplicate.id)
       assert.equal(pendingEvent.data.previousStatus, 'pending')
       assert.equal(f.runtime.store.get('members', f.author.id).status, 'idle', 'I10: the member is freed')
-      assert.deepEqual(f.runtime.lineage(f.mission.id, task.id).map(item => item.id), [task.id, survivor.id], 'I6: lineage resolves to the surviving replacement')
+      assert.deepEqual(f.runtime.boardOf(f.mission.id).graph.lineageOf(task.id).map(item => item.id), [task.id, survivor.id], 'I6: lineage resolves to the surviving replacement')
       // Replay is idempotent: a cancelled task is never re-audited.
       const replay = f.runtime.cancel(f.owner, f.mission.id, { taskId: duplicate.id, reason: 'F11 replay' })
       assert.equal(replay.status, 'cancelled')

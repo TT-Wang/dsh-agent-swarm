@@ -4,6 +4,7 @@ import assert from 'node:assert/strict'
 import { join } from 'node:path'
 import { assignmentAllows, authorIdsOf, canBorrowTask } from '../lib/assignment.js'
 import { FakeWorkers, SwarmRuntime, makeRuntime } from './faults/harness.mjs'
+import { dispatchable, ready, reviewable, unschedulable } from '../lib/board.js'
 
 class Workers extends FakeWorkers {
   busy = new Set()
@@ -88,7 +89,7 @@ test('pinned and legacy assignments never become spare-member work', async t => 
   const f = await fixture(t); await occupy(f)
   for (const assignmentMode of ['pinned', undefined]) {
     const task = f.propose({ assignmentMode })
-    assert.equal(f.runtime.ready(row(f, task), f.spare), false)
+    assert.equal(ready(f.runtime.boardOf(f.mission.id), row(f, task), f.spare), false)
     await assert.rejects(f.runtime.claim(f.actor(f.spare), f.mission.id, task.id), /not ready/)
   }
   await f.runtime.scheduling.dispatch(f.mission, f.mission.id)
@@ -101,7 +102,7 @@ test('borrowed implementation can be independently reviewed by its unused origin
   const review = f.propose({ title: 'Independent review', kind: 'verification', reviewOf: source.id, assigneeId: f.spare.id, checks: [] })
   const claimed = await f.runtime.claim(f.actor(f.spare), f.mission.id, source.id)
   await f.runtime.submit(f.actor(f.spare), f.mission.id, { taskId: source.id, attemptId: claimed.attempt.id, output: 'Immutable change' })
-  assert.equal(f.runtime.reviewable(row(f, source), f.runtime.store.list('tasks', f.mission.id)), true)
+  assert.equal(reviewable(f.runtime.boardOf(f.mission.id), row(f, source)), true)
   await assert.rejects(f.runtime.claim(f.actor(f.spare), f.mission.id, review.id), /not ready/)
   f.runtime.cancel(f.owner, f.mission.id, { taskId: blocker.id, reason: 'No longer needed' })
   f.workers.busy.delete(f.preferred.id)
@@ -118,7 +119,7 @@ test('borrowing cannot consume an explicitly pinned independent reviewer', async
   const f = await fixture(t); await occupy(f)
   const source = f.propose()
   f.propose({ kind: 'verification', reviewOf: source.id, assigneeId: f.spare.id, assignmentMode: 'pinned', checks: [] })
-  assert.equal(f.runtime.ready(row(f, source), f.spare), false)
+  assert.equal(ready(f.runtime.boardOf(f.mission.id), row(f, source), f.spare), false)
   await assert.rejects(f.runtime.claim(f.actor(f.spare), f.mission.id, source.id), /not ready/)
   const third = await f.runtime.addMember(f.owner, f.mission.id, { name: 'Third', role: 'general' })
   const claimed = await f.runtime.claim(f.actor(third), f.mission.id, source.id)
@@ -145,9 +146,8 @@ test('a retired preference does not make untouched work dead or undispatchable',
   const f = await fixture(t), task = f.propose()
   const preferred = f.runtime.store.get('members', f.preferred.id); preferred.phase = 'stopped'
   f.runtime.commit(f.mission.id, () => f.runtime.store.put('members', preferred))
-  const tasks = f.runtime.store.list('tasks', f.mission.id), members = f.runtime.store.list('members', f.mission.id)
-  assert.deepEqual(f.runtime.unschedulable(f.mission, tasks, members), [])
-  assert.deepEqual(f.runtime.fingerprintBoard(f.mission.id).tasks.filter(row => row.ready).map(row => row.id), [task.id])
+  assert.deepEqual(unschedulable(f.runtime.boardOf(f.mission.id)), [])
+  assert.deepEqual(dispatchable(f.runtime.boardOf(f.mission.id)).map(row => row.id), [task.id])
   const claimed = await f.runtime.claim(f.actor(f.spare), f.mission.id, task.id)
   assert.equal(claimed.assigneeId, f.spare.id)
 })

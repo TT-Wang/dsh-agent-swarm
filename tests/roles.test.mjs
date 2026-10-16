@@ -222,6 +222,9 @@ test('all nonterminal missions and unresolved owner questions retain the full ow
   assert.equal(f.scoper.roleOf(owner.agent), 'owner', 'terminal status does not settle an open question')
   f.runtime.commit(mission.id, () => f.runtime.store.put('deliveries', { ...question, state: 'dismissed', answeredBy: 'owner', answeredAt: Date.now() }))
   assert.equal(f.scoper.roleOf(owner.agent), 'historical-owner')
+  const peerQuestion = { id: 'open-peer-question', missionId: mission.id, from: 'reviewer', to: 'implementer', kind: 'question', content: 'Which branch holds your fix?', createdAt: Date.now(), replyExpected: true, state: 'open' }
+  f.runtime.commit(mission.id, () => f.runtime.store.put('deliveries', peerQuestion))
+  assert.equal(f.scoper.roleOf(owner.agent), 'historical-owner', 'a question one member asks another is no owner obligation')
   f.runtime.commit(mission.id, () => f.runtime.store.put('deliveries', {
     id: 'obsolete-review-action', missionId: mission.id, from: 'runtime', to: 'owner', kind: 'control', content: 'Admit a review for an old task',
     subjects: ['old-source@1'], createdAt: Date.now(), notice: { class: 'decision', dedupKey: 'review-blocked:old-source:missing', queuedAt: Date.now(), sentAt: Date.now() },

@@ -47,6 +47,7 @@ import assert from 'node:assert/strict'
 import { silenceReport } from './instruments.mjs'
 import { FakeWorkers, eventually, makeRuntime } from './faults/harness.mjs'
 import { noticeFamily } from '../lib/notices.js'
+import { formatSpan } from '../lib/kernel.js'
 
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
 
@@ -309,7 +310,7 @@ test('R16-D6 pair: F1\'s operation silence owns the clock while an operation is 
   // The adapter reports that same operation as its live one. The row is written
   // directly (not through reportActivity) so no member/activity event records progress.
   f.workers.activity = member.activity
-  assert.equal(f.runtime.sweepSilentAttempts(f.mission.id), 0, 'the attempt bound yields to the in-flight operation')
+  assert.equal(f.runtime.scheduling.sweepSilentAttempts(f.mission.id), 0, 'the attempt bound yields to the in-flight operation')
   const operation = await eventually(() => f.escalations('operation-silent:')[0], 'F1 names the stuck operation', 3000)
   assert.equal(operation.notice.dedupKey, `operation-silent:${claimed.attempt.id}:activity_stuck:${member.activity.startedAt}`)
   await sleep(250)
@@ -390,4 +391,9 @@ test('R16-D8: the silence projection reads both gaps, the wedge record and the u
   assert.ok(report.attemptsEnded >= 1)
   assert.equal(report.passReleases.count, 1, 'the wedge count comes from the durable stall events')
   assert.equal(report.passReleases.worst.runId, wedged.operationId)
+})
+
+test('both silence notices render a span as seconds, minutes and seconds, or hours and minutes', () => {
+  for (const [ms, text] of [[-1_500, '0s'], [59_499, '59s'], [59_500, '1m 0s'], [60_000, '1m 0s'], [3_599_000, '59m 59s'],
+    [3_599_500, '1h 0m'], [3_600_000, '1h 0m'], [3_661_000, '1h 1m'], [90_061_000, '25h 1m']]) assert.equal(formatSpan(ms), text, `${ms}ms`)
 })

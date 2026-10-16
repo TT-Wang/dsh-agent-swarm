@@ -26,6 +26,16 @@ const byId = <T extends { id: string }>(left: T, right: T): number => (left.id <
 /** A covered owner fact (`coveredBy`, src/notices.ts) is never sent: the delivery covering it carried the obligation. */
 export const covered = (delivery: Pick<Delivery, 'notice'>): boolean => (delivery.notice as { coveredBy?: string } | undefined)?.coveredBy !== undefined
 
+/**
+ * L0: the questions on a deliveries ledger that were delivered and still carry
+ * no answer, optionally those to one recipient. The receipt is the durable link
+ * `replyTo` writes; a delivery written before this field existed is never
+ * retro-open.
+ */
+export function openAsks(deliveries: readonly Delivery[], to?: string): Delivery[] {
+  return deliveries.filter(delivery => delivery.replyExpected === true && delivery.answeredBy === undefined && (to === undefined || delivery.to === to))
+}
+
 /** Whether a delivery is still owed to its recipient; a covered fact never is. */
 export function awaitsDelivery(delivery: Pick<Delivery, 'deliveredAt' | 'notice'>): boolean {
   return delivery.deliveredAt === undefined && !covered(delivery)

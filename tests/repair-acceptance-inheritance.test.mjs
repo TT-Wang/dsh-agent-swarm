@@ -12,6 +12,7 @@ import assert from 'node:assert/strict'
 import { join } from 'node:path'
 import { registerTools } from '../lib/tools.js'
 import { FakeWorkers, makeRuntime } from './faults/harness.mjs'
+import { completionError } from '../lib/board.js'
 
 async function fixture(t) {
   const { dir: directory, runtime, budget } = await makeRuntime(t, {
@@ -84,11 +85,11 @@ test('mission completion coverage sees the criteria a repair inherited', async t
   const original = f.propose({ title: 'Original', acceptance: ['works', 'is documented'], covers: ['c1', 'c2'] })
   await f.verdict(original, 'reject')
   const current = () => f.runtime.store.get('missions', f.mission.id)
-  assert.match(f.runtime.completionError(current()), /unfinished or blocked/)
+  assert.match(completionError(f.runtime.boardOf(f.mission.id)), /unfinished or blocked/)
   const repair = f.propose({ title: 'Repair', replaces: [original.id] })
   assert.equal((await f.verdict(repair, 'accept')).status, 'accepted')
   assert.equal(f.stored(original).status, 'cancelled', 'the accepted repair retires the blocked original')
-  assert.equal(f.runtime.completionError(current()), undefined, 'the inherited criteria cover the mission acceptance')
+  assert.equal(completionError(f.runtime.boardOf(f.mission.id)), undefined, 'the inherited criteria cover the mission acceptance')
   assert.equal(f.runtime.control(f.owner, f.mission.id, 'complete', 'Accepted inherited repair').status, 'completed')
 })
 

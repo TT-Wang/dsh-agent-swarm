@@ -9,10 +9,9 @@
  * failures can defer review without converting infrastructure into a code verdict.
  */
 import type { SwarmRuntime } from './runtime.ts'
-import { randomUUID } from 'node:crypto'
+import { id } from './store.ts'
 import type { Artifact, CheckResult, Member, Task, ToolRun } from './types.ts'
 
-const id = (prefix: string) => `${prefix}_${randomUUID()}`
 
 /** Host verification timeout when a task chose none; matches the plugin config default. */
 const DEFAULT_CHECK_TIMEOUT_MS = 60000
@@ -42,6 +41,12 @@ const RECOVERY_EXITS: Record<NonNullable<CheckResult['failureKind']>, (check: Ch
     const found = links === undefined ? '' : ` (dependency directories ${links.mode === 'copy' ? 'copied' : 'linked'} from the source: ${excerpt(links.materializedPaths?.length ? links.materializedPaths.join(', ') : `none of verificationDependencyDirs ${JSON.stringify(links.dirs)}`, 60)})`
     return `a command could not run in the clean verification checkout${found}: provide what it needs in the source or on the host, then ${RESUME}; ${REPLACE}`
   },
+}
+
+/** A deferred review's exit: its last classified failure's (a pass stops at its first failing check), or resuming when no row has a kind. */
+export function recoveryExit(checks: ReadonlyArray<CheckResult>): string {
+  const failure = checks.findLast(check => check.failureKind !== undefined)
+  return failure?.failureKind === undefined ? RESUME : RECOVERY_EXITS[failure.failureKind](failure)
 }
 
 export class DeclaredChecks {
@@ -179,12 +184,6 @@ export class DeclaredChecks {
   recoveryRequired(checks: ReadonlyArray<CheckResult>): boolean {
     const failures = checks.filter(check => check.exitCode !== 0)
     return failures.length > 0 && failures.every(check => check.failureKind !== undefined)
-  }
-
-  /** A deferred review's exit: its last classified failure's (a pass stops at its first failing check), or resuming when no row has a kind. */
-  recoveryExit(checks: ReadonlyArray<CheckResult>): string {
-    const failure = checks.findLast(check => check.failureKind !== undefined)
-    return failure?.failureKind === undefined ? RESUME : RECOVERY_EXITS[failure.failureKind](failure)
   }
 
   /**

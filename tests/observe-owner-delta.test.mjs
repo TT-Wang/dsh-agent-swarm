@@ -2,6 +2,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { registerTools } from '../lib/tools.js'
 import { FakeWorkers, SwarmRuntime, makeRuntime } from './faults/harness.mjs'
+import { openAsks } from '../lib/arena.js'
 
 async function fixture(t, size = 1) {
   const { dir: root, config, runtime, budget } = await makeRuntime(t, {
@@ -35,7 +36,7 @@ test('owner delta reports changed rows, removals and open questions without ackn
   f.runtime.store.put('tasks', { ...f.task, title: 'Implementation updated' })
   f.runtime.store.put('members', { ...f.member, accountedTokens: 75 })
   f.runtime.message({ sessionId: f.member.sessionId }, f.mission.id, { to: 'owner', kind: 'question', content: 'Choose an interface' })
-  const delivery = f.runtime.openAsks(f.mission.id)[0]
+  const delivery = openAsks(f.runtime.store.list('deliveries', f.mission.id))[0]
   const change = await f.read({ cursor: unchanged.nextCursor })
   assert.equal(change.board.length, 1)
   assert.equal(change.board[0].title, 'Implementation updated')

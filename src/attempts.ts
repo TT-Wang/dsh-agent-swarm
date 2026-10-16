@@ -7,12 +7,12 @@
  * site changed. The runtime reference is typed as the class and imported
  * type-only, so no runtime import cycle exists.
  */
-import { createHash, randomUUID } from 'node:crypto'
-import { taskSubject } from './notices.ts'
-import { emitGuardTerminal } from './refusals.ts'
+import { id } from './store.ts'
+import { TERMINAL_STATES, blockCauses, stopPending, taskSubject, terminal, type BlockCause } from './task-graph.ts'
+import { stopFaultKey } from './notices.ts'
 import { memberPhaseOf } from './projection.ts'
 import { PolicyError } from './policy-error.ts'
-import { awaited, type SchedulingPass } from './scheduling.ts'
+import { awaited, formatSpan, type SchedulingPass } from './kernel.ts'
 
 /**
  * The detail a terminal message embeds. A guard's own message may already carry
@@ -24,83 +24,10 @@ import { awaited, type SchedulingPass } from './scheduling.ts'
  */
 const terminalDetail = (text: string): string => text.replace(/\[[a-z][a-z0-9_]{2,63}\]\s*/g, '').trim()
 import type { SwarmRuntime } from './runtime.ts'
-import type { Actor, Artifact, EvidenceStatus, Member, Mission, Task, WorkerActivity } from './types.ts'
-
-const id = (prefix: string) => `${prefix}_${randomUUID()}`
+import type { Actor, Artifact, Member, Mission, Task, WorkerActivity } from './types.ts'
 
 /** Why a fenced task still owes a stop, as the durable marker records it. */
 type StopReason = NonNullable<Task['resumeAfterStop']>['reason']
-
-/**
- * A fence this task still owes: a stop marker recorded at the task's OWN epoch.
- * A marker at an older epoch belongs to a fence a later epoch already replaced,
- * so it obliges nothing. This one comparison was written out at roughly twenty
- * call sites across the runtime, the attempt accounting, the scheduling pass and
- * the notices; naming it is what lets a reader see that they all ask the same
- * question rather than four similar ones.
- */
-export function stopPending(task: Pick<Task, 'epoch' | 'resumeAfterStop'>): boolean {
-  return task.resumeAfterStop?.epoch === task.epoch
-}
-
-/** The local key of a stop fault's decision request: one per task, stop epoch, member and failure text. */
-export const stopFaultKey = (taskId: string, marker: { epoch: number; memberId?: string }, message: string): string => `stop:${taskId}:${marker.epoch}:${marker.memberId ?? 'unresolved'}:${createHash('sha256').update(message).digest('hex')}`
-
-/** A fenced handle must finish stopping before that member can own new work. */
-export function pendingStopOwner(tasks: readonly Task[], memberId: string): boolean {
-  return tasks.some(task => {
-    if (!stopPending(task)) return false
-    const marker = task.resumeAfterStop!
-    if (marker.memberId !== undefined) return marker.memberId === memberId
-    // An unresolved legacy owner is a conservative stop of every mission
-    // handle; reserve every member until the complete scan confirms quiescence.
-    return true
-  })
-}
-
-/**
- * Why a task is, or on its next confirmed stop would be, blocked. A `blocked`
- * status has several causes that can hold together and clear independently (a
- * restart retires an obsolete finding ceiling while a preparation failure still
- * needs repair), so the set is derived from the task's own fields whenever a
- * reader asks, never stored as one discriminant.
- */
-export type BlockCause = 'task-ceiling' | 'preparation-failed' | 'review-deferred' | 'needs-replacement' | 'refuted' | 'recovery-exhausted'
-
-/**
- * The claims of the task's current attempt generation. A rework archives the
- * claims its rejection refuted in `rejections`: they stay refuted, but they no
- * longer block the task and no later submission or verdict touches them.
- */
-export function currentEvidenceIds(task: Pick<Task, 'evidenceIds' | 'rejections'>): string[] {
-  const archived = new Set(task.rejections?.flatMap(rejection => rejection.evidenceIds))
-  return (task.evidenceIds ?? []).filter(evidenceId => !archived.has(evidenceId))
-}
-
-/**
- * The block causes holding for `task` now. `evidenceStatusOf` reads an evidence
- * row's current status; `defaultMaxRecoveryAttempts` is the limit of a task
- * without its own `maxRecoveryAttempts` (the runtime's `maxTasksPerMember`). A
- * preparation failure still inside its backoff retry is not a cause: that task
- * is pending and the host retries it.
- */
-export function blockCauses(
-  task: Pick<Task, 'status' | 'ceiling' | 'preparationFailure' | 'verificationRecovery' | 'artifact' | 'evidenceIds' | 'recoveryCount' | 'maxRecoveryAttempts' | 'rejections'>,
-  evidenceStatusOf: (evidenceId: string) => EvidenceStatus | undefined,
-  defaultMaxRecoveryAttempts: number,
-): Set<BlockCause> {
-  const causes = new Set<BlockCause>()
-  if (task.ceiling !== undefined) causes.add('task-ceiling')
-  if (task.preparationFailure !== undefined && task.preparationFailure.retryAt === undefined) causes.add('preparation-failed')
-  if (task.verificationRecovery !== undefined) causes.add('review-deferred')
-  // A rejected source, or submitted work invalidated after submission: its
-  // artifact is immutable. Only an owner rework (a rejected non-experiment,
-  // whose artifact then moves into history) or a replacement repairs it.
-  if (task.status === 'blocked' && task.artifact !== undefined) causes.add('needs-replacement')
-  if (currentEvidenceIds(task).some(evidenceId => evidenceStatusOf(evidenceId) === 'refuted')) causes.add('refuted')
-  if ((task.recoveryCount ?? 0) >= (task.maxRecoveryAttempts ?? defaultMaxRecoveryAttempts)) causes.add('recovery-exhausted')
-  return causes
-}
 
 /** Stops the host or the owner caused: the task's automatic recovery limit does not decide where they land. */
 const recoveryLimitExempt = (reason: StopReason): boolean => reason === 'resource' || reason === 'handoff' || reason === 'invalidated'
@@ -120,39 +47,6 @@ export function stopOutcome(causes: ReadonlySet<BlockCause>, reason: StopReason)
 const DEFAULT_IDLE_CLOSEOUTS = 2
 /** Renewal allowance per model output token, so a long model call keeps its lease. */
 const LEASE_MS_PER_OUTPUT_TOKEN = 20
-/**
- * F1: the declared bound on how long one in-flight operation may hold an
- * attempt without recording anything. Inside the bound an operation is
- * plausibly bounded (a long build, a declared check, one generation) and the
- * lease-renewal rule is right; past it "bounded" stops being plausible, so the
- * operation stops counting as liveness and the owner is told exactly which
- * member, task and tool went silent. Configuration, never a constant the
- * runtime is trapped behind: `operationBoundMs` on the runtime config, `0`
- * disables the guard, an invalid value keeps this default. The default matches
- * the longest wait this host itself treats as bounded (the harness's
- * `maxWaitTimeoutMs` of 600 s): one operation silently held past it is past the
- * point where "bounded" is still plausible, while an operation that declares a
- * longer bound of its own is judged by that bound instead.
- */
-const DEFAULT_OPERATION_BOUND_MS = 10 * 60_000
-/** Read the declared bound; invalid configuration keeps the default rather than reverting to 0. */
-function declaredOperationBoundMs(config: { operationBoundMs?: unknown }): number {
-  // The bound arrives on the runtime config. `RuntimeConfig` (src/types.ts) and
-  // the plugin `Config` schema (src/index.ts) live outside this task's write
-  // scope, so the read is structural and the two schema lines are recorded in
-  // the submission as a hand-off: a runtime handed `operationBoundMs` uses it,
-  // one without it uses the default above.
-  const value = config.operationBoundMs
-  if (value === 0) return 0
-  return typeof value === 'number' && Number.isFinite(value) && value > 0 ? Math.floor(value) : DEFAULT_OPERATION_BOUND_MS
-}
-/** Human form of an elapsed bound for a notice; the raw milliseconds stay on the witness. */
-function formatElapsed(ms: number): string {
-  const seconds = Math.max(0, Math.round(ms / 1000))
-  if (seconds < 60) return `${seconds}s`
-  const minutes = Math.floor(seconds / 60)
-  return minutes < 60 ? `${minutes}m ${seconds % 60}s` : `${Math.floor(minutes / 60)}h ${minutes % 60}m`
-}
 /** F1: one in-flight operation that has produced nothing beyond the declared bound. */
 interface SilentOperation {
   attemptId: string
@@ -183,8 +77,8 @@ export class Attempts {
 
   /** Stop outside the pass queue; only confirmed quiescence can re-pend this epoch. */
   resumeStoppedAttempt(missionId: string, task: Task, options: { force?: boolean } = {}): void {
+    if (!stopPending(task)) return
     const marker = task.resumeAfterStop
-    if (marker?.epoch !== task.epoch) return
     if (options.force && !this.stopRetries.get(task.id)?.inFlight) {
       delete marker.failure
       this.stopRetries.delete(task.id)
@@ -257,7 +151,7 @@ export class Attempts {
           const { blocked: exhausted, recoveryLimit: recoveryExhausted } = stopOutcome(causes, reason)
           const released = ownerIds.map(memberId => this.rt.store.get('members', memberId)).filter((member): member is Member => member !== undefined)
           if (reason === 'worker-closeout' && state.memberId !== undefined && (released.length === 0 || released[0]!.status === 'stopped')) delete fresh.assigneeId
-          if (fresh.status !== 'cancelled' && fresh.status !== 'accepted') fresh.status = exhausted ? 'blocked' : 'pending'
+          if (!TERMINAL_STATES.has(fresh.status)) fresh.status = exhausted ? 'blocked' : 'pending'
           delete fresh.resumeAfterStop
           this.rt.commit(missionId, () => {
             for (const member of released) if (memberPhaseOf(member) !== 'stopped') {
@@ -268,7 +162,7 @@ export class Attempts {
               // the barrier is in flight, which is the whole window the park used
               // to cover. A terminal mission still ends the membership here,
               // because that is the barrier's own decision, not a released flag.
-              if (this.rt.isMissionTerminal(mission)) member.phase = 'stopped'
+              if (terminal(mission)) member.phase = 'stopped'
               this.rt.store.put('members', member)
             }
             this.rt.store.put('tasks', fresh)
@@ -276,7 +170,7 @@ export class Attempts {
               taskId: fresh.id, ...(state.memberId === undefined ? { memberIds: ownerIds } : { memberId: state.memberId }), reason, retries: state.retries,
             })
           })
-          if (recoveryExhausted && mission.status === 'active' && fresh.status !== 'cancelled') emitGuardTerminal(this.rt, missionId, 'attempt_lease', { taskId: fresh.id, memberId: state.memberId, localKey: `recovery-exhausted:${taskSubject(fresh)}`, detail: `${reason === 'lease-expired' ? 'lease expiry exhausted' : 'idle close-out reached'} the recovery limit (${fresh.recoveryCount ?? 0}/${fresh.maxRecoveryAttempts ?? this.rt.config.maxTasksPerMember}) and left the task blocked` })
+          if (recoveryExhausted && mission.status === 'active' && fresh.status !== 'cancelled') this.rt.notices.emitGuardTerminal(missionId, 'attempt_lease', { taskId: fresh.id, memberId: state.memberId, localKey: `recovery-exhausted:${taskSubject(fresh)}`, detail: `${reason === 'lease-expired' ? 'lease expiry exhausted' : 'idle close-out reached'} the recovery limit (${fresh.recoveryCount ?? 0}/${fresh.maxRecoveryAttempts ?? this.rt.config.maxTasksPerMember}) and left the task blocked` })
         })
         if (this.stopRetries.get(task.id) === state) this.stopRetries.delete(task.id)
         if (state.memberId === undefined) for (const peer of this.rt.store.list('tasks', missionId)) if (peer.id !== task.id && stopPending(peer)) this.resumeStoppedAttempt(missionId, peer)
@@ -315,7 +209,7 @@ export class Attempts {
       : /recorded stop owner is missing/.test(message)
         ? `A resume only repeats this refusal. Withdraw the task with swarm_cancel (taskId "${task.id}"); if its work is still needed, propose its repair with swarm_propose naming replaces: ["${task.id}"].`
         : `The member remains fenced. Repair the recorded workspace condition, then retry cleanup with swarm_control(action: "resume", taskId: "${task.id}"); its cancelled or blocked outcome is preserved.`
-    emitGuardTerminal(this.rt, missionId, 'attempt_lease', { taskId: task.id, memberId: marker.memberId,
+    this.rt.notices.emitGuardTerminal(missionId, 'attempt_lease', { taskId: task.id, memberId: marker.memberId,
       localKey: stopFaultKey(task.id, marker, message),
       detail: `Stopping or preserving this attempt failed: ${message}. ${exit}` })
   }
@@ -324,7 +218,8 @@ export class Attempts {
     const { member } = this.rt.active(actor, missionId)
     const task = this.rt.task(missionId, taskId)
     if (!member || task.status !== 'running' || !task.attempt || task.attempt.id !== attemptId || task.attempt.ownerId !== member.id || task.attempt.leaseUntil < this.rt.now()) throw new PolicyError('task_attempt_stale', 'authorization_error', 'Stale or unauthorized task attempt; stop work and observe the current assignment')
-    if (!task.dependencies.every(dep => this.rt.dependencySatisfied(missionId, dep))) throw new PolicyError('task_prerequisite_revoked', 'tool_error', 'A task prerequisite is no longer accepted; stop work')
+    const board = this.rt.boardOf(missionId)
+    if (!task.dependencies.every(dep => board.graph.dependencyMetOf(dep))) throw new PolicyError('task_prerequisite_revoked', 'tool_error', 'A task prerequisite is no longer accepted; stop work')
     return { task, member }
   }
   /**
@@ -452,7 +347,7 @@ export class Attempts {
     // One operation belongs to the attempt it started under; an operation
     // recorded under a different attempt is not this task's stuck call.
     if (activity.attemptId !== undefined && activity.attemptId !== attempt.id) return undefined
-    const boundMs = this.operationBound(activity, declaredOperationBoundMs(this.rt.config as { operationBoundMs?: unknown }))
+    const boundMs = this.operationBound(activity, this.rt.bounds.operationBoundMs)
     if (boundMs === undefined) return undefined
     const lastRecordedAt = this.rt.store.toolRuns(mission.id, { attemptId: attempt.id }).reduce((latest, run) => Math.max(latest, run.createdAt), 0)
     const silentSince = Math.max(activity.startedAt, lastRecordedAt)
@@ -480,7 +375,7 @@ export class Attempts {
     const member = this.rt.store.get('members', silent.ownerId)
     const name = member === undefined ? silent.ownerId : `${member.name} (${member.id})`
     const what = silent.tool === undefined ? `a ${silent.kind} operation` : `a ${silent.kind} operation \`${silent.tool}\``
-    const message = `${name} has held ${what} for ${formatElapsed(silent.elapsedMs)} (${silent.elapsedMs}ms) without recording anything, past its declared bound of ${formatElapsed(silent.boundMs)}: task ${task.id} "${task.title}", attempt ${silent.attemptId}. The operation no longer counts as liveness, so the lease is not renewed and the attempt expires into the existing recovery, which stops the worker and re-pends the task. Owner actions: inspect the stuck call with swarm_observe (taskId ${task.id}), raise operationBoundMs if the operation is genuinely long, or withdraw the work with swarm_cancel. [witness: activity ${silent.activityId}, kind ${silent.kind}${silent.tool === undefined ? '' : `, tool ${silent.tool}`}, attempt ${silent.attemptId}, startedAt ${silent.startedAt}, lastRecordedAt ${silent.lastRecordedAt}, elapsedMs ${silent.elapsedMs}, boundMs ${silent.boundMs}]`
+    const message = `${name} has held ${what} for ${formatSpan(silent.elapsedMs)} (${silent.elapsedMs}ms) without recording anything, past its declared bound of ${formatSpan(silent.boundMs)}: task ${task.id} "${task.title}", attempt ${silent.attemptId}. The operation no longer counts as liveness, so the lease is not renewed and the attempt expires into the existing recovery, which stops the worker and re-pends the task. Owner actions: inspect the stuck call with swarm_observe (taskId ${task.id}), raise operationBoundMs if the operation is genuinely long, or withdraw the work with swarm_cancel. [witness: activity ${silent.activityId}, kind ${silent.kind}${silent.tool === undefined ? '' : `, tool ${silent.tool}`}, attempt ${silent.attemptId}, startedAt ${silent.startedAt}, lastRecordedAt ${silent.lastRecordedAt}, elapsedMs ${silent.elapsedMs}, boundMs ${silent.boundMs}]`
     // The durable witness is the owner delivery row itself, on the
     // deliveries ledger. A dedicated
     // `task/operation-silent` event type would need its own registry row in
@@ -490,7 +385,7 @@ export class Attempts {
     // silence x lease expiry x the board-level stall — the subject is this task's
     // identity, so a healthy sibling's notices never consume the clock of this
     // one (they carry different subjects and different dedup keys).
-    this.rt.tell(mission.id, message, [taskSubject(task)], { noticeClass: 'stall', dedupKey: `operation-silent:${silent.attemptId}:${silent.activityId}:${silent.silentSince}` })
+    this.rt.notices.tell(mission.id, message, [taskSubject(task)], { noticeClass: 'stall', dedupKey: `operation-silent:${silent.attemptId}:${silent.activityId}:${silent.silentSince}` })
   }
   /**
    * Renew only a still-owned native operation, bounded by the owner's actual
@@ -595,7 +490,7 @@ export class Attempts {
       // checkpoint guard (a dirty or unprovisioned worktree) and the close-out
       // guard co-fire here, so the owner gets the shared coded decision request
       // naming the task and the exits instead of a prose-only reason.
-      emitGuardTerminal(this.rt, mission.id, 'attempt_lease', { taskId: failed.id, memberId: member.id, localKey: `closeout-failed:${taskSubject(failed)}`, detail: terminalDetail(failed.output!) })
+      this.rt.notices.emitGuardTerminal(mission.id, 'attempt_lease', { taskId: failed.id, memberId: member.id, localKey: `closeout-failed:${taskSubject(failed)}`, detail: terminalDetail(failed.output!) })
       this.resumeStoppedAttempt(mission.id, failed)
       return
     }
@@ -622,7 +517,7 @@ export class Attempts {
     // chain fires with the workspace capture guard that produced the checkpoint,
     // with the dispatch sweep that re-pends the task, and (when the recovery
     // limit is already spent) with the close-out exhaustion terminal below.
-    emitGuardTerminal(this.rt, mission.id, 'attempt_lease', { taskId: current.id, memberId: member.id, localKey: `closeout-abandoned:${task.attempt!.id}`, detail: `idle close-out abandoned attempt ${task.attempt?.id ?? 'unknown'}: the workspace was checkpointed at ${checkpoint.commit} and the task was re-pended (recovery ${current.recoveryCount ?? 0})` })
+    this.rt.notices.emitGuardTerminal(mission.id, 'attempt_lease', { taskId: current.id, memberId: member.id, localKey: `closeout-abandoned:${task.attempt!.id}`, detail: `idle close-out abandoned attempt ${task.attempt?.id ?? 'unknown'}: the workspace was checkpointed at ${checkpoint.commit} and the task was re-pended (recovery ${current.recoveryCount ?? 0})` })
     this.idleSignals.delete(member.id)
     this.resumeStoppedAttempt(mission.id, current)
   }
@@ -656,7 +551,7 @@ export class Attempts {
           // silent board. Record it durably and wake the owner once per attempt.
           const ownerMember = this.rt.store.get('members', oldOwner)
           const parked = ownerMember?.status === 'waiting'
-          if (parked) this.rt.notifyParkedHolder(mission, task)
+          if (parked) this.rt.notices.notifyParkedHolder(mission, task)
           // F1: an in-flight operation that has recorded nothing past its
           // declared bound is named to the owner once, and stops renewing the
           // lease so the existing expiry path can free the attempt.
@@ -701,7 +596,7 @@ export class Attempts {
                   // the attempt/lease chain for this attempt: the workspace guard
                   // refused the capture, so recovery will refuse a dirty
                   // workspace too. The coded decision request replaces the prose.
-                  emitGuardTerminal(this.rt, missionId, 'attempt_lease', { taskId: task.id, memberId: oldOwner, localKey: `checkpoint-failed:${attemptId}`, detail: terminalDetail(reason) })
+                  this.rt.notices.emitGuardTerminal(missionId, 'attempt_lease', { taskId: task.id, memberId: oldOwner, localKey: `checkpoint-failed:${attemptId}`, detail: terminalDetail(reason) })
                 }
               }
             }

@@ -16,6 +16,7 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { FakeClock, MISSION_ACCEPTANCE, SwarmRuntime, FakeWorkers, acceptThroughReview, blockThroughReview, events, makeRuntime, taskOf } from './faults/harness.mjs'
 import { NOTICE_TEMPLATES } from '../lib/notices.js'
+import { stallRoots } from '../lib/board.js'
 
 async function fixture(t) {
   const made = await makeRuntime(t, { clock: new FakeClock(), budget: { maxWorkers: 4 } })
@@ -63,8 +64,7 @@ test('an accepted second repair retires the whole chain, and the mission complet
   assert.deepEqual(f.superseded().map(data => [data.taskId, data.supersededBy, data.previousStatus]).sort(),
     [[a.id, r2.id, 'blocked'], [r1.id, r2.id, 'blocked']].sort(), 'one durable event per retired task names the accepted replacement')
   // Retired rows are terminal, so the owner-notice classifiers stop naming them.
-  const tasks = f.runtime.store.list('tasks', f.mission.id)
-  assert.deepEqual(f.runtime.notices.stallRoots(tasks).map(task => task.id), [], 'no retired row is a stall root')
+  assert.deepEqual(stallRoots(f.runtime.boardOf(f.mission.id)).map(task => task.id), [], 'no retired row is a stall root')
   await f.runtime.tick(); await f.runtime.settle(f.mission.id)
   const retiredIds = [a.id, reviewA.id, r1.id, reviewR1.id]
   const naming = f.runtime.store.list('deliveries', f.mission.id).filter(delivery => !earlier.has(delivery.id)

@@ -1,6 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { eventually, makeRuntime } from './faults/harness.mjs'
+import { reviewNeed } from '../lib/board.js'
 
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms))
 async function fixture(t) {
@@ -22,14 +23,15 @@ async function fixture(t) {
 test('a failed tick guard and one failed mission do not suppress other guards or missions', async t => {
   const f = await fixture(t), calls = []
   const second = f.runtime.create(f.owner, { title: 'Other', objective: 'Continue', workspace: f.mission.workspace, scope: ['src/'], acceptance: ['works'], budget: f.budget }, { grantRoot: f.mission.workspace, source: 'session' })
-  f.runtime.pumpOutbox = () => { calls.push('outbox'); throw new Error('injected write contention') }
+  f.runtime.notices.pumpOutbox = () => { calls.push('outbox'); throw new Error('injected write contention') }
   f.runtime.sweepStarts = () => calls.push('starts')
   f.runtime.checkSchedulingPasses = () => calls.push('passes')
   f.runtime.sweepDecisions = () => calls.push('decisions')
   f.runtime.warnBudget = mission => { calls.push(mission.id); if (mission.id === f.mission.id) throw new Error('injected mission failure') }
   f.runtime.startTicker()
   await delay(25)
-  assert.ok(calls.includes('starts') && calls.includes('passes') && calls.includes('decisions'))
+  // The tick reaches its pump through the member patched above, so the injected failure is the first thing it does.
+  assert.deepEqual(calls.slice(0, 4), ['outbox', 'starts', 'passes', 'decisions'], 'the outbox guard failed first and the later guards still ran')
   assert.ok(calls.includes(second.id), 'one mission failure must not skip the next mission')
 })
 
@@ -121,13 +123,13 @@ test('retired members and late start failures cannot resurrect membership', asyn
 test('submission and missing-review identity survive event-window truncation and cache loss', async t => {
   const f = await fixture(t), task = f.propose({})
   f.runtime.store.transaction(() => f.runtime.store.event(f.mission.id, 'task/submitted', f.a.id, { taskId: task.id }))
-  const need = f.runtime.reviewNeed(task)
+  const need = reviewNeed(f.runtime.boardOf(task.missionId), task)
   assert.ok(need.seq > 0)
   assert.equal(need.recorded, false)
   f.runtime.reportMissingReview(f.mission, task)
   f.runtime.store.transaction(() => { for (let i = 0; i < 5; i++) f.runtime.store.event(f.mission.id, 'noise', 'runtime', {}) })
-  assert.equal(f.runtime.reviewNeed(task).seq, need.seq)
-  assert.equal(f.runtime.reviewNeed(task).recorded, true, 'the missing review stays recorded for this need')
+  assert.equal(reviewNeed(f.runtime.boardOf(task.missionId), task).seq, need.seq)
+  assert.equal(reviewNeed(f.runtime.boardOf(task.missionId), task).recorded, true, 'the missing review stays recorded for this need')
 })
 
 test('owner can settle receipts after stop without queuing work or reactivating the mission', async t => {

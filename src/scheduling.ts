@@ -1,106 +1,21 @@
 /**
- * The scheduling seam: the readiness and stall predicates, the in-memory pass
- * guard (open/close and the wedge watchdog) and the dispatch sweep of one
- * serialized pass. M1a seam 7/7.
- *
- * Behaviour-identical to the code moved from src/runtime.ts; the runtime keeps
- * thin forwarding methods and `schedule` calls `dispatch` exactly where its
- * member loop used to be.
+ * The scheduling seam: the in-memory pass guard (open/close and the wedge
+ * watchdog), the dispatch sweep of one serialized pass and the attempt
+ * reporting bound. M1a seam 7/7. The readiness, review and stall predicates
+ * the sweep asks are functions of the board (src/board.ts); the sweep reads the
+ * board where it decides, after each of its awaits.
  */
-import { randomUUID } from 'node:crypto'
-import { selectAcceptedDelivery } from './task-graph.ts'
-import { assignmentAllows, canBorrowTask, canOwnReview, strandedReview } from './assignment.ts'
-import { liveReviewFor } from './admission.ts'
-import { hasNotice } from './arena.ts'
-import { pendingStopOwner, stopPending } from './attempts.ts'
-import { awaitsReviewAdmission, factKey, noticeIdentity, subjectsOfTasks, taskSubject } from './notices.ts'
-import { emitGuardTerminal } from './refusals.ts'
+import { id } from './store.ts'
+import { TERMINAL_STATES, pendingStopOwner, quiescencePending, selectAcceptedDelivery, subjectsOfTasks, taskSubject, terminal } from './task-graph.ts'
+import { eligible, noticeSubjectsFor, overdueStop, ready, startBlocker, unschedulable } from './board.ts'
+import { factKey } from './notices.ts'
 import { AdmissionRefusedError } from './scheduler.ts'
+import { awaited, formatSpan, progressed, type SchedulingPass } from './kernel.ts'
 // R17-G6/G7: the one derivation of the derived member status.
 import { memberPhaseOf } from './projection.ts'
 import { PolicyError } from './policy-error.ts'
 import type { SwarmRuntime } from './runtime.ts'
-import { type Actor, type Attempt, type Member, type Mission, type Task } from './types.ts'
-
-const id = (prefix: string) => `${prefix}_${randomUUID()}`
-
-/**
- * R15-A4: the dispatcher's answer to "why did this ready task not dispatch?",
- * asked per (task, assignee) after a pass. `holder` is present only when the
- * blocker is a member handle that still holds an unfinished turn; the mission
- * admission refusal has no holder. Both carry the task's subject and a dedup key
- * that belongs to the task and epoch, so an unrelated notice can never consume
- * this decision.
- */
-interface DispatchQuestion {
-  task: Task
-  holder?: Member
-  message: string
-  subjects: string[]
-  dedupKey: string
-}
-
-/**
- * The scheduling body that is queued or running for one mission. `openPass`
- * (called by `kick`) records it before the body is queued on the mission's
- * serial queue (`SwarmRuntime.exclusive`), and `closePass` removes it when the
- * body settles, so at most one scheduling body per mission is queued or running.
- * It is in-memory on purpose: it describes an operation this process owns, and
- * a restarted process owns none. The durable row it replaces never gated or
- * named anything after a restart either (it carried the dead process's
- * instance id).
- *
- * Why no release and no fence: the queue is strictly serial and a waiter past
- * its bound is refused, never run (`boundedQueueWait`), so a successor body
- * cannot start until this body settles; a wedged body can never write after its
- * successor starts. The watchdog therefore only names a body past its bound
- * (`checkSchedulingPasses`) and marks the mission wedged for notices; the body
- * itself ends at the bound of whichever await it is in (`workerStartTimeoutMs`,
- * the per-attempt delivery bound, each git subprocess's `HOST_GIT_TIMEOUT_MS`),
- * and a member that held it for a whole bound makes it stop at the next member
- * boundary so the next body resumes from lease recovery (`dispatch`).
- */
-export interface SchedulingPass {
-  /** The mission's stable pass name (`pass_<missionId>`), named by the stall event and the owner notice. */
-  id: string
-  /** This body's identity; the stall event and the owner notice name it as the run. */
-  operationId: string
-  missionId: string
-  startedAt: number
-  /** Store revision and mission digest when the pass was opened. */
-  revisionBefore: number
-  fingerprintBefore: string
-  /** Set once this body's naming fact is on the deliveries ledger, written by its own naming or already held (`escalateWedge`); it is then wedged, not live. */
-  escalatedAt?: number
-  /**
-   * The body's own last progress: when one of its own awaits returned (stamped
-   * before it commits the result) or it reached a member boundary (`progressed`).
-   * A call that commits before its promise settles stamps the record the body
-   * handed it at the instant its adapter call settles, before that commit: the
-   * worker start (`SwarmRuntime.startWorker`), the workspace authorization
-   * check and the preparation's recovery-fallback report. Only the body's own
-   * record is stamped, so a worker turn one of its adapter calls woke commits
-   * without crediting the body; progress proves the body is running, not
-   * sitting in an await (`passState`).
-   */
-  progressAt?: number
-  /**
-   * The member whose task this body is preparing, while its `prepareTask` await
-   * is in flight: the adapter's recovery-fallback report, committed from inside
-   * that call, stamps the body's progress first (`SwarmRuntime.onRecoveryFallback`).
-   */
-  preparing?: string
-  /** The member this body's sweep starts from: the one its predecessor stopped before. */
-  sweepFrom?: string
-  /**
-   * The member where the chain of early-stopped bodies this body belongs to
-   * started. A chained body's sweep ends before it, so the chain covers at most
-   * one rotation and its last body runs the pass-end steps.
-   */
-  chainFrom?: string
-  /** Set when this body stopped early at a member boundary: the first member it did not sweep. */
-  stoppedBefore?: string
-}
+import { type Actor, type Attempt, type Mission, type Task } from './types.ts'
 
 /** R16-D: the dedup-key family of the attempt reporting-bound escalation. */
 const ATTEMPT_SILENCE_PREFIX = 'attempt-silent:'
@@ -120,36 +35,6 @@ interface SilentAttempt {
   boundMs: number
 }
 
-/** Human form of an elapsed bound for a notice; the raw milliseconds stay on the witness. */
-function formatSpan(ms: number): string {
-  const seconds = Math.max(0, Math.round(ms / 1000))
-  if (seconds < 60) return `${seconds}s`
-  const minutes = Math.floor(seconds / 60)
-  return minutes < 60 ? `${minutes}m ${seconds % 60}s` : `${Math.floor(minutes / 60)}h ${minutes % 60}m`
-}
-
-/**
- * A scheduling body's own progress stamp (`SchedulingPass.progressAt`). The body
- * calls it itself, with the record `kick` handed it, when it starts, at each
- * member boundary and when one of its own awaits returns (`awaited`). A call
- * that commits before its promise settles is handed the record and stamps it
- * where its adapter work settles, before that commit (`SchedulingPass.progressAt`).
- * Nothing else stamps it: commits made by a worker turn the body woke inside an
- * adapter call are that turn's, not the body's. Without a record (a direct
- * `schedule` or `dispatch` call) it does nothing.
- */
-export function progressed(pass: SchedulingPass | undefined, now: number): void {
-  if (pass !== undefined) pass.progressAt = now
-}
-
-/**
- * One of a scheduling body's own awaits: `work` settles, the body stamps its
- * progress (`progressed`), and only then does it act on the result, so the
- * commit of that result publishes as a running body's.
- */
-export function awaited<T>(pass: SchedulingPass | undefined, work: Promise<T>, now: () => number): Promise<T> {
-  return pass === undefined ? work : work.finally(() => progressed(pass, now()))
-}
 
 export class Scheduling {
   /**
@@ -159,12 +44,6 @@ export class Scheduling {
    * `startedAt` to name a body past its bound.
    */
   readonly passes = new Map<string, SchedulingPass>()
-  /**
-   * Identity of this runtime process in durable claims (the budget stop claim
-   * in src/gates.ts). A claim written by a different instance is a crashed
-   * process's leftover and never gates this runtime.
-   */
-  readonly instanceId = id('runtime')
 
   constructor(private readonly rt: SwarmRuntime) {}
 
@@ -197,7 +76,7 @@ export class Scheduling {
         // member rows), so no notice can describe a board the dispatcher would
         // act on differently. The view is rebuilt after each await, so it is
         // never staler than the per-step store reads it replaces.
-        const members = this.rt.interpretation(missionId).members
+        const members = this.rt.notices.interpretation(missionId).members
         const from = pass?.sweepFrom === undefined ? -1 : members.findIndex(member => member.id === pass.sweepFrom)
         const rotation = from > 0 ? [...members.slice(from), ...members.slice(0, from)] : members
         const end = pass?.chainFrom === undefined ? -1 : rotation.findIndex((member, index) => index > 0 && member.id === pass.chainFrom)
@@ -205,7 +84,7 @@ export class Scheduling {
         let memberSince = this.rt.now()
         for (const [index, member] of order.entries()) {
           if (this.rt.shuttingDown || this.rt.mission(missionId).status !== 'active') return false
-          if (pass !== undefined && index > 0 && this.rt.now() - memberSince >= this.rt.stallPassTimeoutMs) {
+          if (pass !== undefined && index > 0 && this.rt.now() - memberSince >= this.rt.bounds.stallPassTimeoutMs) {
             pass.stoppedBefore = member.id
             // A chain whose start member is gone restarts from this body's first one.
             pass.chainFrom = end > 0 ? pass.chainFrom : order[0]!.id
@@ -242,8 +121,8 @@ export class Scheduling {
           // question (`startBlocker`), so a member the sweep skipped is never
           // described to the owner with a cause the sweep did not test. The
           // parked-member hatch keeps priority: a parked member is dispatchable.
-          if (this.startBlocker(member) !== undefined) continue
-          const view = this.rt.interpretation(missionId)
+          if (startBlocker(this.rt.view, member) !== undefined) continue
+          const view = this.rt.notices.interpretation(missionId)
           if (pendingStopOwner(view.tasks, member.id)) continue
           const open = view.tasks.find(t => t.status === 'running' && t.attempt?.ownerId === member.id)
           if (open !== undefined) {
@@ -258,13 +137,12 @@ export class Scheduling {
             if (!parkedMember && (durableIdle || cachedIdle)) await this.rt.closeOutIdleAttempt(mission, member, open, pass)
             continue
           }
-          const all = view.tasks
-          const ready = all.filter(t => view.eligible(t, member)).sort((a, b) => b.priority - a.priority || a.createdAt - b.createdAt)
+          const choices = view.tasks.filter(t => eligible(view, t, member)).sort((a, b) => b.priority - a.priority || a.createdAt - b.createdAt)
           // R12-F9 (a task whose text assumes prior work no content-carrying edge
           // provides) is refused where a dependency set is written: plan
           // validation, propose() and the owner's `changes.dependencies`
           // amendment. Dispatch takes the first ready task as admitted.
-          const task = ready[0]
+          const task = choices[0]
           if (!task) continue
           try {
             // Revocation fencing: a mission whose human authorization was withdrawn
@@ -275,12 +153,12 @@ export class Scheduling {
             // (`SwarmRuntime.onRecoveryFallback`), which stamps the body that
             // marked the member it prepares before it commits the report.
             if (pass !== undefined) pass.preparing = member.id
-            try { await awaited(pass, this.rt.workers.prepareTask(member, { ...task, epoch: task.epoch + 1 }, this.rt.effectiveDependencies(missionId, task), task.reviewOf ? this.rt.task(missionId, task.reviewOf) : undefined), this.rt.now) }
+            try { await awaited(pass, this.rt.workers.prepareTask(member, { ...task, epoch: task.epoch + 1 }, this.rt.boardOf(missionId).graph.effectiveDependencies(task), task.reviewOf ? this.rt.task(missionId, task.reviewOf) : undefined), this.rt.now) }
             finally { if (pass !== undefined) delete pass.preparing }
             if (this.rt.shuttingDown || this.rt.mission(missionId).status !== 'active') return false
             const fresh = this.rt.task(missionId, task.id)
             if (fresh.epoch !== task.epoch || fresh.assigneeId !== task.assigneeId || fresh.plannedAssigneeId !== task.plannedAssigneeId
-              || fresh.assignmentMode !== task.assignmentMode || !this.ready(fresh, member)) continue
+              || fresh.assignmentMode !== task.assignmentMode || !ready(this.rt.boardOf(missionId), fresh, member)) continue
             // S7: re-read the isolation invariant after the external preparation
             // await. A state change during it (a member added into this worktree, a
             // second running task admitted) is refused here, never dispatched.
@@ -295,7 +173,7 @@ export class Scheduling {
             // blocked this task, so the changed-task rule below skips it.
             const fresh = this.rt.task(missionId, task.id)
             if (fresh.epoch !== task.epoch || fresh.assigneeId !== task.assigneeId || fresh.plannedAssigneeId !== task.plannedAssigneeId
-              || fresh.assignmentMode !== task.assignmentMode || !this.ready(fresh, member)) continue
+              || fresh.assignmentMode !== task.assignmentMode || !ready(this.rt.boardOf(missionId), fresh, member)) continue
             // Retry only identified transient host failures, with durable bounded
             // backoff. Repeating unchanged deterministic work is not recovery.
             const reason = `Workspace or worker preparation failed: ${String(error).slice(0, Math.max(0, this.rt.config.maxMessageChars - 650))}`
@@ -315,7 +193,7 @@ export class Scheduling {
               this.rt.store.event(missionId, 'task/preparation-failed', 'runtime', { taskId: fresh.id, epoch: fresh.epoch, reason, ...fresh.preparationFailure, status: fresh.status })
               if (retry) return
               this.rt.store.event(missionId, 'task/blocked', 'runtime', { taskId: fresh.id, reason: fresh.output })
-              this.rt.notify(missionId, fresh.output!, this.rt.interpretation(missionId).subjectsOf([fresh]), { trigger: 'task/preparation-failed', reason })
+              this.rt.notices.notify(missionId, fresh.output!, this.rt.notices.interpretation(missionId).subjectsOf([fresh]), { trigger: 'task/preparation-failed', reason })
             })
           }
           } catch (error) {
@@ -323,198 +201,12 @@ export class Scheduling {
             // The terminal of this member's chain, opened by this failure of the work
             // its request names: the same throw over that work on a later pass is the
             // request the owner already holds; other work or another failure is another.
-            const detail = String(error), subjects = this.rt.noticeSubjectsFor(missionId, { memberId: member.id })
-            emitGuardTerminal(this.rt, missionId, 'attempt_lease', { memberId: member.id, detail, subjects, localKey: factKey(missionId, { trigger: `dispatch-failed:${member.id}`, reason: detail, subjects }) })
+            const detail = String(error), subjects = noticeSubjectsFor(this.rt.boardOf(missionId), { memberId: member.id })
+            this.rt.notices.emitGuardTerminal(missionId, 'attempt_lease', { memberId: member.id, detail, subjects, localKey: factKey(missionId, { trigger: `dispatch-failed:${member.id}`, reason: detail, subjects }) })
             continue
           }
         }
     return true
-  }
-
-  /**
-   * R15-A4/A5: the dispatcher's startability question for one member, shared by
-   * the sweep and by the explanation `ensureWitness` gives the owner, so both
-   * answer with the same predicate.
-   *
-   * Guards it can co-fire with:
-   * - the parked-member hatch (`memberPhaseOf(member) === 'parked'`, R10-09/S3): a
-   *   parked member is startable even when the adapter reports a pending inbox item,
-   *   so the hatch wins here exactly as it does in `dispatch`;
-   * - the adapter's `isIdle` precondition (`HarnessWorkers.isIdle`), which now
-   *   drains a stranded `nextStep` item instead of stranding the member (R15-A5);
-   * - the W6 open-attempt close-out, which owns a member that already has a
-   *   running attempt — `dispatch` handles that member before it dispatches, and
-   *   `dispatchQuestion` refuses to answer for a task with an open attempt.
-   */
-  startBlocker(member: Member): 'handle-busy' | undefined {
-    if (memberPhaseOf(member) === 'parked') return undefined
-    return this.rt.workers.isIdle(member.id) ? undefined : 'handle-busy'
-  }
-
-  /**
-   * R15-A4: the dispatcher's own question, asked about the first dispatchable
-   * task that did not dispatch and is not yet asked about at its epoch on the
-   * ledger, so successive passes ask about each such task once, and the owner
-   * notice names the real cause and the member whose handle holds the task
-   * instead of claiming an admission refusal that was never recorded.
-   *
-   * Returns undefined — no owner decision — when no such task remains: every
-   * other one carries an open attempt (the close-out path is already nudging
-   * it; W6 owns that state) or has no eligible member at all (nothing is ready
-   * for a member; the board is someone else's witness, not this notice's).
-   *
-   * Otherwise the notice names a handle holder or an unexplained dispatch gap.
-   * An idle handle alone proves no budget refusal.
-   * - `handle-busy`: every member eligible for the task is working by the
-   *   adapter's contract. The named holder is the task's assignee when the task
-   *   is pinned, else the first eligible member whose handle is busy;
-   */
-  dispatchQuestion(missionId: string, tasks: Task[], members: Member[], dispatchable: Task[]): DispatchQuestion | undefined {
-    const deliveries = this.rt.store.list('deliveries', missionId)
-    for (const task of dispatchable) {
-      const subjects = [taskSubject(task)], dedupKey = `dispatch-question:${missionId}:${task.id}@${task.epoch}`
-      // An open attempt is not a dispatch candidate: the close-out path nudges it
-      // (W6) or the lease path recovers it; a task asked about at its epoch, under
-      // the identity `Notices.tell` writes, is the owner's: a second wake is noise.
-      if (task.attempt !== undefined || hasNotice(deliveries, noticeIdentity(missionId, subjects, { dedupKey }).identity)) continue
-      const eligible = members.filter(member => this.eligible(task, member, tasks))
-      if (!eligible.length) continue
-      if (eligible.some(member => this.startBlocker(member) === undefined)) return { task, subjects, dedupKey,
-        message: `Task ${task.id} (${task.title}, epoch ${task.epoch}) has an eligible idle member but was not dispatched this tick. An idle handle alone does not identify the dispatch blocker. Inspect the task and recorded admission/preparation diagnostics with swarm_observe; repair the reported cause or withdraw the task with swarm_cancel.` }
-      const pinned = task.assigneeId === undefined ? undefined : eligible.find(member => member.id === task.assigneeId)
-      const holder = pinned ?? eligible[0]!
-      return { task, holder, subjects, dedupKey,
-        message: `Task ${task.id} (${task.title}, epoch ${task.epoch}) is ready for member ${holder.name} (${holder.id})${pinned === undefined ? ', one of its eligible members,' : ', the member it is assigned to,'} whose worker handle still holds an unfinished turn, so the dispatcher cannot start it: no admission limit and no budget refusal was recorded for this board. The task is not undispatched for lack of an eligible member. Wait for that turn to end (the close-out path re-pends or completes it), amend this task's assigneeId with swarm_control(taskId: "${task.id}", action: "amend", changes: { assigneeId: "member id" }, reason: "reassign"), or withdraw it with swarm_cancel.` }
-    }
-    return undefined
-  }
-
-  ready(task: Task, member: Member, tasks?: Task[]): boolean {
-    return this.readinessBlocker(task, member, tasks) === undefined
-  }
-
-  /** The dispatcher's eligibility, which every reader of a dispatchable task asks: a live member that owes no stop, for which the task is ready. */
-  eligible(task: Task, member: Member, tasks: Task[]): boolean { return memberPhaseOf(member) !== 'stopped' && !pendingStopOwner(tasks, member.id) && this.ready(task, member, tasks) }
-
-  /** Spec §2: the dispatchable work, each pending task an idle or waiting member is eligible for; a working member is already busy. */
-  dispatchable(tasks: Task[], members: Member[]): Task[] {
-    const runnable = members.filter(member => member.status === 'idle' || member.status === 'waiting')
-    return tasks.filter(task => task.status === 'pending' && runnable.some(member => this.eligible(task, member, tasks)))
-  }
-
-  /** The same readiness decision supplies a concrete refusal without another policy model. */
-  readinessBlocker(task: Task, member: Member, tasks?: Task[]): string | undefined {
-    if (task.status !== 'pending') return `task ${task.id} is ${task.status}; inspect its current attempt, artifact or recovery condition with swarm_observe(taskId)`
-    if ((task.preparationFailure?.retryAt ?? 0) > this.rt.now()) return `preparation is backing off until ${task.preparationFailure!.retryAt}: ${task.preparationFailure!.reason}`
-    if (task.assigneeId === member.id) return this.capabilityBlocker(task, member, tasks)
-    if (task.assigneeId !== undefined && !canBorrowTask(task)) return `task is bound to member ${task.assigneeId}; the owner can amend assigneeId when reassignment is appropriate`
-    const all = tasks ?? this.rt.store.list('tasks', task.missionId)
-    if (!assignmentAllows(task, member.id, all)) return `member ${member.id} is the assignee of review ${strandedReview(all, task.id, { assigneeId: member.id })?.id} of this task, so owning this task would make it that review's author; another member can take it, or the owner can amend that review's assigneeId with swarm_control`
-    const incapable = this.capabilityBlocker(task, member, all)
-    if (incapable !== undefined || task.assigneeId === undefined) return incapable
-    // Keep useful context on the preferred member when it can take this work
-    // now. A busy, stopping, retired or non-independent preference cannot reserve
-    // an untouched task while another member is idle. This adds no reservation.
-    const preferred = this.rt.store.get('members', task.assigneeId)
-    const availableForBorrowing = preferred === undefined || !this.eligible(task, preferred, all)
-      || all.some(candidate => candidate.status === 'running' && candidate.attempt?.ownerId === preferred.id)
-      || this.startBlocker(preferred) !== undefined
-    return availableForBorrowing ? undefined : `preferred member ${task.assigneeId} is available for this task; the owner can amend assigneeId to change the preference`
-  }
-
-  /**
-   * R5-02: whether a member could take this task if it were pending and
-   * unassigned. Same prerequisites and review-independence guard as `ready`,
-   * without the status/assignee pin, so a start-failure re-route can evaluate
-   * candidates before committing the re-pend. The author check matches
-   * admission's definition (`attempt?.ownerId ?? assigneeId`), so a re-route can
-   * never assign a verification to the author of the source it reviews.
-   */
-  capable(task: Task, member: Member, tasks?: Task[]): boolean {
-    return this.capabilityBlocker(task, member, tasks) === undefined
-  }
-
-  private capabilityBlocker(task: Task, member: Member, tasks?: Task[]): string | undefined {
-    const waiting = task.dependencies.find(dep => !this.rt.dependencySatisfied(task.missionId, dep, tasks))
-    if (waiting !== undefined) {
-      const effective = this.rt.effectiveDependency(task.missionId, waiting, tasks)
-      return `dependency ${waiting}${effective.id === waiting ? '' : ` (effective replacement ${effective.id})`} is ${effective.status}, not accepted; inspect it or amend the dependency plan`
-    }
-    if (task.reviewOf) {
-      const source = this.rt.task(task.missionId, task.reviewOf)
-      if (source.status !== 'submitted') return `review source ${source.id} is ${source.status}; review begins only after its artifact is submitted`
-      if (!canOwnReview(source, member.id)) return `member ${member.id} authored review source ${source.id}; assign an independent reviewer`
-    }
-    return undefined
-  }
-
-  /**
-   * Tasks that cannot be dispatched under the current plan: pending work whose dependency
-   * lineage or review source is dead, reviews assigned to their own author,
-   * pending work no live member may take (`assignmentAllows`: a source only its
-   * own bound reviewer is left to take included), and blocked work. This is a
-   * diagnostic for owner repair, not permission to
-   * cancel obligations or mark the mission complete.
-   */
-  unschedulable(mission: Mission, tasks: Task[], members: Member[]): Task[] {
-    const live = members.filter(member => memberPhaseOf(member) !== 'stopped')
-    // W15: a blocked task with a matching stop marker is alive, not dead. Handoff,
-    // worker close-out and lease expiry hold the task at `blocked` +
-    // `resumeAfterStop` only until `workers.stop()` resolves; treating it as
-    // unschedulable lets `control complete` cancel recoverable work.
-    const dead = new Set(tasks.filter(task => task.status === 'blocked' && !this.quiescencePending(task)).map(task => task.id))
-    // Fixpoint: work waiting on dead prerequisites or an unreachable review source is dead too.
-    for (let changed = true; changed;) {
-      changed = false
-      for (const task of tasks) {
-        if (dead.has(task.id) || task.status !== 'pending') continue
-        const stuck = task.dependencies.some(dep => { const effective = this.rt.effectiveDependency(mission.id, dep, tasks); return effective.status === 'cancelled' || dead.has(effective.id) })
-          || (task.reviewOf !== undefined && (() => {
-            const source = this.rt.task(mission.id, task.reviewOf)
-            return source.status === 'cancelled' || source.status === 'accepted' || dead.has(source.id)
-              || !live.some(member => assignmentAllows(task, member.id, tasks) && canOwnReview(source, member.id))
-          })())
-          || !live.some(member => assignmentAllows(task, member.id, tasks))
-        if (stuck) { dead.add(task.id); changed = true }
-      }
-    }
-    return tasks.filter(task => dead.has(task.id))
-  }
-
-  /**
-   * A submitted task is progress only while a live review can still accept it,
-   * under the one live-review rule (`liveReviewFor`). A review that was never
-   * admitted or was retired leaves the submission unreviewable forever;
-   * counting it as progress hid a stalled board from the owner (Round-8 F1).
-   * So does a review no live member may own: counting it silenced the owner's
-   * review-blocked decision. A parked review (blocked with a matching stop
-   * marker) re-pends after the stop acknowledgement, so it still counts.
-   */
-  reviewable(task: Task, tasks: Task[], members: Member[] = this.rt.store.list('members', task.missionId)): boolean {
-    return liveReviewFor(tasks, task, new Set(members.filter(member => memberPhaseOf(member) !== 'stopped').map(member => member.id))) !== undefined
-  }
-
-  /**
-   * Nothing is running, reviewably submitted or dispatchable, and no submission
-   * with no live review awaits the review admission (`awaitsReviewAdmission`,
-   * the admission's own rule): workers would stay idle forever. An empty board
-   * is a mission the owner has not planned yet.
-   */
-  stalled(tasks: Task[], members: Member[]): boolean {
-    return tasks.length > 0 && this.reviewPathStalled(tasks, members)
-      && !tasks.some(task => task.status === 'submitted' && !this.reviewable(task, tasks, members) && awaitsReviewAdmission(this.rt, task))
-  }
-
-  /**
-   * A durable stop transition is in flight: the task is blocked only until the
-   * old worker handle acknowledges the stop, then it re-pends. Every scheduler
-   * and completion decision treats it as live work.
-   */
-  quiescencePending(task: Task): boolean { return task.status === 'blocked' && stopPending(task) }
-
-  /** The runtime's unique deliverable among accepted artifacts; throws when none is unique. */
-  selectDeliveryTarget(_missionId: string, tasks: Task[]): Task {
-    return selectAcceptedDelivery(tasks)
   }
 
   /** One completion policy is shared by manual controls and automatic requests. */
@@ -525,7 +217,7 @@ export class Scheduling {
     if (mission.ownerSessionId !== actor.sessionId || this.rt.isWorkerSession(actor.sessionId)) throw new PolicyError('delivery_owner_required', 'authorization_error', 'Only the mission owner can access deliverables')
     if (mission.status !== 'completed') throw new PolicyError('delivery_acceptance_required', 'tool_error', 'Complete independent acceptance before applying results')
     if (!mission.baseline) throw new PolicyError('delivery_baseline_missing', 'tool_error', 'This historical mission has no saved delivery baseline; inspect its retained artifact')
-    return { mission, task: this.selectDeliveryTarget(missionId, this.rt.store.list('tasks', missionId)) }
+    return { mission, task: selectAcceptedDelivery(this.rt.store.list('tasks', missionId)) }
   }
 
   /** The mission's stable pass name, carried by the stall event (`passId`) and the owner notice. */
@@ -551,7 +243,7 @@ export class Scheduling {
     if (!this.pastBound(pass, now)) return pass
     // Past the declared pass bound the body is live only while the mission has
     // live work to progress AND the bounded live-work hold has not elapsed.
-    if (now - pass.startedAt < this.rt.stallPassReleaseBoundMs && this.hasLiveWork(missionId)) return pass
+    if (now - pass.startedAt < this.rt.bounds.stallPassReleaseBoundMs && this.hasLiveWork(missionId)) return pass
     return undefined
   }
 
@@ -565,7 +257,7 @@ export class Scheduling {
     const now = this.rt.now()
     const holders: Array<{ subject: string; memberId?: string }> = []
     for (const task of this.rt.store.list('tasks', missionId)) {
-      const live = this.quiescencePending(task) || (task.status === 'running' && task.attempt !== undefined && task.attempt.leaseUntil >= now)
+      const live = quiescencePending(task) || (task.status === 'running' && task.attempt !== undefined && task.attempt.leaseUntil >= now)
       if (!live) continue
       const memberId = task.attempt?.ownerId ?? task.assigneeId
       holders.push({ subject: taskSubject(task), ...(memberId === undefined ? {} : { memberId }) })
@@ -602,7 +294,7 @@ export class Scheduling {
    * and another does not yet.
    */
   pastBound(pass: SchedulingPass, now = this.rt.now()): boolean {
-    return now - pass.startedAt >= this.rt.stallPassTimeoutMs
+    return now - pass.startedAt >= this.rt.bounds.stallPassTimeoutMs
   }
 
   /**
@@ -620,7 +312,7 @@ export class Scheduling {
    */
   passState(missionId: string): { passLive: boolean; wedged: boolean } {
     const pass = this.passes.get(missionId)
-    const bound = this.rt.stallPassTimeoutMs
+    const bound = this.rt.bounds.stallPassTimeoutMs
     if (pass?.progressAt !== undefined && this.pastBound(pass, pass.progressAt) && this.rt.now() - pass.progressAt <= bound) return { passLive: true, wedged: false }
     return { passLive: this.livePass(missionId) !== undefined, wedged: this.passWedged(missionId) }
   }
@@ -666,14 +358,14 @@ export class Scheduling {
   private escalateWedge(mission: Mission, pass: SchedulingPass, heldByLiveWork: boolean, holders: Array<{ subject: string; memberId?: string }>): void {
     const missionId = mission.id
     const now = this.rt.now()
-    const tasks = this.rt.store.list('tasks', missionId), members = this.rt.store.list('members', missionId)
+    const board = this.rt.boardOf(missionId), { tasks, members } = board
     // R15-A1/A2: a wedged pass names the work it never reached, so
     // the notice carries subjects even though `unschedulable` is legitimately
     // empty (nothing is unschedulable: the pass simply never ran to a decision).
     // Guard pair: scheduling-pass stall x stall-root classifier — both can fire for
     // one board, and each keeps its own subject and dedup key; the mission root is
     // the fallback only when the board has no non-terminal task left.
-    const unreached = tasks.filter(task => task.status !== 'accepted' && task.status !== 'cancelled')
+    const unreached = tasks.filter(task => !TERMINAL_STATES.has(task.status))
     // R16-D: the live work that held a naming to its second bound is unfinished
     // (`liveWorkHolders`: running, or blocked on its stop), so it is among these
     // subjects: the owner sees which subjects made the wait unavoidable, and
@@ -688,9 +380,9 @@ export class Scheduling {
     const noticeKey = factKey(missionId, { trigger: 'scheduling-pass', reason, subjects })
     const fingerprint = this.rt.fingerprint(missionId)
     const revision = this.rt.store.revision()
-    const bound = this.rt.stallPassTimeoutMs
-    const releaseBoundMs = heldByLiveWork ? this.rt.stallPassReleaseBoundMs : bound
-    const unschedulable = this.unschedulable(mission, tasks, members).map(task => `${task.id} (${task.status})`)
+    const bound = this.rt.bounds.stallPassTimeoutMs
+    const releaseBoundMs = heldByLiveWork ? this.rt.bounds.stallPassReleaseBoundMs : bound
+    const stuck = unschedulable(board).map(task => `${task.id} (${task.status})`)
     const heldText = heldByLiveWork && holders.length
       ? ` The naming was held to its ${releaseBoundMs}ms live-work bound by work that is preserved untouched: ${holders.map(holder => holder.memberId === undefined ? holder.subject : `${holder.subject} held by ${holder.memberId}`).join(', ')}.`
       : ''
@@ -699,15 +391,9 @@ export class Scheduling {
     // past its declared bound (or carries no recorded start), the escalation
     // states that row-supported fact — the wedged pass is exactly what makes
     // the stop unbounded.
-    const stopFacts = unreached.filter(task => task.status === 'blocked' && stopPending(task))
-      .map(task => {
-        const stop = task.resumeAfterStop
-        return stop?.at === undefined
-          ? `${task.id} is blocked and its stop carries no recorded start, so the declared bound (${bound}ms) cannot be shown to hold`
-          : `${task.id} is blocked and its stop has been awaited for ${Math.max(0, now - stop.at)}ms, past its declared bound`
-      })
+    const stopFacts = unreached.flatMap(task => { const fact = overdueStop(board, task); return fact === undefined ? [] : [`${task.id} is blocked and ${fact}`] })
     const stopText = stopFacts.length ? ` Stop state: ${stopFacts.join('; ')}.` : ''
-    this.rt.tell(missionId, `Scheduling pass ${pass.id} (run ${pass.operationId}) for mission ${missionId} did not return within ${bound}ms and produced no durable state change (fingerprint ${fingerprint.slice(0, 12)}). This pass keeps the mission's scheduling until the call it awaits returns at its own bound; the next pass then resumes from lease recovery. Unschedulable: ${unschedulable.join(', ') || 'none'}.${heldText} Work the pass never reached: ${unreachedText}.${stopText} Decide: inspect the named tasks, admit a repair with swarm_propose, or withdraw the blocking work with swarm_cancel.`, subjects,
+    this.rt.notices.tell(missionId, `Scheduling pass ${pass.id} (run ${pass.operationId}) for mission ${missionId} did not return within ${bound}ms and produced no durable state change (fingerprint ${fingerprint.slice(0, 12)}). This pass keeps the mission's scheduling until the call it awaits returns at its own bound; the next pass then resumes from lease recovery. Unschedulable: ${stuck.join(', ') || 'none'}.${heldText} Work the pass never reached: ${unreachedText}.${stopText} Decide: inspect the named tasks, admit a repair with swarm_propose, or withdraw the blocking work with swarm_cancel.`, subjects,
       { dedupKey: noticeKey, reason }, () => {
       // Reuse the registered board-stall event rather than inventing a new type:
       // `cause: 'scheduling-pass'` and `wedged` make the pass-level escalation
@@ -720,7 +406,7 @@ export class Scheduling {
         wedged: true,
         passStartedAt: pass.startedAt, boundMs: bound,
         revisionBefore: pass.revisionBefore, revisionAtStall: revision,
-        missionFingerprint: fingerprint, stateUnchanged: pass.fingerprintBefore === fingerprint, unschedulable, noticeKey,
+        missionFingerprint: fingerprint, stateUnchanged: pass.fingerprintBefore === fingerprint, unschedulable: stuck, noticeKey,
         // R16-D: what the wedge was measured against, whether live work held it,
         // and the subjects whose work it preserved. Nothing is released; the
         // `release*` names are kept for every existing reader and describe the
@@ -748,16 +434,17 @@ export class Scheduling {
    */
   closePass(missionId: string, pass: SchedulingPass): void {
     if (this.passes.get(missionId) === pass) this.passes.delete(missionId)
-    if (!this.rt.closed) this.rt.passSettled(missionId)
+    if (!this.rt.closed) this.rt.notices.transition(missionId)
   }
 
   /**
    * S1/S2: the wedge detector. Runs from the tick timer, outside every mission
    * queue and outside the pass it watches. A body still queued or running past
    * the declared bound is named: the durable stall event is committed, the owner
-   * notice is delivered by an unqueued flush, and the mission publishes as
-   * wedged until the body settles. The queue keeps the body as the physical
-   * owner; each await it can be in carries its own bound.
+   * notice is delivered by the tick's queue-external outbox pump, never by the
+   * wedged mission queue, and the mission publishes as wedged until the body
+   * settles. The queue keeps the body as the physical owner; each await it can
+   * be in carries its own bound.
    *
    * R16-D: the naming is bounded even when the mission still has live work. A
    * live lease or an in-flight quiescence may be progress, so the body is not
@@ -785,7 +472,7 @@ export class Scheduling {
       // Inside the second bound live work keeps the body live: a pass that may
       // legitimately be inside a long adapter await for that work is not named.
       // Past it the window is over, and the notice names the subject that held it.
-      if (held && now - pass.startedAt < this.rt.stallPassReleaseBoundMs) continue
+      if (held && now - pass.startedAt < this.rt.bounds.stallPassReleaseBoundMs) continue
       this.escalateWedge(mission, pass, held, held ? this.liveWorkHolders(missionId) : [])
       // The body counts as named once its naming fact is durable: written just
       // now, or held by the owner already. R17-G5: naming it is a transition
@@ -793,10 +480,7 @@ export class Scheduling {
       // board its live window left unpublished, so a publication is queued that
       // runs with the wedged branch even if the body settles first.
       pass.escalatedAt = now
-      this.rt.expectWedgedRelease(missionId)
-      // The notice path must not share the fate of the pass that could not report
-      // it: the queue-external pump delivers it, never the wedged mission queue.
-      this.rt.pumpOutbox()
+      this.rt.notices.expectWedgedRelease(missionId)
     }
   }
 
@@ -810,7 +494,7 @@ export class Scheduling {
   hasLiveWork(missionId: string): boolean {
     const now = this.rt.now()
     return this.rt.store.list('tasks', missionId).some(task =>
-      this.quiescencePending(task)
+      quiescencePending(task)
       || (task.status === 'running' && task.attempt !== undefined && task.attempt.leaseUntil >= now))
   }
 
@@ -858,7 +542,7 @@ export class Scheduling {
   silentAttempt(task: Task, mission: Mission, now = this.rt.now()): SilentAttempt | undefined {
     const attempt = task.attempt
     if (attempt === undefined || task.status !== 'running') return undefined
-    const boundMs = this.rt.attemptSilenceBoundMs
+    const boundMs = this.rt.bounds.attemptSilenceBoundMs
     if (boundMs <= 0) return undefined
     if (!Number.isSafeInteger(attempt.leaseUntil)) return undefined
     // The W6 idle close-out owns an attempt whose turn ended: it nudges, then
@@ -887,7 +571,7 @@ export class Scheduling {
   sweepSilentAttempts(missionId: string): number {
     if (this.rt.closed || this.rt.shuttingDown) return 0
     const mission = this.rt.store.get('missions', missionId)
-    if (mission === undefined || mission.status !== 'active' || this.rt.isMissionTerminal(mission)) return 0
+    if (mission === undefined || mission.status !== 'active' || terminal(mission)) return 0
     // A deliberate budget pause is host policy, not a stalled worker: the pause
     // owns the board until the owner resumes it.
     if (mission.budgetPause !== undefined) return 0
@@ -910,10 +594,10 @@ export class Scheduling {
     // would otherwise have named the attempt.
     const pass = this.passes.get(mission.id)
     const passState = pass !== undefined && this.passWedged(mission.id)
-      ? ` The mission's scheduling pass ${pass.operationId} is wedged past its ${this.rt.stallPassTimeoutMs}ms bound, so the in-pass recovery sweep cannot run either.`
+      ? ` The mission's scheduling pass ${pass.operationId} is wedged past its ${this.rt.bounds.stallPassTimeoutMs}ms bound, so the in-pass recovery sweep cannot run either.`
       : ''
     const message = `${name} has held task ${task.id} "${task.title}" at epoch ${task.epoch} (attempt ${silent.attemptId}) for ${formatSpan(silent.silentMs)} (${silent.silentMs}ms) with no durable report past its declared bound of ${formatSpan(silent.boundMs)} (${silent.boundMs}ms): no durable event, no task state transition and no recorded tool run names this attempt since ${since}; no operation is in flight and the idle close-out is not handling it.${passState} Nothing was stopped or re-pended by this notice: the attempt may still be working. Owner actions: inspect it with swarm_observe (taskId ${task.id}), send it input or finish it with swarm_handoff, raise attemptSilenceBoundMs if this silence is healthy, or withdraw the work with swarm_cancel. [witness: attempt-silent, subject ${silent.subject}, attempt ${silent.attemptId}, member ${silent.ownerId}, lastDurableAt ${silent.lastDurableAt}, silentMs ${silent.silentMs}, boundMs ${silent.boundMs}]`
-    return this.rt.tell(mission.id, message, [taskSubject(task)], { noticeClass: 'stall', dedupKey: `${ATTEMPT_SILENCE_PREFIX}${silent.attemptId}:${silent.lastDurableAt}` })
+    return this.rt.notices.tell(mission.id, message, [taskSubject(task)], { noticeClass: 'stall', dedupKey: `${ATTEMPT_SILENCE_PREFIX}${silent.attemptId}:${silent.lastDurableAt}` })
   }
 
   /**
@@ -945,34 +629,5 @@ export class Scheduling {
     if (Array.isArray(data)) return data.some(item => this.identityIn(item, taskId, attemptId, depth + 1))
     if (data !== null && typeof data === 'object') return Object.values(data as Record<string, unknown>).some(item => this.identityIn(item, taskId, attemptId, depth + 1))
     return false
-  }
-
-  /**
-   * F2: the board makes no progress except for submitted work. Unlike `stalled`,
-   * a submitted task is not progress: an artifact whose review path is broken
-   * can never reach a verdict by itself.
-   */
-  reviewPathStalled(tasks: Task[], members: Member[]): boolean {
-    if (tasks.some(task => task.status === 'running' || this.quiescencePending(task))) return false
-    const live = members.filter(member => memberPhaseOf(member) !== 'stopped')
-    return !tasks.some(task => task.status === 'pending' && live.some(member => this.ready(task, member, tasks)))
-  }
-
-  /**
-   * R5-02: the live members a failed attempt may be re-routed to, in store
-   * order: capable of the task, and never the member one of its own reviews is
-   * bound to (`strandedReview`), whom a reroute would make that review's author.
-   */
-  rerouteCandidates(missionId: string, task: Task, failedId: string): Member[] {
-    const tasks = this.rt.store.list('tasks', missionId)
-    return this.rt.store.list('members', missionId).filter(member => member.id !== failedId && memberPhaseOf(member) !== 'stopped'
-      && this.capable(task, member, tasks) && strandedReview(tasks, task.id, { assigneeId: member.id }) === undefined)
-  }
-
-  /** R5-02: deterministic next live member for re-routed work, preferring the planned assignee. */
-  rerouteTarget(missionId: string, task: Task, failedId: string): Member | undefined {
-    const candidates = this.rerouteCandidates(missionId, task, failedId)
-    const planned = task.plannedAssigneeId === undefined ? undefined : candidates.find(member => member.id === task.plannedAssigneeId)
-    return planned ?? candidates.sort((a, b) => a.name.localeCompare(b.name) || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))[0]
   }
 }

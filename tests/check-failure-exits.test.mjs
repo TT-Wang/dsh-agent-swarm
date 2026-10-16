@@ -31,6 +31,7 @@ import { join } from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { assertNamedCalls, ownerTools } from './refusal-inventory.mjs'
 import { FakeWorkers, MISSION_ACCEPTANCE, WorkspaceWorkers, events, makeRepo, makeWorkspaces, setup, taskOf } from './faults/harness.mjs'
+import { reviewNeed, reviewPathBlocker } from '../lib/board.js'
 
 const deferredReason = f => events(f.runtime, f.mission.id, 'task/verification-deferred').at(-1)?.data.reason
 const hostRuns = f => f.runtime.store.list('tool_runs', f.mission.id).filter(run => run.tool === 'swarm.host_verification')
@@ -145,7 +146,7 @@ async function deferOn(f, rows, reason, ids = {}) {
   return { source, review, verdict }
 }
 
-const blocker = (f, source) => f.runtime.reviewPathBlocker(taskOf(f.runtime, source.id), f.runtime.reviewNeed(taskOf(f.runtime, source.id)))
+const blocker = (f, source) => { const board = f.runtime.boardOf(f.mission.id), row = taskOf(f.runtime, source.id); return reviewPathBlocker(board, row, reviewNeed(board, row)) }
 
 test('exit 124: the reason names checkTimeoutMs through swarm_budget, and that exit really works', async t => {
   const f = await fakeFixture(t)

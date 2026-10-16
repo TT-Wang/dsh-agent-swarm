@@ -1,7 +1,9 @@
 import type { Context } from '@deepseek-ai/cordis'
 import type { SwarmRuntime } from './runtime.ts'
 import type { Delivery, Mission } from './types.ts'
-import { emitGuardTerminal } from './refusals.ts'
+import { terminal } from './task-graph.ts'
+import { openAsks } from './arena.ts'
+import { noticeSubjectsFor } from './board.ts'
 
 /** One question booked at turn start, with everything the nudge must name. */
 interface Booking {
@@ -83,7 +85,7 @@ export class OwnerReplyGuard {
 
   /** Owner missions that are still live for this session. */
   private ownerMissions(sessionId: string): Mission[] {
-    return this.rt.store.list('missions').filter(mission => mission.ownerSessionId === sessionId && !this.rt.isMissionTerminal(mission) && mission.status !== 'paused')
+    return this.rt.store.list('missions').filter(mission => mission.ownerSessionId === sessionId && !terminal(mission) && mission.status !== 'paused')
   }
 
   /**
@@ -102,7 +104,7 @@ export class OwnerReplyGuard {
     // the question booked by the preceding relay.
     const booked = this.bookings.get(sessionId) ?? new Map<string, Booking>()
     for (const mission of this.ownerMissions(sessionId)) {
-      for (const delivery of this.rt.openAsks(mission.id, 'owner')) {
+      for (const delivery of openAsks(this.rt.store.list('deliveries', mission.id), 'owner')) {
         const consumedNow = delivery.id === consumedId
         if (consumedNow && delivery.consumedAt === undefined) {
           this.rt.commit(mission.id, () => {
@@ -144,7 +146,7 @@ export class OwnerReplyGuard {
    */
   private missing(deliveryId: string, delivery: Delivery, booking: Booking): void {
     const mission = this.rt.store.get('missions', booking.missionId)
-    if (mission === undefined || this.rt.isMissionTerminal(mission) || mission.status === 'paused') return
+    if (mission === undefined || terminal(mission) || mission.status === 'paused') return
     const spent = delivery.replyNudges ?? 0
     // The durable miss record is bounded with the nudges: after the bound the
     // guard terminal is the outcome, so a later turn cannot keep writing rows
@@ -152,7 +154,7 @@ export class OwnerReplyGuard {
     if (spent >= this.options.maxNudges) {
       // Idempotent by its own dedup key: the terminal is emitted once and later
       // turns re-derive the same decision without a second notice.
-      emitGuardTerminal(this.rt, booking.missionId, 'owner_reply', {
+      this.rt.notices.emitGuardTerminal(booking.missionId, 'owner_reply', {
         detail: `question ${deliveryId} from ${booking.from} still has no answer after ${spent} nudge(s)`,
         memberId: booking.from,
         questionId: deliveryId,
@@ -170,8 +172,8 @@ export class OwnerReplyGuard {
       this.rt.store.put('deliveries', delivery)
       // Each recovery turn needs its own wake. Persist its ordinal and outbox
       // row together so restart cannot spend a nudge without retaining it.
-      this.rt.notify(booking.missionId, ownerReplyNudge(booking.missionId, delivery, booking, spent + 1, this.options.maxNudges),
-        this.rt.noticeSubjectsFor(booking.missionId, { ...(booking.taskId === undefined ? {} : { taskId: booking.taskId }), memberId: booking.from }),
+      this.rt.notices.notify(booking.missionId, ownerReplyNudge(booking.missionId, delivery, booking, spent + 1, this.options.maxNudges),
+        noticeSubjectsFor(this.rt.boardOf(booking.missionId), { ...(booking.taskId === undefined ? {} : { taskId: booking.taskId }), memberId: booking.from }),
         { dedupKey: `owner-reply-missing:${deliveryId}:${spent + 1}`, questionId: deliveryId })
     })
   }

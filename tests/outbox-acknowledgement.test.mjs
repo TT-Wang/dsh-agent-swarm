@@ -2,6 +2,7 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { join } from 'node:path'
 import { FakeWorkers, makeRuntime } from './faults/harness.mjs'
+import { openAsks } from '../lib/arena.js'
 
 /** Records a clone of every delivery the outbox sends and lets a test intercept the transport. */
 class OutboxWorkers extends FakeWorkers {
@@ -20,7 +21,7 @@ async function fixture(t, config = {}) {
     budget: { maxTokens: 100000, maxSteps: 1000, maxWorkers: 4, maxDurationMs: 3600000, maxTasks: 100 },
   })
   // Drive the real outbox at a controlled adapter boundary, without a competing pump.
-  runtime.pumpOutbox = () => {}
+  runtime.notices.pumpOutbox = () => {}
   const owner = { sessionId: 'ack-owner' }
   const mission = runtime.create(owner, { title: 'Outbox acknowledgement', objective: 'Preserve concurrent decisions',
     workspace: directory, scope: ['**'], acceptance: ['preserved'], budget }, { grantRoot: directory, source: 'session' })
@@ -125,7 +126,7 @@ for (const dismiss of [false, true]) {
     assert.ok(current.deliveredAt)
     assert.equal(current.state, dismiss ? 'dismissed' : 'answered')
     assert.equal(current.answeredBy, 'owner')
-    assert.equal(f.runtime.openAsks(f.mission.id, 'owner').length, 0)
+    assert.equal(openAsks(f.runtime.store.list('deliveries', f.mission.id), 'owner').length, 0)
   })
 }
 
@@ -267,7 +268,7 @@ for (const summary of [false, true]) test(`cancelled task preservation failure r
   const notice = f.rows().find(item => summary ? item.notice?.aggregatedFacts?.some(fact => fact.dedupKey.includes(':stop:')) : item.notice?.dedupKey.includes(':stop:'))
   assert.ok(notice)
   assert.equal(f.runtime.ownerDeliveryRelevant(f.runtime.mission(f.mission.id), notice), true)
-  assert.deepEqual(f.runtime.notices.unresolvedSubjects(f.runtime.interpretation(f.mission.id), notice), [`${row.id}@${row.epoch}`], 'cancelled execution still owes its saved workspace')
+  assert.deepEqual(f.runtime.notices.unresolvedSubjects(f.runtime.notices.interpretation(f.mission.id), notice), [`${row.id}@${row.epoch}`], 'cancelled execution still owes its saved workspace')
   const cleaned = f.runtime.task(f.mission.id, row.id); delete cleaned.resumeAfterStop
   f.runtime.commit(f.mission.id, () => f.runtime.store.put('tasks', cleaned))
   assert.equal(f.runtime.ownerDeliveryRelevant(f.runtime.mission(f.mission.id), notice), false)

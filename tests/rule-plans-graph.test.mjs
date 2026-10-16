@@ -8,6 +8,7 @@ import { classifyCheck, taskCeilingExhaustion } from '../lib/admission.js'
 import { taskGraphIndex, selectAcceptedDelivery } from '../lib/task-graph.js'
 import { boardIndex, deliverableTask } from '../lib/types/client/projection.js'
 import { FakeWorkers, budget as defaultBudget, makeRuntime } from './faults/harness.mjs'
+import { completionError } from '../lib/board.js'
 
 const budget = { ...defaultBudget, maxTokens: 100000, maxSteps: 100, maxTasks: 12, maxExperiments: 2 }
 const deferred = () => { let resolve; const promise = new Promise(done => { resolve = done }); return { promise, resolve } }
@@ -154,14 +155,14 @@ test('R23/R24 completion and delivery share unique artifact coverage before term
   const f = await fixture(t), mission = f.runtime.create(f.owner, { ...f.input, title: 'graph' }, { grantRoot: f.input.workspace, source: 'session' })
   const rows = [accepted('code'), accepted('one', 'integration', ['code']), accepted('two', 'integration', ['code'])].map(row => ({ ...row, missionId: mission.id }))
   for (const row of rows) f.runtime.store.put('tasks', row)
-  assert.match(f.runtime.completionError(mission), /unique accepted integration/)
+  assert.match(completionError(f.runtime.boardOf(mission.id)), /unique accepted integration/)
   assert.throws(() => f.runtime.control(f.owner, mission.id, 'complete', 'finish'), /unique accepted integration/)
   assert.equal(f.runtime.store.get('missions', mission.id).status, 'active')
   assert.equal(deliverableTask({ tasks: rows }), undefined)
   for (const id of ['one', 'two']) { const row = f.runtime.store.get('tasks', id); row.status = 'cancelled'; f.runtime.store.put('tasks', row) }
   const remaining = f.runtime.store.list('tasks', mission.id)
   assert.equal(selectAcceptedDelivery(remaining).id, 'code')
-  assert.equal(f.runtime.completionError(mission), undefined)
+  assert.equal(completionError(f.runtime.boardOf(mission.id)), undefined)
   assert.equal(deliverableTask({ tasks: remaining }).id, 'code')
   const missingCoverage = [accepted('a'), accepted('b'), accepted('integration', 'integration', ['a'])]
   assert.throws(() => selectAcceptedDelivery(missingCoverage), /all implementation results/)

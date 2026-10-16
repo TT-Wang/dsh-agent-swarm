@@ -1,6 +1,6 @@
 import { EVENT_PANEL_LABELS, type EventKind } from '../events.ts'
 import type { Evidence, Member, Snapshot, Task, WorkerActivity } from '../types.ts'
-import { completionExempt } from '../task-graph.ts'
+import { TERMINAL_STATES, completionExempt, missionSubject, stopPending, taskSubject } from '../task-graph.ts'
 import type { LiveWorkRow } from './live-work.ts'
 
 export type ConnectionState = 'connecting' | 'connected' | 'reconnecting' | 'paused'
@@ -51,7 +51,7 @@ export function currentProgress(snapshot: Snapshot, connection: ConnectionState 
   const firstRunning = running.values().next().value as Task | undefined
   if (firstRunning) return { label: 'Task in progress', task: firstRunning, note: 'Waiting for the next observed activity.', stale }
   if (snapshot.tasks.some(task => task.status === 'submitted')) return { label: 'Waiting for acceptance', note: 'Submitted work is waiting for independent review.', stale }
-  if (snapshot.tasks.length > 0 && snapshot.tasks.every(task => ['accepted', 'cancelled'].includes(task.status) || completionExempt(task, snapshot.tasks))) return { label: 'Preparing the final result', stale }
+  if (snapshot.tasks.length > 0 && snapshot.tasks.every(task => TERMINAL_STATES.has(task.status) || completionExempt(task, snapshot.tasks))) return { label: 'Preparing the final result', stale }
   return { label: 'Waiting for worker activity', note: mission.reason ?? 'No current worker activity has been observed.', stale }
 }
 
@@ -287,8 +287,6 @@ function lastEvent(snapshot: Snapshot, taskId: string, types: ReadonlySet<string
   return undefined
 }
 
-function taskSubject(task: Task): string { return `${task.id}@${task.epoch}` }
-
 function recoveryAge(since: number | undefined, now: number): number | undefined {
   return since === undefined || !Number.isFinite(since) ? undefined : Math.max(0, now - since)
 }
@@ -312,18 +310,20 @@ export function sidebarState(snapshot: Snapshot, connection: ConnectionState = '
   if (mission.status === 'staged') {
     return { ...base, phase: 'waiting-for-owner', label: 'Waiting for you',
       note: 'The plan is staged and has not been launched.',
-      decision: { subject: `mission:${mission.id}`, content: mission.reason ?? 'Launch the staged plan or edit it.', queuedAt: mission.updatedAt, consumption: 'unknown' },
+      decision: { subject: missionSubject(mission), content: mission.reason ?? 'Launch the staged plan or edit it.', queuedAt: mission.updatedAt, consumption: 'unknown' },
       evidence: 'mission.status=staged' }
   }
   // One pass over the durable task rows (F-34: the board render must not rescan
   // per task or per event), keeping the first row of each class in board order.
   const tasks = snapshot.tasks
+  // The unreviewed reading is reached only on a board with no blocked task (a
+  // blocked one is a recovery or an owner decision first), so a parked review
+  // never stands here: a pending or running review is the live one.
   const reviewed: Record<string, true> = {}
   for (const task of tasks) {
-    if (task.kind === 'verification' && task.reviewOf !== undefined
-      && (task.status === 'pending' || task.status === 'running' || (task.status === 'blocked' && task.resumeAfterStop?.epoch === task.epoch))) reviewed[task.reviewOf] = true
+    if (task.kind === 'verification' && task.reviewOf !== undefined && (task.status === 'pending' || task.status === 'running')) reviewed[task.reviewOf] = true
   }
-  let stopping: Task | undefined
+  let stopping: (Task & { resumeAfterStop: NonNullable<Task['resumeAfterStop']> }) | undefined
   let blocked: Task | undefined
   let unreviewed: Task | undefined
   let recovering: Task | undefined
@@ -332,7 +332,7 @@ export function sidebarState(snapshot: Snapshot, connection: ConnectionState = '
   let pendingCount = 0
   for (const task of tasks) {
     if (task.status === 'blocked') {
-      if (task.resumeAfterStop?.epoch === task.epoch) { if (stopping === undefined) stopping = task }
+      if (stopPending(task)) { if (stopping === undefined) stopping = task }
       else if (blocked === undefined) blocked = task
     } else if (task.status === 'submitted') {
       if (unreviewed === undefined && reviewed[task.id] !== true) unreviewed = task
@@ -344,7 +344,7 @@ export function sidebarState(snapshot: Snapshot, connection: ConnectionState = '
   }
   // A durable stop transition is the runtime's own recovery step, with its age.
   if (stopping !== undefined) {
-    const stop = stopping.resumeAfterStop!
+    const stop = stopping.resumeAfterStop
     const since = stop.at
     const start = since ?? lastEvent(snapshot, stopping.id, recoveryEventTypes)?.createdAt
     return { ...base, phase: 'recovering',
@@ -388,7 +388,7 @@ export function sidebarState(snapshot: Snapshot, connection: ConnectionState = '
   }
   if (!tasks.length) {
     return { ...base, phase: 'waiting-for-owner', label: 'Waiting for you', note: 'No work has been admitted yet.',
-      decision: { subject: `mission:${mission.id}`, content: 'Admit work with swarm_propose or inspect the plan.', queuedAt: mission.updatedAt, consumption: 'unknown' },
+      decision: { subject: missionSubject(mission), content: 'Admit work with swarm_propose or inspect the plan.', queuedAt: mission.updatedAt, consumption: 'unknown' },
       evidence: 'no tasks admitted' }
   }
   return { ...base, phase: 'finished', label: 'No task can make further progress', note: mission.reason,

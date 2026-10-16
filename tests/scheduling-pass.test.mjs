@@ -24,7 +24,8 @@ import assert from 'node:assert/strict'
 import { join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { setup, makeRuntime, events, taskOf, FakeWorkers, FakeClock, SwarmRuntime, MISSION_ACCEPTANCE } from './faults/harness.mjs'
-import { waitsLegitimately } from '../lib/notices.js'
+import { ownerTools } from './refusal-inventory.mjs'
+import { reviewNeed, stallRoots, stalled, waitsLegitimately } from '../lib/board.js'
 
 /** `count` ticks of the timer a fake-clock runtime does not run, one tick unit of clock time apart. */
 async function ticks(f, count) { for (let n = 0; n < count; n += 1) { f.clock.advance(f.runtime.config.tickMs); await f.runtime.tick() } }
@@ -163,6 +164,232 @@ test('S1: a wedged body is not followed by refused successor passes, so the owne
     assert.deepEqual(refusals.map(item => item.data.detail), [], 'no successor pass was queued and refused behind the wedged body')
     assert.equal(wedgeEvents(f).length, 1, 'the wedge itself is named exactly once')
   } finally { await f.cleanup() }
+})
+
+test('S2: the naming of a wedged body is delivered in its own tick, by the tick\'s pump once the pump it would join is past its bound', async () => {
+  // An earlier pump is still in flight on a hung owner delivery when the tick
+  // runs. The tick's outbox guard requests a pump one millisecond inside that
+  // pump's bound; the guards after it take that millisecond (the starts guard
+  // stands in for synchronous adapter work), so the watchdog names the body at
+  // the bound. The held pump listed its deliveries before the naming existed,
+  // so the naming is delivered while the body is wedged only because the
+  // tick's pump judges the join when it would start, past the held one's bound.
+  const clock = new FakeClock()
+  const workers = new WedgeStartWorkers({ clock })
+  const held = hold()
+  const deliver = workers.deliver.bind(workers)
+  workers.deliver = async (member, delivery) => {
+    if (member.id === 'owner' && delivery.content === 'A notice whose delivery hangs') { held.entered.resolve(); await held.release.promise }
+    return await deliver(member, delivery)
+  }
+  const f = await setup({ workers, clock, config: { workerStartTimeoutMs: 3_600_000 } })
+  const wedge = workers.arm()
+  try {
+    const bound = f.runtime.bounds.stallPassTimeoutMs
+    await f.runtime.settle(f.mission.id)
+    f.runtime.commit(f.mission.id, () => f.runtime.notify(f.mission.id, 'A notice whose delivery hangs', [`mission:${f.mission.id}`], { trigger: 'test/held', reason: 'held' }))
+    f.runtime.notices.pumpOutbox()
+    await held.entered.promise
+    f.runtime.kick(f.mission.id)
+    await wedge.entered.promise
+    clock.advance(bound - 1)
+    const sweepStarts = f.runtime.sweepStarts.bind(f.runtime)
+    f.runtime.sweepStarts = () => { sweepStarts(); clock.advance(1) }
+    await f.runtime.tick()
+    const [event] = wedgeEvents(f)
+    assert.ok(event !== undefined, 'the watchdog names the body at its bound')
+    const naming = f.runtime.store.list('deliveries', f.mission.id).find(delivery => delivery.notice?.dedupKey === event.data.noticeKey)
+    assert.ok(naming?.deliveredAt !== undefined, 'the naming is delivered in the tick that told it, while the body is wedged')
+  } finally {
+    wedge.release.reject(new Error('Worker startup timed out (released by the test)'))
+    held.release.resolve()
+    await f.runtime.settle(f.mission.id)
+    await f.cleanup()
+  }
+})
+
+test('S2: every row a tick\'s guards tell is delivered by that tick\'s pump once the pump it would join is past its bound, an attempt\'s silence included', async () => {
+  // The same interleaving with no naming in the tick: the body wedged half a
+  // bound after the held pump started, so the watchdog does not name it yet.
+  // The silence sweep, a later guard of the same tick, tells the owner that a
+  // running attempt has recorded nothing past its bound. The tick's pump
+  // decides whether to join the held one when it would start, after every guard
+  // of the tick has committed, so that row is delivered in its own tick too.
+  const clock = new FakeClock()
+  const workers = new WedgeStartWorkers({ clock })
+  const held = hold()
+  const deliver = workers.deliver.bind(workers)
+  workers.deliver = async (member, delivery) => {
+    if (member.id === 'owner' && delivery.content === 'A notice whose delivery hangs') { held.entered.resolve(); await held.release.promise }
+    return await deliver(member, delivery)
+  }
+  const f = await setup({ workers, clock, config: { workerStartTimeoutMs: 3_600_000, stallPassTimeoutMs: 10_000, attemptSilenceBoundMs: 1_000 } })
+  let wedge
+  try {
+    const bound = f.runtime.config.stallPassTimeoutMs
+    const task = f.propose()
+    await f.runtime.claim(f.actor(f.author), f.mission.id, task.id)
+    await f.runtime.settle(f.mission.id)
+    assert.equal(taskOf(f.runtime, task.id).status, 'running', 'a claimed attempt is running')
+    f.runtime.commit(f.mission.id, () => f.runtime.notify(f.mission.id, 'A notice whose delivery hangs', [`mission:${f.mission.id}`], { trigger: 'test/held', reason: 'held' }))
+    f.runtime.notices.pumpOutbox()
+    await held.entered.promise
+    clock.advance(bound / 2)
+    wedge = workers.arm()
+    f.runtime.kick(f.mission.id)
+    await wedge.entered.promise
+    clock.advance(bound / 2 - 1)
+    const sweepStarts = f.runtime.sweepStarts.bind(f.runtime)
+    f.runtime.sweepStarts = () => { sweepStarts(); clock.advance(1) }
+    try { await f.runtime.tick() } finally { delete f.runtime.sweepStarts }
+    assert.deepEqual(wedgeEvents(f), [], 'the body is inside its own bound, so the tick names nothing')
+    const silent = f.runtime.store.list('deliveries', f.mission.id).filter(delivery => String(delivery.notice?.dedupKey).startsWith('attempt-silent:'))
+    assert.equal(silent.length, 1, 'the silence sweep told the owner in this tick')
+    assert.ok(silent[0].deliveredAt !== undefined, 'the silence is delivered in the tick that told it, while the held pump is still in flight')
+  } finally {
+    wedge?.release.reject(new Error('Worker startup timed out (released by the test)'))
+    held.release.resolve()
+    await f.runtime.settle(f.mission.id)
+    await f.cleanup()
+  }
+})
+
+test('S2: a row a tick tells while the pump in flight is inside its bound is delivered by that pump, which sweeps again once its sweep ends', async () => {
+  // The interleaving of the test above, half a bound earlier: the held pump is
+  // inside its bound when the tick's pump would start, so that start joins it.
+  // The held pump read the mission's outbox before the silence existed, so it
+  // sweeps again once its sweep ends, and the silence is delivered then, with no
+  // further tick, while the body is still wedged.
+  const clock = new FakeClock()
+  const workers = new WedgeStartWorkers({ clock })
+  const held = hold()
+  const deliver = workers.deliver.bind(workers)
+  workers.deliver = async (member, delivery) => {
+    if (member.id === 'owner' && delivery.content === 'A notice whose delivery hangs') { held.entered.resolve(); await held.release.promise }
+    return await deliver(member, delivery)
+  }
+  const f = await setup({ workers, clock, config: { workerStartTimeoutMs: 3_600_000, stallPassTimeoutMs: 10_000, attemptSilenceBoundMs: 1_000 } })
+  let wedge
+  try {
+    const bound = f.runtime.config.stallPassTimeoutMs
+    const task = f.propose()
+    await f.runtime.claim(f.actor(f.author), f.mission.id, task.id)
+    await f.runtime.settle(f.mission.id)
+    f.runtime.commit(f.mission.id, () => f.runtime.notify(f.mission.id, 'A notice whose delivery hangs', [`mission:${f.mission.id}`], { trigger: 'test/held', reason: 'held' }))
+    const before = new Set(f.runtime.operations)
+    f.runtime.notices.pumpOutbox()
+    const pump = [...f.runtime.operations].find(operation => !before.has(operation))
+    await held.entered.promise
+    clock.advance(bound / 2)
+    wedge = workers.arm()
+    f.runtime.kick(f.mission.id)
+    await wedge.entered.promise
+    await f.runtime.tick()
+    const silence = () => f.runtime.store.list('deliveries', f.mission.id).find(delivery => String(delivery.notice?.dedupKey).startsWith('attempt-silent:'))
+    assert.ok(silence() !== undefined, 'the silence sweep told the owner in this tick')
+    assert.equal(silence().deliveredAt, undefined, 'the tick\'s pump joined the held one, which is still in its first sweep')
+    held.release.resolve()
+    await pump
+    assert.ok(silence().deliveredAt !== undefined, 'the held pump delivered the silence in the sweep after its first, with no further tick')
+    assert.equal(workers.wedgeSettledAt, undefined, 'while the body is still wedged')
+  } finally {
+    wedge?.release.reject(new Error('Worker startup timed out (released by the test)'))
+    held.release.resolve()
+    await f.runtime.settle(f.mission.id)
+    await f.cleanup()
+  }
+})
+
+test('R15-D2: the naming of a wedged body states a blocked task\'s stop only past its declared bound, in the words of the stall root it is', async () => {
+  // A body wedges in start. Past the live-work bound, three tasks are parked
+  // behind a stop at their own epoch: one awaited 10ms of the 1000ms bound, one
+  // awaited three bounds, one with no recorded start. They are the live work
+  // that held the naming, and the naming states the stops past their bound.
+  const clock = new FakeClock()
+  const workers = new WedgeStartWorkers({ clock })
+  const f = await setup({ workers, clock, config: { workerStartTimeoutMs: 3_600_000, stallPassTimeoutMs: 1_000, stallPassLiveGraceMs: 1_000 } })
+  let wedge
+  try {
+    const bound = f.runtime.config.stallPassTimeoutMs
+    const tasks = ['inside', 'past', 'unstarted'].map(title => f.propose({ title }))
+    await f.runtime.settle(f.mission.id)
+    wedge = workers.arm()
+    f.runtime.kick(f.mission.id)
+    await wedge.entered.promise
+    clock.advance(3 * bound)
+    const stoppedAt = { inside: clock.now() - 10, past: clock.now() - 3 * bound, unstarted: undefined }
+    for (const task of tasks) {
+      const row = taskOf(f.runtime, task.id)
+      const at = stoppedAt[row.title]
+      f.runtime.store.put('tasks', { ...row, status: 'blocked', resumeAfterStop: { epoch: row.epoch, memberId: f.author.id, ...(at === undefined ? {} : { at }) } })
+    }
+    await f.runtime.tick()
+    const [event] = wedgeEvents(f)
+    assert.ok(event !== undefined, 'the watchdog names the body past its live-work bound')
+    const naming = f.runtime.store.list('deliveries', f.mission.id).find(delivery => delivery.notice?.dedupKey === event.data.noticeKey)
+    const [past, unstarted] = tasks.slice(1).map(task => task.id)
+    assert.equal(naming.content.match(/ Stop state: (.*?)\. Decide:/)?.[1], [
+      `${past} is blocked and its stop has been awaited for ${3 * bound}ms, past the declared bound (${bound}ms)`,
+      `${unstarted} is blocked and its stop carries no recorded start, so the declared bound (${bound}ms) cannot be shown to hold`,
+    ].join('; '), 'a stop inside its bound is never stated as past it')
+    assert.deepEqual(stallRoots(f.runtime.boardOf(f.mission.id)).map(task => task.id), [past, unstarted], 'the stops it states are the stall roots\' stops')
+  } finally {
+    wedge?.release.reject(new Error('Worker startup timed out (released by the test)'))
+    await f.runtime.settle(f.mission.id)
+    await f.cleanup()
+  }
+})
+
+test('S1: the exits a wedge naming names work through the owner\'s registered tools: swarm_cancel retires the work it named, and swarm_propose admits a repair the next pass dispatches', async () => {
+  // A body wedges in the start of the member its task is assigned to, and the
+  // watchdog names that task. The owner performs one named exit while the body
+  // is still wedged; the body then settles at its start bound and the next pass
+  // acts on the board the exit left.
+  for (const exit of ['swarm_cancel', 'swarm_propose']) {
+    const clock = new FakeClock()
+    const workers = new WedgeStartWorkers({ clock })
+    const f = await setup({ workers, clock, config: { workerStartTimeoutMs: 3_600_000 } })
+    let wedge
+    try {
+      const builder = await f.runtime.addMember(f.owner, f.mission.id, { name: 'Builder', role: 'implementation', maxOutputTokens: 5_000 })
+      workers.idle.add(builder.id)
+      const stuck = f.propose({ title: 'Blocked behind the hung start' })
+      await f.runtime.settle(f.mission.id)
+      wedge = workers.arm()
+      f.runtime.kick(f.mission.id)
+      await wedge.entered.promise
+      clock.advance(f.runtime.config.stallPassTimeoutMs)
+      await f.runtime.tick()
+      const [event] = wedgeEvents(f)
+      assert.ok(event !== undefined, 'the watchdog names the body')
+      const naming = f.runtime.store.list('deliveries', f.mission.id).find(delivery => delivery.notice?.dedupKey === event.data.noticeKey)
+      assert.deepEqual(naming.subjects, [`${stuck.id}@${stuck.epoch}`], 'the naming names the work the body never reached')
+      assert.match(naming.content, /Decide: inspect the named tasks, admit a repair with swarm_propose, or withdraw the blocking work with swarm_cancel\.$/)
+      const tool = await ownerTools(f)
+      const repair = exit === 'swarm_cancel'
+        ? (await tool('swarm_cancel', { taskId: stuck.id, reason: 'Withdraw the work the wedged pass holds' }), undefined)
+        : await tool('swarm_propose', { workstreamId: f.stream.id, title: 'Repair on a member that can start', objective: 'Do the held work on a member whose start returns', kind: 'implementation', scope: ['**'], covers: ['c1'], outputs: [], checks: ['test -d .'], assigneeId: builder.id })
+      wedge.release.reject(new Error('Worker startup timed out (released by the test)'))
+      wedge = undefined
+      await f.runtime.settle(f.mission.id)
+      await f.runtime.tick()
+      const mission = f.runtime.mission(f.mission.id)
+      if (exit === 'swarm_cancel') {
+        assert.equal(taskOf(f.runtime, stuck.id).status, 'cancelled', 'the withdrawn work stays withdrawn')
+        assert.equal(f.runtime.store.list('deliveries', f.mission.id).some(delivery => delivery.kind === 'assignment' && delivery.taskId === stuck.id), false, 'no pass dispatches it')
+        assert.equal(f.runtime.ownerDeliveryRelevant(mission, f.runtime.store.get('deliveries', naming.id)), false, 'the exit retires the naming')
+      } else {
+        const dispatched = taskOf(f.runtime, repair.id)
+        assert.deepEqual([dispatched.status, dispatched.attempt?.ownerId], ['running', builder.id], 'the next pass dispatches the repair to its member')
+        assert.ok(f.runtime.store.list('deliveries', f.mission.id).some(delivery => delivery.kind === 'assignment' && delivery.taskId === repair.id && delivery.deliveredAt !== undefined), 'and its assignment is delivered')
+        assert.equal(f.runtime.ownerDeliveryRelevant(mission, f.runtime.store.get('deliveries', naming.id)), true, 'the work the naming named is still unfinished, so the naming holds')
+      }
+    } finally {
+      wedge?.release.reject(new Error('Worker startup timed out (released by the test)'))
+      await f.runtime.settle(f.mission.id)
+      await f.cleanup()
+    }
+  }
 })
 
 test('S1: every body that wedges is named once, also when an earlier named body left the board unchanged', async () => {
@@ -1006,7 +1233,7 @@ test('S5: clearing every in-memory scheduling cache leaves the durable outcome u
     f.runtime.queues.clear()
     f.runtime.attempts.idleSignals.clear()
     f.runtime.startFailures.clear()
-    f.runtime.gates.fingerprintCache.clear()
+    f.runtime.fingerprintCache.clear()
     const task = f.propose()
     const running = await ticksUntil(f, () => taskOf(f.runtime, task.id).status === 'running' ? taskOf(f.runtime, task.id) : undefined,
       'dispatch must not depend on any in-memory gate', 400)
@@ -1114,7 +1341,7 @@ test('manualTick runs no timer while tickMs stays the tick unit: settle() return
     // durable submission, so a submission's review need ripens only past it.
     const claimed = taskOf(f.runtime, task.id)
     await f.runtime.submit(f.actor(f.author), f.mission.id, { taskId: task.id, attemptId: claimed.attempt.id, output: 'candidate' })
-    const ripe = () => f.runtime.reviewNeed(taskOf(f.runtime, task.id)).ripe
+    const ripe = () => reviewNeed(f.runtime.boardOf(f.mission.id), taskOf(f.runtime, task.id)).ripe
     assert.equal(ripe(), false, 'a submission\'s review need is not ripe at its own instant')
     clock.advance(Math.max(tickMs, 1_000) - 1)
     assert.equal(ripe(), false, 'nor one clock millisecond inside the grace')
@@ -1136,9 +1363,9 @@ test('an unreviewed submission is a stall exactly when it stops waiting legitima
       if (blocked) f.runtime.commit(f.mission.id, () => f.runtime.store.put('members', { ...f.runtime.store.get('members', f.reviewer.id), phase: 'stopped' }))
       await f.runtime.submit(f.actor(f.author), f.mission.id, { taskId: task.id, attemptId: claimed.attempt.id, output: 'candidate' })
       const classified = () => {
-        const tasks = f.runtime.store.list('tasks', f.mission.id)
-        const row = tasks.find(candidate => candidate.id === task.id)
-        return { stall: f.runtime.stalled(tasks, f.runtime.store.list('members', f.mission.id)), waits: waitsLegitimately(f.runtime, row, tasks) }
+        const board = f.runtime.boardOf(f.mission.id)
+        const row = board.tasks.find(candidate => candidate.id === task.id)
+        return { stall: stalled(board), waits: waitsLegitimately(board, row) }
       }
       const past = blocked ? { stall: true, waits: false } : { stall: false, waits: true }
       // One scheduler period, at least 1 s.
@@ -1148,7 +1375,7 @@ test('an unreviewed submission is a stall exactly when it stops waiting legitima
       assert.deepEqual(classified(), past, `tickMs ${tickMs}, blocked ${blocked}: past it, a source the admission names a blocker for is a stall, and one it would admit a review for waits for the admission, before the admission has run`)
       await f.runtime.tick()
       await f.runtime.settle(f.mission.id)
-      assert.equal(f.runtime.reviewNeed(taskOf(f.runtime, task.id)).recorded, true, `tickMs ${tickMs}, blocked ${blocked}: the next pass's admission recorded the need`)
+      assert.equal(reviewNeed(f.runtime.boardOf(f.mission.id), taskOf(f.runtime, task.id)).recorded, true, `tickMs ${tickMs}, blocked ${blocked}: the next pass's admission recorded the need`)
       assert.deepEqual(classified(), past, `tickMs ${tickMs}, blocked ${blocked}: and the record changes neither reader`)
       assert.equal(f.runtime.store.list('tasks', f.mission.id).some(row => row.reviewOf === task.id), !blocked, `tickMs ${tickMs}, blocked ${blocked}: the admission admitted a review exactly when it named no blocker`)
     } finally { await f.cleanup() }

@@ -24,6 +24,7 @@ import assert from 'node:assert/strict'
 import path from 'node:path'
 import { orchestratorCommands } from '../lib/trace.js'
 import { FakeWorkers, eventually, makeRuntime } from './faults/harness.mjs'
+import { startBlocker } from '../lib/board.js'
 
 const artifact = commit => ({ commit, baseCommit: '0'.repeat(40), workspace: '/w', changedPaths: ['src/x.ts'] })
 
@@ -44,7 +45,7 @@ async function fixture(t) {
     budget: { maxTokens: 1000000, maxSteps: 5000, maxWorkers: 6, maxDurationMs: 3600000, maxTasks: 60 },
   })
   runtime.kick = () => {}
-  runtime.pumpOutbox = () => {}
+  runtime.notices.pumpOutbox = () => {}
   const holdStop = () => {
     workers.stop = async memberId => { workers.stopped.push(memberId); await new Promise(resolve => { held.release = resolve }) }
     return () => held.release?.()
@@ -183,7 +184,7 @@ test('R20-7: cancelling a ceiling-blocked task after its barrier settled leaves 
   f.runtime.cancel(f.owner, f.mission.id, { taskId: bound.id, reason: 'The ceiling is not worth raising' })
   assert.equal(f.runtime.store.get('members', f.author.id).phase, 'active', 'the member is not left waiting on a withdrawn task')
   assert.equal(memberStatus(f, f.author.id), 'idle')
-  assert.equal(f.runtime.scheduling.startBlocker(f.runtime.store.get('members', f.author.id)), undefined, 'and it is dispatchable again')
+  assert.equal(startBlocker(f.runtime.view, f.runtime.store.get('members', f.author.id)), undefined, 'and it is dispatchable again')
   const next = propose(f, 'Follow-up work', { assigneeId: f.author.id })
   assert.equal(await f.workers.callbacks.beforeStep(f.author.id), undefined, 'the member can take the step that claims its next task')
   const claimed = await f.runtime.claim(f.actor(f.author), f.mission.id, next.id)

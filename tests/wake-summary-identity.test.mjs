@@ -20,7 +20,7 @@ async function fixture(t) {
     config: { tickMs: 60000, maxEvents: 500, maxTasksPerMember: 10, checkTimeoutMs: undefined },
     budget: { maxTokens: 100000, maxSteps: 1000, maxWorkers: 2, maxDurationMs: 3600000, maxTasks: 20 } })
   // Exercise the real durable outbox at deterministic transport boundaries.
-  const quiet = () => { runtime.pumpOutbox = () => {} }
+  const quiet = () => { runtime.notices.pumpOutbox = () => {} }
   quiet()
   const owner = { sessionId: 'wake-identity-owner' }
   const mission = runtime.create(owner, { title: 'Wake identity', objective: 'Report each fact once',

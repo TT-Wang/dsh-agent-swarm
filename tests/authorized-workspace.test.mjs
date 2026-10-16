@@ -18,6 +18,7 @@ import { Config } from '../lib/index.js'
 import { subprocessSeam } from './subprocess-seam.mjs'
 import { FakeClock, FakeWorkers, SwarmRuntime, WorkspaceWorkers, budget as sharedBudget, eventually, makeRepo, makeRuntime, makeWorkspaces, makeRuntimeStub } from './faults/harness.mjs'
 import { tempDirectory } from './temp-root.mjs'
+import { completionError } from '../lib/board.js'
 
 const budget = { ...sharedBudget, maxTokens: 100000, maxSteps: 100, maxTasks: 10, maxExperiments: 2 }
 const plan = workspace => ({
@@ -932,7 +933,7 @@ test('An accepted source closes the reviews the fence blocked, so the restored m
   assert.equal(restored.store.get('tasks', automatic.id).status, 'cancelled', 'the verdict closed the fenced automatic review')
   const retired = restored.store.events(f.mission.id, 500).filter(event => event.type === 'task/review-retired').map(event => [event.data.taskId, event.data.previousStatus])
   assert.deepEqual(retired, [[automatic.id, 'blocked']])
-  assert.equal(restored.completionError(restored.mission(f.mission.id)), undefined, 'no review of the accepted source holds the mission open')
+  assert.equal(completionError(restored.boardOf(f.mission.id)), undefined, 'no review of the accepted source holds the mission open')
   assert.equal(restored.control(f.owner, f.mission.id, 'complete', 'done').status, 'completed')
 })
 

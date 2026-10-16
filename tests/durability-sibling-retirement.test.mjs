@@ -10,6 +10,7 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { join } from 'node:path'
 import { FakeWorkers, eventually, makeRuntime } from './faults/harness.mjs'
+import { completionError } from '../lib/board.js'
 
 async function fixture(t) {
   const { dir: directory, runtime, workers, budget } = await makeRuntime(t, {
@@ -123,7 +124,7 @@ test('an accepting verdict closes a sibling review deferred on the same artifact
   assert.equal(closed.status, 'cancelled', 'the deferred sibling of an accepted source is closed')
   assert.match(closed.output, /deferred its verdict[\s\S]*Superseded: .* was accepted by review/, 'its deferral is kept beside the retirement')
   assert.deepEqual(f.events('task/review-retired').map(event => [event.data.taskId, event.data.previousStatus]), [[deferred.id, 'blocked']])
-  assert.equal(f.runtime.completionError(f.runtime.mission(f.mission.id)), undefined)
+  assert.equal(completionError(f.runtime.boardOf(f.mission.id)), undefined)
 })
 
 test('a rejecting verdict retires a running sibling review too', async t => {

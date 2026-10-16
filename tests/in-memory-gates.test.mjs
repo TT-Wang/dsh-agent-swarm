@@ -130,7 +130,6 @@ const CENSUS = [
   ["src/delivery.ts",1,"Set","const activeSources = new Set<string>()","outside","","outside the runtime decision path: the delivery engine module (applyDelivery); the runtime serializes applies per workspace through exclusive(\"delivery:<workspace>\"), so the runtime path does not depend on this process-global mutex (enumerated, no label claimed)"],
   ["src/delivery.ts",2,"Map","const sourceIdentities = new Map<string, string>()","outside","","outside the runtime decision path: the delivery engine module (applyDelivery); the runtime serializes applies per workspace through exclusive(\"delivery:<workspace>\"), so the runtime path does not depend on this process-global mutex (enumerated, no label claimed)"],
   ["src/delivery.ts",3,"Set","const FALLBACK_TEMP_CODES = new Set(['EPERM', 'EACCES', 'ENOENT', 'ENOTDIR'])","constant","","module-level immutable lookup table, never mutated after construction: the errno allowlist the R15-F5 temp-root fallback decides on, data rather than a gate"],
-  ["src/gates.ts",1,"Map","readonly fingerprintCache = new Map<string, { revision: number; fingerprint: string }>()","gate","cache-only","keyed by the global store revision; the digest is pure over durable state and is bypassed inside a transaction"],
   ["src/gates.ts",3,"Set","const ready = new Set(tasks.filter(task => task.status === 'pending' && runnable.some(member => this.rt.eligible(task, member, tasks))).map(task => task.id))","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
   ["src/gates.ts",4,"Set","const unreviewed = new Set(tasks.filter(task => task.status === 'submitted' && !this.rt.reviewable(task, tasks)).map(task => task.id))","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
   ["src/git-snapshot.ts",1,"Set","const trackedSet = new Set(tracked)","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
@@ -144,10 +143,8 @@ const CENSUS = [
   ["src/harness-workers.ts",5,"Set","const resident: Resident = { spec, abort: new AbortController(), opening: Promise.resolve(), observations: new Set(), delivered: new Set(), recoveryInbox: new Map(), journalWrites: Promise.resolve(), totalTokens: 0, usage: emptyBuckets(), lastPromptTokens: 0, compactionRequested: false, recordedExecutions: new WeakSet(), rejectedPendingStep: false, activities: new Map() }","outside","","outside the runtime decision path: the harness worker adapter (HarnessWorkers): resident handle, observation, delivered-message and recovery-inbox state for live host agents; the runtime reaches it only through the injected WorkerAdapter (enumerated, no label claimed)"],
   ["src/harness-workers.ts",6,"Set","const visible = new Set(agentCtx.tools.schemas(agent).map(schema => schema.name))","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
   ["src/harness-workers.ts",7,"Set","const claimedIds = new Set(messages.map(message => message.id))","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
-  ["src/notices.ts",1,"Set","const TERMINAL_STATES = new Set(['accepted', 'cancelled'])","constant","","module-level immutable lookup table, never mutated after construction: data, not a gate"],
   ["src/notices.ts",2,"Set","const NO_LIVE_PATH_FAMILIES = new Set(['stall-root', 'fallthrough'])","constant","","module-level immutable lookup table, never mutated after construction: data, not a gate"],
   ["src/notices.ts",3,"Set","const FOLLOWUP_EXCLUDED_FAMILIES = new Set(['obligation-followup', 'absence', 'owner-reply-missing', 'owner-reply-blocked'])","constant","","module-level immutable lookup table; excludes recursive and receipt followups, no mutable recovery state"],
-  ["src/notices.ts",1,"Set","const TERMINAL_STATES = new Set(['accepted', 'cancelled'])","constant","","module-level immutable lookup table, never mutated after construction: data, not a gate"],
   ["src/notices.ts",2,"Set","const NO_LIVE_PATH_FAMILIES = new Set(['stall-root', 'fallthrough'])","constant","","module-level immutable lookup table, never mutated after construction: data, not a gate"],
   ["src/notices.ts",3,"Set","const FOLLOWUP_EXCLUDED_FAMILIES = new Set(['obligation-followup', 'absence', 'owner-reply-missing', 'owner-reply-blocked'])","constant","","module-level immutable lookup table; excludes recursive and receipt followups, no mutable recovery state"],
   ["src/notices.ts",3,"Set","const replaced = new Set<string>()","local","","function-local: created and discarded inside one synchronous call (the shared lineage helper `replacementCoverage`), so it cannot gate a later call"],
@@ -209,6 +206,7 @@ const CENSUS = [
   ["src/runtime.ts",38,"Set","const memberMissions = new Set(this.store.list('members').filter(m => m.sessionId === actor.sessionId && memberPhaseOf(m) !== 'stopped').map(m => m.missionId))","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
   ["src/runtime.ts",39,"Set","const leftover = options.cancelUnschedulable ? new Set(this.unschedulable(mission, tasks, this.store.list('members', mission.id)).map(task => task.id)) : new Set<string>()","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
   ["src/runtime.ts",40,"Set","const dead = new Set(tasks.filter(task => task.status === 'cancelled' || leftover.has(task.id)).map(task => task.id))","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
+  ["src/runtime.ts",41,"Map","readonly fingerprintCache = new Map<string, { revision: number; fingerprint: string }>()","gate","cache-only","keyed by the global store revision; the digest is pure over durable state and is bypassed inside a transaction"],
   ["src/scheduling.ts",1,"Map","readonly passes = new Map<string, SchedulingPass>()","gate","in-flight","the scheduling body queued or running on a mission's serial queue, removed only when that body settles; every await in the body is bounded and the tick watchdog names a body past its bound, and losing the record can only queue a second body that the mission queue refuses while the first is in flight (probe below)"],
   ["src/scheduling.ts",2,"Set","const dead = new Set(tasks.filter(task => task.status === 'blocked' && !this.quiescencePending(task)).map(task => task.id))","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
   ["src/scheduling.ts",3,"Set","const covers = (task: Task, sourceId: string, seen = new Set<string>()): boolean => {","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
@@ -220,6 +218,7 @@ const CENSUS = [
   ["src/store.ts",2,"Set","this.transactionScopes = new Set()","transient","","created and destroyed inside one store transaction; the revision-bump decision it feeds is re-derived on every call"],
   ["src/store.ts",3,"Set","let liveOwners = new Set<string>()","local","","R17-G7 function-local: the live-attempt owner ids for the member rows being hydrated, created and discarded inside one synchronous read, so it cannot gate a later call"],
   ["src/store.ts",4,"Set","return new Set(rows.map(row => String(row.owner_id)))","local","","R17-G7 function-local: the owner ids of the running attempts in one mission, read from the durable tasks table and discarded inside the same synchronous hydration, so it cannot gate a later call"],
+  ["src/task-graph.ts",17,"Set","export const TERMINAL_STATES: ReadonlySet<string> = new Set(['accepted', 'cancelled'])","constant","","module-level immutable lookup table, never mutated after construction: data, not a gate"],
   ["src/trace.ts",1,"Set","const reclaimed = new Set<string>()","local","","function-local: created and discarded inside one sweep call, so it cannot gate a later call; the selection it drives is re-derived from the files' mtimes and the declared bound on every later sweep"],
   ["src/trace.ts",2,"WeakMap","const hostTelemetryLinks = new WeakMap<object, HostTelemetryLink>()","outside","","outside the runtime decision path: where a runtime's span recorder and its host-sink binding meet (whichever binds first creates the one link); the link carries the attached sink and the best-effort failure count, so losing it can cost reporting records and that count, never a durable row or a mission decision"],
   ["src/trace.ts",3,"Map","private readonly indexes = new Map<string, SpanIndex>()","outside","","outside the runtime decision path: the trace read model (TraceIndex): an owner-UI projection cache no runtime decision reads (enumerated, no label claimed)"],
@@ -310,7 +309,7 @@ const RECOVERY_COLLECTIONS = {
     reason: 'Task.resumeAfterStop carries the fenced epoch and old owner; this map only coalesces attempts and delays retries.' },
   'src/runtime.ts:workerStarts': { kind: 'Map', label: 'lifecycle', proof: 'tests/r12-native-start-fixes.test.mjs',
     behavior: 'cancelled unpublished setup fences', reason: 'One cancellable native-start operation per member; durable member/mission checks fence late settlement, and adapter disposal owns handles.' },
-  'src/refusals.ts:writerRecoveries': { kind: 'WeakMap', label: 'pending-audit', proof: 'tests/r12-protocol-fixes.test.mjs',
+  'src/refusals.ts:writerRecoveries': { kind: 'Map', label: 'pending-audit', proof: 'tests/r12-protocol-fixes.test.mjs',
     behavior: 'writer recovery retains distinct refusals',
     reason: 'Coalesced admission/guard persistence failures; never grants or blocks task authority. Until SQLite accepts a write this audit buffer is process-local.' },
 }
@@ -508,12 +507,12 @@ const GATE_TESTS = {
       assert.ok(cursor.eventSeq <= durableEvents.at(-1).seq, 'a cursor can never exceed the durable log, so presence cannot hide an event')
     } finally { await f.cleanup() }
   },
-  'src/gates.ts:1': async t => {
+  'src/runtime.ts:41': async t => {
     const f = await setup()
     try {
       const before = f.runtime.fingerprint(f.mission.id)
-      assert.ok(f.runtime.gates.fingerprintCache.size > 0, 'the loss must be exercised on a non-empty collection')
-      f.runtime.gates.fingerprintCache.clear()   // the loss
+      assert.ok(f.runtime.fingerprintCache.size > 0, 'the loss must be exercised on a non-empty collection')
+      f.runtime.fingerprintCache.clear()   // the loss
       assert.equal(f.runtime.fingerprint(f.mission.id), before, 'the digest is recomputed from durable state and is identical')
       let inside
       const task = f.propose({ title: 'Board change' })

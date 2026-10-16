@@ -3,7 +3,7 @@
  *
  * The kernel obligation is structural: every guard chain ends in an escalation
  * that has no conditions of its own, so a dead end is impossible. In production
- * that terminal element is `emitGuardTerminal` (src/refusals.ts), which every
+ * that terminal element is `Notices.emitGuardTerminal` (src/notices.ts), which every
  * chain calls directly with `guardTerminal`'s coded request. This module is the
  * vocabulary the property test and the dead-end census use to CHECK that claim
  * over a generated board space: `guardDispatchActions` and `guardProgressActions`
@@ -26,6 +26,8 @@
 import { guardTerminal } from '../lib/refusals.js'
 import { taskCeilingExhaustion } from '../lib/admission.js'
 import { authorIdsOf } from '../lib/assignment.js'
+import { reviewable } from '../lib/board.js'
+import { taskGraphIndex } from '../lib/task-graph.js'
 
 /**
  * The durable board as the guard-chain model sees it. Every field is derived
@@ -34,6 +36,8 @@ import { authorIdsOf } from '../lib/assignment.js'
 export function guardBoard(runtime, missionId, mission) {
   const row = mission ?? runtime.store.get('missions', missionId)
   const tasks = runtime.store.list('tasks', missionId)
+  // The rows the board predicates below read; no mission row is needed.
+  const board = { tasks, members: runtime.store.list('members', missionId), graph: taskGraphIndex(tasks) }
   const now = Date.now()
   const revoked = runtime.store.events(missionId, 1000).some(event => event.type === 'mission/workspace-revoked')
   return {
@@ -46,7 +50,7 @@ export function guardBoard(runtime, missionId, mission) {
       const exhaustion = taskCeilingExhaustion(task)
       const source = task.reviewOf === undefined ? undefined : runtime.task(missionId, task.reviewOf)
       const reviewSourceLive = task.reviewOf === undefined
-        ? (task.status === 'submitted' ? runtime.reviewable(task, tasks) : undefined)
+        ? (task.status === 'submitted' ? reviewable(board, task) : undefined)
         // A review whose named source is missing can never be dispatched: the
         // scheduler's `capable` reads the source row, so a dangling review is
         // reported as no live source rather than omitted.
@@ -55,8 +59,8 @@ export function guardBoard(runtime, missionId, mission) {
         id: task.id, status: task.status,
         ...(task.attempt === undefined ? {} : { attempt: { leaseLive: task.attempt.leaseUntil >= now } }),
         ...(exhaustion === undefined ? {} : { ceilingExhausted: true }),
-        dependenciesSatisfied: task.dependencies.every(dependency => runtime.dependencySatisfied(missionId, dependency, tasks)),
-        dependenciesDead: task.dependencies.some(dependency => runtime.effectiveDependency(missionId, dependency, tasks).status === 'cancelled'),
+        dependenciesSatisfied: task.dependencies.every(dependency => board.graph.dependencyMetOf(dependency)),
+        dependenciesDead: task.dependencies.some(dependency => board.graph.effectiveOf(dependency).status === 'cancelled'),
         ...(task.reviewOf === undefined ? {} : { reviewOf: task.reviewOf }),
         // S4r-D4: `reviewSourceLive` is the SAME predicate the scheduler uses. A
         // review task is live exactly while its source is submitted (`capable`);

@@ -1137,6 +1137,16 @@ export interface RuntimeConfig {
    */
   stallPassTimeoutMs?: number
   /**
+   * R16-D: the further window a pass past `stallPassTimeoutMs` stays live
+   * (unnamed) while the mission has live work. Defaults to the pass bound
+   * itself; `0` names it at the first bound.
+   */
+  stallPassLiveGraceMs?: number
+  /** R16-D: the bound on a live attempt that records nothing durable before it is escalated by name; `0` disables it. */
+  attemptSilenceBoundMs?: number
+  /** F1: the bound on one in-flight operation that records nothing before it stops counting as liveness; `0` disables it. */
+  operationBoundMs?: number
+  /**
    * The human-authorized roots, loaded once from plugin configuration at
    * start (`loadWorkspaceGrants`; no configured root loads an empty snapshot,
    * which authorizes only the calling session's own directory): the one

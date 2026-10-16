@@ -6,6 +6,7 @@ import { join } from 'node:path'
 import { canBorrowTask } from '../lib/assignment.js'
 import { taskGraphIndex } from '../lib/task-graph.js'
 import { FakeWorkers, SwarmRuntime, eventually, makeRuntime } from './faults/harness.mjs'
+import { openAsks } from '../lib/arena.js'
 
 class Workers extends FakeWorkers {
   checks = [{ command: 'npm test', exitCode: 0, output: 'ok' }]
@@ -21,7 +22,7 @@ async function fixture(t, extra = {}) {
     budget: { maxTokens: 100000, maxSteps: 1000, maxWorkers: 4, maxDurationMs: 3600000, maxTasks: 100 } })
   const nativeKick = runtime.kick.bind(runtime)
   runtime.kick = () => {}
-  runtime.pumpOutbox = () => {}
+  runtime.notices.pumpOutbox = () => {}
   runtimes.push(runtime)
   const owner = { sessionId: 'identity-owner' }
   const mission = runtime.create(owner, { title: 'Orchestration identities', objective: 'Complete independently verified work', workspace: root, scope: ['src/'], acceptance: ['done'], budget }, { grantRoot: root, source: 'session' })
@@ -44,7 +45,7 @@ async function fixture(t, extra = {}) {
   const restart = async () => {
     await runtimes.at(-1).dispose()
     const restored = new SwarmRuntime(config, new Workers())
-    restored.kick = () => {}; restored.pumpOutbox = () => {}
+    restored.kick = () => {}; restored.notices.pumpOutbox = () => {}
     runtimes.push(restored)
     await restored.start()
     return restored
@@ -71,8 +72,8 @@ test('C04: an ancestor fork cannot displace an accepted repair or change a runni
   const tasksBefore = f.runtime.store.list('tasks', f.mission.id).length
   assert.throws(() => f.propose('Competing ancestor repair', { replaces: [original.id] }), error => /already replaced/.test(error.message) && error.message.includes(current.id))
   assert.equal(f.runtime.store.list('tasks', f.mission.id).length, tasksBefore)
-  assert.equal(f.runtime.effectiveDependency(f.mission.id, original.id).id, current.id)
-  assert.equal(f.runtime.dependencySatisfied(f.mission.id, original.id), true)
+  assert.equal(f.runtime.boardOf(f.mission.id).graph.effectiveOf(original.id).id, current.id)
+  assert.equal(f.runtime.boardOf(f.mission.id).graph.dependencyMetOf(original.id), true)
   assert.equal(f.runtime.task(f.mission.id, integration.id).attempt.id, running.attempt.id)
   assert.equal(f.workers.callbacks.guard(f.integrator.id, 'write_file'), undefined)
 })
@@ -81,7 +82,7 @@ test('C04: a pending descendant also prevents an ancestor from admitting a compe
   const f = await fixture(t)
   const { original, current } = await replacementChain(f)
   assert.throws(() => f.propose('Competing repair', { replaces: [original.id] }), error => /already replaced/.test(error.message) && error.message.includes(current.id))
-  assert.equal(f.runtime.effectiveDependency(f.mission.id, original.id).id, current.id)
+  assert.equal(f.runtime.boardOf(f.mission.id).graph.effectiveOf(original.id).id, current.id)
 })
 
 test('C04: legacy forks keep an accepted descendant visible and refuse ambiguous accepted branches', () => {
@@ -145,7 +146,7 @@ for (const paused of [false, true]) test(`C06: a ${paused ? 'paused' : 'live'} o
   const f = await fixture(t)
   f.runtime.message(f.actor(f.author), f.mission.id, { to: 'owner', kind: 'question', content: 'Which result should I produce?' })
   await f.runtime.flushOutbox(f.mission.id)
-  const question = f.runtime.openAsks(f.mission.id, 'owner')[0]
+  const question = openAsks(f.runtime.store.list('deliveries', f.mission.id), 'owner')[0]
   if (paused) f.runtime.control(f.owner, f.mission.id, 'pause', 'Pause while considering the answer')
   const before = f.runtime.store.list('deliveries', f.mission.id)
   assert.throws(() => f.runtime.message(f.owner, f.mission.id, { to: f.reviewer.id, kind: 'question', content: 'Wrong destination', replyTo: question.id }), error => error.code === 'reply_recipient_mismatch')
@@ -161,7 +162,7 @@ for (const paused of [false, true]) test(`C06: a ${paused ? 'paused' : 'live'} o
 test('C06: member replies use the same recipient check; dismiss still closes without sending', async t => {
   const f = await fixture(t)
   f.runtime.message(f.actor(f.author), f.mission.id, { to: f.reviewer.id, kind: 'question', content: 'Can you clarify the acceptance?' })
-  const question = f.runtime.openAsks(f.mission.id, f.reviewer.id)[0]
+  const question = openAsks(f.runtime.store.list('deliveries', f.mission.id), f.reviewer.id)[0]
   assert.throws(() => f.runtime.message(f.actor(f.reviewer), f.mission.id, { to: 'owner', kind: 'question', content: 'Misrouted answer', replyTo: question.id }), error => error.code === 'reply_recipient_mismatch')
   assert.equal(f.runtime.store.get('deliveries', question.id).state, 'open')
   const result = f.runtime.message(f.actor(f.reviewer), f.mission.id, { to: 'owner', kind: 'question', content: 'This question is no longer needed', replyTo: question.id, dismiss: true })
@@ -184,7 +185,7 @@ test('dependency amendments report full replacement and cancellation names the s
   assert.deepEqual(withdrawn.strandedDependents, [integration.id])
   assert.equal(f.runtime.task(f.mission.id, integration.id).status, 'pending')
   const repair = f.propose('Corrected input', { replaces: [second.id] })
-  assert.equal(f.runtime.effectiveDependency(f.mission.id, second.id).id, repair.id)
+  assert.equal(f.runtime.boardOf(f.mission.id).graph.effectiveOf(second.id).id, repair.id)
   assert.deepEqual(f.runtime.task(f.mission.id, integration.id).dependencies, [second.id], 'replacement reuses the dependent instead of duplicating delivery work')
 })
 

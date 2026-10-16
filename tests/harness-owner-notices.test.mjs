@@ -22,6 +22,7 @@ import { runProcess } from '../lib/workspaces.js'
 import { subprocessSeam, SubprocessLocal } from './subprocess-seam.mjs'
 import { tempDirectory } from './temp-root.mjs'
 import { budget } from './faults/harness.mjs'
+import { openAsks } from '../lib/arena.js'
 
 const deferred = () => { let resolve; const promise = new Promise(done => { resolve = done }); return { promise, resolve } }
 const text = value => ({ kind: 'text', text: value })
@@ -61,7 +62,7 @@ async function fixture(t, respond = () => text('Done'), configure, profile = {})
   const handle = await ctx.agents.create({ sessionId: SessionId('owner-session'), meta: { cwd: source }, agentOptions: { provider: 'swarm-test', model: 'scripted' } })
   await ctx.plugin(Swarm, { statePath: path.join(root, 'state.sqlite'), workspacesRoot: path.join(root, 'worktrees'), tickMs: 60000, leaseMs: 60000, maxEvents: 500, maxAttempts: 100, maxMessageChars: 10000, ...profile })
   const rt = ctx.swarm
-  rt.kick = () => {}; rt.pumpOutbox = () => {}
+  rt.kick = () => {}; rt.notices.pumpOutbox = () => {}
   const owner = { sessionId: 'owner-session' }
   // The owner session's own cwd, authorized as the session workspace every production caller records.
   const mission = rt.create(owner, { title: 'Native owner notices', objective: 'Preserve correct owner work', workspace: source, scope: ['**'], acceptance: ['correct'], budget: { ...budget, maxTokens: 100000, maxSteps: 1000, maxWorkers: 4, maxDurationMs: 3600000, maxTasks: 100 } }, { grantRoot: source, source: 'session' })
@@ -99,7 +100,7 @@ test('full plugin books first consumed question before the transport flush ackno
   })
   f.rt.message({ sessionId: member.sessionId }, f.mission.id, { to: 'owner', kind: 'question', content: 'Which API?' })
   await f.rt.flushOutbox(f.mission.id); await f.agent.whenIdle()
-  const question = f.rt.openAsks(f.mission.id, 'owner')[0]
+  const question = openAsks(f.rt.store.list('deliveries', f.mission.id), 'owner')[0]
   assert.ok(question?.consumedAt)
   assert.equal(ackAtConsumption, undefined, 'fixture reaches consumption before flush ack')
   assert.equal(question.state, 'open')
@@ -169,7 +170,7 @@ test('a wedged pass\'s naming handed to a busy owner is read once the body has s
   const rt = f.rt, mid = f.mission.id, scheduling = rt.scheduling
   /** A scheduling body past its bound, as the tick watchdog finds and names it. */
   const wedge = operationId => {
-    const pass = { id: scheduling.passKey(mid), operationId, missionId: mid, startedAt: rt.now() - rt.stallPassTimeoutMs - 1, revisionBefore: rt.store.revision(), fingerprintBefore: rt.fingerprint(mid) }
+    const pass = { id: scheduling.passKey(mid), operationId, missionId: mid, startedAt: rt.now() - rt.bounds.stallPassTimeoutMs - 1, revisionBefore: rt.store.revision(), fingerprintBefore: rt.fingerprint(mid) }
     scheduling.passes.set(mid, pass)
     t.after(() => scheduling.closePass(mid, pass))
     scheduling.checkSchedulingPasses()

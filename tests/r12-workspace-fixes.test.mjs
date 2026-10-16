@@ -12,11 +12,13 @@ import { FakeWorkers, makeRuntimeStub, workspaceOptions } from './faults/harness
 const sourceMode = process.env.SWARM_TEST_SOURCE === '1'
 const moduleOf = name => import(new URL(`../${sourceMode ? 'src' : 'lib'}/${name}.${sourceMode ? 'ts' : 'js'}`, import.meta.url))
 const { Scheduling } = await moduleOf('scheduling')
-const { Notices } = await moduleOf('notices')
+const { Notices, dispatchQuestion } = await moduleOf('notices')
+const { reviewNeed } = await moduleOf('board')
+const { taskGraphIndex } = await moduleOf('task-graph')
+const { RefusalRegistry } = await moduleOf('refusals')
 const { Workspaces, runProcess } = await moduleOf('workspaces')
 const { WorkspaceAdmission, isolationIssues } = await moduleOf('workspace-admission')
 const { SwarmStore } = await moduleOf('store')
-const { SwarmRuntime } = await moduleOf('runtime')
 const { captureGitSnapshot } = await moduleOf('git-snapshot')
 const git = (cwd, args, env) => execFileSync('git', ['-c', 'user.name=R12 Test', '-c', 'user.email=r12@example.invalid', ...args], {
   cwd, env: { ...process.env, ...env }, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 30000,
@@ -46,10 +48,11 @@ test('M2-1: a repeated pass-timeout naming is recorded once, through the ledger'
   // The stub store writes only ledger rows: a naming that wrote the mission row would throw.
   const rt = makeRuntimeStub({ store: { get: () => structuredClone(mission), list: table => table === 'deliveries' ? deliveries : [], event: (_m, _t, _a, data) => records.push(data), revision: () => 0,
     put: (table, row) => { assert.equal(table, 'deliveries'); deliveries.push(row) } },
-    stallPassTimeoutMs: 1000, fingerprint: () => 'same', commit: (_id, fn) => fn(), expectWedgedRelease() {}, pumpOutbox() {}, passSettled() {} })
-  // The runtime's own telling, over this store.
-  const notices = new Notices(rt)
-  rt.tell = notices.tell.bind(notices)
+    bounds: { stallPassTimeoutMs: 1000 }, fingerprint: () => 'same', commit: (_id, fn) => fn(),
+    boardOf: missionId => ({ missionId, mission, tasks: [], members: [], graph: taskGraphIndex([]) }) })
+  // The runtime's own telling, over this store; the publication is outside this test.
+  const notices = new Notices(rt, new RefusalRegistry(rt))
+  rt.notices = { tell: notices.tell.bind(notices), expectWedgedRelease() {}, transition() {} }
   const scheduling = new Scheduling(rt)
   // Two bodies wedge in turn on one naming fact. The first naming's row is the
   // record: the second body is marked named and writes neither row nor event.
@@ -75,47 +78,48 @@ test('M2-2: submission grace survives newer unrelated events without aging a new
     store.transaction(() => store.event('mission', 'task/submitted', 'runtime', { taskId: 'old' }))
   } finally { Date.now = clock }
   store.transaction(() => { for (let index = 0; index < 5; index++) store.event('mission', 'message/sent', 'runtime', { index }) })
-  const rt = makeRuntimeStub({ store, config: { tickMs: 100, maxEvents: 1 } })
-  // The runtime's own review-need derivation, over this store: its grace is the one every reader of a need asks.
-  const reviewNeed = SwarmRuntime.prototype.reviewNeed.bind(rt)
+  // The board's own review-need derivation, over this store's log: its grace is the one every reader of a need asks.
+  const board = { tasks: [], records: store, clock: Date.now, bounds: { tickMs: 100 } }
   const submitted = id => ({ id, missionId: 'mission', epoch: 0, evidenceIds: [] })
-  assert.equal(reviewNeed(submitted('old')).ripe, true)
+  assert.equal(reviewNeed(board, submitted('old')).ripe, true)
   store.transaction(() => store.event('mission', 'task/submitted', 'runtime', { taskId: 'new' }))
-  assert.equal(reviewNeed(submitted('new')).ripe, false)
+  assert.equal(reviewNeed(board, submitted('new')).ripe, false)
 })
 
 test('M2-3: the dispatch question is asked on its own condition, beside the isolation invariant\'s refusal, about each undispatched task not yet asked about at its epoch, without inventing budget refusals', () => {
   // The question is a predicate of the board, the handles and the ledger's own rows.
   const deliveries = []
-  const rt = makeRuntimeStub({ workers: new FakeWorkers({ autoIdle: true }), store: { list: table => table === 'deliveries' ? deliveries : [] } })
-  const scheduling = new Scheduling(rt); scheduling.ready = () => true
+  const workers = new FakeWorkers({ autoIdle: true })
+  const board = (tasks, members) => ({ missionId: 'm', tasks, members, graph: taskGraphIndex(tasks), view: { startable: id => workers.isIdle(id) }, records: { list: table => table === 'deliveries' ? deliveries : [] }, clock: Date.now })
   const asked = dedupKey => deliveries.push({ to: 'owner', from: 'runtime', notice: { class: 'decision', dedupKey } })
   const member = { id: 'one', name: 'One', phase: 'ready', status: 'idle', workspace: '/one' }
-  const independent = { id: 't', title: 'Work', epoch: 0, objective: 'Write a new file from the baseline.', acceptance: [], dependencies: [], scope: ['**'] }
+  // Pending, unassigned and free of prerequisites: ready for the member by the dispatcher's own predicate.
+  const independent = { id: 't', missionId: 'm', title: 'Work', status: 'pending', epoch: 0, objective: 'Write a new file from the baseline.', acceptance: [], dependencies: [], scope: ['**'] }
   const later = { ...independent, id: 'later', title: 'Later work' }
   // The isolation invariant refuses the only startable member (it has no provisioned worktree): its request is not this question's answer.
   const refused = [{ ...member, workspace: '' }]
-  const question = scheduling.dispatchQuestion('m', [independent, later], refused, [independent, later])
+  const question = dispatchQuestion(board([independent, later], refused), [independent, later])
   assert.deepEqual([question.task.id, question.dedupKey], ['t', 'dispatch-question:m:t@0'])
   assert.match(question.message, /idle handle alone does not identify the dispatch blocker/)
   // Once the ledger holds it, the next pass asks about the later work, then about nothing; a new epoch is asked about again.
   asked(question.dedupKey)
-  assert.equal(scheduling.dispatchQuestion('m', [independent, later], refused, [independent, later]).dedupKey, 'dispatch-question:m:later@0')
+  assert.equal(dispatchQuestion(board([independent, later], refused), [independent, later]).dedupKey, 'dispatch-question:m:later@0')
   asked('dispatch-question:m:later@0')
-  assert.equal(scheduling.dispatchQuestion('m', [independent, later], refused, [independent, later]), undefined)
-  assert.equal(scheduling.dispatchQuestion('m', [{ ...independent, epoch: 1 }], refused, [{ ...independent, epoch: 1 }]).dedupKey, 'dispatch-question:m:t@1')
+  assert.equal(dispatchQuestion(board([independent, later], refused), [independent, later]), undefined)
+  assert.equal(dispatchQuestion(board([{ ...independent, epoch: 1 }], refused), [{ ...independent, epoch: 1 }]).dedupKey, 'dispatch-question:m:t@1')
 })
 
 test('stop recovery owns its member until quiescence, including before native startup', async () => {
   const member = { id: 'old-owner', name: 'Old owner', phase: 'active', status: 'idle', workspace: '/owned' }
   const stopping = { id: 'old-task', status: 'blocked', epoch: 3, resumeAfterStop: { epoch: 3, memberId: member.id } }
-  const ready = { id: 'new-task', title: 'New task', epoch: 0, status: 'pending', dependencies: [], acceptance: [], scope: ['**'], objective: 'New work' }
+  const ready = { id: 'new-task', missionId: 'm', title: 'New task', epoch: 0, status: 'pending', dependencies: [], acceptance: [], scope: ['**'], objective: 'New work' }
   let starts = 0
-  const rt = makeRuntimeStub({ store: { list: () => [stopping, ready] }, interpretation: () => ({ members: [member], tasks: [stopping, ready] }), mission: () => ({ status: 'active' }), startWorker: async () => { starts++ }, workers: new FakeWorkers({ autoIdle: true }) })
-  const scheduling = new Scheduling(rt); scheduling.ready = () => true
+  const rt = makeRuntimeStub({ store: { list: () => [stopping, ready] }, notices: { interpretation: () => ({ members: [member], tasks: [stopping, ready] }) }, mission: () => ({ status: 'active' }), startWorker: async () => { starts++ }, workers: new FakeWorkers({ autoIdle: true }) })
+  const scheduling = new Scheduling(rt)
   assert.equal(await scheduling.dispatch({ status: 'active' }, 'm'), true)
   assert.equal(starts, 0)
-  assert.equal(scheduling.dispatchQuestion('m', [stopping, ready], [member], [ready]), undefined)
+  const board = { missionId: 'm', tasks: [stopping, ready], members: [member], graph: taskGraphIndex([stopping, ready]), view: { startable: () => true }, records: { list: () => [] }, clock: Date.now }
+  assert.equal(dispatchQuestion(board, [ready]), undefined)
 })
 
 test('M2-4: a pruned source artifact is fetched from the mission repo before dependency preparation', async t => {
@@ -271,11 +275,11 @@ test('M2-10: inline # remains word data, while actual shell comments remain igno
 
 test('M2-11: isolation uses explicit member IDs including task workspace conflicts', () => {
   const members = [{ id: 'bad', name: 'victim', workspace: '', status: 'idle' }, { id: 'victim', name: 'Safe', workspace: '/safe', status: 'idle' }]
-  const admission = new WorkspaceAdmission(makeRuntimeStub({ store: { list: table => table === 'members' ? members : [], get: () => undefined }, scopesOverlap: () => false, noticeSubjectsFor: () => [] }))
+  const admission = new WorkspaceAdmission(makeRuntimeStub({ store: { list: table => table === 'members' ? members : [], get: () => undefined }, boardOf: missionId => ({ missionId, tasks: [] }), notices: { emitGuardTerminal() {} } }))
   assert.equal(admission.isolationAllows('m', members[1]), true)
   assert.equal(admission.isolationAllows('m', members[0]), false)
   const tasks = ['a', 'b'].map(id => ({ id, status: 'running', scope: ['**'], attempt: { ownerId: 'victim' } }))
-  const issues = isolationIssues(members, tasks, () => true)
+  const issues = isolationIssues(members, tasks)
   assert.ok(issues.some(issue => issue.memberIds.includes('victim') && issue.message.includes('concurrently running tasks')))
 })
 

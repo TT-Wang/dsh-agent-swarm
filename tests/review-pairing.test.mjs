@@ -17,6 +17,7 @@ import { registerTools } from '../lib/tools.js'
 import { DraftEditor, removeTask } from '../lib/types/client/DraftEditor.js'
 import { completionBlocker } from '../lib/types/client/projection.js'
 import { FakeClock, FakeWorkers, makeRuntime, makeRuntimeStub, taskOf } from './faults/harness.mjs'
+import { completionError, reviewable } from '../lib/board.js'
 
 class PairingWorkers extends FakeWorkers {
   checks = [{ command: 'node check.cjs', exitCode: 0, output: 'ok' }]
@@ -195,7 +196,7 @@ test('the added review of an optional experiment inherits its exemption: a rejec
   assert.equal(task('exp-review').status, 'blocked', 'the rejecting review is the experiment\'s verdict record')
   assert.equal(task('exp-review').experiment, false, 'the host-added review is not itself an experiment')
   await deliver('impl', 'accept')
-  assert.equal(runtime.completionError(runtime.mission(missionId)), undefined, 'neither the rejected experiment nor its review holds completion open')
+  assert.equal(completionError(runtime.boardOf(missionId)), undefined, 'neither the rejected experiment nor its review holds completion open')
   assert.equal(completionBlocker({ ...runtime.snapshot(owner, missionId), completion: undefined }), undefined, 'the client\'s legacy completion rule agrees')
 })
 
@@ -312,7 +313,7 @@ test('a host-added review no live member may own is no review path: the owner is
       for (let tick = 0; tick < 6; tick++) { clock.advance(1_500); await runtime.tick(); await runtime.settle(missionId) }
       const tasks = runtime.store.list('tasks', missionId)
       assert.equal(reviewsOf(tasks, source).filter(review => review.status === 'pending').length, 1, 'the host-added review is still pending')
-      assert.equal(runtime.reviewable(taskOf(runtime, source.id), tasks), false, 'a review nobody live may own is not a review path')
+      assert.equal(reviewable(runtime.boardOf(missionId), taskOf(runtime, source.id)), false, 'a review nobody live may own is not a review path')
       const delivered = workers.deliveries.filter(delivery => delivery.memberId === 'owner').map(delivery => delivery.content)
       assert.ok(delivered.some(content => content.startsWith('[review_path_missing]') && content.includes(source.id) && content.includes('add an independent member')),
         `the owner receives the actionable review-path decision: ${JSON.stringify(delivered)}`)

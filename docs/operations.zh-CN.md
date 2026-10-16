@@ -196,6 +196,7 @@ npm run verify
 | `npm test` | 构建和完整行为测试。 |
 | `npm run test:faults` | 故障注入；每个场景须证明故障实际发生。 |
 | `npm run test:replay` | 基于持久日志的确定性回放。 |
+| `npm run test:oracle` | 全日志 oracle：回放场景和时钟化的故障场景必须留下已记录的事件、行和适配器调用轨迹（`scripts/replay/oracle/`）。 |
 | `npm run test:load` | 负载下的准入和调度。 |
 | `npm run test:isolation` | 仅宿主执行的沙箱和工作区隔离检查。 |
 | `npm run test:harness` | 真实 Harness Loader 组合。 |

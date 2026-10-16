@@ -1,21 +1,23 @@
 /**
- * Gates and caches: the mission fingerprint and its revision-keyed cache, the
- * owner/board instruments, and the usage accounting that gates a budget stop.
- * M1a seam 2/7.
+ * Gates: the owner/board instruments and the usage accounting that gates a
+ * budget stop. M1a seam 2/7. F(S), the fingerprint the instruments show, is a
+ * function of the board (`fingerprintBoard`, src/board.ts) the kernel caches
+ * (`Kernel.fingerprint`).
  *
  * Behaviour-identical to the code moved from src/runtime.ts; the runtime keeps
  * thin forwarding methods and re-exports the symbols its public surface had.
  */
-import { randomUUID, createHash } from 'node:crypto'
-import { arenaView as projectArenaView, hasNotice } from './arena.ts'
-import { currentEvidenceIds } from './attempts.ts'
+import { createHash } from 'node:crypto'
+import { id } from './store.ts'
+import { arenaView as projectArenaView, hasNotice, openAsks } from './arena.ts'
+import { TERMINAL_STATES, currentEvidenceIds, subjectsOfTasks, terminal } from './task-graph.ts'
 import { excerpt } from './declared-checks.ts'
 import { executionElapsed } from './resource-time.ts'
 import { memberPhaseOf } from './projection.ts'
-import { emitGuardTerminal } from './refusals.ts'
-import { noticeFamily, noticeIdentity, subjectsOfTasks } from './notices.ts'
+import { dispatchable } from './board.ts'
+import { noticeFamily, noticeIdentity } from './notices.ts'
 import type { SwarmRuntime } from './runtime.ts'
-import type { Delivery, Member, Mission, Post, Task, UsageBuckets, UsageSnapshotSource } from './types.ts'
+import type { Delivery, Mission, Post, Task, UsageBuckets, UsageSnapshotSource } from './types.ts'
 
 const USAGE_KEYS = ['uncachedInputTokens', 'cacheReadTokens', 'cacheWriteTokens', 'outputTokens', 'reasoningTokens', 'requests'] as const
 
@@ -36,59 +38,6 @@ function usageDelta(next: UsageBuckets, previous: UsageBuckets | undefined): Usa
 
 function validUsage(value: unknown): value is UsageBuckets {
   return value !== null && typeof value === 'object' && USAGE_KEYS.every(key => Number.isSafeInteger((value as Record<string, unknown>)[key]) && Number((value as Record<string, unknown>)[key]) >= 0)
-}
-
-/** The owner-observable board slice `missionFingerprint` digests (spec §4). */
-export interface MissionFingerprintBoard {
-  status: Mission['status']
-  tasks: readonly MissionFingerprintTask[]
-  members: ReadonlyArray<{ id: string; status: Member['status'] }>
-  /** Undelivered worker outbox rows whose recipient can no longer receive them. */
-  pendingDeliveries: number
-  challengedEvidence: number
-  /** Ceilings already hit: the budget pause id and each task's exhausted dimension. */
-  ceilings: readonly string[]
-}
-
-/**
- * One task's owner-observable slice of the no-silent-state board. `ready` and
- * `unreviewed` are derived by the runtime from durable state (`ready()` and the
- * live review path); they are never supplied by a caller's claim.
- */
-interface MissionFingerprintTask {
-  id: string
-  status: Task['status']
-  /** The attempt owner only; a planned assignee is not an observed owner. */
-  attemptOwner?: string
-  /** A pending task at least one idle or waiting member can run right now. */
-  ready: boolean
-  /** A submitted task no live independent review can accept. */
-  unreviewed: boolean
-}
-
-/**
- * Stable digest `F(S)` of the owner-observable board (docs/no-silent-state-spec.md
- * §4). Every field is durable state; wall-clock fields are excluded by
- * construction, so an idle tick never changes the fingerprint. It is an owner
- * instrument and an audit field, never a notice's identity. Pure so a test can
- * recompute it from the board.
- */
-export function missionFingerprint(board: MissionFingerprintBoard): string {
-  const order = (a: { id: string }, b: { id: string }) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0)
-  const tasks = [...board.tasks].sort(order).map(task => [task.id, task.status, task.attemptOwner ?? null, task.ready ? 1 : 0, task.unreviewed ? 1 : 0])
-  const members = [...board.members].sort(order).map(member => [member.id, member.status])
-  const canonical = JSON.stringify({
-    status: board.status,
-    tasks,
-    ready: board.tasks.filter(task => task.ready).length,
-    notReady: board.tasks.filter(task => task.status === 'pending' && !task.ready).length,
-    unreviewed: board.tasks.filter(task => task.unreviewed).length,
-    members,
-    pendingDeliveries: board.pendingDeliveries,
-    challengedEvidence: board.challengedEvidence,
-    ceilings: [...board.ceilings].sort(),
-  })
-  return createHash('sha256').update(canonical).digest('hex').slice(0, 32)
 }
 
 /** Observe shows only the newest few new posts; the board tool pages the rest. */
@@ -122,59 +71,8 @@ export function postView(post: Post, now: number, full = false): Record<string, 
 /** A board page shows a bounded body excerpt; the full body is read by postId. */
 const BOARD_BODY_EXCERPT = 600
 
-const id = (prefix: string) => `${prefix}_${randomUUID()}`
-
 export class RuntimeGates {
-  /** F(S) cache keyed by the store revision: the digest is pure over durable state. */
-  readonly fingerprintCache = new Map<string, { revision: number; fingerprint: string }>()
-
   constructor(private readonly rt: SwarmRuntime) {}
-
-  /** Current `F(S)`: the board digest the owner instruments and the audit fields of the stall events carry. */
-  fingerprint(missionId: string): string {
-    // Cache per store revision: F(S) is pure over durable state, so a tick that
-    // changed nothing cannot change it. Never trust the cache inside an open
-    // transaction: the revision has not advanced yet while the board is mutating.
-    if (this.rt.commitDepth > 0) return missionFingerprint(this.fingerprintBoard(missionId))
-    const revision = this.rt.store.revision()
-    const cached = this.fingerprintCache.get(missionId)
-    if (cached !== undefined && cached.revision === revision) return cached.fingerprint
-    const fingerprint = missionFingerprint(this.fingerprintBoard(missionId))
-    this.fingerprintCache.set(missionId, { revision, fingerprint })
-    return fingerprint
-  }
-
-  /**
-   * The owner-observable fingerprint board built from durable state only. The
-   * readiness/review counts come from the same predicates the scheduler and the
-   * completion check use, so the digest cannot disagree with the board.
-   */
-  fingerprintBoard(missionId: string): MissionFingerprintBoard {
-    const mission = this.rt.mission(missionId)
-    const tasks = this.rt.store.list('tasks', missionId)
-    const members = this.rt.store.list('members', missionId)
-    const ready = new Set(this.rt.dispatchable(tasks, members).map(task => task.id))
-    const unreviewed = new Set(tasks.filter(task => task.status === 'submitted' && !this.rt.reviewable(task, tasks)).map(task => task.id))
-    return {
-      status: mission.status,
-      tasks: tasks.map(task => ({ id: task.id, status: task.status,
-        ...(task.attempt?.ownerId === undefined ? {} : { attemptOwner: task.attempt.ownerId }),
-        ready: ready.has(task.id), unreviewed: unreviewed.has(task.id) })),
-      members: members.map(member => ({ id: member.id, status: member.status })),
-      // Owner-observable outbox backlog only: a delivery to a live member is the
-      // wake channel and is flushed in the same scheduling pass, and an owner
-      // notice is the ledger's record of a fact told about this board, not
-      // board state, so telling one never moves the digest.
-      pendingDeliveries: this.rt.store.list('deliveries', missionId).filter(delivery => delivery.deliveredAt === undefined
-        && delivery.to !== 'owner'
-        && !members.some(member => member.id === delivery.to && member.status !== 'stopped')).length,
-      challengedEvidence: this.rt.store.list('evidence', missionId).filter(evidence => evidence.status === 'challenged').length,
-      ceilings: [
-        ...(mission.budgetPause === undefined ? [] : [`budget:${mission.budgetPause.id}`]),
-        ...tasks.filter(task => task.ceiling !== undefined).map(task => `task:${task.id}:${task.ceiling!.dimension}`),
-      ],
-    }
-  }
 
   /**
    * Read-only owner instruments (docs/no-silent-state-spec.md §6): the current
@@ -190,8 +88,8 @@ export class RuntimeGates {
     const counts = { sent: view.notices.length, queued: view.notices.filter(entry => entry.state === 'queued').length, claimed: view.notices.filter(entry => entry.state === 'claimed').length }
     return {
       // T3d: the owner-visible fingerprint is the board digest F(S); no notice is keyed by it.
-      fingerprint: this.fingerprint(missionId),
-      pendingDispatchable: this.fingerprintBoard(missionId).tasks.filter(task => task.ready).length,
+      fingerprint: this.rt.fingerprint(missionId),
+      pendingDispatchable: dispatchable(this.rt.boardOf(missionId)).length,
       ...(view.lastNotice === undefined ? {} : { lastWitness: { ...view.lastNotice, family: noticeFamily(records.deliveries.find(delivery => delivery.id === view.notices[0]!.deliveryId)!) } }),
       notices: counts,
       // L3: the receipts nobody has settled yet. A question with no answer is a
@@ -205,7 +103,8 @@ export class RuntimeGates {
 
   /** L3: open receipts as the owner reads them, bounded and answerable by id. */
   private openAsks(missionId: string): { count: number; asks: Array<Record<string, unknown>>; note: string } {
-    const asks = this.rt.openAsks(missionId)
+    const open = openAsks(this.rt.store.list('deliveries', missionId))
+    const asks = [...open]
       .sort((a, b) => (a.deliveredAt ?? a.createdAt) - (b.deliveredAt ?? b.createdAt))
       .slice(0, 10)
       .map(delivery => ({
@@ -218,7 +117,7 @@ export class RuntimeGates {
         question: delivery.content.replace(/\s+/g, ' ').slice(0, 200),
       }))
     return {
-      count: this.rt.openAsks(missionId).length,
+      count: open.length,
       asks,
       note: 'Questions with no receipt. Answer one with swarm_message and its deliveryId in replyTo, or close it with dismiss: true; an owner question answered only in chat is still open here.',
     }
@@ -294,7 +193,7 @@ export class RuntimeGates {
    */
   recordOwnerUsage(sessionId: string, usage: UsageBuckets): void {
     if (this.rt.closed || this.rt.shuttingDown || !validUsage(usage) || this.rt.isWorkerSession(sessionId)) return
-    const mission = this.rt.store.list('missions').filter(item => item.ownerSessionId === sessionId && !this.rt.isMissionTerminal(item)).sort((a, b) => b.createdAt - a.createdAt)[0]
+    const mission = this.rt.store.list('missions').filter(item => item.ownerSessionId === sessionId && !terminal(item)).sort((a, b) => b.createdAt - a.createdAt)[0]
     if (mission) {
       mission.ownerUsage = addUsage(mission.ownerUsage, usage); mission.updatedAt = this.rt.now()
       this.rt.commit(mission.id, () => this.rt.store.put('missions', mission))
@@ -331,7 +230,7 @@ export class RuntimeGates {
       && (this.rt.workers.currentActivity(member.id) ?? member.activity)?.kind === 'model')
     const tasks = this.rt.store.list('tasks', mission.id)
     const pairedSources = new Set(tasks.filter(task => task.kind === 'verification' && task.status !== 'cancelled').map(task => task.reviewOf))
-    const pendingReviewSlots = tasks.filter(task => task.kind !== 'verification' && !['accepted', 'cancelled'].includes(task.status) && !pairedSources.has(task.id)).length
+    const pendingReviewSlots = tasks.filter(task => task.kind !== 'verification' && !TERMINAL_STATES.has(task.status) && !pairedSources.has(task.id)).length
     const dimensions: Array<{ dimension: string; used: number; limit: number; inFlight: number; reviewSlots?: number; task?: Task }> = [
       { dimension: 'maxTokens', used: mission.usedTokens, limit: mission.budget.maxTokens, inFlight: this.rt.inFlightEstimate(members) },
       { dimension: 'maxSteps', used: mission.usedSteps, limit: mission.budget.maxSteps, inFlight: inFlight.length },
@@ -339,7 +238,7 @@ export class RuntimeGates {
       { dimension: 'maxTasks', used: tasks.length, limit: mission.budget.maxTasks, inFlight: 0, reviewSlots: pendingReviewSlots },
     ]
     for (const task of tasks) {
-      if (['accepted', 'cancelled'].includes(task.status)) continue
+      if (TERMINAL_STATES.has(task.status)) continue
       if (task.maxSteps !== undefined) dimensions.push({ dimension: 'maxSteps', used: task.usedSteps ?? 0, limit: task.maxSteps,
         inFlight: inFlight.some(member => member.id === task.attempt?.ownerId) ? 1 : 0, task })
       // A claim a rework archived is history of a rejected round, so it counts toward no round's findings.
@@ -379,7 +278,7 @@ export class RuntimeGates {
       const keys = warnings.map(warning => warning.key)
       const dedupKey = warnings.length === 1 ? keys[0]! : `budget-review:${mission.id}:batch:${createHash('sha256').update(keys.join('\n')).digest('hex').slice(0, 20)}`
       const instructions = 'Review remaining work and use swarm_budget with reason: budget for the mission, or taskId and taskBudget for a task. Exhaustion preserves work; an extension never overrides a user pause or fixed deadline.'
-      this.rt.notify(mission.id, `Resource review (${warnings.length} threshold${warnings.length === 1 ? '' : 's'}):\n${warnings.map(warning => `- ${warning.content}`).join('\n')}\n${instructions}`,
+      this.rt.notices.notify(mission.id, `Resource review (${warnings.length} threshold${warnings.length === 1 ? '' : 's'}):\n${warnings.map(warning => `- ${warning.content}`).join('\n')}\n${instructions}`,
         [...new Set(warnings.flatMap(warning => warning.subjects))], { noticeClass: 'budget', dedupKey, trigger: 'mission/budget-warning', reason: keys.join('\n'),
           facts: [...warnings.map(warning => warning.content), instructions],
           aggregatedIdentities: warnings.map(warning => ({ ...noticeIdentity(mission.id, warning.subjects, { noticeClass: 'budget', dedupKey: warning.key }).identity, contentDigest: createHash('sha256').update(warning.content).digest('hex') })) })
@@ -387,7 +286,7 @@ export class RuntimeGates {
   }
 
   blockBudget(mission: Mission): void {
-    if (this.rt.isMissionTerminal(mission) || mission.status === 'blocked') return
+    if (terminal(mission) || mission.status === 'blocked') return
     const dimensions = this.exhaustedDimensions(mission)
     mission.status = 'blocked'
     mission.reason = dimensions.length ? `Aggregate mission budget exhausted: ${dimensions.join(', ')}` : 'Aggregate mission budget exhausted'
@@ -403,7 +302,7 @@ export class RuntimeGates {
         this.rt.store.putTask(task)
       }
       for (const member of this.rt.store.list('members', mission.id)) { delete member.activity; this.rt.store.put('members', member) }
-      this.rt.upsertBudgetRefusals(mission, mission.reason!)
+      this.rt.refusals.upsertBudgetRefusals(mission, mission.reason!)
       this.rt.store.event(mission.id, 'mission/budget-exhausted', 'runtime', { tokens: mission.usedTokens, steps: mission.usedSteps, dimensions })
     })
     // S4b: the budget chain's terminal. The mission is durably blocked and the
@@ -414,7 +313,7 @@ export class RuntimeGates {
     // Co-firing guards: the budget guard fires with the attempt/lease chain (the
     // preserved attempts) and with the dispatch sweep (nothing new is admitted
     // while the pause holds).
-    emitGuardTerminal(this.rt, mission.id, 'budget', { detail: mission.reason!, localKey: `budget-pause:${mission.budgetPause.id}` })
+    this.rt.notices.emitGuardTerminal(mission.id, 'budget', { detail: mission.reason!, localKey: `budget-pause:${mission.budgetPause.id}` })
     this.beginBudgetStop(mission.id, mission.budgetPause.id)
   }
 
@@ -434,7 +333,7 @@ export class RuntimeGates {
     const pause = mission.budgetPause
     if (pause === undefined || pause.id !== pauseId || pause.quiesced) return
     const claim = pause.stopping
-    if (claim !== undefined && claim.instanceId === this.rt.instanceId && this.rt.now() - claim.at < this.rt.stallPassTimeoutMs) return
+    if (claim !== undefined && claim.instanceId === this.rt.instanceId && this.rt.now() - claim.at < this.rt.bounds.stallPassTimeoutMs) return
     // The durable claim lands BEFORE the first await, so it is the gate for any
     // later caller.
     pause.stopping = { instanceId: this.rt.instanceId, at: this.rt.now() }
@@ -453,7 +352,7 @@ export class RuntimeGates {
         this.rt.store.event(missionId, 'mission/budget-quiesced', 'runtime', { pauseId })
       })
       this.rt.kick(missionId)
-      await this.rt.flushOutbox(missionId)
+      await this.rt.notices.flushOutbox(missionId)
     })
   }
 

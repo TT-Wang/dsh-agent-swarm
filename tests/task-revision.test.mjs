@@ -24,7 +24,7 @@
  *    loss cannot make two writers both win, because the CAS is in the store;
  *  - the writer-busy classification (`WriterBusyError` / `withWriterRetry`): a
  *    stale refusal is NOT contention and must not be retried as one;
- *  - the revision-keyed fingerprint cache (`RuntimeGates.fingerprintCache`):
+ *  - the revision-keyed fingerprint cache (`SwarmRuntime.fingerprintCache`):
  *    the refusal record advances the store revision, so the cached digest can
  *    never be the stale board's.
  */
@@ -32,7 +32,7 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { join } from 'node:path'
 import { SwarmStore, StaleTaskRevisionError, STALE_TASK_REFUSAL_EVENT, WriterBusyError, isSqliteBusy } from '../lib/store.js'
-import { missionFingerprint } from '../lib/gates.js'
+import { fingerprintBoard, missionFingerprint } from '../lib/board.js'
 import { EVENT_VOCABULARY } from '../lib/events.js'
 import { eventVocabularyReport } from '../lib/trace.js'
 import { FakeWorkers, SwarmRuntime, makeRuntime } from './faults/harness.mjs'
@@ -188,14 +188,14 @@ test('S5 pair: a stale refusal is not writer contention — it is neither retrie
 test('S5 pair: the revision-keyed fingerprint cache can never serve the stale board', async t => {
   const f = await fixture(t)
   const before = f.runtime.fingerprint(f.mission.id)
-  assert.equal(before, missionFingerprint(f.runtime.fingerprintBoard(f.mission.id)), 'the digest is pure over durable state')
+  assert.equal(before, missionFingerprint(fingerprintBoard(f.runtime.boardOf(f.mission.id))), 'the digest is pure over durable state')
   const [winner, loser] = f.twoReaders()
   f.write(winner)
   assert.throws(() => f.write(loser), StaleTaskRevisionError)
   const after = f.runtime.fingerprint(f.mission.id)
-  assert.equal(after, missionFingerprint(f.runtime.fingerprintBoard(f.mission.id)),
+  assert.equal(after, missionFingerprint(fingerprintBoard(f.runtime.boardOf(f.mission.id))),
     'the refusal record advanced the store revision, so the cache recomputed instead of gating on the stale digest')
-  f.runtime.gates.fingerprintCache.clear()
+  f.runtime.fingerprintCache.clear()
   assert.equal(f.runtime.fingerprint(f.mission.id), after, 'losing the cache changes no digest (cache-only)')
 })
 

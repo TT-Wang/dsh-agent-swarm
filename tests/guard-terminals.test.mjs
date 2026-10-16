@@ -48,10 +48,11 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { setTimeout as sleep } from 'node:timers/promises'
 import { guardActions, guardBoard, guardDispatchActions, guardMissionTerminal, guardProgressActions, guardTerminalChain, terminalEscalation } from './guard-model.mjs'
-import { emitGuardTerminal, guardTerminal } from '../lib/refusals.js'
+import { guardTerminal } from '../lib/refusals.js'
 import { dependencyAssumptions, reconcileTaskAdmission } from '../lib/admission.js'
 import { assessText, ownerTools, sessionTools, toolSchemaIndex } from './refusal-inventory.mjs'
 import { setup, eventually, events, FakeClock, budget } from './faults/harness.mjs'
+import { reviewable } from '../lib/board.js'
 
 /** The model-visible code of the R12-F9 admission refusal. */
 const DEPENDENCY_ASSUMPTION_CODE = 'dependency_assumption_missing'
@@ -439,7 +440,7 @@ test('R14 hand-off mechanism: emitGuardTerminal lets any call site opt in mechan
   try {
     const task = f.propose({ title: 'Held work' })
     const context = { taskId: task.id, memberId: f.author.id, detail: 'the workspace guard refused the close-out (Member has uncommitted commits)', localKey: `closeout-refused:${task.id}@${task.epoch}` }
-    const terminal = emitGuardTerminal(f.runtime, f.mission.id, 'attempt_lease', context)
+    const terminal = f.runtime.notices.emitGuardTerminal(f.mission.id, 'attempt_lease', context)
     assert.ok(terminal, 'the call site always gets a terminal back')
     assert.equal(terminal.chain, 'attempt_lease')
     assert.equal(terminal.code, 'attempt_terminal')
@@ -455,7 +456,7 @@ test('R14 hand-off mechanism: emitGuardTerminal lets any call site opt in mechan
     // The same call under the same opener is the same decision request: the
     // repeat is suppressed because the request is durable, not because the
     // caller chose to stay silent.
-    assert.ok(emitGuardTerminal(f.runtime, f.mission.id, 'attempt_lease', context))
+    assert.ok(f.runtime.notices.emitGuardTerminal(f.mission.id, 'attempt_lease', context))
     await sleep(60)
     assert.equal(events(f.runtime, f.mission.id, 'mission/stalled')
       .filter(item => item.data.cause === 'guard-terminal' && item.data.chain === 'attempt_lease').length, 1,
@@ -532,7 +533,7 @@ test('S4r-D4: guardBoard reports review liveness from the same predicate the sch
     f.runtime.cancel(f.owner, f.mission.id, { taskId: review.id, reason: 'S4r: withdraw the review' })
     const board = guardBoard(f.runtime, f.mission.id)
     const source = board.tasks.find(candidate => candidate.id === task.id)
-    const schedulerSays = f.runtime.scheduling.reviewable(f.runtime.store.get('tasks', task.id), f.runtime.store.list('tasks', f.mission.id))
+    const schedulerSays = reviewable(f.runtime.boardOf(f.mission.id), f.runtime.store.get('tasks', task.id))
     assert.equal(schedulerSays, false, 'the scheduler sees no live review')
     assert.equal(source.reviewSourceLive, schedulerSays, 'the board view and the scheduler agree')
     assert.equal(guardActions(board).filter(action => action.kind === 'progress' && action.taskId === task.id).length, 0,
@@ -563,7 +564,7 @@ test('S4r-D5: a budget-blocked mission still escalates, and the terminal emissio
       'the budget block delivers the coded owner decision request', 8_000)
     assert.deepEqual(lintRefusal(notice.content), [])
     // The emission is still unconditional and idempotent for the same state.
-    const terminal = emitGuardTerminal(f.runtime, f.mission.id, 'budget', { detail: 'budget-blocked probe', localKey: 'budget-blocked-probe' })
+    const terminal = f.runtime.notices.emitGuardTerminal(f.mission.id, 'budget', { detail: 'budget-blocked probe', localKey: 'budget-blocked-probe' })
     assert.ok(terminal, 'the terminal emission is unconditional for a blocked mission')
     assert.equal(terminal.code, 'budget_terminal')
   } finally { await f.cleanup() }

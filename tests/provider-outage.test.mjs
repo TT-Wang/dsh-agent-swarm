@@ -11,7 +11,7 @@ import assert from 'node:assert/strict'
 import { join } from 'node:path'
 import { LlmError } from '@deepseek-ai/dsh-llm'
 import { classifyProviderOutage } from '../lib/scheduler.js'
-import { FakeWorkers, eventually, makeRuntime } from './faults/harness.mjs'
+import { FakeClock, FakeWorkers, eventually, makeRuntime } from './faults/harness.mjs'
 
 class OutageWorkers extends FakeWorkers {
   autoIdle = true
@@ -105,4 +105,34 @@ test('R11-01: a start failure classified as an outage re-routes without spending
   const recovered = await eventually(() => f.runtime.store.events(f.mission.id, 500).find(event => event.type === 'provider/recovered'), 'the recovered route was not recorded', 4000)
   assert.equal(recovered.data.memberId, f.first.id)
   assert.equal(f.runtime.store.get('members', f.first.id).providerOutage, undefined)
+})
+
+test('R11-01: a reroute that passes over a name-first candidate inside its outage window takes the first live candidate in store order', async t => {
+  const clock = new FakeClock()
+  const workers = new OutageWorkers()
+  const { dir: directory, runtime, budget } = await makeRuntime(t, { workers, clock,
+    config: { maxMessageChars: 10000, maxEvents: 500, checkTimeoutMs: undefined },
+    budget: { maxTokens: 100000, maxSteps: 1000, maxWorkers: 4, maxDurationMs: 3600000, maxTasks: 100 } })
+  await runtime.start()
+  const owner = { sessionId: 'outage-owner' }
+  const mission = runtime.create(owner, { title: 'Outage', objective: 'Route around a provider outage', workspace: directory, scope: ['**'], acceptance: ['works'], budget }, { grantRoot: directory, source: 'session' })
+  const stream = runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Main' })
+  const failing = await runtime.addMember(owner, mission.id, { name: 'Failing', role: 'implementation' })
+  // Store order (Cat, Bob, Amy) is the reverse of name order.
+  const cat = await runtime.addMember(owner, mission.id, { name: 'Cat', role: 'implementation' })
+  const bob = await runtime.addMember(owner, mission.id, { name: 'Bob', role: 'implementation' })
+  const amy = await runtime.addMember(owner, mission.id, { name: 'Amy', role: 'implementation' })
+  await runtime.settle(mission.id)
+  // Amy, the first candidate by name, is inside her outage window when the
+  // failing route's start is classified as an outage.
+  workers.callbacks.providerOutage(amy.id, { class: 'quota', status: 402, message: 'insufficient quota' })
+  workers.failFor = failing.id
+  workers.failWith = new LlmError('insufficient quota for this account', 'QUOTA', { status: 402 })
+  const task = runtime.propose(owner, mission.id, { outputs: [], workstreamId: stream.id, title: 'Work', objective: 'Work', kind: 'implementation',
+    scope: ['**'], acceptance: ['works'], checks: ['test'], assigneeId: failing.id, maxRecoveryAttempts: 1 })
+  await runtime.settle(mission.id)
+  const reassigned = runtime.store.events(mission.id, 500).filter(event => event.type === 'task/reassigned')
+  assert.deepEqual(reassigned.map(event => [event.data.from, event.data.to]), [[failing.id, cat.id]],
+    `the work moved to Cat, first in store order outside an outage window, not to Bob, first by name (${JSON.stringify({ cat: cat.id, bob: bob.id, amy: amy.id })})`)
+  assert.equal(runtime.store.get('tasks', task.id).assigneeId, cat.id)
 })

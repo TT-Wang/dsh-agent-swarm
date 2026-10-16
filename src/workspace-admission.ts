@@ -8,13 +8,15 @@
  * so no call site changed; the pure helpers are imported by name.
  */
 import { tmpdir } from 'node:os'
-import { stopPending } from './attempts.ts'
+import { stopPending, subjectsOfTasks, terminal } from './task-graph.ts'
+import { scopeKeysOverlap } from './scheduler.ts'
 import { claimFor, isContained, reauthorizeWorkspace, WorkspaceRevokedError, WORKSPACE_AUTHORIZATION_CODE, type WorkspaceClaim } from './authorization.ts'
 import { hasNotice } from './arena.ts'
-import { noticeIdentity, reasonDigest, subjectsOfTasks } from './notices.ts'
-import { emitGuardTerminal, guardTerminalKey } from './refusals.ts'
+import { isolationOpener, noticeIdentity } from './notices.ts'
+import { noticeSubjectsFor } from './board.ts'
+import { guardTerminalKey } from './refusals.ts'
 import type { SwarmRuntime } from './runtime.ts'
-import { progressed, type SchedulingPass } from './scheduling.ts'
+import { progressed, type SchedulingPass } from './kernel.ts'
 import { absoluteCheckPaths, shellSegments } from './admission.ts'
 import type { Member, Mission, Task } from './types.ts'
 
@@ -409,7 +411,7 @@ export class WorkspaceAdmission {
    */
   fenceWorkspace(missionId: string, reason: string): void {
     const mission = this.rt.store.get('missions', missionId)
-    if (mission === undefined || this.rt.isMissionTerminal(mission)) return
+    if (mission === undefined || terminal(mission)) return
     const blocked = this.rt.store.list('tasks', missionId).filter(task => task.status === 'pending' || task.status === 'running')
     // A revocation lasts this process (above), so its decision is keyed on it.
     const revocation = `workspace-revoked:${this.rt.instanceId}`
@@ -436,7 +438,7 @@ export class WorkspaceAdmission {
     // S4b: the fence reaches the shared coded workspace terminal. A revocation
     // is a local fault, not a board state, so the decision is keyed by it and
     // the owner is woken once per revocation however the board moves afterwards.
-    emitGuardTerminal(this.rt, missionId, 'workspace', { detail: reason, localKey: revocation, subjects: subjectsOfTasks(blocked, mission) })
+    this.rt.notices.emitGuardTerminal(missionId, 'workspace', { detail: reason, localKey: revocation, subjects: subjectsOfTasks(blocked, mission) })
   }
 
   /**
@@ -508,7 +510,8 @@ export class WorkspaceAdmission {
   isolationAllows(missionId: string, member: Member): boolean {
     const violation = this.isolationIssues(missionId).find(entry => entry.memberIds.includes(member.id))
     if (violation === undefined) return true
-    emitGuardTerminal(this.rt, missionId, 'workspace', { subjects: violation.memberIds.flatMap(id => this.rt.noticeSubjectsFor(missionId, { memberId: id })), localKey: isolationOpener(violation.message),
+    const board = this.rt.boardOf(missionId)
+    this.rt.notices.emitGuardTerminal(missionId, 'workspace', { subjects: violation.memberIds.flatMap(id => noticeSubjectsFor(board, { memberId: id })), localKey: isolationOpener(violation.message),
       detail: `the isolation invariant refuses dispatch: ${violation.message}` })
     return false
   }
@@ -530,17 +533,14 @@ export class WorkspaceAdmission {
   }
 
   private isolationIssues(missionId: string): IsolationIssue[] {
-    return isolationIssues(this.rt.store.list('members', missionId), this.rt.store.list('tasks', missionId), (left, right) => this.rt.scopesOverlap(left, right))
+    return isolationIssues(this.rt.store.list('members', missionId), this.rt.store.list('tasks', missionId))
   }
 }
 
 interface IsolationIssue { memberIds: string[]; message: string }
 
-/** The opener of the workspace terminal one isolation violation raises: the violation's own text. */
-export function isolationOpener(message: string): string { return `isolation:${reasonDigest(message)}` }
-
 /** Identity-bearing evidence shared by admission and its read-only explanation. */
-export function isolationIssues(allMembers: readonly Member[], tasks: readonly Task[], overlaps: (left: string[], right: string[]) => boolean): IsolationIssue[] {
+export function isolationIssues(allMembers: readonly Member[], tasks: readonly Task[]): IsolationIssue[] {
     const violations: IsolationIssue[] = []
     const members = allMembers.filter(member => member.status !== 'stopped')
     const byWorkspace = new Map<string, Member[]>()
@@ -562,7 +562,7 @@ export function isolationIssues(allMembers: readonly Member[], tasks: readonly T
       if (group.length > 1) violations.push({ memberIds: group.map(task => task.attempt!.ownerId), message: `concurrently running tasks ${group.map(task => task.id).join(', ')} share worktree ${workspace}` })
       for (let left = 0; left < group.length; left++) {
         for (let right = left + 1; right < group.length; right++) {
-          if (overlaps(group[left]!.scope, group[right]!.scope)) {
+          if (group[left]!.scope.some(a => group[right]!.scope.some(b => scopeKeysOverlap(a, b)))) {
             violations.push({ memberIds: [group[left]!.attempt!.ownerId, group[right]!.attempt!.ownerId], message: `concurrently running tasks ${group[left]!.id} and ${group[right]!.id} declare overlapping scope in worktree ${workspace}` })
           }
         }

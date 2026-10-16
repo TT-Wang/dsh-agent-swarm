@@ -1,24 +1,28 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
+import { createHash } from 'node:crypto'
 import { join } from 'node:path'
 import { OwnerReplyGuard } from '../lib/owner-reply.js'
 import { RoleScoper } from '../lib/roles.js'
-import { RefusalRegistry, emitGuardTerminal, guardTerminalKey } from '../lib/refusals.js'
+import { RefusalRegistry, guardTerminalKey } from '../lib/refusals.js'
+import { Notices } from '../lib/notices.js'
 import { WriterBusyError } from '../lib/store.js'
-import { Attempts, pendingStopOwner } from '../lib/attempts.js'
+import { Attempts } from '../lib/attempts.js'
+import { pendingStopOwner } from '../lib/task-graph.js'
 import { wakePrecision } from './instruments.mjs'
 import { FakeClock, FakeWorkers, MISSION_ACCEPTANCE, makeRuntime, makeRuntimeStub, setup } from './faults/harness.mjs'
+import { openAsks } from '../lib/arena.js'
+import { dispatchable as dispatchableOf } from '../lib/board.js'
 
-/** A stub runtime's `tell`: the fact's own transaction, then the record that exists only with it (the ledger is not modelled). */
-function tell(missionId, _content, _subjects, _options, then) { return this.commit(missionId, () => { then?.(); return true }) }
+/** A stub `Notices.tell`: the record that exists only with the fact, in the stubs' pass-through transaction (the ledger is not modelled). */
+function tell(_missionId, _content, _subjects, _options, then) { then?.(); return true }
 
 function guardFixture() {
   const mission = { id: 'm', ownerSessionId: 'owner', status: 'active' }
   const question = { id: 'q', missionId: 'm', from: 'worker', to: 'owner', content: 'Choose an API', replyExpected: true, deliveredAt: 1 }
   const rt = makeRuntimeStub({
-    store: { list: () => [mission], get: table => table === 'missions' ? mission : question, put() {}, event() {} },
-    isMissionTerminal: value => ['completed', 'stopped'].includes(value.status), openAsks: () => [question],
-    commit: (_id, fn) => fn(), notify() {}, noticeSubjectsFor: () => [],
+    store: { list: table => table === 'deliveries' ? [question] : [mission], get: table => table === 'missions' ? mission : question, put() {}, event() {} },
+    commit: (_id, fn) => fn(), notices: { notify() {} }, boardOf: missionId => ({ missionId, tasks: [] }),
   })
   return { mission, question, rt, guard: new OwnerReplyGuard({ on: () => () => {} }, rt, { maxNudges: 2 }) }
 }
@@ -42,7 +46,7 @@ test('R12: muted stopped questions do not retain the full owner role; completed 
   const scoper = Object.assign(Object.create(RoleScoper.prototype), {
     runtime: {
       isWorkerSession: () => false, starts: () => [], list: () => [mission],
-      isMissionTerminal: () => true, openAsks: () => [{ id: 'question' }], store: { list: () => [] },
+      store: { list: table => table === 'deliveries' ? [{ id: 'question', to: 'owner', replyExpected: true }] : [] },
     }, handling: new Map(), applied: new Map(),
   })
   const owner = { id: 'owner', status: 'idle', session: { header: {} } }
@@ -71,25 +75,27 @@ test('R12: owner can settle a receipt in paused, blocked and terminal missions w
     })
     const result = rt.message(owner, mission.id, { to: 'retired-member', kind: 'question', replyTo: questionId, dismiss: true, content: 'No further work needed' })
     assert.equal(result.dismissed, questionId)
-    assert.equal(rt.openAsks(mission.id, 'owner').length, 0)
+    assert.equal(openAsks(rt.store.list('deliveries', mission.id), 'owner').length, 0)
     assert.equal(rt.mission(mission.id).status, status)
     assert.equal(rt.store.list('deliveries', mission.id).filter(row => row.to === 'retired-member').length, 0)
     assert.throws(() => rt.message(owner, mission.id, { to: 'retired-member', kind: 'question', content: 'New work' }))
   }
 })
 
+/** A refusal registry on a kernel stub whose writer is busy until released, and the notices that queue a guard terminal on that one registry. */
 function refusalFixture() {
   let busy = true
   const admissions = new Map(), events = []
-  const rt = makeRuntimeStub({
+  const kernel = makeRuntimeStub({
     commit: (_id, fn) => { if (busy) throw new WriterBusyError('busy', 2); return fn() },
     store: {
       get: (table, id) => table === 'missions' ? { id, status: 'active' } : admissions.get(id), list: () => [],
       recordAdmission: row => admissions.set(row.id, structuredClone(row)),
       event: (missionId, type, actor, data) => events.push({ missionId, type, actor, data }),
-    }, fingerprint: () => 'stable', isMissionTerminal: () => false, noticeSubjectsFor: () => [], notify() {}, tell, pumpOutbox() {},
+    }, boardOf: missionId => ({ missionId, tasks: [] }),
   })
-  return { rt, registry: new RefusalRegistry(rt), admissions, events, release: () => { busy = false } }
+  const registry = new RefusalRegistry(kernel)
+  return { registry, notices: new Notices(kernel, registry), admissions, events, release: () => { busy = false } }
 }
 
 test('R12: writer recovery retains distinct refusals and flushes them only under their own mission', () => {
@@ -111,7 +117,7 @@ test('R12: writer recovery retains distinct refusals and flushes them only under
 
 test('R12: failed guard writes preserve their origin without manufacturing an admission', () => {
   const f = refusalFixture()
-  emitGuardTerminal(f.rt, 'mission', 'attempt_lease', { taskId: 'task', memberId: 'member', detail: 'lease stop failed', localKey: 'stop:task' })
+  f.notices.emitGuardTerminal('mission', 'attempt_lease', { taskId: 'task', memberId: 'member', detail: 'lease stop failed', localKey: 'stop:task' })
   f.release()
   f.registry.recordWriterBusyRecovery()
   assert.equal(f.admissions.size, 0)
@@ -133,7 +139,7 @@ test('a busy writer records each guard request it could not write: distinct open
     ['task_ceiling', { detail: 'mission experiment budget exhausted', localKey: 'experiment-budget:0' }],
     ['attempt_lease', { taskId: 'task', memberId: 'member', detail: 'idle close-out abandoned attempt_1', localKey: 'closeout-abandoned:attempt_1' }],
   ]
-  for (const [chain, context] of failures) emitGuardTerminal(f.rt, 'mission', chain, context)
+  for (const [chain, context] of failures) f.notices.emitGuardTerminal('mission', chain, context)
   f.release()
   f.registry.recordWriterBusyRecovery()
   assert.deepEqual(f.events.map(event => [event.data.cause, event.data.chain, event.data.taskId, event.data.count]), [
@@ -151,13 +157,14 @@ test('a guard request a busy writer could not write is named by its cause and ch
   t.after(f.cleanup)
   const context = { detail: 'mission task budget exhausted (1/1 tasks admitted)', localKey: 'task-budget:1' }
   f.runtime.commit = () => { throw new WriterBusyError('database is locked', 3) }
-  emitGuardTerminal(f.runtime, f.mission.id, 'task_ceiling', context)
+  f.runtime.notices.emitGuardTerminal(f.mission.id, 'task_ceiling', context)
   delete f.runtime.commit
+  assert.equal(f.runtime.notices.refusals, f.runtime.refusals, 'one registry per runtime: the notices queue the refused request on the registry the tick drains')
   f.clock.advance(f.runtime.config.tickMs)
   await f.runtime.tick()
   const stalls = () => f.runtime.store.events(f.mission.id, 500).filter(event => event.type === 'mission/stalled').map(event => event.data)
   assert.deepEqual(stalls().map(data => [data.cause, data.chain]), [['guard-terminal-write-failed', 'task_ceiling']], 'the writer\'s refusal is recorded')
-  emitGuardTerminal(f.runtime, f.mission.id, 'task_ceiling', context)
+  f.runtime.notices.emitGuardTerminal(f.mission.id, 'task_ceiling', context)
   const requests = f.runtime.store.list('deliveries', f.mission.id).filter(delivery => delivery.notice?.dedupKey.startsWith('guard-terminal:task_ceiling:'))
   assert.equal(requests.length, 1, 'the request is written once the writer is free')
   assert.deepEqual(stalls().filter(data => data.noticeKey === requests[0].notice.dedupKey).map(data => data.cause), ['guard-terminal'], 'one stall event names that row: the one written with it, never the record of the write that failed')
@@ -171,8 +178,8 @@ test('R12: a pending review is dispatchable only once its source is submitted, t
   const source = f.propose({ title: 'Source' })
   const review = f.runtime.propose(f.owner, f.mission.id, { outputs: [], workstreamId: f.stream.id, title: 'Review', objective: 'Independent review',
     kind: 'verification', reviewOf: source.id, scope: ['**'], acceptance: MISSION_ACCEPTANCE })
-  // The owner instruments' dispatchable set: the dispatcher's eligibility over idle or waiting members.
-  const dispatchable = () => f.runtime.fingerprintBoard(f.mission.id).tasks.filter(task => task.ready).map(task => task.id)
+  // The dispatchable set the owner instruments count and F(S) digests: the dispatcher's eligibility over idle or waiting members.
+  const dispatchable = () => dispatchableOf(f.runtime.boardOf(f.mission.id)).map(task => task.id)
   assert.deepEqual(dispatchable(), [source.id], 'only the source can run')
   const claimed = await f.runtime.claim(f.actor(f.author), f.mission.id, source.id)
   await f.runtime.submit(f.actor(f.author), f.mission.id, { taskId: source.id, attemptId: claimed.attempt.id, output: 'candidate' })
@@ -216,9 +223,8 @@ function stopFixture(reason, stop) {
     },
     workers: new FakeWorkers({ stop: async memberId => { stopped.push(memberId); await stop(stopped.length) } }),
     task: (_mission, id) => structuredClone(rows.get(id)), mission: () => mission,
-    isMissionTerminal: value => ['stopped', 'completed'].includes(value.status),
     defer: fn => { pending.push(Promise.resolve().then(fn)) }, exclusive: (_id, fn) => fn(), commit: (_id, fn) => fn(),
-    kick() {}, fingerprint: () => 'stable', noticeSubjectsFor: () => [], notify() {}, tell, pumpOutbox() {},
+    kick() {}, fingerprint: () => 'stable', notices: { emitGuardTerminal() {}, notify() {}, tell },
   })
   return { mission, rows, pending, events, stopped, attempts: new Attempts(rt) }
 }
@@ -311,4 +317,46 @@ test('R12: a stop whose recorded owner has no member row is refused, and the own
   // The named exit works: the task is withdrawn and its repair is admitted.
   runtime.cancel(owner, mission.id, { taskId: task.id, reason: 'The recorded stop owner is gone' })
   assert.deepEqual(runtime.propose(owner, mission.id, { ...work, replaces: [task.id] }).replaces, [task.id])
+})
+
+test('R12: an unresolved legacy stop owner reserves every member, and a marker at an older epoch reserves none', () => {
+  const blocked = (epoch, marker) => ({ id: 'task', status: 'blocked', epoch, resumeAfterStop: { reason: 'handoff', at: 1, ...marker } })
+  assert.equal(pendingStopOwner([blocked(2, { epoch: 2 })], 'member_any'), true, 'a stop whose owner an older build never recorded reserves every member')
+  assert.equal(pendingStopOwner([blocked(2, { epoch: 2, memberId: 'member_old' })], 'member_old'), true, 'a recorded owner waits for its own stop')
+  assert.equal(pendingStopOwner([blocked(2, { epoch: 2, memberId: 'member_old' })], 'member_any'), false, 'and reserves no other member')
+  assert.equal(pendingStopOwner([blocked(3, { epoch: 2 })], 'member_any'), false, 'a marker at an older epoch is no pending stop, even without an owner')
+  assert.equal(pendingStopOwner([blocked(3, { epoch: 2, memberId: 'member_old' })], 'member_old'), false)
+})
+
+test('R12: each distinct stop failure at one epoch is its own decision, keyed by task, epoch, owner and the failure digest', async t => {
+  class Workers extends FakeWorkers { fault; async stop(id) { this.stopped.push(id); if (this.fault !== undefined) throw this.fault } }
+  const workers = new Workers()
+  const clock = new FakeClock(1_700_000_000_000)
+  const { dir, runtime, budget } = await makeRuntime(t, { workers, clock })
+  await runtime.start()
+  const owner = { sessionId: 'owner' }
+  const mission = runtime.create(owner, { title: 'Stop faults', objective: 'Tell each stop failure once', workspace: dir, scope: ['src/'], acceptance: ['works'], budget }, { grantRoot: dir, source: 'session' })
+  const stream = runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Main' })
+  const member = await runtime.addMember(owner, mission.id, { name: 'Builder', role: 'implementation' })
+  await runtime.settle(mission.id)
+  workers.fault = new Error('EBUSY: the handle is busy (first)')
+  const task = runtime.propose(owner, mission.id, { outputs: [], workstreamId: stream.id, title: 'Work', objective: 'Do the work', kind: 'implementation', scope: ['src/'], acceptance: ['works'], checks: ['test -d .'] })
+  const row = runtime.store.get('tasks', task.id)
+  row.status = 'blocked'; row.epoch++
+  row.resumeAfterStop = { epoch: row.epoch, memberId: member.id, reason: 'handoff', at: runtime.now() }
+  runtime.store.transaction(() => runtime.store.put('tasks', row))
+  const keyOf = message => `guard-terminal:attempt_lease:attempt_terminal:stop:${task.id}:${row.epoch}:${member.id}:${createHash('sha256').update(message).digest('hex')}`
+  const told = () => runtime.store.list('deliveries', mission.id).filter(delivery => delivery.to === 'owner' && /\[attempt_terminal\]/.test(delivery.content)).map(delivery => delivery.notice.dedupKey)
+  const retry = async ms => { clock.advance(ms); await runtime.tick(); await runtime.settle(mission.id) }
+  await retry(0)
+  assert.deepEqual(told(), [keyOf('EBUSY: the handle is busy (first)')], 'the failed stop is told under its full key')
+  await retry(1_000)
+  assert.ok(workers.stopped.length >= 2, 'the stop was retried')
+  assert.deepEqual(told(), [keyOf('EBUSY: the handle is busy (first)')], 'the same failure again is the same decision')
+  workers.fault = new Error('EBUSY: the handle is busy (second)')
+  await retry(2_000)
+  assert.deepEqual(told(), [keyOf('EBUSY: the handle is busy (first)'), keyOf('EBUSY: the handle is busy (second)')], 'a different failure at the same epoch is a new decision')
+  workers.fault = undefined
+  await retry(4_000)
+  assert.equal(runtime.store.get('tasks', task.id).resumeAfterStop, undefined, 'the confirmed stop clears the fence')
 })

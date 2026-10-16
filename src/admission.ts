@@ -1,5 +1,4 @@
 /** Shared input normalization and repair guidance; matching and authority stay strict. */
-import { assignmentAllows, canOwnReview, type AssignmentCandidate, type AuthoredTask } from './assignment.ts'
 import { readFileSync } from 'node:fs'
 import { isAbsolute, join } from 'node:path'
 import { scopeSubset, validScope, withinScope } from './scope.ts'
@@ -41,28 +40,6 @@ export function citedCovers(covers: unknown, count: number, location: string): s
 /** reviewOf already waits for submission; an ordinary edge would wait for acceptance. */
 export function normalizeReviewDependencies(kind: string, reviewOf: string | undefined, dependencies: readonly string[] = []): string[] {
   return dependencies.filter(dependency => kind !== 'verification' || dependency !== reviewOf)
-}
-
-/** The minimal task shape a review path needs: one verification task and its source. */
-interface ReviewPathCandidate extends AssignmentCandidate {
-  id: string
-  kind: string
-  resumeAfterStop?: { epoch?: number }
-}
-
-/**
- * The one live-review rule: the review of `source` that can still reach a
- * verdict. Its status is pending, running or parked (blocked behind a stop at
- * its own epoch, the `stopPending` marker, so it re-pends once the stop
- * settles), and at least one live member may own it: independently
- * (`canOwnReview`) and by assignment (`assignmentAllows`). A review nobody live
- * may own is no path. The dispatcher's stall, the owner notices, the arena
- * digest and the runtime's own review admission all answer from this.
- */
-export function liveReviewFor<T extends ReviewPathCandidate>(reviews: readonly T[], source: AuthoredTask & { id: string }, liveMemberIds: ReadonlySet<string>): T | undefined {
-  return reviews.find(review => review.kind === 'verification' && review.reviewOf === source.id
-    && (review.status === 'pending' || review.status === 'running' || (review.status === 'blocked' && review.resumeAfterStop !== undefined && review.resumeAfterStop.epoch === review.epoch))
-    && [...liveMemberIds].some(memberId => canOwnReview(source, memberId) && assignmentAllows(review, memberId, reviews)))
 }
 
 /* ------------------------------------------------------------------------- *
@@ -181,7 +158,7 @@ export class TaskGraphAdmissionError extends AdmissionError {
   override toString(): string { return `${this.name}: ${this.message}` }
 }
 
-/** Machine-checkable diagnostic for a submitted code deliverable no review can accept; the reason names its cause's own exit (`SwarmRuntime.reviewPathBlocker`). */
+/** Machine-checkable diagnostic for a submitted code deliverable no review can accept; the reason names its cause's own exit (`reviewPathBlocker`, src/board.ts). */
 export function missingReviewDiagnostic(taskId: string, reason: string): AdmissionDiagnostic {
   return { code: 'review_path_missing', location: `task ${JSON.stringify(taskId)}`, message: reason }
 }

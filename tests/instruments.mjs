@@ -5,7 +5,9 @@
  * production classifiers it measures (they stay in src/ because the live
  * notice paths use them) and writes nothing.
  */
-import { NO_LIVE_PATH_FAMILIES, TERMINAL_STATES, noticeFamily, taskFromSubject, taskSubject } from '../lib/notices.js'
+import { NO_LIVE_PATH_FAMILIES, noticeFamily, taskFromSubject } from '../lib/notices.js'
+import { stallRoots, waitsLegitimately } from '../lib/board.js'
+import { TERMINAL_STATES, taskSubject } from '../lib/task-graph.js'
 import { ATTEMPT_FENCING_EVENTS } from '../lib/types.js'
 
 
@@ -30,12 +32,11 @@ import { ATTEMPT_FENCING_EVENTS } from '../lib/types.js'
  * historical false wakes are not reconstructed here.
  */
 export function wakePrecision(runtime, missionId) {
-  const notices = runtime.notices
-  const tasks = runtime.store.list('tasks', missionId)
+  const board = runtime.boardOf(missionId), tasks = board.tasks
   // A covered fact (`coveredBy`) is never sent: the delivery covering it is the wake.
   const deliveries = runtime.store.list('deliveries', missionId).filter(delivery => delivery.to === 'owner' && delivery.notice?.coveredBy === undefined
     && (delivery.notice?.class === 'decision' || delivery.notice?.class === 'escalation' || delivery.kind === 'escalation'))
-  const roots = new Set(notices.stallRoots(tasks).map(task => taskSubject(task)))
+  const roots = new Set(stallRoots(board).map(task => taskSubject(task)))
   const byFamily = {}
   const falseByFamily = {}
   const falseSubjects = []
@@ -50,7 +51,7 @@ export function wakePrecision(runtime, missionId) {
       if (task === undefined) continue
       const falseWake = family === 'stall-root'
         ? task.status === 'blocked' && !roots.has(subject)
-        : notices.waitsLegitimately(task, tasks)
+        : waitsLegitimately(board, task)
       if (!falseWake) continue
       falseByFamily[family] = (falseByFamily[family] ?? 0) + 1
       falseSubjects.push(subject)
@@ -59,7 +60,7 @@ export function wakePrecision(runtime, missionId) {
   const missed = []
   for (const task of tasks) {
     if (TERMINAL_STATES.has(task.status)) continue
-    if (notices.waitsLegitimately(task, tasks)) continue
+    if (waitsLegitimately(board, task)) continue
     const subject = taskSubject(task)
     if (named.has(subject)) continue
     missed.push(subject)
@@ -109,7 +110,7 @@ const isAttemptCloser = type => ATTEMPT_FENCING_EVENTS.some(kind => kind === typ
 export function silenceReport(runtime, missionId) {
   const scheduling = runtime.scheduling
   const now = Date.now()
-  const bounds = { passMs: runtime.stallPassTimeoutMs, passReleaseMs: runtime.stallPassReleaseBoundMs, attemptMs: runtime.attemptSilenceBoundMs }
+  const bounds = { passMs: runtime.bounds.stallPassTimeoutMs, passReleaseMs: runtime.bounds.stallPassReleaseBoundMs, attemptMs: runtime.bounds.attemptSilenceBoundMs }
   const events = runtime.store.events(missionId, runtime.config.maxEvents)
   const deliveries = runtime.store.list('deliveries', missionId)
   const current = new Map(runtime.store.list('tasks', missionId).map(task => [task.id, task]))

@@ -18,6 +18,7 @@ import { rm, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { assessText, toolSchemaIndex } from './refusal-inventory.mjs'
 import { FakeClock, FakeWorkers, WorkspaceWorkers, makeRepo, makeRuntime, makeWorkspaces, setup } from './faults/harness.mjs'
+import { completionError, reviewNeed, reviewPathBlocker, stalled, waitsLegitimately } from '../lib/board.js'
 
 /** Every attempt captures its own commit unless `fixedCommit` pins one (an unchanged resubmission). */
 class ReworkWorkers extends FakeWorkers {
@@ -145,7 +146,7 @@ test('a deferred review of the rejected commit is retired with the rework, so th
   assert.deepEqual(f.live(source).map(task => task.id), [rejecting.id], 'exactly one live review of the resubmission')
   await f.verify(reviewer, rejecting, 'accept', 'The rework meets the criterion')
   assert.equal(f.current(source).status, 'accepted')
-  assert.equal(f.runtime.completionError(f.runtime.mission(f.mission.id)), undefined)
+  assert.equal(completionError(f.runtime.boardOf(f.mission.id)), undefined)
 })
 
 test('a re-opened review re-reviews with a fresh review\'s step allowance; the rejecting round\'s steps are history', async t => {
@@ -305,9 +306,8 @@ test('a challenge re-opens the grace, so the owner\'s own review of the re-opene
   await f.verify(reviewer, automatic, 'accept', 'The artifact meets the criterion')
   f.clock.advance(60_000)
   f.runtime.challenge(f.owner, f.mission.id, { evidenceId: claim.id, reason: 'A counterexample overturns the claim', toolRunIds: [] })
-  const tasks = f.runtime.store.list('tasks', f.mission.id)
-  assert.equal(f.runtime.notices.waitsLegitimately(f.current(source), tasks), true, 'the re-opened need waits out its own grace')
-  assert.equal(f.runtime.stalled(tasks, f.runtime.store.list('members', f.mission.id)), false)
+  assert.equal(waitsLegitimately(f.runtime.boardOf(f.mission.id), f.current(source)), true, 'the re-opened need waits out its own grace')
+  assert.equal(stalled(f.runtime.boardOf(f.mission.id)), false)
   await f.runtime.settle(f.mission.id)
   f.clock.advance(200)
   // The owner's next call in the same turn: its own review of the re-opened source.
@@ -361,10 +361,10 @@ test('a challenge that takes no review away leaves the review need as it was', a
   const source = f.propose('Implement')
   const claim = await f.submit(author, source, 'The change meets the criterion')
   await f.pastReviewGrace(2)
-  const { id, seq } = f.runtime.reviewNeed(f.current(source))
+  const { id, seq } = reviewNeed(f.runtime.boardOf(f.mission.id), f.current(source))
   for (const reason of ['A counterexample overturns the claim', 'A second counterexample']) {
     f.runtime.challenge(f.owner, f.mission.id, { evidenceId: claim.id, reason, toolRunIds: [] })
-    const need = f.runtime.reviewNeed(f.current(source))
+    const need = reviewNeed(f.runtime.boardOf(f.mission.id), f.current(source))
     assert.deepEqual([need.id, need.seq], [id, seq], 'a challenge of an unreviewed submission re-opens nothing')
     await f.pastReviewGrace(2)
   }
@@ -376,7 +376,7 @@ test('a challenge that takes no review away leaves the review need as it was', a
   assert.equal(automatic.status, 'pending')
   f.runtime.challenge(f.owner, f.mission.id, { evidenceId: claim.id, reason: 'A third counterexample', toolRunIds: [] })
   assert.equal(f.current(automatic).status, 'pending', 'a pending review is not taken away')
-  assert.equal(`task_auto_review_${f.runtime.reviewNeed(f.current(source)).id}`, automatic.id, 'the pending automatic review is still the need\'s review')
+  assert.equal(`task_auto_review_${reviewNeed(f.runtime.boardOf(f.mission.id), f.current(source)).id}`, automatic.id, 'the pending automatic review is still the need\'s review')
 })
 
 test('a real unchanged resubmission is re-reviewed by the automatic review that rejected it', async t => {
@@ -484,7 +484,7 @@ test('the rejecting reviewer\'s claims are archived with its verdict: disputing 
   })
   assert.deepEqual([f.current(source).status, f.current(review).status], ['accepted', 'accepted'], 'the accepting review is not reverted')
   assert.equal(f.runtime.store.get('evidence', finding.id).challenges.length, 0, 'no dispute was recorded')
-  assert.equal(f.runtime.completionError(f.runtime.mission(f.mission.id)), undefined)
+  assert.equal(completionError(f.runtime.boardOf(f.mission.id)), undefined)
 })
 
 test('a resubmission of a rejected commit with no new claim is refused; with new claims it is re-reviewed and marked as a repeat', async t => {
@@ -548,7 +548,7 @@ test('a released rework is never taken by the reviewer its re-opened review is b
       assert.deepEqual(f.events('task/review-admitted'), [])
       await f.verify(reviewer, review, 'accept', 'The rework meets the criterion')
       assert.equal(f.current(source).status, 'accepted')
-      assert.equal(f.runtime.completionError(f.runtime.mission(f.mission.id)), undefined)
+      assert.equal(completionError(f.runtime.boardOf(f.mission.id)), undefined)
     })
   }
 })
@@ -565,7 +565,8 @@ test('a missing review path names every author of a reworked artifact', async t 
   f.runtime.cancel(f.owner, f.mission.id, { taskId: review.id, reason: 'Hand the rework over' })
   f.runtime.controlTask(f.owner, f.mission.id, source.id, 'amend', { assigneeId: reviewer.id }, 'The author is unavailable')
   await f.submit(reviewer, source)
-  const blocker = f.runtime.reviewPathBlocker(f.current(source), f.runtime.reviewNeed(f.current(source)))
+  const board = f.runtime.boardOf(f.mission.id)
+  const blocker = reviewPathBlocker(board, f.current(source), reviewNeed(board, f.current(source)))
   assert.match(blocker, /^no live member other than the author \(/)
   assert.ok(blocker.includes(author.id) && blocker.includes(reviewer.id), `both authors are named: ${blocker}`)
 })

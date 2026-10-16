@@ -19,10 +19,10 @@
  * owner-assembled mission returned silently.
  */
 import assert from 'node:assert/strict'
-import { acceptThroughReview, blockThroughReview, clone, eventually, events, makeRuntime, runScenario, setup, taskOf } from './harness.mjs'
+import { completionError, fingerprintBoard } from '../../lib/board.js'
+import { acceptThroughReview, blockThroughReview, clone, eventually, events, makeRuntime, now, runScenario, setup, taskOf, wait } from './harness.mjs'
 import { noticeFamily } from '../../lib/notices.js'
 
-const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
 const ownerNotices = f => f.runtime.store.list('deliveries', f.mission.id).filter(delivery => delivery.to === 'owner' && delivery.kind === 'control')
 const reviewsOf = (f, sourceId) => f.runtime.store.list('tasks', f.mission.id).filter(task => task.kind === 'verification' && task.reviewOf === sourceId)
 /** When a task's acceptance was recorded: the instant a board that needs it holds. */
@@ -36,9 +36,10 @@ const assertWitness = (f, row, family, since, label) => {
   return row
 }
 /** A host-recorded run for this attempt, so research evidence is citable. */
+let runs = 0
 const publishEvidence = (f, task, attemptId, outcome = 'supported') => {
-  const run = { id: `run_f19_${Math.random().toString(16).slice(2)}`, seq: 1, missionId: f.mission.id, memberId: f.author.id,
-    taskId: task.id, attemptId, tool: 'bash', arguments: {}, result: {}, isError: false, createdAt: Date.now() }
+  const run = { id: `run_f19_${++runs}`, seq: 1, missionId: f.mission.id, memberId: f.author.id,
+    taskId: task.id, attemptId, tool: 'bash', arguments: {}, result: {}, isError: false, createdAt: now() }
   f.runtime.store.transaction(() => f.runtime.store.put('tool_runs', run))
   return f.runtime.publish(f.actor(f.author), f.mission.id, { taskId: task.id, attemptId, claim: 'F19 host-backed claim', outcome, toolRunIds: [run.id] })
 }
@@ -91,7 +92,7 @@ await runScenario({
       try {
         const task = f.propose()
         await f.runtime.claim(f.actor(f.author), f.mission.id, task.id)
-        await sleep(120)
+        await wait(120)
         assert.equal(taskOf(f.runtime, task.id).status, 'running')
         assert.deepEqual(events(f.runtime, f.mission.id, 'mission/stalled'), [], 'row 3: a live lease is not a stall')
         assert.deepEqual(ownerNotices(f), [], 'row 3: no notice is required while the lease is alive')
@@ -126,7 +127,7 @@ await runScenario({
         })
         const task = f.propose()
         const claimed = await f.runtime.claim(f.actor(f.author), f.mission.id, task.id)
-        const since = Date.now()
+        const since = now()
         await f.runtime.submit(f.actor(f.author), f.mission.id, { taskId: task.id, attemptId: claimed.attempt.id, output: 'candidate' })
         const blocked = await eventually(() => events(f.runtime, f.mission.id, 'task/review-blocked').find(event => event.data.taskId === task.id),
           'row 5: an unreviewable submission must be reported after the grace')
@@ -155,7 +156,7 @@ await runScenario({
         const source = f.propose({ title: `${kind} source`, ...(kind === 'research' ? { kind: 'research', checks: undefined } : {}) })
         const claimed = await f.runtime.claim(f.actor(f.author), f.mission.id, source.id)
         if (kind === 'research') publishEvidence(f, source, claimed.attempt.id)
-        const since = Date.now()
+        const since = now()
         await f.runtime.submit(f.actor(f.author), f.mission.id, { taskId: source.id, attemptId: claimed.attempt.id, output: `${kind} candidate` })
         // Unrelated work keeps running under a live lease while the submission
         // has no live review path. Research keeps the board free of the
@@ -163,7 +164,7 @@ await runScenario({
         const other = f.propose({ title: `Unrelated ${kind} work`, kind: 'research', checks: undefined })
         await f.runtime.claim(f.actor(f.author), f.mission.id, other.id)
         assert.equal(taskOf(f.runtime, other.id).status, 'running')
-        await sleep(200)
+        await wait(200)
         assert.equal(ownerNotices(f).some(delivery => delivery.content.includes(source.id)), false,
           `row 5 ${kind}: the bounded missing-review grace is honored before the notice`)
         // The witness names the runtime's own blocker: no independent member is live.
@@ -173,7 +174,7 @@ await runScenario({
         assertWitness(f, notice, 'review-blocked', since, `row 5 ${kind}`)
         await eventually(() => events(f.runtime, f.mission.id, 'task/review-missing').some(event => event.data.taskId === source.id),
           `row 5 ${kind}: the missing review is recorded durably`)
-        await sleep(150)
+        await wait(150)
         assert.equal(ownerNotices(f).filter(delivery => delivery.content.includes(source.id) && /no live member other than the author/.test(delivery.content)).length, 1,
           `row 5 ${kind}: an unchanged mixed board does not spam`)
         rows[`row5_${kind}`] = { witness: 'W2', taskId: source.id }
@@ -190,7 +191,7 @@ await runScenario({
       try {
         const source = f.propose({ title: 'Implementation source' })
         const claimed = await f.runtime.claim(f.actor(f.author), f.mission.id, source.id)
-        const since = Date.now()
+        const since = now()
         await f.runtime.submit(f.actor(f.author), f.mission.id, { taskId: source.id, attemptId: claimed.attempt.id, output: 'candidate' })
         const other = f.propose({ title: 'Unrelated running work', kind: 'research', checks: undefined })
         await f.runtime.claim(f.actor(f.author), f.mission.id, other.id)
@@ -213,7 +214,7 @@ await runScenario({
         const task = f.propose()
         const claimed = await f.runtime.claim(f.actor(f.author), f.mission.id, task.id)
         const firstAttempt = claimed.attempt.id
-        const since = Date.now()
+        const since = now()
         // The adapter-side park state a pre-fix swarm_wait could create.
         f.runtime.store.transaction(() => {
           const parked = f.runtime.store.get('members', f.author.id)
@@ -226,7 +227,7 @@ await runScenario({
         assertWitness(f, notice, 'parked', since, 'row 6')
         // Force the lease to expire: the park must not spend a recovery credit.
         const expiring = taskOf(f.runtime, task.id)
-        expiring.attempt.leaseUntil = Date.now() + 5
+        expiring.attempt.leaseUntil = now() + 5
         f.runtime.store.transaction(() => f.runtime.store.put('tasks', expiring))
         const after = await eventually(() => {
           const current = taskOf(f.runtime, task.id)
@@ -248,7 +249,7 @@ await runScenario({
         const dependent = { ...taskOf(f.runtime, blocked.id), id: 'task_f19_dependent', title: 'Dependent on dead work',
           dependencies: [blocked.id], status: 'pending', assigneeId: undefined, attempt: undefined, epoch: 0,
           artifact: undefined, evidenceIds: [], reviewOf: undefined, replaces: undefined, output: undefined, recoveryCount: undefined }
-        const since = Date.now()
+        const since = now()
         f.runtime.store.transaction(() => f.runtime.store.put('tasks', dependent))
         const stall = await eventually(() => events(f.runtime, f.mission.id, 'mission/stalled').filter(event => event.data.cause === undefined).at(-1),
           'row 7: a board with only not-ready pending work must stall')
@@ -282,14 +283,14 @@ await runScenario({
         const prerequisite = f.propose({ title: 'Queued prerequisite', ...research })
         const waiting = dependentOf('task_f19_waiting_dependent', prerequisite.id)
         f.runtime.store.transaction(() => f.runtime.store.put('tasks', waiting))
-        await sleep(200)
+        await wait(200)
         assert.deepEqual(fallthroughs(), [], 'row 7b: work queued behind a live lease is a bounded wait, not a stall')
         // (b) A dependent admitted before its prerequisite was withdrawn: its
         // lineage is dead (spec row 7), and the running work must not hide it.
         const withdrawn = f.propose({ title: 'Withdrawn prerequisite', ...research })
         f.runtime.cancel(f.owner, f.mission.id, { taskId: withdrawn.id, reason: 'withdrawn by the owner' })
         const dependent = dependentOf('task_f19_running_dependent', withdrawn.id)
-        const since = Date.now()
+        const since = now()
         f.runtime.store.transaction(() => f.runtime.store.put('tasks', dependent))
         const notice = await eventually(() => fallthroughs()[0],
           'row 7b: running work plus a not-ready dependent must still leave a witness')
@@ -314,7 +315,7 @@ await runScenario({
         await f.runtime.claim(f.actor(runner), f.mission.id, first.id)
         const prerequisite = f.propose({ title: 'Ceilinged prerequisite', ...research, maxSteps: 1 })
         await f.runtime.claim(f.actor(f.author), f.mission.id, prerequisite.id)
-        const since = Date.now()
+        const since = now()
         const dependent = { ...taskOf(f.runtime, first.id), id: 'task_f19_blocked_dependent', title: 'Dependent of a blocked prerequisite',
           dependencies: [prerequisite.id], status: 'pending', assigneeId: undefined, attempt: undefined, epoch: 0,
           artifact: undefined, evidenceIds: [], reviewOf: undefined, replaces: undefined, output: undefined, recoveryCount: undefined }
@@ -349,7 +350,7 @@ await runScenario({
         await f.runtime.claim(f.actor(f.author), f.mission.id, first.id)
         const other = f.propose({ title: 'Unrelated dead end', ...research })
         const backoff = f.propose({ title: 'Backing off', ...research, assigneeId: second.id })
-        const retryAt = Date.now() + 400
+        const retryAt = now() + 400
         f.runtime.commit(f.mission.id, () => {
           const row = taskOf(f.runtime, backoff.id)
           row.epoch++
@@ -371,7 +372,7 @@ await runScenario({
         assert.ok(notice.createdAt > retryAt + tickMs, 'row 7d: named only once the bound has passed')
         assert.deepEqual(notice.subjects, [subject], 'row 7d: only the expired back-off is named')
         assertWitness(f, notice, 'fallthrough', retryAt + tickMs, 'row 7d')
-        await sleep(150)
+        await wait(150)
         assert.equal(naming().length, 1, 'row 7d: named exactly once')
         rows.row7d = { witness: 'W2', taskId: backoff.id }
       } finally { await f.cleanup() }
@@ -390,7 +391,7 @@ await runScenario({
         const mission = f.runtime.store.get('missions', f.mission.id)
         assert.equal(mission.status, 'active', 'row 8: the owner keeps the completion decision')
         assertWitness(f, notice, 'coverage-complete', since, 'row 8: the coverage-complete decision is outstanding while the owner has not decided')
-        await sleep(80)
+        await wait(80)
         assert.equal(ownerNotices(f).filter(delivery => /ready to complete/.test(delivery.content)).length, 1, 'row 8: an unchanged state must not spam')
         rows.row8 = { witness: 'W2', taskId: task.id }
       } finally { await f.cleanup() }
@@ -428,7 +429,7 @@ await runScenario({
         // The delivery predicate's wording since 69211b9; the row's claim is that
         // the stall carries exactly what completion reports.
         assert.match(stall.data.reason, /A unique independently accepted implementation artifact is required/)
-        assert.equal(stall.data.reason, f.runtime.completionError(f.runtime.store.get('missions', f.mission.id)))
+        assert.equal(stall.data.reason, completionError(f.runtime.boardOf(f.mission.id)))
         assertWitness(f, ownerNotices(f).find(delivery => delivery.notice.dedupKey === stall.data.noticeKey), 'board-stall', since, 'row 9b')
         rows.row9b = { witness: 'W3', reason: stall.data.reason }
       } finally { await f.cleanup() }
@@ -440,7 +441,7 @@ await runScenario({
       try {
         const task = f.propose({ maxSteps: 1 })
         await f.runtime.claim(f.actor(f.author), f.mission.id, task.id)
-        const since = Date.now()
+        const since = now()
         await f.workers.callbacks.beforeStep(f.author.id)
         assert.equal(await f.workers.callbacks.beforeStep(f.author.id), false)
         assert.equal(taskOf(f.runtime, task.id).status, 'blocked')
@@ -462,7 +463,7 @@ await runScenario({
         await f.runtime.claim(f.actor(f.author), f.mission.id, task.id)
         // An authoritative usage snapshot past the ceiling blocks the mission
         // synchronously at the transition (no scheduler race).
-        const since = Date.now()
+        const since = now()
         await f.workers.callbacks.usage(f.author.id, 100)
         const mission = f.runtime.store.get('missions', f.mission.id)
         assert.equal(mission.status, 'blocked', 'row 11: the mission blocks at the aggregate ceiling')
@@ -489,12 +490,13 @@ await runScenario({
         const claimedReview = await f.runtime.claim(f.actor(f.reviewer), f.mission.id, review.id)
         await f.runtime.verify(f.actor(f.reviewer), f.mission.id, { taskId: review.id, attemptId: claimedReview.attempt.id, verdict: 'accept', reason: 'Checks pass' })
         assert.equal(taskOf(f.runtime, task.id).status, 'accepted')
-        const since = Date.now()
+        const since = now()
         f.runtime.challenge(f.actor(f.reviewer), f.mission.id, { evidenceId: evidence.id, reason: 'Counter-evidence changes the conclusion', toolRunIds: [] })
         const notice = await eventually(() => ownerNotices(f).find(delivery => /challenged/.test(delivery.content)), 'row 12: the challenge must wake the owner')
         assert.equal(f.runtime.store.get('evidence', evidence.id).status, 'challenged')
         assert.equal(f.runtime.snapshot(f.owner, f.mission.id).completion.eligible, false, 'row 12: an open challenge blocks completion')
-        assert.throws(() => f.runtime.control(f.owner, f.mission.id, 'complete', 'too early'), /unfinished or blocked required work|Unresolved evidence challenges/)
+        // The challenge re-opens the accepted source, so completion is refused as unfinished work naming it.
+        assert.throws(() => f.runtime.control(f.owner, f.mission.id, 'complete', 'too early'), new RegExp(`Mission still has unfinished or blocked required work: (.+, )?${task.id} \\(submitted\\)`))
         assertWitness(f, notice, noticeFamily(notice), since, 'row 12')
         rows.row12 = { witness: 'W2', evidenceId: evidence.id }
       } finally { await f.cleanup() }
@@ -504,7 +506,7 @@ await runScenario({
     {
       const f = await setup()
       try {
-        const since = Date.now()
+        const since = now()
         f.workers.callbacks.failure(f.author.id, 'provider exploded')
         const notice = await eventually(() => ownerNotices(f).find(delivery => /Author failed/.test(delivery.content)),
           'row 13: a member failure must wake the owner')
@@ -522,7 +524,7 @@ await runScenario({
       const f = await setup()
       try {
         const before = f.runtime.store.get('missions', f.mission.id).usedTokens
-        const since = Date.now()
+        const since = now()
         f.workers.callbacks.failure(f.author.id, '429 Too Many Requests: provider quota exceeded')
         const notice = await eventually(() => ownerNotices(f).find(delivery => /quota|429/.test(delivery.content)),
           'row 14: a provider outage must be routed to the owner, never silent')
@@ -543,7 +545,7 @@ await runScenario({
         assert.equal(mission.status, 'paused')
         assert.deepEqual(events(f.runtime, f.mission.id, 'mission/pause').map(event => [event.actor, event.data.reason]), [['owner', 'owner paused the mission']], 'row 16: the owner\'s own event records the decision')
         assert.equal(Object.hasOwn(f.runtime.store.get('missions', f.mission.id), 'witness'), false, 'row 16: nothing on the mission row records a witness')
-        await sleep(80)
+        await wait(80)
         assert.equal(ownerNotices(f).length, count, 'row 16: a paused mission must not spam the owner')
         rows.row16 = { witness: 'owner event', status: mission.status }
       } finally { await f.cleanup() }
@@ -562,7 +564,7 @@ await runScenario({
         const mission = runtime.create(owner, { title: 'Empty', objective: 'Owner still planning', workspace: directory, scope: ['**'],
           acceptance: ['x'], budget }, { grantRoot: directory, source: 'session' })
         const first = runtime.fingerprint(mission.id)
-        await sleep(120)
+        await wait(120)
         assert.equal(runtime.store.list('deliveries', mission.id).filter(delivery => delivery.to === 'owner').length, 0, 'row 17: the documented exemption is not spammed')
         assert.deepEqual(runtime.store.list('deliveries', mission.id), [], 'row 17: no witness is fabricated for the exemption')
         assert.equal(runtime.fingerprint(mission.id), first, 'row 17: wall-clock ticks never change F(S)')
@@ -576,7 +578,7 @@ await runScenario({
       const f = await setup()
       try {
         const task = f.propose()
-        const base = clone(f.runtime.fingerprintBoard(f.mission.id))
+        const base = clone(fingerprintBoard(f.runtime.boardOf(f.mission.id)))
         assert.equal(f.runtime.fingerprint(f.mission.id), missionFingerprint(base))
         const shuffled = { ...base, tasks: [...base.tasks].reverse(), members: [...base.members].reverse() }
         assert.equal(f.runtime.fingerprint(f.mission.id), missionFingerprint(shuffled), 'F(S) is order-independent')

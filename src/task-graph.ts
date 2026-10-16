@@ -1,5 +1,6 @@
-/** Pure task identity selectors shared by runtime and read-only projections. */
-import { criterionId, type Task } from './types.ts'
+/** Pure functions of task and mission rows, shared by the runtime seams and the read-only projections. */
+import { PolicyError } from './policy-error.ts'
+import { criterionId, type EvidenceStatus, type Mission, type Task } from './types.ts'
 
 const oldest = (tasks: readonly Task[]): Task | undefined => [...tasks].sort((a, b) => a.createdAt - b.createdAt || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))[0]
 
@@ -77,6 +78,13 @@ export function taskGraphIndex(tasks: readonly Task[]) {
     return targets
   }
   const chains = new Map<string, Task[]>()
+  /**
+   * Follow repair lineage from a referenced dependency to the task that now
+   * carries its obligations. A blocked or cancelled task replaced by a live
+   * repair resolves to that repair, recursively; the original identity in a
+   * dependent's `dependencies` therefore keeps working after replacement. An id
+   * outside the index has no chain.
+   */
   const lineage = (id: string): Task[] => {
     const cached = chains.get(id)
     if (cached) return cached
@@ -122,6 +130,41 @@ export function taskGraphIndex(tasks: readonly Task[]) {
     return result
   }
   const dependencyMet = (id: string): boolean => effective(id)?.status === 'accepted'
+  /**
+   * The runtime's reads of an id it holds as one of this mission's tasks: the
+   * row, `lineage`, `effective` and `dependencyMet`, with one difference, an id
+   * that names no task of the mission is refused rather than read as no task.
+   * A projection, a classifier and a review source read the plain forms.
+   */
+  const taskOf = (id: string): Task => {
+    const task = byId.get(id)
+    if (task === undefined) throw new PolicyError('task_not_in_mission', 'validation_error', 'Task is not in this mission')
+    return task
+  }
+  const lineageOf = (id: string): Task[] => lineage(taskOf(id).id)
+  const effectiveOf = (id: string): Task => lineageOf(id).at(-1)!
+  const dependencyMetOf = (id: string): boolean => dependencyMet(taskOf(id).id)
+  /** Effective prerequisites for workspace preparation; one accepted repair covering several originals is merged once. */
+  const effectiveDependencies = (task: Pick<Task, 'dependencies'>): Task[] => {
+    const seen = new Set<string>()
+    return task.dependencies.map(dependency => effectiveOf(dependency)).filter(dependency => !seen.has(dependency.id) && seen.add(dependency.id))
+  }
+  /**
+   * R16-A: the EFFECTIVE unfinished prerequisites of one task, deduplicated in
+   * reference order. This is the one seam the waking classifier reads, so a notice
+   * and the scheduler resolve a replaced dependency through the same lineage.
+   */
+  const unfinishedDependencies = (task: Pick<Task, 'dependencies'>): Task[] => {
+    const seen = new Set<string>()
+    const unfinished: Task[] = []
+    for (const dependency of task.dependencies) {
+      const endpoint = effective(dependency)
+      if (endpoint === undefined || TERMINAL_STATES.has(endpoint.status) || seen.has(endpoint.id)) continue
+      seen.add(endpoint.id)
+      unfinished.push(endpoint)
+    }
+    return unfinished
+  }
   // Reviews always name the exact submitted source; replacement lineage is only for ordinary dependencies.
   const reviewSource = (task: Pick<Task, 'reviewOf'>): Task | undefined => task.reviewOf === undefined ? undefined : byId.get(task.reviewOf)
   /** The mission criteria `id` answers for: its covers and those of every task it replaces. */
@@ -163,7 +206,8 @@ export function taskGraphIndex(tasks: readonly Task[]) {
       return identities(id).has(sourceId) || covers(endpoint, sourceId, seen)
     })
   }
-  return { byId, lineage, effective, identities, dependencyMet, reviewSource, covers, replacementDescendants, liveReplacement, replacedLineage, criteriaOf, checklist }
+  return { byId, lineage, effective, identities, dependencyMet, taskOf, lineageOf, effectiveOf, dependencyMetOf, effectiveDependencies, unfinishedDependencies,
+    reviewSource, covers, replacementDescendants, liveReplacement, replacedLineage, criteriaOf, checklist }
 }
 
 /** Each mission criterion whose id `covered` lacks, as the id and its quoted text (`c2 "text"`), in mission order. */
@@ -199,4 +243,104 @@ export function completionExempt(task: Pick<Task, 'status' | 'experiment' | 'rev
   if (task.experiment) return true
   const source = task.reviewOf === undefined ? undefined : tasks.find(candidate => candidate.id === task.reviewOf)
   return source !== undefined && completionExempt(source, tasks)
+}
+
+/** The states that leave a task no future. */
+export const TERMINAL_STATES: ReadonlySet<string> = new Set(['accepted', 'cancelled'])
+
+/** The mission is terminal: no further scheduling or fencing applies. */
+export const terminal = (mission: Pick<Mission, 'status'>): boolean => mission.status === 'stopped' || mission.status === 'completed'
+
+/** R14-F2(a): the durable identity of one task at one epoch, as notices carry it. */
+export function taskSubject(task: Pick<Task, 'id' | 'epoch'>): string { return `${task.id}@${task.epoch}` }
+/**
+ * R15-A1: the mission-scoped subject for a decision that names no single task (a
+ * wedged scheduling pass, a failed member with no assigned work, an escalation).
+ * It is the exact lineage root of such a decision, never a placeholder, so an
+ * owner-facing notice always has something to be attributed to.
+ */
+export function missionSubject(mission: Pick<Mission, 'id'>): string { return `mission:${mission.id}` }
+/**
+ * R15-A1: the subjects of a set of tasks, with the mission root as the honest
+ * fallback when the set is empty. Deduplicated and order-preserving.
+ */
+export function subjectsOfTasks(tasks: readonly Pick<Task, 'id' | 'epoch'>[], mission: Pick<Mission, 'id'>): string[] {
+  const subjects: string[] = []
+  for (const task of tasks) { const subject = taskSubject(task); if (!subjects.includes(subject)) subjects.push(subject) }
+  return subjects.length ? subjects : [missionSubject(mission)]
+}
+
+/**
+ * A fence this task still owes: a stop marker recorded at the task's OWN epoch.
+ * A marker at an older epoch belongs to a fence a later epoch already replaced,
+ * so it obliges nothing. This one comparison was written out at roughly twenty
+ * call sites across the runtime, the attempt accounting, the scheduling pass and
+ * the notices; naming it is what lets a reader see that they all ask the same
+ * question rather than four similar ones.
+ */
+export function stopPending<T extends Pick<Task, 'epoch' | 'resumeAfterStop'>>(task: T): task is T & { resumeAfterStop: NonNullable<T['resumeAfterStop']> } {
+  return task.resumeAfterStop?.epoch === task.epoch
+}
+
+/**
+ * A durable stop transition is in flight: the task is blocked only until the
+ * old worker handle acknowledges the stop, then it re-pends. Every scheduler
+ * and completion decision treats it as live work.
+ */
+export function quiescencePending<T extends Pick<Task, 'status' | 'epoch' | 'resumeAfterStop'>>(task: T): task is T & { resumeAfterStop: NonNullable<T['resumeAfterStop']> } { return task.status === 'blocked' && stopPending(task) }
+
+/** A fenced handle must finish stopping before that member can own new work. */
+export function pendingStopOwner(tasks: readonly Task[], memberId: string): boolean {
+  return tasks.some(task => {
+    if (!stopPending(task)) return false
+    const marker = task.resumeAfterStop
+    if (marker.memberId !== undefined) return marker.memberId === memberId
+    // An unresolved legacy owner is a conservative stop of every mission
+    // handle; reserve every member until the complete scan confirms quiescence.
+    return true
+  })
+}
+
+/**
+ * Why a task is, or on its next confirmed stop would be, blocked. A `blocked`
+ * status has several causes that can hold together and clear independently (a
+ * restart retires an obsolete finding ceiling while a preparation failure still
+ * needs repair), so the set is derived from the task's own fields whenever a
+ * reader asks, never stored as one discriminant.
+ */
+export type BlockCause = 'task-ceiling' | 'preparation-failed' | 'review-deferred' | 'needs-replacement' | 'refuted' | 'recovery-exhausted'
+
+/**
+ * The claims of the task's current attempt generation. A rework archives the
+ * claims its rejection refuted in `rejections`: they stay refuted, but they no
+ * longer block the task and no later submission or verdict touches them.
+ */
+export function currentEvidenceIds(task: Pick<Task, 'evidenceIds' | 'rejections'>): string[] {
+  const archived = new Set(task.rejections?.flatMap(rejection => rejection.evidenceIds))
+  return (task.evidenceIds ?? []).filter(evidenceId => !archived.has(evidenceId))
+}
+
+/**
+ * The block causes holding for `task` now. `evidenceStatusOf` reads an evidence
+ * row's current status; `defaultMaxRecoveryAttempts` is the limit of a task
+ * without its own `maxRecoveryAttempts` (the runtime's `maxTasksPerMember`). A
+ * preparation failure still inside its backoff retry is not a cause: that task
+ * is pending and the host retries it.
+ */
+export function blockCauses(
+  task: Pick<Task, 'status' | 'ceiling' | 'preparationFailure' | 'verificationRecovery' | 'artifact' | 'evidenceIds' | 'recoveryCount' | 'maxRecoveryAttempts' | 'rejections'>,
+  evidenceStatusOf: (evidenceId: string) => EvidenceStatus | undefined,
+  defaultMaxRecoveryAttempts: number,
+): Set<BlockCause> {
+  const causes = new Set<BlockCause>()
+  if (task.ceiling !== undefined) causes.add('task-ceiling')
+  if (task.preparationFailure !== undefined && task.preparationFailure.retryAt === undefined) causes.add('preparation-failed')
+  if (task.verificationRecovery !== undefined) causes.add('review-deferred')
+  // A rejected source, or submitted work invalidated after submission: its
+  // artifact is immutable. Only an owner rework (a rejected non-experiment,
+  // whose artifact then moves into history) or a replacement repairs it.
+  if (task.status === 'blocked' && task.artifact !== undefined) causes.add('needs-replacement')
+  if (currentEvidenceIds(task).some(evidenceId => evidenceStatusOf(evidenceId) === 'refuted')) causes.add('refuted')
+  if ((task.recoveryCount ?? 0) >= (task.maxRecoveryAttempts ?? defaultMaxRecoveryAttempts)) causes.add('recovery-exhausted')
+  return causes
 }

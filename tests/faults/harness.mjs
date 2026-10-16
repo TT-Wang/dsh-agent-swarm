@@ -14,7 +14,9 @@
  *  - `makeWorkspaces(dir, overrides)` / `workspaceOptions(dir, overrides)`: the
  *    real Workspaces engine behind the subprocess seam.
  *  - `makeRuntimeStub(overrides)`: a partial runtime for one component.
- *  - `eventually(read, message, timeoutMs)`, `FakeClock`.
+ *  - `eventually(read, message, timeoutMs)`, `wait(ms)`, `now()`, `FakeClock`:
+ *    a scenario that waits and reads time only through these also runs as its
+ *    own clocked variant in the full-log oracle (oracle mode, below).
  *
  * The suite asserts from durable state, never from logs. Two seams are used:
  *  - Tier A drives the real `SwarmRuntime` with a controllable `WorkerAdapter`
@@ -31,11 +33,13 @@
 import assert from 'node:assert/strict'
 import { execFile } from 'node:child_process'
 import { mkdir, readFile, realpath, rm, writeFile } from 'node:fs/promises'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
+import { appendFileSync } from 'node:fs'
 import { tempDirectory } from '../temp-root.mjs'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { promisify } from 'node:util'
 import { subprocessSeam } from '../subprocess-seam.mjs'
+import { ORACLE_EPOCH, deterministicIds, oracleLog, traceAdapter } from './oracle.mjs'
 
 const execute = promisify(execFile)
 export const PROJECT = fileURLToPath(new URL('../../', import.meta.url))
@@ -57,8 +61,65 @@ export class FakeClock {
   advance(ms) { this.#at += ms; return this.#at }
 }
 
+/**
+ * Oracle mode, the clocked variant of every scenario written with `now`,
+ * `wait` and `eventually` (scripts/replay/oracle.mjs sets `SWARM_ORACLE` to
+ * the file it reads). Every `setup`/`makeRuntime` runtime of the process then
+ * runs on one FakeClock at a fixed epoch with `manualTick`, ids come from a
+ * counter, the adapter it is handed records every call into it, and its
+ * cleanup appends its normalized full log (tests/faults/oracle.mjs) to that
+ * file. Waiting becomes deterministic: `eventually` settles every live
+ * runtime, reads, and otherwise moves the clock one tick and ticks them;
+ * `wait(ms)` ticks through `ms` of clock time.
+ */
+const oracle = process.env.SWARM_ORACLE === undefined ? undefined : (() => {
+  deterministicIds()
+  const clock = new FakeClock(ORACLE_EPOCH)
+  const live = new Map()
+  const step = () => Math.min(10, ...[...live.keys()].map(runtime => runtime.config.tickMs))
+  const settle = async () => { for (const runtime of live.keys()) for (const mission of runtime.store.list('missions')) await runtime.settle(mission.id) }
+  const tick = async () => { clock.advance(step()); for (const runtime of live.keys()) await runtime.tick() }
+  return {
+    clock,
+    /** The traced adapter a fixture runtime is handed, and the record of it. */
+    trace: workers => traceAdapter(workers),
+    track: (runtime, calls, directories) => live.set(runtime, { calls, directories }),
+    /** Append the runtime's full log, once, before it is disposed. */
+    dump(runtime) {
+      const entry = live.get(runtime)
+      if (entry === undefined) return
+      live.delete(runtime)
+      appendFileSync(process.env.SWARM_ORACLE, `${JSON.stringify(oracleLog(runtime, entry.calls, entry.directories))}\n`)
+    },
+    async eventually(read, message, timeoutMs) {
+      for (let elapsed = 0; ; elapsed += step()) {
+        await settle()
+        const value = await read()
+        if (value) return value
+        if (elapsed >= timeoutMs) assert.fail(`Timed out after ${timeoutMs}ms of oracle clock: ${message}`)
+        await tick()
+      }
+    },
+    async wait(ms) {
+      await settle()
+      for (let elapsed = 0; elapsed < ms; elapsed += step()) await tick()
+      await settle()
+    },
+  }
+})()
+
+/** The scenario's clock: the oracle clock in oracle mode, else the wall clock. */
+export const now = () => oracle?.clock.now() ?? Date.now()
+
+/** Let `ms` pass: real time, or that much oracle clock time ticked through. */
+export async function wait(ms) {
+  if (oracle !== undefined) return await oracle.wait(ms)
+  await new Promise(resolve => setTimeout(resolve, ms))
+}
+
 /** Poll a synchronous reader; fail loudly instead of hanging. */
 export async function eventually(read, message, timeoutMs = 8_000) {
+  if (oracle !== undefined) return await oracle.eventually(read, message, timeoutMs)
   const deadline = Date.now() + timeoutMs
   while (Date.now() < deadline) {
     const value = await read()
@@ -241,11 +302,13 @@ function runtimeConfig(dir, overrides, clock) {
  * `storeOptions` is the runtime's third argument (the SQLite writer's busy
  * timeout and retries), for a test that holds the writer lock itself.
  */
-export async function makeRuntime(t, { workers = new FakeWorkers(), config = {}, budget: overrides = {}, clock, storeOptions } = {}) {
+export async function makeRuntime(t, { workers = new FakeWorkers(), config = {}, budget: overrides = {}, clock = oracle?.clock, storeOptions } = {}) {
   const dir = await realpath(await tempDirectory('swarm-runtime-'))
   const runtimeSettings = runtimeConfig(dir, config, clock)
-  const runtime = new SwarmRuntime(runtimeSettings, workers, storeOptions)
-  t.after(async () => { await runtime.dispose(); await rm(dir, { recursive: true, force: true }) })
+  const traced = oracle?.trace(workers)
+  const runtime = new SwarmRuntime(runtimeSettings, traced?.adapter ?? workers, storeOptions)
+  if (traced !== undefined) oracle.track(runtime, traced.calls, [dir])
+  t.after(async () => { oracle?.dump(runtime); await runtime.dispose(); await rm(dir, { recursive: true, force: true }) })
   return { dir, config: runtimeSettings, runtime, workers, budget: { ...budget, ...overrides }, clock }
 }
 
@@ -282,9 +345,11 @@ export const makeRuntimeStub = (overrides = {}) => ({ now: () => Date.now(), con
  * windows the clock moves through. The pass bound then defaults to a minute of
  * clock time, which the real timers that share it never reach within a test.
  */
-export async function setup({ workers = new FakeWorkers(), config = {}, budget: overrides = {}, acceptance = MISSION_ACCEPTANCE, checks = ['test -d .'], workspace, clock } = {}) {
+export async function setup({ workers = new FakeWorkers(), config = {}, budget: overrides = {}, acceptance = MISSION_ACCEPTANCE, checks = ['test -d .'], workspace, clock = oracle?.clock } = {}) {
   const dir = await realpath(await tempDirectory('swarm-faults-'))
-  const runtime = new SwarmRuntime(runtimeConfig(dir, config, clock), workers)
+  const traced = oracle?.trace(workers)
+  const runtime = new SwarmRuntime(runtimeConfig(dir, config, clock), traced?.adapter ?? workers)
+  if (traced !== undefined) oracle.track(runtime, traced.calls, [dir, ...(workspace === undefined ? [] : [workspace, dirname(workspace)])])
   await runtime.start()
   const owner = { sessionId: 'fault-owner' }
   const mission = runtime.create(owner, { title: 'Fault injection', objective: 'Prove the injected fault fired and recovery holds', workspace: workspace ?? dir, scope: ['**'], acceptance, budget: { ...budget, ...overrides } }, { grantRoot: workspace ?? dir, source: 'session' })
@@ -300,7 +365,7 @@ export async function setup({ workers = new FakeWorkers(), config = {}, budget: 
     outputs: [], workstreamId: stream.id, title: 'Implement', objective: 'Implement the scoped change',
     kind: 'implementation', scope: ['**'], acceptance, ...(extra.kind === 'verification' ? {} : { covers: acceptance.map((_, index) => `c${index + 1}`) }), checks, assigneeId: author.id, ...extra,
   })
-  const cleanup = async () => { await runtime.dispose(); await rm(dir, { recursive: true, force: true }) }
+  const cleanup = async () => { oracle?.dump(runtime); await runtime.dispose(); await rm(dir, { recursive: true, force: true }) }
   return { dir, runtime, workers, owner, mission, stream, author, reviewer, actor, propose, cleanup, clock }
 }
 

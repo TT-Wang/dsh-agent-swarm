@@ -35,7 +35,7 @@ test('OWNER QUIET: a stopped mission delivers nothing it queued before the stop'
     f.propose()
     f.runtime.control(f.owner, f.mission.id, 'stop', 'owner stopped it')
     queue(f, { id: 'msg_quiet_stopped', content: 'decision queued while out of play' })
-    f.runtime.pumpOutbox()
+    f.runtime.notices.pumpOutbox()
     await sleep(150)
     assert.equal(delivered(f, 'msg_quiet_stopped'), false, 'a terminal mission never back-fills its queue to the owner')
     assert.equal(handedToOwner(f, 'decision queued while out of play'), false, 'and the adapter is never asked to deliver it')
@@ -54,7 +54,7 @@ test('OWNER QUIET: automatic completion does not swallow the facts it raced', as
     mission.status = 'completed'
     f.runtime.store.put('missions', mission)
     queue(f, { id: 'msg_quiet_completed', content: 'a fact produced while the mission was still running' })
-    f.runtime.pumpOutbox()
+    f.runtime.notices.pumpOutbox()
     await eventually(() => delivered(f, 'msg_quiet_completed') ? true : undefined,
       'a completed mission still delivers the facts the pump reached after the transition', 4_000)
     assert.equal(handedToOwner(f, 'a fact produced while the mission was still running'), true, 'and the owner session receives it')
@@ -67,7 +67,7 @@ test('OWNER QUIET: a paused mission keeps a question that still needs an answer 
     f.runtime.control(f.owner, f.mission.id, 'pause', 'owner stepped away')
     queue(f, { id: 'msg_quiet_question', kind: 'question', replyExpected: true, content: 'which scope did you mean?' })
     queue(f, { id: 'msg_quiet_report', content: 'a report nobody can act on while paused' })
-    f.runtime.pumpOutbox()
+    f.runtime.notices.pumpOutbox()
     await eventually(() => delivered(f, 'msg_quiet_question') ? true : undefined,
       'a question awaiting the owner must survive a pause: it is a receipt', 4_000)
     assert.equal(handedToOwner(f, 'which scope did you mean?'), true, 'the question reaches the owner session')
@@ -83,7 +83,7 @@ test('OWNER QUIET: a blocked mission is a decision addressed to the owner and st
     mission.status = 'blocked'
     f.runtime.store.put('missions', mission)
     queue(f, { id: 'msg_quiet_blocked', content: 'the mission is blocked and needs a decision' })
-    f.runtime.pumpOutbox()
+    f.runtime.notices.pumpOutbox()
     await eventually(() => delivered(f, 'msg_quiet_blocked') ? true : undefined,
       'a blocked mission must still reach the owner: that is the decision it exists to ask for', 4_000)
   } finally { await f.cleanup() }

@@ -6,8 +6,9 @@ import { OwnerReplyGuard } from '../lib/owner-reply.js'
 import { RoleScoper } from '../lib/roles.js'
 import { HarnessWorkers } from '../lib/harness-workers.js'
 import { registerAutomaticStart } from '../lib/planner.js'
-import { hasNotice } from '../lib/arena.js'
+import { hasNotice, openAsks } from '../lib/arena.js'
 import { FakeWorkers, SwarmRuntime, makeRuntime, makeRuntimeStub } from './faults/harness.mjs'
+import { reviewNeed, reviewPathBlocker, reviewable, waitsLegitimately } from '../lib/board.js'
 
 async function fixture(t) {
   let runtime
@@ -51,7 +52,7 @@ for (const status of ['paused', 'blocked', 'budget-quiescing']) test(`R02: full 
   await f.runtime.flushOutbox(row.id)
   assert.equal(f.rows().filter(item => item.inReplyTo === question.id).length, 1)
   assert.equal(f.workers.deliveries.filter(item => item.inReplyTo === question.id).length, 0)
-  assert.equal(f.runtime.openAsks(row.id, 'owner').length, 0)
+  assert.equal(openAsks(f.runtime.store.list('deliveries', row.id), 'owner').length, 0)
   await f.reload()
   f.runtime.message(f.owner, row.id, input)
   const restored = f.rows().find(item => item.inReplyTo === question.id)
@@ -84,7 +85,7 @@ test('R01: the reply guard leaves owner tool execution available to answer', asy
   guard.observe('owner', 'turn/end', { reason: { kind: 'completed' } })
   assert.equal(f.runtime.store.get('deliveries', question.id).replyNudges, 1)
   f.runtime.message(f.owner, f.mission.id, { to: f.member.id, kind: 'question', replyTo: question.id, content: 'Now answered' })
-  assert.equal(f.runtime.openAsks(f.mission.id).length, 0)
+  assert.equal(openAsks(f.runtime.store.list('deliveries', f.mission.id)).length, 0)
 })
 
 test('R03: a host append rejection is never an acknowledgement, even one naming this package', async t => {
@@ -172,8 +173,8 @@ for (const reviewStatus of ['pending', 'running', 'parked']) test(`owner reminde
     f.runtime.store.put('tasks', review)
   })
   t.mock.timers.tick(120000)
-  assert.equal(f.runtime.reviewNeed(source).ripe, true)
-  assert.equal(f.runtime.notices.waitsLegitimately(source, f.runtime.store.list('tasks', f.mission.id)), true)
+  assert.equal(reviewNeed(f.runtime.boardOf(f.mission.id), source).ripe, true)
+  assert.equal(waitsLegitimately(f.runtime.boardOf(f.mission.id), source), true)
   const key = `obligation-followup:${original.id}:`
   for (let i = 0; i < 2; i++) {
     f.runtime.notices.obligationFollowupMs = 0
@@ -205,8 +206,8 @@ test('a reminder queued before review admission is retained in the ledger but ne
   // Each review-blocked decision comes from the one emitter, per source and review need, with the blocker the runtime derives.
   const mission = f.runtime.mission(f.mission.id)
   for (const task of [source, other]) {
-    const need = f.runtime.reviewNeed(task)
-    f.runtime.notices.notifyReviewBlocked(mission, task, need.id, f.runtime.reviewPathBlocker(task, need) ?? `no live independent review admits ${task.id}`)
+    const board = f.runtime.boardOf(task.missionId), need = reviewNeed(board, task)
+    f.runtime.notices.notifyReviewBlocked(mission, task, need.id, reviewPathBlocker(board, task, need) ?? `no live independent review admits ${task.id}`)
   }
   const decisionOf = task => f.rows().find(row => row.notice?.dedupKey?.startsWith(`review-blocked:${f.mission.id}:${task.id}:`))
   await f.runtime.flushOutbox(f.mission.id)
@@ -229,7 +230,7 @@ test('a generic decision an older build wrote is an unclassified legacy fact: no
   })
   const legacy = f.rows().find(row => row.content === 'Legacy review decision')
   assert.equal(legacy.notice.dedupKey, `decision:${f.mission.id}:${source.id}@${source.epoch}:none`, 'the key an older build wrote')
-  assert.equal(f.runtime.reviewable(f.runtime.task(f.mission.id, source.id), f.runtime.store.list('tasks', f.mission.id)), true, 'the source has a live review')
+  assert.equal(reviewable(f.runtime.boardOf(f.mission.id), f.runtime.task(f.mission.id, source.id)), true, 'the source has a live review')
   assert.equal(f.runtime.ownerDeliveryRelevant(f.runtime.mission(f.mission.id), legacy), true, 'and the legacy decision is still deliverable')
 })
 
@@ -325,7 +326,7 @@ test('a delivered summary does not revive a resolved review request because unre
   t.mock.timers.tick(120000)
   f.runtime.notices.wakeBudget = 1
   f.runtime.store.transaction(() => f.runtime.notify(f.mission.id, 'An observed fact', ['mission:' + f.mission.id], { noticeClass: 'progress', trigger: 'test/progress' }))
-  f.runtime.notices.notifyReviewBlocked(f.runtime.mission(f.mission.id), source, f.runtime.reviewNeed(source).id, 'Please admit the review')
+  f.runtime.notices.notifyReviewBlocked(f.runtime.mission(f.mission.id), source, reviewNeed(f.runtime.boardOf(f.mission.id), source).id, 'Please admit the review')
   await f.runtime.flushOutbox(f.mission.id)
   const summary = f.rows().find(row => row.notice?.aggregatedFacts?.some(part => part.subjects.includes(`${source.id}@1`)))
   assert.ok(summary.deliveredAt)
@@ -384,7 +385,7 @@ function plannerFixture(t) {
   const agent = { id: 'owner', session: { snapshotEvents: () => events }, send(message) { sent.push(message); events.push({ type: 'user/message', data: message }) } }
   const ctx = { agents: { get: () => agent }, sessions: { async flush() { if (failFlush) throw new Error('persistence offline') } },
     on: () => () => {}, effect: factory => disposers.push(factory()), inject() {}, commands: { register: () => () => {} } }
-  const runtime = makeRuntimeStub({ config: { tickMs: 60000 }, stallPassTimeoutMs: 1000, store: { list: () => [...requests.values()], get: (_table, id) => structuredClone(requests.get(id)), put: (_table, row) => requests.set(row.id, structuredClone(row)) },
+  const runtime = makeRuntimeStub({ config: { tickMs: 60000 }, bounds: { stallPassTimeoutMs: 1000 }, store: { list: () => [...requests.values()], get: (_table, id) => structuredClone(requests.get(id)), put: (_table, row) => requests.set(row.id, structuredClone(row)) },
     subscribe(fn) { handlers.add(fn); return () => handlers.delete(fn) }, commit: (_id, fn) => fn() })
   registerAutomaticStart(ctx, runtime)
   t.after(() => disposers.forEach(dispose => dispose()))

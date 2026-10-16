@@ -30,6 +30,7 @@ import { writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { assertNamedCalls, ownerTools, toolSchemaIndex } from './refusal-inventory.mjs'
 import { FakeClock, MISSION_ACCEPTANCE, acceptThroughReview, events, makeRuntime, taskOf } from './faults/harness.mjs'
+import { reviewPathStalled, reviewable } from '../lib/board.js'
 import { sidebarState } from '../lib/types/client/progress.js'
 import { noticeFamily } from '../lib/notices.js'
 import { WriterBusyError } from '../lib/store.js'
@@ -102,7 +103,7 @@ async function fixture(t, { members = ['Author', 'Reviewer'], budget: overrides,
     /** One scheduling tick past the review grace. */
     pass: async () => { clock.advance(1_500); await runtime.tick(); await runtime.settle(mission.id) },
     reviewsOf: source => runtime.store.list('tasks', mission.id).filter(task => task.reviewOf === source.id),
-    live: source => runtime.reviewable(taskOf(runtime, source.id), runtime.store.list('tasks', mission.id)),
+    live: source => reviewable(runtime.boardOf(mission.id), taskOf(runtime, source.id)),
   }
 }
 
@@ -501,7 +502,7 @@ test('a refused admission is its review need\'s cause, as a withdrawn host revie
   assert.equal(outstanding(f, refusal), true, 'beside running work the refusal is still the outstanding cause')
   await f.tool('swarm_cancel', { taskId: running.id, reason: 'Stop the unrelated work' })
   for (let pass = 0; pass < 3; pass++) await f.pass()
-  assert.equal(f.runtime.reviewPathStalled(f.runtime.store.list('tasks', f.mission.id), f.runtime.store.list('members', f.mission.id)), true, 'the board stalls again')
+  assert.equal(reviewPathStalled(f.runtime.boardOf(f.mission.id)), true, 'the board stalls again')
   assert.deepEqual([proposals.length, f.reviewsOf(source)], [1, []], 'the host proposed its review once, and no review of the source exists')
   const recorded = events(f.runtime, f.mission.id, 'task/review-blocked').filter(event => event.data.taskId === source.id).map(event => event.data.reason)
   assert.deepEqual(recorded, [refusal.notice.reason], 'the refusal is the one recorded cause: the running board never displaced it')
@@ -723,7 +724,7 @@ test('while a wedged pass keeps the host\'s admission from running, the classifi
     // The owner frees a task slot, and no pass runs to admit a review or name the next cause.
     f.runtime.store.transaction(() => { const mission = f.runtime.mission(f.mission.id); f.runtime.store.put('missions', { ...mission, budget: { ...mission.budget, maxTasks: 2 } }) })
     await publish(f, true)
-    assert.equal(f.runtime.reviewPathStalled(f.runtime.store.list('tasks', f.mission.id), f.runtime.store.list('members', f.mission.id)), true, 'nothing runs on the board')
+    assert.equal(reviewPathStalled(f.runtime.boardOf(f.mission.id)), true, 'nothing runs on the board')
     if (members.length === 1) {
       // No member may review it: the cause the admission would name next is true of the board now.
       const next = blockedNotice(f, source, NO_MEMBER)

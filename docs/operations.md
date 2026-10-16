@@ -190,6 +190,7 @@ This runs typecheck, build, the behavioral suite, packaged-artifact loading, rea
 | `npm test` | Build and the full behavioral suite. |
 | `npm run test:faults` | Fault injection; each scenario must establish that its fault fired. |
 | `npm run test:replay` | Deterministic replay over the durable log. |
+| `npm run test:oracle` | The full-log oracle: the replay scenario and the clocked fault scenarios must leave the recorded events, rows and adapter call trace (`scripts/replay/oracle/`). |
 | `npm run test:load` | Admission and scheduling under load. |
 | `npm run test:isolation` | Host-only sandbox and workspace confinement. |
 | `npm run test:harness` | Real Harness Loader composition. |
