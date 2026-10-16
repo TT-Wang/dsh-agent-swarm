@@ -123,6 +123,15 @@ export class RefusalRegistry {
   }
 
   /**
+   * The refusal of new work for a member still owed its previous attempt's
+   * stop, or undefined when it owes none: the one statement of that rule, which
+   * a claim, a worker start and an admission all meet.
+   */
+  stopOwed(missionId: string, memberId: string): Error | undefined {
+    return pendingStopOwner(this.k.store.list('tasks', missionId), memberId) ? new Error('Worker is waiting for its previous attempt to stop') : undefined
+  }
+
+  /**
    * The admission of one task to one member, asserted before any workspace
    * mutation and again inside the assignment: a member still owed its previous
    * attempt's stop is refused, the mission's queued writer-busy refusals are
@@ -130,7 +139,8 @@ export class RefusalRegistry {
    * `AdmissionRefusedError`.
    */
   assertAdmission(task: Task, member: Member): { candidate: AdmissionCandidate; decision: AdmissionDecision; latencyMs: number } {
-    if (pendingStopOwner(this.k.store.list('tasks', task.missionId), member.id)) throw new Error('Worker is waiting for its previous attempt to stop')
+    const owed = this.stopOwed(task.missionId, member.id)
+    if (owed !== undefined) throw owed
     member = this.k.store.get('members', member.id) ?? member
     const mission = this.k.mission(task.missionId)
     this.recordWriterBusyRecovery(mission)

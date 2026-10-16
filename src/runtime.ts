@@ -1181,7 +1181,8 @@ export class SwarmRuntime implements Kernel {
       const { member } = this.active(actor, missionId)
       if (!member) throw new Error('[owner_cannot_claim] Only a member can claim work: Inspect `taskId` with `swarm_observe`, or decide the mission with `swarm_control` and its `action`.')
       const task = this.task(missionId, taskId)
-      if (pendingStopOwner(this.store.list('tasks', missionId), member.id)) throw new Error('Worker is waiting for its previous attempt to stop')
+      const owed = this.refusals.stopOwed(missionId, member.id)
+      if (owed !== undefined) throw owed
       const blocker = readinessBlocker(this.boardOf(missionId), task, member)
       if (blocker !== undefined) throw new PolicyError('task_not_ready', 'conflict_error', `Task is not ready for this member: ${blocker}`)
       this.refusals.assertAdmission(task, member)
@@ -3755,7 +3756,8 @@ export class SwarmRuntime implements Kernel {
    */
   startWorker(mission: Mission, member: Member, options: { admission?: boolean; signal?: AbortSignal; pass?: SchedulingPass } = {}): Promise<void> {
     if (this.closed || this.shuttingDown) return Promise.reject(new PolicyError('runtime_shutting_down', 'conflict_error', 'Swarm runtime is shutting down'))
-    if (pendingStopOwner(this.store.list('tasks', mission.id), member.id)) return Promise.reject(new Error('Worker is waiting for its previous attempt to stop'))
+    const owed = this.refusals.stopOwed(mission.id, member.id)
+    if (owed !== undefined) return Promise.reject(owed)
     const existing = this.workerStarts.get(member.id)
     const superseded = existing !== undefined && options.admission && (existing.admissionSignal !== options.signal || (!existing.nativePending && existing.retryAfter !== undefined))
     if (superseded) existing.controller.abort(new Error('Worker startup superseded by a new admission'))
@@ -3782,7 +3784,8 @@ export class SwarmRuntime implements Kernel {
         const latest = this.store.get('members', member.id)
         const active = current?.status === 'active' || (options.admission && current?.status === 'staged')
         if (!active || latest === undefined || memberPhaseOf(latest) === 'stopped') throw new Error('Worker startup is no longer active')
-        if (pendingStopOwner(this.store.list('tasks', mission.id), member.id)) throw new Error('Worker is waiting for its previous attempt to stop')
+        const owed = this.refusals.stopOwed(mission.id, member.id)
+        if (owed !== undefined) throw owed
         try {
           const selected = options.admission ? { ...latest, provider: member.provider, model: member.model, reasoningEffort: member.reasoningEffort } : latest
           const native = Promise.resolve(this.workers.start({ mission: current!, member: selected, ownerSessionId: current!.ownerSessionId }, controller.signal))
