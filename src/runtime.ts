@@ -773,6 +773,15 @@ export class SwarmRuntime implements Kernel {
     if (participant.mission.status !== 'staged' && this.now() >= participant.mission.deadline) throw new PolicyError('mission_duration_exhausted', 'budget_error', 'Mission duration budget exhausted')
     return participant
   }
+  /**
+   * An id that must name a task of this mission, refused otherwise
+   * (`task_not_in_mission`): a task id a caller supplies, where it enters (the
+   * task of the evidence a challenge names included), and the re-read of a row
+   * a call already holds. An id a stored row holds for another task (a task's
+   * dependency, its review source, a review recovery's source, an assignment
+   * delivery's task) is read through the task graph instead, where an id that
+   * names no task reads as no task (`taskGraphIndex`).
+   */
   task(missionId: string, taskId: string): Task {
     const task = this.store.get('tasks', taskId)
     if (!task || task.missionId !== missionId) throw new PolicyError('task_not_in_mission', 'validation_error', 'Task is not in this mission')
@@ -1052,7 +1061,7 @@ export class SwarmRuntime implements Kernel {
         // by the primary agent. Follow the source/repair/prerequisite lineage.
         const reference = input.reviewOf ?? input.replaces?.[0] ?? input.dependencies?.[0]
         const origin = reference ? this.task(missionId, reference) : this.store.list('tasks', missionId)[0]
-        const source = origin?.reviewOf ? this.task(missionId, origin.reviewOf) : origin
+        const source = origin?.reviewOf ? this.boardOf(missionId).graph.reviewSource(origin) : origin
         input = { ...input, maxRecoveryAttempts: origin?.maxRecoveryAttempts,
           checkTimeoutMs: origin?.checkTimeoutMs ?? source?.checkTimeoutMs,
           maxSteps: input.maxSteps ?? origin?.maxSteps, maxFindings: input.maxFindings ?? origin?.maxFindings,
@@ -1312,7 +1321,8 @@ export class SwarmRuntime implements Kernel {
     if (canBorrowTask(task)) task.plannedAssigneeId = member.id
     task.epoch++
     task.attempt = { id: id('attempt'), epoch: task.epoch, ownerId: member.id, leaseUntil: Math.min(this.now() + this.config.leaseMs, mission.deadline) }
-    if (task.reviewOf) task.attempt.sourceCommit = this.task(task.missionId, task.reviewOf).artifact?.commit
+    const source = this.boardOf(task.missionId).graph.reviewSource(task)
+    if (source !== undefined) task.attempt.sourceCommit = source.artifact?.commit
     // R17-G7: assigning the attempt is what makes the derived status `working`;
     // there is no member status to write and none to fall behind the attempt.
     task.status = 'running'; task.assigneeId = member.id
@@ -1353,7 +1363,8 @@ export class SwarmRuntime implements Kernel {
       if (blocker !== undefined) throw new PolicyError('task_not_ready', 'conflict_error', `Task is not ready for this member: ${blocker}`)
       this.assertAdmission(task, member)
       await this.assertWorkspaceAuthorized(this.mission(missionId))
-      await this.workers.prepareTask(member, { ...task, epoch: task.epoch + 1 }, this.boardOf(missionId).graph.effectiveDependencies(task), task.reviewOf ? this.task(missionId, task.reviewOf) : undefined)
+      const { graph } = this.boardOf(missionId)
+      await this.workers.prepareTask(member, { ...task, epoch: task.epoch + 1 }, graph.effectiveDependencies(task), graph.reviewSource(task))
       this.active(actor, missionId)
       const fresh = this.task(missionId, taskId)
       if (fresh.epoch !== task.epoch || fresh.assigneeId !== task.assigneeId
@@ -1468,8 +1479,8 @@ export class SwarmRuntime implements Kernel {
     const prepared = await this.exclusive(missionId, async () => {
       const { task, member } = this.ownAttempt(actor, missionId, input.taskId, input.attemptId)
       if (task.kind !== 'verification' || !task.reviewOf) throw new Error('[not_a_verification_task] This is not a verification task. Call `swarm_verify` with `taskId` and `verdict`, then retry.')
-      const source = this.task(missionId, task.reviewOf)
-      if (source.status !== 'submitted' || !source.artifact || !canOwnReview(source, member.id)) throw new PolicyError('verification_not_independent', 'tool_error', 'Only independent verification of a submitted artifact by a member who never owned it is allowed')
+      const source = this.boardOf(missionId).graph.reviewSource(task)
+      if (source?.status !== 'submitted' || !source.artifact || !canOwnReview(source, member.id)) throw new PolicyError('verification_not_independent', 'tool_error', 'Only independent verification of a submitted artifact by a member who never owned it is allowed')
       // The reviewer's own reason is required and bounded; the check-failure
       // report is appended to it, never substituted for it.
       this.bounded(input.reason)
@@ -2023,7 +2034,7 @@ export class SwarmRuntime implements Kernel {
     // author of the reviewed source, so a handoff that skipped the check left the
     // review bound to a member who can never claim it: pending forever, blocking
     // completion, with no notice naming the cause.
-    if (input.to !== undefined && task.reviewOf !== undefined && !canOwnReview(this.task(missionId, task.reviewOf), input.to)) throw new PolicyError('review_independence_required', 'authorization_error', '[review_independence_required] Review requires an independent assignee; that member authored the reviewed source. Hand this review to a member who never owned it, or hand off the source instead.')
+    if (input.to !== undefined && !canOwnReview(this.boardOf(missionId).graph.reviewSource(task), input.to)) throw new PolicyError('review_independence_required', 'authorization_error', '[review_independence_required] Review requires an independent assignee; that member authored the reviewed source. Hand this review to a member who never owned it, or hand off the source instead.')
     // The source side of the same rule: the new owner must stay independent of this task's own reviews.
     const stranded = input.to === undefined ? undefined : strandedReview(this.store.list('tasks', missionId), task.id, { ...task, assigneeId: input.to })
     if (stranded !== undefined) throw new PolicyError('review_independence_required', 'authorization_error', `[review_independence_required] Member ${input.to} is the assignee of review ${stranded.id} of this task; owning this task would make it that review's author. Hand off to another member with \`to\`, or omit \`to\` to release the task.`)
@@ -3246,7 +3257,9 @@ export class SwarmRuntime implements Kernel {
     if (TERMINAL_STATES.has(task.status)) throw new PolicyError('task_immutable', 'conflict_error', 'Accepted and cancelled tasks are immutable')
     // A replacement carries this task's obligation while any row of its
     // replacement chain is not cancelled, even behind a withdrawn repair.
-    const carrier = taskGraphIndex(this.store.list('tasks', missionId)).liveReplacement(task.id)
+    // Nothing below writes before the amendment commits, so this graph is the board each decision reads.
+    const graph = taskGraphIndex(this.store.list('tasks', missionId))
+    const carrier = graph.liveReplacement(task.id)
     if (carrier !== undefined) throw new PolicyError('task_replaced', 'conflict_error', `[task_replaced] Task ${task.id} is carried by its replacement ${carrier.id} (${carrier.status}), so it is neither amended nor resumed. Amend or resume that replacement with \`swarm_control\` and its \`taskId\` while it is live; withdraw it with \`swarm_cancel\` and its \`taskId\` to re-open this task, or withdraw this task once the replacement is accepted.`)
     // A submitted artifact may acquire additional checks without changing its
     // content, authorship or obligations. The verdict fences this exact check list.
@@ -3314,7 +3327,7 @@ export class SwarmRuntime implements Kernel {
       else {
         const member = this.store.get('members', changes.assigneeId)
         if (member?.missionId !== missionId || memberPhaseOf(member) === 'stopped') throw new PolicyError('task_assignee_invalid', 'validation_error', 'Unknown live assignee')
-        if (task.reviewOf && !canOwnReview(this.task(missionId, task.reviewOf), member.id)) throw new PolicyError('review_independence_required', 'authorization_error', 'Review requires an independent assignee')
+        if (!canOwnReview(graph.reviewSource(task), member.id)) throw new PolicyError('review_independence_required', 'authorization_error', 'Review requires an independent assignee')
         const stranded = strandedReview(this.store.list('tasks', missionId), task.id, { ...task, assigneeId: member.id })
         if (stranded !== undefined) throw new PolicyError('review_independence_required', 'authorization_error', `[review_independence_required] Member ${member.id} is the assignee of review ${stranded.id} of this task; owning this task would make it that review's author. Pass another member as \`assigneeId\` in \`changes\`, or first amend review ${stranded.id}'s \`assigneeId\` with \`swarm_control\`.`)
         next.assigneeId = member.id; next.plannedAssigneeId = member.id
@@ -3338,8 +3351,8 @@ export class SwarmRuntime implements Kernel {
     if (resumes && task.status === 'submitted') throw new PolicyError('task_awaiting_verdict', 'conflict_error', 'Submitted work waits for an independent verdict')
     if (resumes && taskCeilingBlock(next, this.now()) !== undefined) throw new PolicyError('task_budget_exhausted', 'budget_error', 'Task budget exhausted; raise the same task allocation with swarm_budget before resuming')
     if (resumes && task.verificationRecovery) {
-      const source = this.task(missionId, task.verificationRecovery.sourceTaskId)
-      if (source.status !== 'submitted' || source.artifact?.commit !== task.verificationRecovery.commit) throw new PolicyError('review_artifact_changed', 'conflict_error', 'Review recovery requires its exact submitted artifact')
+      const source = graph.byId.get(task.verificationRecovery.sourceTaskId)
+      if (source?.status !== 'submitted' || source.artifact?.commit !== task.verificationRecovery.commit) throw new PolicyError('review_artifact_changed', 'conflict_error', 'Review recovery requires its exact submitted artifact')
     }
     if (resumes && this.taskBlockCauses(next).has('recovery-exhausted')) throw new PolicyError('task_recovery_exhausted', 'budget_error', 'Raise maxRecoveryAttempts before resuming exhausted automatic recovery')
     // An explicit owner recovery keeps the stop barrier but records the desired

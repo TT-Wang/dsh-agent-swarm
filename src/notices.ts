@@ -1337,8 +1337,9 @@ export class Notices {
       const delivery = this.rt.store.get('deliveries', queued.id)
       if (delivery === undefined || delivery.deliveredAt !== undefined) continue
       if (delivery.kind === 'assignment' && delivery.taskId) {
-        const task = this.rt.task(missionId, delivery.taskId)
-        if (task.attempt?.id !== delivery.attemptId || task.status !== 'running') {
+        // Moot unless its task, read as the row holds the id, still runs this attempt.
+        const task = this.rt.boardOf(missionId).graph.byId.get(delivery.taskId)
+        if (task?.status !== 'running' || task.attempt?.id !== delivery.attemptId) {
           delivery.deliveredAt = this.rt.now(); this.rt.commit(missionId, () => this.rt.store.put('deliveries', delivery)); continue
         }
       }

@@ -153,7 +153,8 @@ export class Scheduling {
             // (`SwarmRuntime.onRecoveryFallback`), which stamps the body that
             // marked the member it prepares before it commits the report.
             if (pass !== undefined) pass.preparing = member.id
-            try { await awaited(pass, this.rt.workers.prepareTask(member, { ...task, epoch: task.epoch + 1 }, this.rt.boardOf(missionId).graph.effectiveDependencies(task), task.reviewOf ? this.rt.task(missionId, task.reviewOf) : undefined), this.rt.now) }
+            const { graph } = this.rt.boardOf(missionId)
+            try { await awaited(pass, this.rt.workers.prepareTask(member, { ...task, epoch: task.epoch + 1 }, graph.effectiveDependencies(task), graph.reviewSource(task)), this.rt.now) }
             finally { if (pass !== undefined) delete pass.preparing }
             if (this.rt.shuttingDown || this.rt.mission(missionId).status !== 'active') return false
             const fresh = this.rt.task(missionId, task.id)

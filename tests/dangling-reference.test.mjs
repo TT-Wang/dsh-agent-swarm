@@ -153,3 +153,50 @@ test('running work whose dependency comes to name no task: the member sees it mi
   assert.equal(f.workers.callbacks.guard(f.author.id, 'read'), 'A prerequisite was invalidated; stop work and inspect the challenge')
   await assert.rejects(f.runtime.submit(f.actor(f.author), f.mission.id, { taskId: work.id, attemptId: claimed.attempt.id, output: 'done' }), error => error.code === 'task_prerequisite_revoked')
 })
+
+test('a running review whose source comes to name no task gets one answer from every reader: the guard and verify hold the source unsubmitted, observe renders it missing, an amendment is refused naming the edge, and the reviewer can hand the review off', async t => {
+  const f = await fixture(t)
+  const source = f.propose({ title: 'Submitted source' })
+  const sourceAttempt = await f.runtime.claim(f.actor(f.author), f.mission.id, source.id)
+  await f.runtime.submit(f.actor(f.author), f.mission.id, { taskId: source.id, attemptId: sourceAttempt.attempt.id, output: 'candidate' })
+  const review = f.propose({ title: 'Review', kind: 'verification', reviewOf: source.id, assigneeId: f.reviewer.id, checks: [] })
+  const reviewing = await f.runtime.claim(f.actor(f.reviewer), f.mission.id, review.id)
+  f.runtime.store.transaction(() => f.runtime.store.put('tasks', { ...taskOf(f.runtime, review.id), reviewOf: 'task_missing_source' }))
+  assert.equal(f.workers.callbacks.guard(f.reviewer.id, 'read'), 'The reviewed source is no longer submitted; await a fresh review assignment', 'the guard stops the reviewer\'s tools')
+  assert.deepEqual(f.runtime.observe(f.actor(f.reviewer), f.mission.id).current.reviewSource, missing('task_missing_source'), 'the current assignment renders the source as missing')
+  await assert.rejects(f.runtime.verify(f.actor(f.reviewer), f.mission.id, { taskId: review.id, attemptId: reviewing.attempt.id, verdict: 'accept', reason: 'Independent host checks pass' }),
+    error => error.code === 'verification_not_independent', 'verify holds the source unsubmitted, as the guard does')
+  assert.throws(() => f.runtime.controlTask(f.owner, f.mission.id, review.id, 'amend', { assigneeId: f.author.id }, 'reassign the review'),
+    error => error.code === 'task_graph_invalid' && error.diagnostics.some(diagnostic => diagnostic.code === 'task_graph_unknown_edge' && diagnostic.path === 'task_missing_source'),
+    'the amendment reaches the graph check, which names the edge')
+  // No source names an author, so no member is kept from the review.
+  const handed = f.runtime.handoff(f.actor(f.reviewer), f.mission.id, { taskId: review.id, attemptId: reviewing.attempt.id, to: f.author.id, summary: 'its source names no task' })
+  assert.match(handed.handoff, /Ownership revoked/)
+  assert.equal(taskOf(f.runtime, review.id).assigneeId, f.author.id)
+  // A deferred review's recovery reads its source the same way.
+  const deferred = inject(f, source, { id: 'task_deferred_review', title: 'Deferred review', kind: 'verification', reviewOf: 'task_missing_source', covers: undefined, status: 'blocked',
+    verificationRecovery: { sourceTaskId: 'task_missing_source', commit: f.workers.artifact.commit, reason: 'deferred', at: f.clock.now() } })
+  assert.throws(() => f.runtime.controlTask(f.owner, f.mission.id, deferred.id, 'resume', {}, 'retry the review'), error => error.code === 'review_artifact_changed',
+    'its exact submitted artifact is gone')
+})
+
+test('a worker\'s proposal behind a review whose source names no task is refused by the graph check naming that edge', async t => {
+  const f = await fixture(t)
+  f.runtime.store.transaction(() => f.runtime.store.put('starts', { id: 'start_dangling', ownerSessionId: f.owner.sessionId, commandId: 'dangling',
+    goal: 'an automatic plan', workspace: f.dir, status: 'running', createdAt: f.clock.now(), updatedAt: f.clock.now(), missionId: f.mission.id }))
+  const template = f.propose({ title: 'Template', maxRecoveryAttempts: 1, checkTimeoutMs: 30_000 })
+  const review = inject(f, template, { id: 'task_dangling_review', title: 'Reviews nothing', kind: 'verification', reviewOf: 'task_missing_source', covers: undefined })
+  assert.throws(() => f.runtime.propose(f.actor(f.author), f.mission.id, { outputs: [], workstreamId: f.stream.id, title: 'Behind the review', objective: 'Implement the scoped change',
+    kind: 'implementation', scope: ['**'], acceptance: ['the change works'], checks: ['test -d .'], dependencies: [review.id] }),
+  error => error.code === 'task_graph_invalid' && error.diagnostics.some(diagnostic => diagnostic.code === 'task_graph_unknown_edge' && diagnostic.path === 'task_missing_source'))
+})
+
+test('an assignment delivery whose task names no task is moot: the outbox marks it delivered without sending it, and no pass fails', async t => {
+  const f = await fixture(t)
+  f.runtime.store.transaction(() => f.runtime.store.put('deliveries', { id: 'msg_dangling', missionId: f.mission.id, from: 'runtime', to: f.author.id, kind: 'assignment',
+    taskId: 'task_missing', attemptId: 'attempt_missing', content: '{}', createdAt: f.clock.now() }))
+  await tick(f)
+  assert.deepEqual(f.failures, [], 'no pass fails on the outbox')
+  assert.notEqual(f.runtime.store.get('deliveries', 'msg_dangling').deliveredAt, undefined, 'the moot assignment is marked delivered')
+  assert.ok(!f.workers.deliveries.some(delivery => delivery.id === 'msg_dangling'), 'and never sent')
+})
