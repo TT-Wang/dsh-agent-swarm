@@ -2,7 +2,8 @@
  * The declared-check execution path: the bounded timeout window, the host call
  * that runs the task's declared checks, the measured envelope record, the
  * pass/fail classification, the durable tool-run row per check and the rejection
- * text; and the check environment: the envelope an assignment delivers, its
+ * text; and the check environment: the assignment delivery that hands an
+ * attempt its envelope (the one writer of an assignment delivery), its
  * reproduction by the host checks that support a verdict and the refusal of an
  * acceptance they do not reproduce.
  *
@@ -11,7 +12,7 @@
  * failures can defer review without converting infrastructure into a code verdict.
  */
 import { id } from './store.ts'
-import { openAttempt } from './task-graph.ts'
+import { memberTask, openAttempt } from './task-graph.ts'
 import type { Kernel } from './kernel.ts'
 import type { WorkspaceAdmission } from './workspace-admission.ts'
 import type { Artifact, CheckEnvelope, CheckEnvironment, CheckResult, Member, Task, ToolRun } from './types.ts'
@@ -133,7 +134,7 @@ const isDeclaredCheckEnvironment = (value: unknown): value is CheckEnvironment =
   typeof value === 'object' && value !== null && 'home' in value && 'sandboxPolicy' in value && 'dependencyLinks' in value && 'checkCacheRoot' in value
 /**
  * ENV: the fields an assignment delivery carries about the check environment.
- * `assignmentFields` writes them and `deliveredEnvironment` reads them back
+ * `deliverAssignment` writes them and `deliveredEnvironment` reads them back
  * through this one type, so neither side can rename the key alone.
  */
 interface AssignmentEnvironment { checkEnvironment?: { note: string; environment: CheckEnvironment; selfRun?: CheckEnvironment } }
@@ -290,8 +291,23 @@ export class DeclaredChecks {
     catch { return undefined } // reporting the environment must never break a delivery or a verdict
   }
 
+  /**
+   * The one writer of an assignment delivery, at a claim and at a budget resume
+   * alike. Its worker reads the task as `memberTask` renders it, without the
+   * preparation record (this attempt's workspace was prepared), beside the
+   * facts the host runs its declared checks under (ENV), which `reproduce`
+   * reads back from this delivery at the verdict, and the caller's
+   * instructions. Returns the task as delivered.
+   */
+  deliverAssignment(task: Task, instructions: string): Task {
+    const { preparationFailure: _retried, ...assigned } = memberTask(this.k.boardOf(task.missionId), task)
+    this.k.store.put('deliveries', { id: id('msg'), missionId: task.missionId, from: 'runtime', to: task.attempt!.ownerId, kind: 'assignment', taskId: task.id, attemptId: task.attempt!.id,
+      content: JSON.stringify({ missionId: task.missionId, task: assigned, ...this.assignmentFields(), instructions }), createdAt: this.k.now() })
+    return assigned
+  }
+
   /** ENV: the facts the host runs a task's declared checks under, as the fields an assignment delivery carries; none when the adapter reports no environment. */
-  assignmentFields(): AssignmentEnvironment {
+  private assignmentFields(): AssignmentEnvironment {
     const envelope = this.envelope()
     return envelope?.environment === undefined ? {} : { checkEnvironment: {
       note: 'These are the facts the host runs this task\'s declared checks under. Acceptance compares the supporting host checks with this envelope; unrelated diagnostics do not determine the verdict. The scoped cache roots are provided inside the disposable verification checkout; the user cache roots and HOME are what a self-run inherits.',
@@ -300,7 +316,7 @@ export class DeclaredChecks {
     } }
   }
 
-  /** ENV: the declared envelope delivered with one attempt's assignment, read back from the durable delivery `assignmentFields` wrote. */
+  /** ENV: the declared envelope delivered with one attempt's assignment, read back from the durable delivery `deliverAssignment` wrote. */
   private deliveredEnvironment(missionId: string, taskId: string, attemptId: string): CheckEnvironment | undefined {
     for (const delivery of this.k.store.list('deliveries', missionId)) {
       if (delivery.kind !== 'assignment' || delivery.taskId !== taskId || delivery.attemptId !== attemptId) continue

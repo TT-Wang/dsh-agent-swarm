@@ -253,8 +253,12 @@ export class SwarmRuntime implements Kernel {
   private closePass(missionId: string, pass: SchedulingPass): void { return this.scheduling.closePass(missionId, pass) }
   private checkSchedulingPasses(): void { return this.scheduling.checkSchedulingPasses() }
 
-  /** M1a seam 2/7: derived fingerprints, usage accounting and the budget gate. */
-  private readonly gates = new RuntimeGates(this)
+  /**
+   * M1a seam 2/7: usage accounting, the budget gate and the owner read models,
+   * on the kernel, the notices, the refusals and the declared checks whose
+   * assignment delivery a budget resume writes.
+   */
+  private readonly gates = new RuntimeGates(this, this.notices, this.refusals, this.declaredChecks)
   private ownerInstruments(missionId: string, full: boolean): Record<string, unknown> { return this.gates.ownerInstruments(missionId, full) }
   private boardWindow(missionId: string, memberId: string, afterSeq: number): Record<string, unknown> { return this.gates.boardWindow(missionId, memberId, afterSeq) }
   private async usage(memberId: string, tokens: number): Promise<void> { return this.gates.usage(memberId, tokens) }
@@ -1140,20 +1144,6 @@ export class SwarmRuntime implements Kernel {
     return owner ? task : memberTask(this.boardOf(missionId), task)
   }
 
-  /**
-   * The one writer of an assignment delivery, at a claim and at a budget resume
-   * alike. Its worker reads the task as `memberTask` renders it, without the
-   * preparation record (this attempt's workspace was prepared), beside the
-   * fields the declared checks write about the environment the host runs them
-   * under (ENV). Returns the task as delivered.
-   */
-  deliverAssignment(task: Task, mission: Mission, instructions = ASSIGNMENT_INSTRUCTIONS): Task {
-    const { preparationFailure: _retried, ...assigned } = memberTask(this.boardOf(mission.id), task)
-    this.store.put('deliveries', { id: id('msg'), missionId: mission.id, from: 'runtime', to: task.attempt!.ownerId, kind: 'assignment', taskId: task.id, attemptId: task.attempt!.id,
-      content: JSON.stringify({ missionId: mission.id, task: assigned, ...this.declaredChecks.assignmentFields(), instructions }), createdAt: this.now() })
-    return assigned
-  }
-
   /** Check before any workspace mutation, and again immediately before assignment. */
   assertAdmission(task: Task, member: Member): { candidate: AdmissionCandidate; decision: AdmissionDecision; latencyMs: number } {
     if (pendingStopOwner(this.store.list('tasks', task.missionId), member.id)) throw new Error('Worker is waiting for its previous attempt to stop')
@@ -1191,7 +1181,7 @@ export class SwarmRuntime implements Kernel {
       return this.commit(task.missionId, () => {
         this.store.put('tasks', task); this.store.put('members', member)
         this.store.recordAdmission(admitted)
-        const assigned = this.deliverAssignment(task, mission)
+        const assigned = this.declaredChecks.deliverAssignment(task, ASSIGNMENT_INSTRUCTIONS)
         this.store.event(task.missionId, 'task/claimed', member.id, { taskId: task.id, attempt: task.attempt })
         return assigned
       })
