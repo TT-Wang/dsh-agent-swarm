@@ -13,7 +13,7 @@ import { Scheduling } from './scheduling.ts'
 import { progressed, type Kernel, type SchedulingPass } from './kernel.ts'
 import { ADMISSION_REFUSED, AUTOMATIC_REVIEW_PREFIX, bounds, capable, completionError, fingerprintBoard, missionFingerprint, noticeSubjectsFor, readBoard, readinessBlocker, readMission, ready, rerouteTarget, reviewable, reviewNeed, reviewPathBlocker, reviewPathStalled, unreviewedSources, unschedulable, type AdapterView, type Board, type Bounds, type ReviewNeed } from './board.ts'
 // R17-G6/G7: the one derivation of mission derived state and its host projection.
-import { deriveMemberBoard, deriveMemberStatus, memberPhaseOf, memberDeliveryHealth, type MissionBoardMember } from './projection.ts'
+import { deriveMemberStatus, memberPhaseOf, memberDeliveryHealth, type MissionBoardMember } from './projection.ts'
 export { emptyUsage, addUsage } from './gates.ts'
 export { missionFingerprint, type MissionFingerprintBoard } from './board.ts'
 import { RuntimeGates, emptyUsage, addUsage, BOARD_DELTA_POSTS, postView } from './gates.ts'
@@ -28,7 +28,7 @@ import { canBorrowTask, canOwnReview, strandedReview } from './assignment.ts'
 import { executionClock, executionElapsed } from './resource-time.ts'
 import { TERMINAL_STATES, blockCauses, currentEvidenceIds, holdsOpenAttempt, missionSubject, openAttempt, pendingStopOwner, quiescencePending, selectAcceptedDelivery, stopPending, taskEdges, taskGraphIndex, taskSubject, terminal, uncoveredCriteria, type BlockCause, type HeldTask } from './task-graph.ts'
 import { checkSyntaxDetail, declaredPlanChecks, orderedTasks, pairReviews, planAdvisories, validatePlan } from './plans.ts'
-import { OWNER_ONLY_TOOLS, type Actor, type AutoStart, BoardQuery, Budget, CheckAttribution, CheckEnvelope, CheckEnvironment, CreateMissionInput, CriticalPath, criterionId, Delivery, DraftPlan, Escalation, Evidence, EvidenceStatus, Member, MemberStatus, Mission, nextWorkerName, ObserveQuery, MessageInput, PlanInput, Post, PostInput, PostKind, PROVIDER_OUTAGE_WINDOW_MS, ProposeTaskInput, ProviderOutage, providerQuiescent, PublishInput, RecoveryFallback, RequestStartInput, RuntimeConfig, Snapshot, Task, TaskAmendment, TaskRejection, TaskCeiling, ToolRun, UsageBuckets, UsageSnapshotSource, VerificationCleanupFailure, WorkerAdapter, WorkerActivity, Workstream } from './types.ts'
+import { OWNER_ONLY_TOOLS, type Actor, type AutoStart, BoardQuery, Budget, CheckAttribution, CheckEnvelope, CheckEnvironment, CreateMissionInput, CriticalPath, criterionId, Delivery, DraftPlan, Escalation, Evidence, EvidenceStatus, Member, Mission, nextWorkerName, ObserveQuery, MessageInput, PlanInput, Post, PostInput, PostKind, PROVIDER_OUTAGE_WINDOW_MS, ProposeTaskInput, ProviderOutage, providerQuiescent, PublishInput, RecoveryFallback, RequestStartInput, RuntimeConfig, Snapshot, Task, TaskAmendment, TaskRejection, TaskCeiling, ToolRun, UsageBuckets, UsageSnapshotSource, VerificationCleanupFailure, WorkerAdapter, WorkerActivity, Workstream } from './types.ts'
 import { requireArtifactChecks } from './artifact-policy.ts'
 
 /** Release a prelaunch caller even when an adapter ignores cancellation. Its late writes remain fenced. */
@@ -707,31 +707,19 @@ export class SwarmRuntime implements Kernel {
     return fingerprint
   }
 /**
-   * R17-G6: the derived member board — the read face the guard model and the
-   * owner/UI views consume, and the ONLY one: the single derivation
-   * (`src/projection.ts`) applied to the durable rows. It used to prefer a host
-   * projection unit's published state, but that unit published the board as a
-   * plugin-owned session event the host's format cannot read back (see the
-   * module header of `src/projection.ts`), so the unit is gone and the
-   * derivation is the read face on every composition. Unlike `missionBoard` it
-   * needs no mission row, so the guard model can project a board whose mission
-   * is not (or no longer) in the store.
+   * R17-G6: the derived member board — the read face the guard model consumes:
+   * each member's phase and status as the store's one member read face hydrates
+   * them (`src/projection.ts`), the same rows `snapshot()` and `observe()` read
+   * from their board. It used to prefer a host projection unit's published
+   * state, but that unit published the board as a plugin-owned session event
+   * the host's format cannot read back (see the module header of
+   * `src/projection.ts`), so the unit is gone and the derivation is the read
+   * face on every composition. Unlike `boardOf` it needs no mission row, so
+   * the guard model can project a board whose mission is not (or no longer) in
+   * the store.
    */
   memberBoard(missionId: string): MissionBoardMember[] {
-    return deriveMemberBoard(this.store.list('members', missionId), this.store.list('tasks', missionId))
-  }
-  /**
-   * R17-G6: the durable member rows with the board's derived status merged in —
-   * the one place `snapshot()` and `observe()` take member statuses from, so the
-   * owner/UI read face is an instance of the projection being read rather than a
-   * second derivation. The rows themselves stay the durable records (name, role,
-   * subscriptions, activity); only the derived status comes from the board.
-   */
-  private projectedMembers(missionId: string): Member[] {
-    const board = this.memberBoard(missionId)
-    const status: Record<string, MemberStatus> = {}
-    for (const member of board) status[member.id] = member.status
-    return this.store.list('members', missionId).map(member => ({ ...member, status: status[member.id] ?? member.status }))
+    return this.store.list('members', missionId).map(member => ({ id: member.id, phase: memberPhaseOf(member), status: member.status }))
   }
   mission(missionId: string): Mission { return readMission(this.store, missionId, this.now) }
   /**
@@ -2967,9 +2955,9 @@ export class SwarmRuntime implements Kernel {
       if (target.artifact) deliveryTarget = { taskId: target.id, commit: target.artifact.commit }
     } catch { deliveryTarget = undefined }
     const completionReason = completionError(board)
-    // R17-G6: the client's read face takes member statuses from the derived board
-    // (the registered projection when published), not from a second derivation.
-    return { mission, members: this.projectedMembers(missionId), workstreams: this.store.list('workstreams', missionId), tasks, evidence: this.store.list('evidence', missionId), events: this.store.events(missionId, this.config.maxEvents), pendingDeliveries: this.store.list('deliveries', missionId).filter(awaitsDelivery).length,
+    // R17-G6: the client's read face takes member statuses from the board's
+    // member rows, which the store's one read face hydrates; nothing derives them again.
+    return { mission, members: board.members, workstreams: this.store.list('workstreams', missionId), tasks, evidence: this.store.list('evidence', missionId), events: this.store.events(missionId, this.config.maxEvents), pendingDeliveries: this.store.list('deliveries', missionId).filter(awaitsDelivery).length,
       ...(deliveryTarget === undefined ? {} : { deliveryTarget }),
       completion: { eligible: completionReason === undefined, ...(completionReason === undefined ? {} : { reason: completionReason }) },
       criticalPath: this.criticalPath(missionId),
@@ -2999,7 +2987,7 @@ export class SwarmRuntime implements Kernel {
     // Worker guidance alone did not prevent detail=full, so the runtime refuses
     // it for worker sessions while the owner path keeps the complete view.
     if (member && query.detail === 'full') throw new ObserveDetailRefusedError()
-    const board = this.boardOf(missionId), { tasks, graph } = board, members = this.projectedMembers(missionId)
+    const board = this.boardOf(missionId), { tasks, graph, members } = board
     const runRef = (run: ToolRun) => ({ id: run.id, seq: run.seq ?? 0, taskId: run.taskId, attemptId: run.attemptId, memberId: run.memberId, tool: run.tool, isError: run.isError, arguments: excerpt(run.arguments, 240) })
     const evidenceRef = (evidence: Evidence, full = false) => ({ id: evidence.id, taskId: evidence.taskId, authorId: evidence.authorId, claim: full ? evidence.claim : excerpt(evidence.claim, 400), outcome: evidence.outcome, status: evidence.status, toolRunIds: evidence.toolRunIds,
       ...(evidence.challenges.length ? { challenges: full ? evidence.challenges : evidence.challenges.length } : {}), ...(evidence.supersedes.length ? { supersedes: evidence.supersedes } : {}) })
