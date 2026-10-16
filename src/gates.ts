@@ -295,7 +295,7 @@ export class RuntimeGates {
     this.rt.commit(mission.id, () => {
       this.rt.store.put('missions', mission)
       for (const task of this.rt.store.list('tasks', mission.id)) if (holdsOpenAttempt(task)) {
-        task.budgetResume = { pauseId: mission.budgetPause!.id, attemptId: task.attempt.id, epoch: task.epoch }
+        task.budgetResume = { pauseId: mission.budgetPause!.id, attemptId: task.attempt.id }
         // S5: every task write is a compare-and-swap on the task's own revision.
         // These records were read inside this transaction, so the presented
         // revision is the durable one and the write is accepted; a record that

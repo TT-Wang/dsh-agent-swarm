@@ -176,7 +176,7 @@ async function budgetFixture(t) {
   }
   const preserve = attemptId => {
     const taskRecord = runtime.store.get('tasks', task.id)
-    taskRecord.budgetResume = { pauseId: 'pause-1', attemptId, epoch: taskRecord.epoch }
+    taskRecord.budgetResume = { pauseId: 'pause-1', attemptId }
     runtime.store.put('tasks', taskRecord)
   }
   return { directory, config, runtime, owner, mission, member, task, claimed, pause, preserve }

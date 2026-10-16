@@ -575,7 +575,7 @@ test('ENV-R2: the budget-resume assignment carries the check envelope too', asyn
   const fixture = await missionFixture(t, { checkEnv: checkEnvFor(home) })
   const reviewer = fixture.reviews[0]
   const review = fixture.runtime.store.get('tasks', reviewer.review.id)
-  review.budgetResume = { pauseId: 'pause-1', attemptId: review.attempt.id, epoch: review.epoch }
+  review.budgetResume = { pauseId: 'pause-1', attemptId: review.attempt.id }
   fixture.runtime.store.put('tasks', review)
   const mission = fixture.runtime.store.get('missions', fixture.mission.id)
   mission.status = 'blocked'

@@ -472,7 +472,7 @@ export interface Task {
   /** Per-command host verification timeout chosen for this task. */
   checkTimeoutMs?: number
   /** Same-owner resume preserves attempt provenance after budget quiescence. */
-  budgetResume?: { pauseId: string; attemptId: string; epoch: number }
+  budgetResume?: { pauseId: string; attemptId: string }
   /** Durable quiescence transition; epoch matching prevents reopening invalidated work. */
   resumeAfterStop?: { epoch: number; memberId?: string; reason: 'handoff' | 'lease-expired' | 'worker-closeout' | 'resource' | 'invalidated'; /** R14-F2(d): when the stop began, so a waited-on stop has a durable bound. */ at?: number; /** Deterministic preservation failures retain the fence until an explicit resume retries them. */ failure?: { message: string; deterministic: boolean } }
   /** Idle close-out nudges already delivered for this attempt; cleared when a new attempt starts. */
