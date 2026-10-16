@@ -2,7 +2,7 @@
 import { randomUUID } from 'node:crypto'
 import { isAbsolute, join } from 'node:path'
 import { SwarmStore, WriterBusyError, StoreRecoveryError, id, stageRestore, type PendingRestore, type PostFilter, type StoreOptions } from './store.ts'
-import { Attempts } from './attempts.ts'
+import { Attempts, dropAttempt } from './attempts.ts'
 import { PolicyError } from './policy-error.ts'
 export { WorkspaceRevokedError } from './authorization.ts'
 import { recordedClaim, type WorkspaceClaim } from './authorization.ts'
@@ -302,7 +302,6 @@ export class SwarmRuntime implements Kernel {
   tempRendezvous(memberId: string, taskId: string, input: { tool: string; arguments: unknown }): { path: string; first: TempMention; second: TempMention } | undefined { return this.workspaceAdmission.tempRendezvous(memberId, taskId, input) }
   isolationAllows(missionId: string, member: Member): boolean { return this.workspaceAdmission.isolationAllows(missionId, member) }
 
-  readonly attempts = new Attempts(this)
   /** M1a seam 4/7: the durable refusal registry and its writer-busy recovery, on the kernel alone. */
   readonly refusals = new RefusalRegistry(this)
 
@@ -315,6 +314,13 @@ export class SwarmRuntime implements Kernel {
    * publication reads, handed down as a closure over `scheduling`.
    */
   readonly notices = new Notices(this, this.refusals, missionId => this.scheduling.passState(missionId))
+
+  /**
+   * M1a seam 1/7: lease and attempt accounting, on the kernel and the notices.
+   * Every caller reaches it as `attempts`: the runtime's tool and control
+   * paths, the adapter's idle callback, the seams and the tests.
+   */
+  readonly attempts = new Attempts(this, this.notices)
 
   /** M1a seam 7/7: pass bookkeeping, the dispatch sweep and the attempt reporting bound; its predicates are the board's. */
   private readonly scheduling = new Scheduling(this)
@@ -342,7 +348,7 @@ export class SwarmRuntime implements Kernel {
     this.store = new SwarmStore(config.statePath, { ...storeOptions, now: this.now })
     workers.bind({
       activity: (memberId, activity) => this.onActivity(memberId, activity),
-      idle: memberId => this.onIdle(memberId),
+      idle: memberId => this.attempts.onIdle(memberId),
       beforeStep: (memberId, hasFreshInput) => this.beforeStep(memberId, hasFreshInput),
       usage: (memberId, tokens) => this.usage(memberId, tokens),
       usageSnapshot: (memberId, totalTokens, usage, source) => this.usageSnapshot(memberId, totalTokens, usage, source),
@@ -453,7 +459,7 @@ export class SwarmRuntime implements Kernel {
             task.status = 'pending'
             task.epoch++
             task.handoff = `${task.handoff ?? ''}\nRecovered after host restart; inspect prior tool runs and workspace before repeating effects.`
-            this.dropAttempt(task)
+            dropAttempt(task)
             delete task.budgetResume
             this.store.put('tasks', task)
             this.store.event(mission.id, 'task/restart-repended', 'runtime', {
@@ -820,13 +826,6 @@ export class SwarmRuntime implements Kernel {
     const defects = taskGraphDefects(graph)
     if (defects.length) throw new TaskGraphAdmissionError(defects)
   }
-  // M1a: lease/attempt accounting lives in src/attempts.ts; these forwarders keep
-  // the call sites unchanged.
-  private fenceAttempt(mission: Mission, task: Task, windowMs: number): void { return this.attempts.fenceAttempt(mission, task, windowMs) }
-  dropAttempt(task: Task, ownerId?: string): void { return this.attempts.dropAttempt(task, ownerId) }
-  private onIdle(memberId: string): void { return this.attempts.onIdle(memberId) }
-  async closeOutIdleAttempt(mission: Mission, member: Member, task: Task, pass?: SchedulingPass): Promise<void> { return this.attempts.closeOutIdleAttempt(mission, member, task, pass) }
-
   /**
    * S6: critical-path accounting. The longest chain of dependent steps is read
    * from the durable task graph and reported next to the mission's total spend,
@@ -1421,7 +1420,7 @@ export class SwarmRuntime implements Kernel {
       // A refuted claim, or one a rework archived, supports nothing.
       const liveClaim = currentEvidenceIds(task).some(evidenceId => this.store.get('evidence', evidenceId)?.status !== 'refuted')
       if (task.kind === 'research' && !liveClaim) throw new Error('[research_evidence_required] Research submission requires host-backed evidence. Supply host-backed evidence with `swarm_publish` and its `toolRunIds`, then retry with `swarm_submit` and its `taskId`.')
-      this.fenceAttempt(this.mission(missionId), task, this.config.leaseMs)
+      this.attempts.fenceAttempt(this.mission(missionId), task, this.config.leaseMs)
       // A declared output that is not written is refused at capture with
       // [output_missing] before any commit, while the attempt is still running.
       const artifact = await this.workers.captureArtifact(member, task, input.deliverables, { requireOutputs: true })
@@ -1494,7 +1493,7 @@ export class SwarmRuntime implements Kernel {
         // M1a seam 5/7: the check window is src/declared-checks.ts#windowFor.
         const verificationWindow = this.declaredChecks.windowFor(source)
         if (!Number.isSafeInteger(verificationWindow)) throw new Error('Verification check duration exceeds the supported clock range')
-        this.fenceAttempt(this.mission(missionId), task, verificationWindow)
+        this.attempts.fenceAttempt(this.mission(missionId), task, verificationWindow)
         this.ownAttempt(actor, missionId, task.id, input.attemptId)
       }
       const evidenceRevision = JSON.stringify(source.evidenceIds.map(eid => this.store.get('evidence', eid)))
@@ -2041,7 +2040,7 @@ export class SwarmRuntime implements Kernel {
     // The source side of the same rule: the new owner must stay independent of this task's own reviews.
     const stranded = input.to === undefined ? undefined : strandedReview(this.store.list('tasks', missionId), task.id, { ...task, assigneeId: input.to })
     if (stranded !== undefined) throw new PolicyError('review_independence_required', 'authorization_error', `[review_independence_required] Member ${input.to} is the assignee of review ${stranded.id} of this task; owning this task would make it that review's author. Hand off to another member with \`to\`, or omit \`to\` to release the task.`)
-    task.status = 'blocked'; task.handoff = input.summary; task.epoch++; task.assigneeId = input.to; this.dropAttempt(task)
+    task.status = 'blocked'; task.handoff = input.summary; task.epoch++; task.assigneeId = input.to; dropAttempt(task)
     if (input.to !== undefined) task.plannedAssigneeId = input.to
     task.resumeAfterStop = { epoch: task.epoch, reason: 'handoff', memberId: member.id, at: this.now() }
     this.commit(missionId, () => { this.store.put('tasks', task); this.store.event(missionId, 'task/handoff-started', member.id, { taskId: task.id, to: input.to ?? null, summary: input.summary }) })
@@ -2120,7 +2119,7 @@ export class SwarmRuntime implements Kernel {
     const author = task.attempt?.ownerId ?? task.assigneeId
     if (author !== undefined) { task.assigneeId = author; task.plannedAssigneeId = author; task.assignmentMode = 'pinned' }
     delete task.artifact
-    this.dropAttempt(task); task.epoch++
+    dropAttempt(task); task.epoch++
     // The reason is carried once, in `rejections`; the handoff points at it.
     task.handoff = `${task.handoff ?? ''}\nRejected by review ${review.id} at ${commit}; its reason is rejections[${task.rejections.length - 1}].reason. Rework it from that commit, then resubmit.`.trim()
   }
@@ -2149,7 +2148,7 @@ export class SwarmRuntime implements Kernel {
     const reopened: Task = { ...review, status: 'pending', rejections: [...review.rejections ?? [], archived] }
     const reviewer = review.attempt?.ownerId ?? review.assigneeId
     if (reviewer !== undefined) reopened.assigneeId = reviewer
-    this.dropAttempt(reopened); reopened.epoch++
+    dropAttempt(reopened); reopened.epoch++
     delete reopened.reviewedCommit; delete reopened.reviewArtifact; delete reopened.output
     delete reopened.usedSteps; delete reopened.recoveryCount; delete reopened.ceiling
     this.store.put('tasks', reopened)
@@ -3369,7 +3368,7 @@ export class SwarmRuntime implements Kernel {
     // A rejected submission holds no live attempt: its author is not stopped.
     const activeOwner = rework === undefined ? task.attempt?.ownerId : undefined
     if (activeOwner !== undefined && (structural || (resumes && task.status === 'blocked'))) {
-      next.status = 'blocked'; next.epoch++; this.dropAttempt(next)
+      next.status = 'blocked'; next.epoch++; dropAttempt(next)
       next.resumeAfterStop = { epoch: next.epoch, memberId: activeOwner, reason: 'handoff', at: this.now() }
     } else {
       if (structural && !next.resumeAfterStop) next.epoch++ // Fence a preparation already awaiting I/O.
@@ -3581,7 +3580,7 @@ export class SwarmRuntime implements Kernel {
     task.status = 'blocked'
     task.ceiling = ceiling
     task.epoch++
-    this.dropAttempt(task); delete task.budgetResume; delete task.closeout; delete task.idleSignal; delete task.gitWriteDenied
+    dropAttempt(task); delete task.budgetResume; delete task.closeout; delete task.idleSignal; delete task.gitWriteDenied
     if (ownerId !== undefined) task.resumeAfterStop = { epoch: task.epoch, memberId: ownerId, reason: 'resource', at: this.now() }
     task.output = `${task.output ?? ''}\n${ceiling.reason}`.trim()
     if (member !== undefined && memberPhaseOf(member) !== 'stopped') delete member.activity
@@ -3850,7 +3849,7 @@ export class SwarmRuntime implements Kernel {
         if (task.assigneeId !== member.id || !['pending', 'running'].includes(task.status)) continue
         task.output = reason
         if (task.attempt !== undefined) task.epoch++
-        this.dropAttempt(task); delete task.closeout; delete task.idleSignal; delete task.gitWriteDenied
+        dropAttempt(task); delete task.closeout; delete task.idleSignal; delete task.gitWriteDenied
         const pinned = task.assigneeId
         delete task.assigneeId
         task.status = 'pending'

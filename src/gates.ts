@@ -12,6 +12,7 @@ import { id } from './store.ts'
 import { arenaView as projectArenaView, hasNotice, openAsks } from './arena.ts'
 import { TERMINAL_STATES, currentEvidenceIds, subjectsOfTasks, terminal } from './task-graph.ts'
 import { excerpt } from './declared-checks.ts'
+import { dropAttempt } from './attempts.ts'
 import { executionElapsed } from './resource-time.ts'
 import { memberPhaseOf } from './projection.ts'
 import { dispatchable } from './board.ts'
@@ -368,7 +369,7 @@ export class RuntimeGates {
         if (task.status !== 'running' || !task.attempt || task.attempt.id !== resume.attemptId || task.epoch !== resume.epoch) {
           // The pause marker outlived its attempt (challenge, handoff or restart):
           // re-pend the work without charging a recovery attempt.
-          if (task.status === 'running') { task.status = 'pending'; this.rt.dropAttempt(task) }
+          if (task.status === 'running') { task.status = 'pending'; dropAttempt(task) }
           // S5: compare-and-swap on the task's own revision (see blockBudget).
           this.rt.store.putTask(task)
           this.rt.store.event(mission.id, 'task/budget-resume-skipped', 'runtime', { taskId: task.id, pauseId: pause.id })

@@ -224,9 +224,9 @@ function stopFixture(reason, stop) {
     workers: new FakeWorkers({ stop: async memberId => { stopped.push(memberId); await stop(stopped.length) } }),
     task: (_mission, id) => structuredClone(rows.get(id)), mission: () => mission,
     defer: fn => { pending.push(Promise.resolve().then(fn)) }, exclusive: (_id, fn) => fn(), commit: (_id, fn) => fn(),
-    kick() {}, fingerprint: () => 'stable', notices: { emitGuardTerminal() {}, notify() {}, tell },
+    kick() {}, fingerprint: () => 'stable',
   })
-  return { mission, rows, pending, events, stopped, attempts: new Attempts(rt) }
+  return { mission, rows, pending, events, stopped, attempts: new Attempts(rt, { emitGuardTerminal() {}, notify() {}, tell }) }
 }
 
 for (const reason of ['lease-expired', 'worker-closeout', 'handoff']) test(`R12: ${reason} retries a rejected stop before re-pending without charging another recovery`, async () => {

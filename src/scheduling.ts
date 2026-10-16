@@ -134,7 +134,7 @@ export class Scheduling {
             // is only a cache for an attempt whose row write is still in flight.
             const durableIdle = open.idleSignal?.attemptId === open.attempt?.id
             const cachedIdle = this.rt.attempts.idleSignals.get(member.id)?.attemptId === open.attempt?.id
-            if (!parkedMember && (durableIdle || cachedIdle)) await this.rt.closeOutIdleAttempt(mission, member, open, pass)
+            if (!parkedMember && (durableIdle || cachedIdle)) await this.rt.attempts.closeOutIdleAttempt(mission, member, open, pass)
             continue
           }
           const choices = view.tasks.filter(t => eligible(view, t, member)).sort((a, b) => b.priority - a.priority || a.createdAt - b.createdAt)
