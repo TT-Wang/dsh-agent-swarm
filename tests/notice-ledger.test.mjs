@@ -978,6 +978,38 @@ test('a cancellation that strands a dependent leaves it to the board classifier:
   }
 })
 
+test('every exit the fall-through names, performed through the owner\'s registered tools, retires it: for a dependent a cancellation stranded beside running work, a repair of the withdrawn prerequisite, an amendment of the dependent and its withdrawal with swarm_cancel(taskId, reason)', async t => {
+  const toolsNamed = text => [...new Set(text.match(/\bswarm_\w+/g))].sort()
+  /** The fall-through's board: a dependent a cancellation stranded while the reviewer's work runs. */
+  const strandedBoard = async () => {
+    const f = await setup({ clock: new FakeClock() })
+    t.after(f.cleanup)
+    await f.runtime.claim(f.actor(f.reviewer), f.mission.id, f.propose({ title: 'Unrelated work', kind: 'research', checks: [], assigneeId: f.reviewer.id }).id)
+    const prerequisite = f.propose({ title: 'Prerequisite', kind: 'research', checks: [] })
+    const dependent = f.propose({ title: 'Dependent', kind: 'research', checks: [], dependencies: [prerequisite.id] })
+    f.runtime.cancel(f.owner, f.mission.id, { taskId: prerequisite.id, reason: 'Not needed' })
+    await f.runtime.settle(f.mission.id)
+    await ticks(f, 1)
+    const fallthrough = ownerRows(f).find(delivery => noticeFamily(delivery) === 'fallthrough')
+    assert.deepEqual(fallthrough?.subjects, [`${dependent.id}@${taskOf(f.runtime, dependent.id).epoch}`], 'the fall-through names the stranded dependent')
+    return { f, prerequisite, dependent, fallthrough }
+  }
+  const exits = {
+    'admit a repair or review with swarm_propose': ({ f, prerequisite, tool }) => tool('swarm_propose', { workstreamId: f.stream.id, title: 'Repair the prerequisite', objective: 'Do the withdrawn work again',
+      kind: 'research', scope: ['**'], outputs: [], checks: [], replaces: [prerequisite.id] }),
+    'decide with swarm_control': ({ dependent, tool }) => tool('swarm_control', { action: 'amend', taskId: dependent.id, changes: { dependencies: [] }, reason: 'The prerequisite is not needed' }),
+    'withdraw the stuck work with swarm_cancel(taskId, reason)': ({ dependent, tool }) => tool('swarm_cancel', { taskId: dependent.id, reason: 'No longer required' }),
+  }
+  for (const [exit, perform] of Object.entries(exits)) {
+    const { f, ...board } = await strandedBoard()
+    assert.deepEqual(toolsNamed(board.fallthrough.content), ['swarm_cancel', 'swarm_control', 'swarm_propose'], 'the fall-through names these tools')
+    assert.ok(board.fallthrough.content.includes(exit), `the fall-through names: ${exit}`)
+    assert.equal(relevant(f, board.fallthrough), true)
+    await perform({ f, ...board, tool: await ownerTools(f) })
+    assert.equal(relevant(f, board.fallthrough), false, `${exit} retires the fall-through`)
+  }
+})
+
 test('the dispatch question is one emitter among the board\'s: a dependent a cancellation strands beside dispatchable work is named by the fall-through, beside ready work whose member\'s handle is busy (GATE-BUSY) and beside isolation-refused work (GATE-ISO), and the dispatchable work is the question\'s alone', async t => {
   const boards = {
     // Every handle is busy (the fixture's workers report none idle), so the T3 rule asks no question about the ready work.

@@ -144,7 +144,8 @@ test('the exits the fall-through names for a dependency that names no task, perf
   await tick(f)
   const named = ownerNotices(f).find(delivery => /no live path will advance/.test(delivery.content))
   assert.ok(named?.subjects.includes(`${dangling.id}@0`), `the fall-through names it: ${JSON.stringify(named?.subjects)}`)
-  assert.match(named.content, /Inspect the board, admit a repair or review with swarm_propose, or decide with swarm_control/, 'it names inspecting the board, a repair and a swarm_control decision')
+  assert.ok(named.content.includes('Inspect the board, admit a repair or review with swarm_propose, decide with swarm_control, or withdraw the stuck work with swarm_cancel(taskId, reason)'),
+    'it names inspecting the board, a repair, a swarm_control decision and the withdrawal')
   // Only blocked or cancelled work can be replaced, so the repair clears nothing here.
   assert.equal((await refusal(repair(f, dangling))).code, 'replacement_source_not_blocked', 'the repair of pending work is refused')
   assert.deepEqual((await f.tool('swarm_observe', { taskId: dangling.id })).dependencies, [missing('task_missing')], 'the board shows the edge that names no task')
@@ -155,6 +156,32 @@ test('the exits the fall-through names for a dependency that names no task, perf
   assert.ok(!(await f.tool('swarm_observe', {})).unschedulable.includes(dangling.id), 'the amended task is no longer unschedulable')
   const claimed = await f.runtime.claim(f.actor(f.reviewer), f.mission.id, dangling.id)
   assert.equal(claimed.status, 'running', 'and is ready')
+})
+
+test('the exits the fall-through names for a pending review whose source names no task, performed with the owner\'s registered tools: the swarm_propose repair and the swarm_control amendment are refused, and withdrawing the stuck work with swarm_cancel(taskId, reason) clears it and retires the fall-through', async t => {
+  const f = await fixture(t)
+  const running = f.propose({ title: 'Running work' })
+  await f.runtime.claim(f.actor(f.author), f.mission.id, running.id)
+  const review = inject(f, running, { id: 'task_dangling_review', title: 'Reviews nothing', kind: 'verification', reviewOf: 'task_missing_source', covers: undefined })
+  await tick(f)
+  const named = ownerNotices(f).find(delivery => /no live path will advance/.test(delivery.content))
+  assert.deepEqual(named?.subjects, [`${review.id}@0`], 'the fall-through names the review')
+  // The one exit written as a call is checked against the published swarm_cancel schema.
+  await assertNamedCalls(named.content, ['swarm_cancel'])
+  const outstanding = () => f.runtime.notices.ownerDeliveryRelevant(f.runtime.mission(f.mission.id), f.runtime.store.get('deliveries', named.id))
+  assert.equal(outstanding(), true, 'the fall-through is outstanding')
+  assert.equal((await refusal(repair(f, review))).code, 'replacement_source_verification', 'a repair of the review is refused')
+  const amended = await refusal(f.tool('swarm_control', { action: 'amend', taskId: review.id, changes: { assigneeId: f.author.id }, reason: 'reassign the review' }))
+  assert.ok(amended.code === 'task_graph_invalid' && amended.diagnostics.some(diagnostic => diagnostic.code === 'task_graph_unknown_edge' && diagnostic.path === 'task_missing_source'),
+    'an amendment is refused naming the edge')
+  assert.deepEqual([(await f.tool('swarm_observe', {})).unschedulable, outstanding()], [[review.id], true], 'the refused exits clear nothing')
+  await f.tool('swarm_cancel', { taskId: review.id, reason: 'its source does not exist' })
+  assert.equal(taskOf(f.runtime, review.id).status, 'cancelled', 'the withdrawal clears the review')
+  assert.equal(outstanding(), false, 'and retires the fall-through')
+  await tick(f)
+  assert.deepEqual(f.failures, [], 'no pass fails on the board')
+  assert.deepEqual((await f.tool('swarm_observe', {})).unschedulable, [], 'the owner board holds nothing unschedulable')
+  assert.deepEqual(ownerNotices(f).filter(delivery => /no live path will advance/.test(delivery.content)).map(delivery => delivery.id), [named.id], 'and no further fall-through is told')
 })
 
 test('pending work holding an id that names no task beside live edges is dead whatever else it waits on: the fall-through names it within one tick, and its refusal names that edge first', async t => {

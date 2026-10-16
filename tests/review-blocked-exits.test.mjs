@@ -681,7 +681,7 @@ test('every exit the W3 stall and the fall-through name for a submission an olde
     const subject = `${source.id}@${taskOf(f.runtime, source.id).epoch}`
     const namings = f.runtime.store.list('deliveries', f.mission.id).filter(delivery => delivery.to === 'owner' && delivery.notice !== undefined && (delivery.subjects ?? []).includes(subject))
     assert.deepEqual(namings.map(delivery => noticeFamily(delivery)), [running ? 'fallthrough' : 'board-stall'], `running=${running}: the board's decision names the submission`)
-    assert.match(namings[0].content, running ? /admit a repair or review with swarm_propose, or decide with swarm_control/ : /amend the existing task dependencies or assignee with swarm_control, admit a repair or review with swarm_propose.*withdraw it explicitly with swarm_cancel.*Use swarm_control stop/)
+    assert.match(namings[0].content, running ? /admit a repair or review with swarm_propose, decide with swarm_control, or withdraw the stuck work with swarm_cancel\(taskId, reason\)/ :/amend the existing task dependencies or assignee with swarm_control, admit a repair or review with swarm_propose.*withdraw it explicitly with swarm_cancel.*Use swarm_control stop/)
     const relevant = () => f.runtime.notices.ownerDeliveryRelevant(f.runtime.mission(f.mission.id), f.runtime.store.get('deliveries', namings[0].id))
     assert.equal(relevant(), true, `running=${running}: and it is outstanding`)
     return { f, source, relevant }

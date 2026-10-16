@@ -249,7 +249,7 @@ const subjectOf = task => `${task.id}@${task.epoch}`
 const DECISIONS = {
   'stall-root': ['allocation with swarm_budget', 'swarm_propose with replaces', 'swarm_cancel to withdraw'],
   'board-stall': ['assignee with swarm_control', 'review with swarm_propose', 'explicitly with swarm_cancel', 'swarm_control stop'],
-  fallthrough: ['review with swarm_propose', 'decide with swarm_control'],
+  fallthrough: ['review with swarm_propose', 'decide with swarm_control', 'stuck work with swarm_cancel(taskId, reason)'],
   parked: ['held by a parked member', 'without spending a recovery attempt'],
   'integration-gap': ['integration task depending on every branch'],
   'coverage-complete': ['stays active until you decide', 'swarm_control complete', 'more work with swarm_propose'],
