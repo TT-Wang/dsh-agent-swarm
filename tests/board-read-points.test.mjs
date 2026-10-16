@@ -19,13 +19,17 @@
  *  - one board asks the adapter about one member twice and gets two answers:
  *    the view is called through and never memoized, because asking whether a
  *    handle is idle can drain a stranded inbox item (R15-A5);
- *  - a notice that reads only rows (the tasks it names, its subjects) reads the
- *    board, never the interpretation, so it asks the adapter nothing and no
- *    inbox drains inside its commit.
+ *  - each member step of the dispatch sweep judges the board (the
+ *    interpretation) before it asks that member's eligibility, so a preferred
+ *    member that judgement drains leaves its work to the borrower in the same
+ *    pass.
+ *
+ * A notice that reads only rows reads the board and asks the adapter nothing:
+ * tests/notice-board-reads.test.mjs.
  */
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { interpret, isolationViolation, ready } from '../lib/board.js'
+import { isolationViolation, ready } from '../lib/board.js'
 import { FakeClock, setup, taskOf } from './faults/harness.mjs'
 
 const deferred = () => { let resolve; return { promise: new Promise(r => { resolve = r }), resolve: value => resolve(value) } }
@@ -189,46 +193,4 @@ test('each member step of the dispatch sweep judges the board before it asks eli
   assert.deepEqual([row.status, row.attempt?.ownerId], ['running', f.author.id], 'the author borrowed the work its drained preferred member cannot start')
   assert.deepEqual(f.runtime.store.list('deliveries', f.mission.id).filter(delivery => delivery.to === 'owner' && delivery.notice?.dedupKey.startsWith('dispatch-question:')).map(delivery => delivery.content), [],
     'and the owner was asked no dispatch question about it')
-})
-
-test('a notice that names only board rows asks the adapter nothing: a challenge is told inside its commit, and an integration gap is warned of, without one idleness ask', async t => {
-  const f = await setup({ clock: new FakeClock() })
-  t.after(() => f.cleanup())
-  // Work preferred to the reviewer, whose handle is busy, so an interpretation
-  // of this board asks the adapter whether the reviewer can start before it
-  // lets the author borrow the work.
-  f.propose({ title: 'Preferred to the reviewer', assigneeId: f.reviewer.id, assignmentMode: 'preferred' })
-  const source = f.propose({ title: 'Accepted source' })
-  f.runtime.commit(f.mission.id, () => {
-    f.runtime.store.put('tasks', { ...taskOf(f.runtime, source.id), status: 'accepted', artifact: { ...f.workers.artifact }, evidenceIds: ['e-source'] })
-    f.runtime.store.put('evidence', { id: 'e-source', missionId: f.mission.id, taskId: source.id, workstreamId: f.stream.id, authorId: f.author.id,
-      claim: 'the source works', outcome: 'supported', status: 'verified', toolRunIds: [], supersedes: [], challenges: [], createdAt: f.clock.now() })
-  })
-  await f.runtime.settle(f.mission.id)
-  const asked = []
-  for (const question of ['isIdle', 'currentActivity']) {
-    const answer = f.workers[question].bind(f.workers)
-    f.workers[question] = memberId => { asked.push([question, memberId, `commit depth ${f.runtime.commitDepth}`]); return answer(memberId) }
-  }
-  interpret(f.runtime.boardOf(f.mission.id))
-  assert.deepEqual(asked, [['isIdle', f.reviewer.id, 'commit depth 0'], ['isIdle', f.reviewer.id, 'commit depth 0']],
-    'the board judgement asks whether the preferred reviewer can start, for the dispatchable work and again for the stall')
-  asked.length = 0
-  // The owner disputes the source's claim: the challenge's notice names the
-  // source from inside the challenge's commit. (The pass the challenge kicks
-  // afterwards asks the adapter for its board digest, outside any commit.)
-  f.runtime.challenge(f.owner, f.mission.id, { evidenceId: 'e-source', reason: 'a counterexample', toolRunIds: [] })
-  const told = () => f.runtime.store.list('deliveries', f.mission.id).filter(delivery => delivery.to === 'owner')
-  assert.deepEqual(told().filter(delivery => delivery.notice?.trigger === 'evidence/challenged').map(delivery => delivery.subjects), [[`${source.id}@${taskOf(f.runtime, source.id).epoch}`]],
-    'the challenge was told, naming its source')
-  assert.deepEqual(asked.filter(([, , depth]) => depth !== 'commit depth 0'), [], 'nothing was asked of the adapter inside the challenge\'s commit')
-  // A third implementation branch with no integration task: the gap's warning
-  // names every branch, and asks the adapter nothing while it does.
-  const warn = f.runtime.notices.warnIntegrationGap.bind(f.runtime.notices)
-  const warning = []
-  f.runtime.notices.warnIntegrationGap = (...args) => { const from = asked.length; warn(...args); warning.push(...asked.slice(from)) }
-  const third = f.propose({ title: 'Third implementation' })
-  assert.ok(told().some(delivery => delivery.notice?.dedupKey === `integration-gap:${f.mission.id}:3` && delivery.subjects.includes(`${third.id}@${third.epoch}`)),
-    'the integration gap was told, naming the new branch')
-  assert.deepEqual(warning, [], 'the warning asked the adapter nothing')
 })
