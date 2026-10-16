@@ -35,7 +35,7 @@ import { compareCheckEnvironments } from '../lib/declared-checks.js'
 import { checkTempEnvironment, runProcess } from '../lib/workspaces.js'
 import { tempDirectory } from './temp-root.mjs'
 import { subprocessSeam } from './subprocess-seam.mjs'
-import { FakeWorkers, makeRepo, makeRuntime, makeWorkspaces } from './faults/harness.mjs'
+import { FakeClock, FakeWorkers, makeRepo, makeRuntime, makeWorkspaces, setup } from './faults/harness.mjs'
 
 const FIXTURE_TEST = 'tests/fixture-failing.test.mjs'
 const DEFAULT_DEPENDENCY_DIRS = ['node_modules', '.venv', 'venv', 'vendor', '.tox']
@@ -417,6 +417,33 @@ test('ENV: the supporting host checks are the environment the envelope is compar
   assert.ok(fixture.workers.verifications.length >= 1, 'the host check really ran')
   const review = fixture.runtime.store.get('tasks', reviewer.review.id)
   assert.equal(review.status, 'accepted', 'the review is decided by its supporting host checks')
+})
+
+test('ENV: a verdict compares the envelope delivered with its attempt, not the one the adapter reports when it verifies', async t => {
+  const f = await setup({ clock: new FakeClock() })
+  t.after(() => f.cleanup())
+  const environment = home => ({ home, userCacheDir: `${home}/.cache`, huggingfaceCacheDir: `${home}/.cache/huggingface`,
+    userCacheDirExists: false, huggingfaceCacheDirExists: false, xdgCacheHome: '/check/.cache',
+    sandboxPolicy: { mode: 'workspace-write', enforcement: 'full', workspaceRoot: '/check' },
+    dependencyLinks: { mode: 'copy', dirs: [] }, checkCacheRoot: '/check/.cache', checkCacheRoots: {} })
+  const delivered = environment('/delivered'), current = environment('/current')
+  const reports = env => () => ({ environment: env, selfRunEnvironment: env })
+  f.workers.checkEnvelope = reports(delivered)
+  const source = f.propose()
+  const sourceClaim = await f.runtime.claim(f.actor(f.author), f.mission.id, source.id)
+  await f.runtime.submit(f.actor(f.author), f.mission.id, { taskId: source.id, attemptId: sourceClaim.attempt.id, output: 'ready for review' })
+  const review = f.propose({ title: 'Review', kind: 'verification', reviewOf: source.id, assigneeId: f.reviewer.id })
+  const { attempt } = await f.runtime.claim(f.actor(f.reviewer), f.mission.id, review.id)
+  const assignment = f.runtime.store.list('deliveries', f.mission.id).find(delivery => delivery.kind === 'assignment' && delivery.attemptId === attempt.id)
+  assert.equal(JSON.parse(assignment.content).checkEnvironment.environment.home, '/delivered', 'the attempt was assigned under the delivered envelope')
+  // The adapter's envelope changes after the delivery and before the verdict.
+  f.workers.checkEnvelope = reports(current)
+  const verify = () => f.runtime.verify(f.actor(f.reviewer), f.mission.id, { taskId: review.id, attemptId: attempt.id, verdict: 'accept', reason: 'Independent review' })
+  f.workers.checks = [{ command: 'test -d .', exitCode: 0, output: 'ok', environment: current }]
+  await assert.rejects(verify(), error => error.code === 'check_environment_mismatch' && error.message.includes('home: envelope /delivered, self-run /current'),
+    'host checks under the envelope the adapter reports now do not reproduce the one this attempt was given')
+  f.workers.checks = [{ command: 'test -d .', exitCode: 0, output: 'ok', environment: delivered }]
+  assert.equal((await verify()).status, 'accepted', 'host checks under the delivered envelope reproduce it, whatever the adapter reports now')
 })
 
 test('ENV: a cold user cache is recorded as advisory and never refuses an acceptance', async t => {
