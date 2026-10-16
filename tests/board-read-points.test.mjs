@@ -164,6 +164,33 @@ test('a board asks the adapter at every ask: two asks about one member on one bo
   assert.deepEqual(asked, [f.author.id, f.author.id], 'each ask reached the adapter')
 })
 
+test('each member step of the dispatch sweep judges the board before it asks eligibility: a preferred member drained there leaves its work to the borrower in the same pass, and the owner is asked nothing', async t => {
+  const f = await setup({ clock: new FakeClock() })
+  t.after(() => f.cleanup())
+  const work = f.propose({ title: 'Preferred to the reviewer', assigneeId: f.reviewer.id, assignmentMode: 'preferred' })
+  await f.runtime.settle(f.mission.id)
+  // The Harness adapter's idleness question drains a stranded inbox item
+  // (`HarnessWorkers.isIdle`, R15-A5): the first ask about an idle handle that
+  // holds one answers that it can start and wakes it, so every later ask
+  // answers busy. The reviewer's handle is left that way while the sweep
+  // starts the author, the member it steps through first.
+  let stranded = false
+  f.workers.isIdle = memberId => {
+    if (memberId === f.author.id) return true
+    if (memberId !== f.reviewer.id || !stranded) return false
+    stranded = false
+    return true
+  }
+  const start = f.runtime.startWorker.bind(f.runtime)
+  f.runtime.startWorker = async (mission, member, options) => { await start(mission, member, options); if (member.id === f.author.id) stranded = true }
+  await f.runtime.tick()
+  await f.runtime.settle(f.mission.id)
+  const row = taskOf(f.runtime, work.id)
+  assert.deepEqual([row.status, row.attempt?.ownerId], ['running', f.author.id], 'the author borrowed the work its drained preferred member cannot start')
+  assert.deepEqual(f.runtime.store.list('deliveries', f.mission.id).filter(delivery => delivery.to === 'owner' && delivery.notice?.dedupKey.startsWith('dispatch-question:')).map(delivery => delivery.content), [],
+    'and the owner was asked no dispatch question about it')
+})
+
 test('a notice that names only board rows asks the adapter nothing: a challenge is told inside its commit, and an integration gap is warned of, without one idleness ask', async t => {
   const f = await setup({ clock: new FakeClock() })
   t.after(() => f.cleanup())
