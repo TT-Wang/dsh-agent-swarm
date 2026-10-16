@@ -446,6 +446,20 @@ test('ENV: a verdict compares the envelope delivered with its attempt, not the o
   assert.equal((await verify()).status, 'accepted', 'host checks under the delivered envelope reproduce it, whatever the adapter reports now')
 })
 
+test('ENV: the environment report is best-effort: an adapter whose report throws still gets its assignment, without an envelope', async t => {
+  const f = await setup({ clock: new FakeClock() })
+  t.after(() => f.cleanup())
+  f.workers.checkEnvelope = () => { throw new Error('probe: the environment report failed') }
+  const task = f.propose()
+  const { attempt } = await f.runtime.claim(f.actor(f.author), f.mission.id, task.id)
+  const assignments = f.runtime.store.list('deliveries', f.mission.id).filter(delivery => delivery.kind === 'assignment' && delivery.attemptId === attempt.id)
+  assert.equal(assignments.length, 1, 'the claim delivered its assignment')
+  const content = JSON.parse(assignments[0].content)
+  assert.equal(content.task.id, task.id, 'the assignment names its task')
+  assert.equal(Object.hasOwn(content, 'checkEnvironment'), false, 'a report that throws delivers no envelope instead of breaking the delivery')
+  assert.equal(f.runtime.store.get('tasks', task.id).status, 'running', 'the claim holds its attempt')
+})
+
 test('ENV: a cold user cache is recorded as advisory and never refuses an acceptance', async t => {
   const coldHome = await cacheHome(await realpath(await tempDirectory('swarm-env-home-')), false)
   t.after(async () => rm(path.dirname(coldHome), { recursive: true, force: true }))
