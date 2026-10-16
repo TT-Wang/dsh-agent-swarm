@@ -1,8 +1,9 @@
 /**
  * One durable field records that the owner session admitted an owner-addressed
  * delivery: `Delivery.consumedAt`. Its one writer is `Notices.recordConsumption`,
- * driven by the host's admitted `user/message`, for an owner notice and an owner
- * question alike. The one observer of that message is the owner-reply guard's host
+ * driven by the host's admitted `user/message`, for an owner notice, an owner
+ * question and any other owner-addressed delivery alike, in an active or a paused
+ * mission. The one observer of that message is the owner-reply guard's host
  * subscription: it hands the admission to the writer, then books the turn from
  * the stored field. The notice ledger reads it as the delivery's own field.
  *
@@ -55,23 +56,30 @@ async function hosted(t) {
   return { ctx, clock, runtime, owner, mission, member, row, latest, missing, admit, endTurn, notice, toOwner }
 }
 
-test('the owner session\'s admission records consumption on the delivery itself, for a notice and a question alike, once and on the runtime clock', async t => {
+test('the owner session\'s admission records consumption on the delivery itself, for a notice, a question and a finding alike, in an active or a paused mission, once and on the runtime clock', async t => {
   const f = await hosted(t)
   const notice = await f.notice('consumption probe')
   const question = await f.toOwner('question', 'Which API version?')
+  const finding = await f.toOwner('finding', 'The parser drops trailing commas')
   f.runtime.message(f.owner, f.mission.id, { to: f.member.id, kind: 'question', content: 'Which branch?' })
   const toMember = f.latest(delivery => delivery.to === f.member.id && delivery.kind === 'question')
-  assert.ok(notice.deliveredAt !== undefined && question.deliveredAt !== undefined && toMember !== undefined)
+  assert.ok([notice, question, finding].every(delivery => delivery.deliveredAt !== undefined) && toMember !== undefined)
   f.clock.advance(1_000)
   // Admission into any other session, or of a delivery addressed to a member, is not the owner consuming it.
   f.admit('another-session', notice.id)
   f.admit(f.member.sessionId, toMember.id)
   f.admit(f.owner.sessionId, toMember.id)
-  assert.deepEqual([notice, question, toMember].map(delivery => f.row(delivery.id).consumedAt), [undefined, undefined, undefined])
+  assert.deepEqual([notice, question, finding, toMember].map(delivery => f.row(delivery.id).consumedAt), [undefined, undefined, undefined, undefined])
   f.admit(f.owner.sessionId, notice.id)
+  const noticeConsumedAt = f.clock.now()
+  // A paused mission's owner still consumes what the host admits: a question and any other owner-addressed delivery.
+  f.runtime.control(f.owner, f.mission.id, 'pause', 'the owner reads before deciding')
+  assert.equal(f.runtime.mission(f.mission.id).status, 'paused')
+  f.clock.advance(1_000)
   f.admit(f.owner.sessionId, question.id)
-  const consumedAt = f.clock.now()
-  for (const delivery of [notice, question]) {
+  f.admit(f.owner.sessionId, finding.id)
+  const pausedConsumedAt = f.clock.now()
+  for (const [delivery, consumedAt] of [[notice, noticeConsumedAt], [question, pausedConsumedAt], [finding, pausedConsumedAt]]) {
     const row = f.row(delivery.id)
     assert.equal(row.consumedAt, consumedAt, `${delivery.kind}: the admission instant on the runtime clock, recorded on the delivery`)
     assert.notEqual(row.consumedAt, row.deliveredAt, 'consumed is its own fact, never the transport timestamp')
@@ -79,10 +87,9 @@ test('the owner session\'s admission records consumption on the delivery itself,
   assert.deepEqual(Object.keys(f.row(notice.id).notice).filter(key => key.startsWith('consum')), [], 'the notice envelope holds no second copy of the fact')
   // A replayed admission cannot move it (compare-and-swap).
   f.clock.advance(1_000)
-  f.admit(f.owner.sessionId, notice.id)
-  f.admit(f.owner.sessionId, question.id)
-  assert.deepEqual([f.row(notice.id).consumedAt, f.row(question.id).consumedAt], [consumedAt, consumedAt])
-  assert.equal(f.runtime.observe(f.owner, f.mission.id, { detail: 'full' }).noticeLedger.find(entry => entry.deliveryId === notice.id).consumedAt, consumedAt, 'the ledger reads the delivery\'s field')
+  for (const delivery of [notice, question, finding]) f.admit(f.owner.sessionId, delivery.id)
+  assert.deepEqual([notice, question, finding].map(delivery => f.row(delivery.id).consumedAt), [noticeConsumedAt, pausedConsumedAt, pausedConsumedAt])
+  assert.equal(f.runtime.observe(f.owner, f.mission.id, { detail: 'full' }).noticeLedger.find(entry => entry.deliveryId === notice.id).consumedAt, noticeConsumedAt, 'the ledger reads the delivery\'s field')
 })
 
 test('one observer records the admitted question as consumed, then books the turn from the stored field: a question the transport has not acknowledged is booked, and its miss states the admission instant', async t => {
