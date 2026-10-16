@@ -1145,13 +1145,14 @@ export class SwarmRuntime implements Kernel {
   /**
    * The one writer of an assignment delivery, at a claim and at a budget resume
    * alike. Its worker reads the task as `memberTask` renders it, without the
-   * preparation record (this attempt's workspace was prepared), beside the facts
-   * the host runs its declared checks under (ENV). Returns the task as delivered.
+   * preparation record (this attempt's workspace was prepared), beside the
+   * fields the declared checks write about the environment the host runs them
+   * under (ENV). Returns the task as delivered.
    */
   deliverAssignment(task: Task, mission: Mission, instructions = ASSIGNMENT_INSTRUCTIONS): Task {
-    const { preparationFailure: _retried, ...assigned } = this.memberTask(task, mission), checkEnvironment = this.declaredChecks.assignmentEnvironment()
+    const { preparationFailure: _retried, ...assigned } = this.memberTask(task, mission)
     this.store.put('deliveries', { id: id('msg'), missionId: mission.id, from: 'runtime', to: task.attempt!.ownerId, kind: 'assignment', taskId: task.id, attemptId: task.attempt!.id,
-      content: JSON.stringify({ missionId: mission.id, task: assigned, checkEnvironment, instructions }), createdAt: this.now() })
+      content: JSON.stringify({ missionId: mission.id, task: assigned, ...this.declaredChecks.assignmentFields(), instructions }), createdAt: this.now() })
     return assigned
   }
 

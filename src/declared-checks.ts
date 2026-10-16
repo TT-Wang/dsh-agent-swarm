@@ -131,6 +131,12 @@ type DeclaredCheckEnvelope = CheckEnvelope & {
 }
 const isDeclaredCheckEnvironment = (value: unknown): value is CheckEnvironment =>
   typeof value === 'object' && value !== null && 'home' in value && 'sandboxPolicy' in value && 'dependencyLinks' in value && 'checkCacheRoot' in value
+/**
+ * ENV: the fields an assignment delivery carries about the check environment.
+ * `assignmentFields` writes them and `deliveredEnvironment` reads them back
+ * through this one type, so neither side can rename the key alone.
+ */
+interface AssignmentEnvironment { checkEnvironment?: { note: string; environment: CheckEnvironment; selfRun?: CheckEnvironment } }
 
 export class DeclaredChecks {
   /**
@@ -284,23 +290,23 @@ export class DeclaredChecks {
     catch { return undefined } // reporting the environment must never break a delivery or a verdict
   }
 
-  /** ENV: the facts the host runs a task's declared checks under, as an assignment delivers them; none when the adapter reports no environment. */
-  assignmentEnvironment(): { note: string; environment: CheckEnvironment; selfRun?: CheckEnvironment } | undefined {
+  /** ENV: the facts the host runs a task's declared checks under, as the fields an assignment delivery carries; none when the adapter reports no environment. */
+  assignmentFields(): AssignmentEnvironment {
     const envelope = this.envelope()
-    return envelope?.environment === undefined ? undefined : {
+    return envelope?.environment === undefined ? {} : { checkEnvironment: {
       note: 'These are the facts the host runs this task\'s declared checks under. Acceptance compares the supporting host checks with this envelope; unrelated diagnostics do not determine the verdict. The scoped cache roots are provided inside the disposable verification checkout; the user cache roots and HOME are what a self-run inherits.',
       environment: envelope.environment,
       ...(envelope.selfRunEnvironment === undefined ? {} : { selfRun: envelope.selfRunEnvironment }),
-    }
+    } }
   }
 
-  /** ENV: the declared envelope delivered with one attempt's assignment, from the durable delivery. */
+  /** ENV: the declared envelope delivered with one attempt's assignment, read back from the durable delivery `assignmentFields` wrote. */
   private deliveredEnvironment(missionId: string, taskId: string, attemptId: string): CheckEnvironment | undefined {
     for (const delivery of this.k.store.list('deliveries', missionId)) {
       if (delivery.kind !== 'assignment' || delivery.taskId !== taskId || delivery.attemptId !== attemptId) continue
       try {
-        const content = JSON.parse(delivery.content) as { checkEnvironment?: { environment?: unknown } }
-        const environment = content.checkEnvironment?.environment
+        const { checkEnvironment } = JSON.parse(delivery.content) as Partial<Record<keyof AssignmentEnvironment, { environment?: unknown }>>
+        const environment = checkEnvironment?.environment
         if (isDeclaredCheckEnvironment(environment)) return environment
       } catch { /* a delivery without the envelope simply has none */ }
     }
