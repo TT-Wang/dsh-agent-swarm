@@ -840,8 +840,7 @@ export function fingerprintBoard(board: Board): MissionFingerprintBoard {
 
 /* ----------------------------------------------------------------------- *
  * R17-G1: the interpretation, the one judgement of a board the board
- * classifiers and the dispatch sweep's member steps read. A reader of rows
- * alone reads the board.
+ * classifiers read. A reader of rows alone reads the board.
  * ----------------------------------------------------------------------- */
 
 /** Whether a durably parked member holds this task's open attempt (the R10-15 holder family): rows alone, so asking asks the adapter nothing. */
@@ -866,19 +865,16 @@ export interface Interpretation extends Board {
 /**
  * R17-G1: the ONE shared interpretation of a board. Every board classifier
  * (`Notices.ensureWitness`, the absence net, the obligation follow-ups and the
- * relevance of a board fact) and each member step of the dispatch sweep read it
- * instead of re-reading raw rows and re-deriving their own answer: it is the
- * board, so the dispatcher's own predicates (`eligible`, `reviewable`,
- * `completionError`) are asked of it directly, and beside it what they answer
- * over it once (`dispatchable`, `unschedulable`, `stalled`), so a notice can
- * never describe a board the dispatcher would act on differently. A value of
- * the board alone: it writes nothing, holds no cache, and asks the adapter
- * exactly where its predicates ask it, so it is built only where a decision
- * needs those asks: by a judgement that reads its answers, and by a member
- * step of the sweep, whose eligibility asks follow its asks (an ask can drain
- * a stranded inbox, R15-A5). A reader of rows alone (the sweep's member order,
- * a notice naming the tasks it is about with `subjectsOfTasks`) reads the
- * board, and asks the adapter nothing.
+ * relevance of a board fact) reads it instead of re-reading raw rows and
+ * re-deriving its own answer: it is the board, so the dispatcher's own
+ * predicates (`eligible`, `reviewable`, `completionError`) are asked of it
+ * directly, and beside it what they answer over it once (`dispatchable`,
+ * `unschedulable`, `stalled`), so a notice can never describe a board the
+ * dispatcher would act on differently. A value of the board alone: it writes
+ * nothing, holds no cache, and asks the adapter exactly where its predicates
+ * ask it. A reader of rows alone (the sweep's member order, a notice naming the
+ * tasks it is about with `subjectsOfTasks`) reads the board, and asks the
+ * adapter nothing.
  */
 export function interpret(board: Board): Interpretation {
   return {

@@ -85,11 +85,11 @@ export class Scheduling {
    */
   async dispatch(mission: Mission, missionId: string, pass?: SchedulingPass): Promise<boolean> {
         // The sweep's order is a read of rows: the board's members. R17-G1: each
-        // member's step below decides on the SAME interpretation every board
-        // classifier judges (`eligible`, `dispatchable`, the task rows), so no
-        // notice can describe a board the dispatcher would act on differently.
-        // It is built again after each await, so it is never staler than the
-        // per-step store reads it replaces.
+        // member's step asks the predicates the board classifiers ask
+        // (`eligible`, `startBlocker`), so no notice can describe a board the
+        // dispatcher would act on differently, and it reads the board again
+        // after each await, so it is never staler than the per-step store reads
+        // it replaces.
         const members = this.k.boardOf(missionId).members
         const from = pass?.sweepFrom === undefined ? -1 : members.findIndex(member => member.id === pass.sweepFrom)
         const rotation = from > 0 ? [...members.slice(from), ...members.slice(0, from)] : members
@@ -139,10 +139,6 @@ export class Scheduling {
           // described to the owner with a cause the sweep did not test. The
           // parked-member hatch keeps priority: a parked member is dispatchable.
           if (startBlocker(this.k.view, member) !== undefined) continue
-          // The interpretation asks whether each preferred member can start
-          // before this member's eligibility does, and that question can drain
-          // a stranded inbox (R15-A5), so this member's eligibility reads the
-          // handle the drain left, never the drain's own answer.
           const view = interpret(this.k.boardOf(missionId))
           if (pendingStopOwner(view.tasks, member.id)) continue
           const open = openAttempt(view.tasks, member.id)

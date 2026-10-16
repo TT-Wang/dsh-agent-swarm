@@ -19,10 +19,11 @@
  *  - one board asks the adapter about one member twice and gets two answers:
  *    the view is called through and never memoized, because asking whether a
  *    handle is idle can drain a stranded inbox item (R15-A5);
- *  - each member step of the dispatch sweep judges the board (the
- *    interpretation) before it asks that member's eligibility, so a preferred
- *    member that judgement drains leaves its work to the borrower in the same
- *    pass.
+ *  - a preferred member whose stranded inbox the dispatch sweep drains leaves
+ *    its work to the borrower in the same pass, as it did before S11 (the
+ *    sweep's member step still builds the interpretation, whose asks precede
+ *    the borrower's eligibility ask, until the adapter separates isIdle's
+ *    question from its drain).
  *
  * A notice that reads only rows reads the board and asks the adapter nothing:
  * tests/notice-board-reads.test.mjs.
@@ -168,7 +169,7 @@ test('a board asks the adapter at every ask: two asks about one member on one bo
   assert.deepEqual(asked, [f.author.id, f.author.id], 'each ask reached the adapter')
 })
 
-test('each member step of the dispatch sweep judges the board before it asks eligibility: a preferred member drained there leaves its work to the borrower in the same pass, and the owner is asked nothing', async t => {
+test('a preferred member the dispatch sweep drains leaves its work to the borrower in the same pass, and the owner is asked nothing', async t => {
   const f = await setup({ clock: new FakeClock() })
   t.after(() => f.cleanup())
   const work = f.propose({ title: 'Preferred to the reviewer', assigneeId: f.reviewer.id, assignmentMode: 'preferred' })
