@@ -284,7 +284,7 @@ test('a rework ends the rejected attempt and its review\'s, with every marker', 
   assert.equal(taskOf(f.runtime, task.id).reworkCount, 1, 'the source was re-opened for rework')
 })
 
-test('an owner resume is not a fence: the running attempt keeps running, and its idle close-out restarts from the first nudge', async t => {
+test('an owner resume is not a fence: the running attempt keeps running with its turn end, and its idle close-out restarts from the first nudge', async t => {
   const f = await fixture(t)
   const { task, attemptId } = await f.claim()
   const closeOut = () => f.runtime.attempts.closeOutIdleAttempt(f.runtime.mission(f.mission.id), f.member(), taskOf(f.runtime, task.id))
@@ -295,7 +295,13 @@ test('an owner resume is not a fence: the running attempt keeps running, and its
   assert.deepEqual([nudges(), taskOf(f.runtime, task.id).closeout?.nudges], [[1, 2], 2], 'the close-out spent its nudges')
   f.runtime.controlTask(f.owner, f.mission.id, task.id, 'resume', {}, 'Retry after the environment repair')
   const resumed = taskOf(f.runtime, task.id)
-  assert.deepEqual([resumed.status, resumed.attempt?.id, resumed.closeout, resumed.idleSignal], ['running', attemptId, undefined, undefined], 'the resume keeps the attempt and forgets its close-out')
+  assert.deepEqual([resumed.status, resumed.attempt?.id, resumed.closeout, resumed.idleSignal?.attemptId], ['running', attemptId, undefined, attemptId],
+    'the resume keeps the attempt and the turn end that armed its close-out, and forgets the nudges')
+  // The close-out still owns the attempt, so past its silence bound the
+  // attempt reporting bound leaves it to the close-out (R16-D5).
+  const past = f.clock.now() + f.runtime.bounds.attemptSilenceBoundMs + 1
+  assert.equal(f.runtime.scheduling.silentAttempt(resumed, f.runtime.mission(f.mission.id), past), undefined,
+    'the reporting bound does not name the resumed attempt the close-out acts on')
   // The next idle turn is nudged from the first nudge again, instead of abandoning the attempt.
   await closeOut()
   await f.runtime.settle(f.mission.id)

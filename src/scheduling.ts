@@ -543,9 +543,9 @@ export class Scheduling {
    *    stays quiet rather than double-reporting the same attempt. (It is also
    *    the conservative half of the F1v D1/D2 pair: this guard never judges a
    *    live declared check or retry, where a wall-clock bound false-positived.)
-   *  - the W6 idle close-out (`Attempts.closeOutOwns`): an attempt whose turn
-   *    ended is already being nudged and then checkpointed with a coded
-   *    terminal, so this guard stays quiet for exactly that attempt.
+   *  - the W6 idle close-out (`Attempts.turnEnded`): an attempt whose turn
+   *    ended is the close-out's, which nudges it and then checkpoints it with a
+   *    coded terminal, so this guard stays quiet for exactly that attempt.
    *  - the parked member (`waiting`): `notifyParkedHolder` names the holder;
    *    the park is the owner's intent, not silence.
    *  - the budget pause: a deliberate host pause is not a stalled worker.
@@ -566,9 +566,9 @@ export class Scheduling {
     const boundMs = this.k.bounds.attemptSilenceBoundMs
     if (boundMs <= 0) return undefined
     if (!Number.isSafeInteger(attempt.leaseUntil)) return undefined
-    // Naming an attempt the W6 idle close-out owns would double-report it
+    // Naming an attempt the W6 idle close-out acts on would double-report it
     // (the pair is pinned by R16-D5).
-    if (this.attempts.closeOutOwns(task)) return undefined
+    if (this.attempts.turnEnded(task)) return undefined
     const member = this.k.store.get('members', attempt.ownerId)
     if (member === undefined || memberPhaseOf(member) === 'stopped' || memberPhaseOf(member) === 'parked') return undefined
     // F1's subject: any recorded in-flight operation means that guard owns this

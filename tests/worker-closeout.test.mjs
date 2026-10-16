@@ -309,14 +309,19 @@ async function turnEndedUnrecorded(t, config = {}) {
   assert.throws(() => f.workers.callbacks.idle(f.author.id), WriterBusyError, 'the writer refused the row write that records the ended turn')
   delete f.runtime.store.put
   assert.equal(taskOf(f.runtime, task.id).idleSignal, undefined, 'the row does not record the ended turn')
+  return { ...f, task, attemptId: claimed.attempt.id }
+}
+
+/** The author's handle is idle and a pass runs, so the idle close-out acts on the ended turn. */
+async function closeOutPass(f) {
   f.workers.idle.add(f.author.id)
   f.runtime.kick(f.mission.id)
   await f.runtime.settle(f.mission.id)
-  return { ...f, task, attemptId: claimed.attempt.id }
 }
 
 test('an ended turn the writer could not record on the row is still closed out: the next pass nudges on the attempt seam\'s own signal', async t => {
   const f = await turnEndedUnrecorded(t)
+  await closeOutPass(f)
   const row = taskOf(f.runtime, f.task.id)
   assert.deepEqual([row.status, row.attempt?.id, row.idleSignal, row.closeout?.nudges], ['running', f.attemptId, undefined, 1],
     'the pass nudged the open attempt that its row alone does not name')
@@ -325,18 +330,23 @@ test('an ended turn the writer could not record on the row is still closed out: 
     'and the member is told to finish it')
 })
 
-test('the attempt reporting bound never names an attempt the close-out nudged, though its row holds no idle signal', async t => {
+test('the attempt reporting bound never names an attempt whose turn ended, though only the attempt seam records it, before the close-out\'s first nudge or after it', async t => {
   const f = await turnEndedUnrecorded(t, { attemptSilenceBoundMs: 1_000 })
-  const nudged = taskOf(f.runtime, f.task.id)
-  assert.deepEqual([nudged.idleSignal, nudged.closeout?.nudges], [undefined, 1], 'the close-out owns the attempt through its delivered nudge alone')
+  // The reviewer holds an attempt too, and never ends a turn on it.
+  const other = f.propose({ title: 'Never idle', assigneeId: f.reviewer.id })
+  const { attempt } = await f.runtime.claim(f.actor(f.reviewer), f.mission.id, other.id)
+  await f.runtime.settle(f.mission.id)
+  const named = () => f.runtime.store.list('deliveries', f.mission.id).filter(delivery => delivery.notice?.dedupKey?.startsWith('attempt-silent:'))
+    .map(delivery => delivery.notice.dedupKey.split(':')[1])
   f.clock.advance(2_000)
-  const mission = f.runtime.store.get('missions', f.mission.id)
-  assert.equal(f.runtime.scheduling.silentAttempt(nudged, mission), undefined, 'the reporting bound does not name the attempt the close-out owns')
-  assert.equal(f.runtime.scheduling.sweepSilentAttempts(f.mission.id), 0)
-  assert.deepEqual(f.runtime.store.list('deliveries', f.mission.id).filter(delivery => delivery.notice?.dedupKey?.startsWith('attempt-silent:')), [],
-    'and no owner notice reports it')
-  // The pair's other side on the same row: without the delivered nudge the
-  // same silence is past its bound and is named.
-  assert.equal(f.runtime.scheduling.silentAttempt({ ...nudged, closeout: undefined }, mission)?.attemptId, f.attemptId,
-    'the same row without the nudge is named, so the nudge alone keeps the bound quiet')
+  assert.equal(f.runtime.scheduling.sweepSilentAttempts(f.mission.id), 1, 'past the bound, before any nudge, one attempt is named')
+  assert.deepEqual(named(), [attempt.id], 'the attempt whose owner never ended a turn, never the one the close-out is about to nudge')
+  await closeOutPass(f)
+  const nudged = taskOf(f.runtime, f.task.id)
+  assert.deepEqual([nudged.idleSignal, nudged.closeout?.nudges], [undefined, 1], 'the close-out nudged the attempt its row does not name')
+  f.clock.advance(2_000)
+  assert.equal(f.runtime.scheduling.silentAttempt(nudged, f.runtime.store.get('missions', f.mission.id)), undefined,
+    'after the nudge, the reporting bound still leaves the attempt to the close-out')
+  f.runtime.scheduling.sweepSilentAttempts(f.mission.id)
+  assert.deepEqual(named(), [attempt.id], 'and no owner notice ever names it')
 })

@@ -475,12 +475,12 @@ export interface Task {
   budgetResume?: { pauseId: string; attemptId: string }
   /** Durable quiescence transition; epoch matching prevents reopening invalidated work. */
   resumeAfterStop?: { epoch: number; memberId?: string; reason: 'handoff' | 'lease-expired' | 'worker-closeout' | 'resource' | 'invalidated'; /** R14-F2(d): when the stop began, so a waited-on stop has a durable bound. */ at?: number; /** Deterministic preservation failures retain the fence until an explicit resume retries them. */ failure?: { message: string; deterministic: boolean } }
-  /** Idle close-out nudges already delivered for this attempt; they leave the row with the attempt. */
+  /** Idle close-out nudges already delivered for this attempt; an owner resume restarts them, and they leave the row with the attempt. */
   closeout?: { nudges: number; at: number }
   /**
    * S5: durable form of the adapter's "this member ended a turn while still
    * owning this attempt" signal. The attempts seam, which writes it, is its one
-   * reader (`Attempts.turnEnded`, `Attempts.closeOutOwns`): the scheduling path
+   * reader (`Attempts.turnEnded`): the scheduling path
    * asks it rather than trusting the in-memory `idleSignals` map, which is now only a
    * cache: a lost cache delays the bounded close-out until lease expiry, it
    * cannot make the close-out wrong. It names its attempt and leaves the row with it.

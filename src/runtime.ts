@@ -2,7 +2,7 @@
 import { randomUUID } from 'node:crypto'
 import { isAbsolute, join } from 'node:path'
 import { SwarmStore, WriterBusyError, StoreRecoveryError, id, stageRestore, type PendingRestore, type PostFilter, type StoreOptions } from './store.ts'
-import { Attempts, clearCloseout, endAttempt } from './attempts.ts'
+import { Attempts, endAttempt } from './attempts.ts'
 import { PolicyError } from './policy-error.ts'
 export { WorkspaceRevokedError } from './authorization.ts'
 import { recordedClaim, type WorkspaceClaim } from './authorization.ts'
@@ -3176,8 +3176,9 @@ export class SwarmRuntime implements Kernel {
       next.resumeAfterStop = { ...next.resumeAfterStop, reason: 'handoff' }
     }
     if (taskCeilingBlock(next, this.now()) === undefined) delete next.ceiling
-    // A resume is not a fence: a running attempt keeps running, with a fresh idle close-out.
-    if (resumes) { delete next.preparationFailure; delete next.verificationRecovery; clearCloseout(next) }
+    // A resume is not a fence: a running attempt keeps running, and its idle
+    // close-out restarts from the first nudge; the turn end that armed it stays.
+    if (resumes) { delete next.preparationFailure; delete next.verificationRecovery; delete next.closeout }
     if (rework !== undefined) this.reopenForRework(next, rework)
     // A rejected submission holds no live attempt: its author is not stopped.
     // Any other attempt the row holds owes its owner's stop, a blocked row's

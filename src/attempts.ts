@@ -42,15 +42,6 @@ export function stopOutcome(causes: ReadonlySet<BlockCause>, reason: StopReason)
 }
 
 /**
- * The idle close-out of the row's open attempt: the nudges it delivered and the
- * turn end that armed it. Cleared, the attempt's next idle turn is nudged from
- * the first nudge again; an owner resume of a running attempt clears it so.
- */
-export function clearCloseout(task: Task): void {
-  delete task.closeout; delete task.idleSignal
-}
-
-/**
  * X1 (P0): take the attempt off the row with its markers (`dropForeignMarkers`:
  * a row without an attempt carries none) and remember its owner durably, so the
  * union below can never forget a member who already touched the work. Only the
@@ -457,25 +448,16 @@ export class Attempts {
     return task
   }
   /**
-   * W6: whether the owner of an open attempt ended its turn on it (`onIdle`).
-   * The durable signal on the row is the record; the in-memory one stands in
-   * for its row write while that is still in flight.
+   * W6: whether the owner of an open attempt ended its turn on it (`onIdle`),
+   * the one question of the idle close-out: the dispatch sweep closes out such
+   * an attempt (it nudges, then checkpoints and re-pends with a coded
+   * terminal), and the attempt reporting bound leaves it to the close-out. A
+   * turn end is a fact of the attempt, so it leaves the row only with the
+   * attempt. The durable signal on the row is the record; the in-memory one
+   * stands in for its row write when that did not land.
    */
   turnEnded(open: HeldTask): boolean {
-    return this.endedOnRow(open) || this.idleSignals.get(open.attempt.ownerId)?.attemptId === open.attempt.id
-  }
-  /**
-   * W6: the idle close-out owns this open attempt: the row records that its
-   * turn ended, or a close-out nudge was already delivered for it. The
-   * close-out nudges, then checkpoints and re-pends with a coded terminal, so
-   * the attempt reporting bound does not name the same attempt.
-   */
-  closeOutOwns(open: HeldTask): boolean {
-    return this.endedOnRow(open) || (open.closeout?.nudges ?? 0) > 0
-  }
-  /** W6: the durable record of `onIdle` on the row, for the attempt it names. */
-  private endedOnRow(open: HeldTask): boolean {
-    return open.idleSignal?.attemptId === open.attempt.id
+    return open.idleSignal?.attemptId === open.attempt.id || this.idleSignals.get(open.attempt.ownerId)?.attemptId === open.attempt.id
   }
   onIdle(memberId: string): void {
     if (this.k.closed || this.k.shuttingDown) return
