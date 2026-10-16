@@ -15,9 +15,10 @@
  *
  * The budget-resume marker is one of those markers, so it never outlives the
  * attempt it names: a fence during a budget pause takes it, and the resume
- * finds no stale marker to skip. Each test here fails on the hand-assembled
- * fences (b462a61), except the last, which pins what the fence is not: an
- * owner resume keeps a running attempt and restarts its idle close-out.
+ * finds no stale marker to skip; one an older build left behind is inert. Each
+ * test here fails on the hand-assembled fences (b462a61), except the last,
+ * which pins what the fence is not: an owner resume keeps a running attempt and
+ * restarts its idle close-out.
  */
 import test from 'node:test'
 import assert from 'node:assert/strict'
@@ -153,6 +154,30 @@ test('a fence during a budget pause takes the pause marker with the attempt, so 
   assert.deepEqual(events(f.runtime, f.mission.id, 'task/budget-resume-skipped'), [], 'no marker outlived its attempt, so none is skipped')
   assert.deepEqual(events(f.runtime, f.mission.id, 'task/budget-resumed'), [], 'the fenced attempt is not resumed')
   assert.equal(taskOf(f.runtime, task.id).recoveryCount, undefined, 'the fence spent no recovery credit')
+})
+
+test('the budget resume resumes only a row that still holds the attempt its marker names; a marker an older build left behind stays inert until the next assignment', { timeout: 30_000 }, async t => {
+  // The timeout turns a resume that throws on such a row, which re-runs its pass without end, into a failure.
+  const f = await fixture(t)
+  const { task } = await f.claim()
+  const older = f.propose({ title: 'Older build row', assigneeId: f.reviewer.id })
+  await f.workers.callbacks.usage(f.author.id, budget.maxTokens + 1)
+  const pauseId = f.runtime.mission(f.mission.id).budgetPause.id
+  // Rows an older build wrote under this pause: a fence dropped the attempt and
+  // left its marker (the row re-pended since), and a running row's marker names
+  // an attempt the row no longer holds.
+  const forge = (id, patch) => f.runtime.commit(f.mission.id, () => f.runtime.store.put('tasks', { ...taskOf(f.runtime, id), ...patch }))
+  forge(older.id, { priorOwnerIds: [f.author.id], budgetResume: { pauseId, attemptId: 'attempt-an-older-fence-dropped' } })
+  forge(task.id, { budgetResume: { pauseId, attemptId: 'attempt-the-row-no-longer-holds' } })
+  const before = [taskOf(f.runtime, older.id), taskOf(f.runtime, task.id)]
+  f.runtime.updateBudget(f.owner, f.mission.id, { ...f.runtime.mission(f.mission.id).budget, maxTokens: budget.maxTokens * 4 })
+  f.runtime.control(f.owner, f.mission.id, 'resume', 'Budget raised')
+  for (let tick = 0; tick < 20 && f.runtime.mission(f.mission.id).budgetPause !== undefined; tick++) { f.clock.advance(10); await f.runtime.tick() }
+  assert.equal(f.runtime.mission(f.mission.id).budgetPause, undefined, 'the resume cleared the pause')
+  assert.deepEqual([...events(f.runtime, f.mission.id, 'task/budget-resumed'), ...events(f.runtime, f.mission.id, 'task/budget-resume-skipped')], [], 'no row held the attempt its marker names, and none is reported')
+  assert.deepEqual([taskOf(f.runtime, older.id), taskOf(f.runtime, task.id)], before, 'the resume wrote neither row')
+  await f.runtime.claim(f.actor(f.reviewer), f.mission.id, older.id)
+  assert.equal(taskOf(f.runtime, older.id).budgetResume, undefined, 'the next assignment starts its attempt without the marker')
 })
 
 test('a failed worker start ends the attempt it was assigned, with every marker', async t => {
