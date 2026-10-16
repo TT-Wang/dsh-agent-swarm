@@ -519,6 +519,13 @@ test('S4r-D3: the admission guard refuses at propose() and at plan validation', 
       /dependency_assumption_missing/, 'plan admission refuses the same prejudged content')
     const valid = validatePlan({ ...base, tasks: [{ key: 'code', workstreamKey: 'main', title: 'Code', objective: 'Implement the change in src/answer.txt.', kind: 'implementation', scope: ['src/'], acceptance: ['works'], assigneeKey: 'builder', checks: ['test -d .'] }] })
     assert.equal(valid.tasks.length, 1, 'a self-contained plan task is still admitted')
+    // A review's source is one of its edges (`taskEdges`): it carries the
+    // reviewed content, so a plan review naming that content is admitted.
+    const code = { key: 'code', workstreamKey: 'main', title: 'Code', objective: 'Implement the change in src/answer.txt.', kind: 'implementation', scope: ['src/'], acceptance: ['works'], assigneeKey: 'builder', checks: ['test -d .'] }
+    const review = { key: 'review', workstreamKey: 'main', title: 'Review', objective: 'Review the submitted artifact `09883f3` already in your worktree.', kind: 'verification', scope: ['src/'], acceptance: ['works'], assigneeKey: 'checker', checks: ['test -d .'] }
+    const reviewers = { ...base, members: [...base.members, { key: 'checker', name: 'Checker', role: 'verification' }] }
+    assert.equal(validatePlan({ ...reviewers, tasks: [code, { ...review, reviewOf: 'code' }] }).tasks.length, 2, 'the review source carries the content the review names')
+    assert.throws(() => validatePlan({ ...reviewers, tasks: [code, { ...review, kind: 'implementation', assigneeKey: 'builder' }] }), error => error.code === 'dependency_assumption_missing', 'the same text with no edge is refused')
   } finally { await f.cleanup() }
 })
 

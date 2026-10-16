@@ -200,7 +200,7 @@ export function validatePlan(value: unknown, options: PlanValidationOptions = {}
       for (const diagnostic of dependencyAssumptions({
         objective: task.objective,
         acceptance: taskAcceptance,
-        dependencies: [...(Array.isArray(task.dependencies) ? task.dependencies as string[] : []), ...(typeof task.reviewOf === 'string' ? [task.reviewOf] : [])],
+        dependencies: taskEdges({ dependencies: Array.isArray(task.dependencies) ? task.dependencies as string[] : [], reviewOf: typeof task.reviewOf === 'string' ? task.reviewOf : undefined }),
         replaces: Array.isArray(task.replaces) ? task.replaces as string[] : [],
       }, `${at}.objective`)) if (diagnostic.severity !== 'advisory') admissionIssues.push({ category: 'tool_error', diagnostics: [diagnostic], message: formatDiagnostic(diagnostic) })
     }
