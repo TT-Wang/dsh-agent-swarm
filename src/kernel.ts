@@ -95,7 +95,7 @@ export interface SchedulingPass {
   /**
    * The member whose task this body is preparing, while its `prepareTask` await
    * is in flight: the adapter's recovery-fallback report, committed from inside
-   * that call, stamps the body's progress first (`SwarmRuntime.onRecoveryFallback`).
+   * that call, stamps the body's progress first (`Scheduling.preparationReported`).
    */
   preparing?: string
   /** The member this body's sweep starts from: the one its predecessor stopped before. */

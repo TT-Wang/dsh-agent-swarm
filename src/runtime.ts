@@ -3565,11 +3565,9 @@ export class SwarmRuntime implements Kernel {
    */
   onRecoveryFallback(info: RecoveryFallback): void {
     if (this.closed) return
-    // The report arrives from inside a `prepareTask` call. When the scheduling
-    // body awaiting it marked this member (`SchedulingPass.preparing`), the
-    // body stamps its progress before the report commits.
-    const body = this.scheduling.passes.get(info.missionId)
-    if (body?.preparing === info.memberId) progressed(body, this.now())
+    // The report arrives from inside a `prepareTask` call; the scheduling body
+    // awaiting that call is credited before the report commits.
+    this.scheduling.preparationReported(info.missionId, info.memberId)
     const names = (memberId: string) => this.store.get('members', memberId)?.name ?? memberId
     const previous = names(info.previousOwnerId)
     const content = info.preserved

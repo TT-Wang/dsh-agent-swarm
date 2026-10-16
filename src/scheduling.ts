@@ -162,8 +162,8 @@ export class Scheduling {
             this.refusals.assertAdmission(task, member)
             await awaited(pass, this.workspaceAdmission.assertWorkspaceAuthorized(this.k.mission(missionId), pass), this.k.now)
             // The adapter reports a recovery fallback from inside this call
-            // (`SwarmRuntime.onRecoveryFallback`), which stamps the body that
-            // marked the member it prepares before it commits the report.
+            // (`preparationReported`), which stamps the body that marked the
+            // member it prepares before the report commits.
             if (pass !== undefined) pass.preparing = member.id
             const { graph } = this.k.boardOf(missionId)
             try { await awaited(pass, this.k.workers.prepareTask(member, { ...task, epoch: task.epoch + 1 }, graph.effectiveDependencies(task), graph.reviewSource(task)), this.k.now) }
@@ -222,6 +222,17 @@ export class Scheduling {
           }
         }
     return true
+  }
+
+  /**
+   * The adapter reported from inside a member's `prepareTask` call (a recovery
+   * fallback): when the body awaiting that call marked the member
+   * (`SchedulingPass.preparing`), the report is the body's own progress, stamped
+   * before the report commits.
+   */
+  preparationReported(missionId: string, memberId: string): void {
+    const pass = this.passes.get(missionId)
+    if (pass?.preparing === memberId) progressed(pass, this.k.now())
   }
 
   /** The mission's stable pass name, carried by the stall event (`passId`) and the owner notice. */
