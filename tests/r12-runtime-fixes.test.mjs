@@ -27,7 +27,7 @@ test('a failed tick guard and one failed mission do not suppress other guards or
   f.runtime.sweepStarts = () => calls.push('starts')
   f.runtime.checkSchedulingPasses = () => calls.push('passes')
   f.runtime.sweepDecisions = () => calls.push('decisions')
-  f.runtime.warnBudget = mission => { calls.push(mission.id); if (mission.id === f.mission.id) throw new Error('injected mission failure') }
+  f.runtime.gates.warnBudget = mission => { calls.push(mission.id); if (mission.id === f.mission.id) throw new Error('injected mission failure') }
   f.runtime.startTicker()
   await delay(25)
   // The tick reaches its pump through the member patched above, so the injected failure is the first thing it does.

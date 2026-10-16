@@ -742,7 +742,7 @@ test('S5r: the durable budget-stop claim absorbs a duplicate stop in flight, and
       'the durable claim is written before the stop awaits the adapter')
     // Ask for the same stop again while the first is in flight: the durable
     // claim must absorb it.
-    f.runtime.beginBudgetStop(f.mission.id, pauseId)
+    f.runtime.gates.beginBudgetStop(f.mission.id, pauseId)
     releaseStop()
     await eventually(() => f.runtime.mission(f.mission.id).budgetPause?.quiesced === true, 'the stop completes')
     await f.runtime.settle(f.mission.id)
@@ -762,7 +762,7 @@ test('S5r: the durable budget-stop claim absorbs a duplicate stop in flight, and
       mission.budgetPause = { id: 'pause-crashed', quiesced: false, stopping: { instanceId: 'other-runtime', at: Date.now() - 60_000 } }
       crashed.runtime.store.put('missions', mission)
     })
-    crashed.runtime.beginBudgetStop(crashed.mission.id, 'pause-crashed')
+    crashed.runtime.gates.beginBudgetStop(crashed.mission.id, 'pause-crashed')
     await eventually(() => crashed.runtime.mission(crashed.mission.id).budgetPause?.quiesced === true,
       'a foreign, expired claim does not gate the stop')
     assert.equal(events(crashed.runtime, crashed.mission.id, 'mission/budget-quiesced').length, 1)

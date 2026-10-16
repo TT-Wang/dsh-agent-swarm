@@ -7,7 +7,8 @@
  * `RuntimeGates` stands on the kernel and three seams below it, each called one
  * hop: the notices a warning and the budget terminal go through, the refusals a
  * budget block records and the declared checks, whose assignment delivery a
- * budget resume writes.
+ * budget resume writes. Every caller reaches it as `runtime.gates`, so a test
+ * that patches `runtime.gates.<method>` intercepts them all.
  */
 import { createHash } from 'node:crypto'
 import { id } from './store.ts'

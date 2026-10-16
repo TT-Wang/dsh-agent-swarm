@@ -28,7 +28,7 @@ import { canBorrowTask, canOwnReview, strandedReview } from './assignment.ts'
 import { executionClock, executionElapsed } from './resource-time.ts'
 import { TERMINAL_STATES, blockCauses, currentEvidenceIds, holdsAttempt, holdsOpenAttempt, memberTask, missionSubject, openAttempt, pendingStopOwner, quiescencePending, selectAcceptedDelivery, stopPending, taskEdges, taskGraphIndex, taskSubject, terminal, uncoveredCriteria, type BlockCause, type HeldTask } from './task-graph.ts'
 import { checkSyntaxDetail, declaredPlanChecks, orderedTasks, pairReviews, planAdvisories, validatePlan } from './plans.ts'
-import { OWNER_ONLY_TOOLS, type Actor, type AutoStart, BoardQuery, Budget, CheckAttribution, CreateMissionInput, CriticalPath, criterionId, Delivery, DraftPlan, Escalation, Evidence, EvidenceStatus, Member, Mission, nextWorkerName, ObserveQuery, MessageInput, PlanInput, Post, PostInput, PostKind, PROVIDER_OUTAGE_WINDOW_MS, ProposeTaskInput, ProviderOutage, providerQuiescent, PublishInput, RecoveryFallback, RequestStartInput, RuntimeConfig, Snapshot, Task, TaskAmendment, TaskRejection, TaskCeiling, ToolRun, UsageBuckets, UsageSnapshotSource, VerificationCleanupFailure, WorkerAdapter, WorkerActivity, Workstream } from './types.ts'
+import { OWNER_ONLY_TOOLS, type Actor, type AutoStart, BoardQuery, Budget, CheckAttribution, CreateMissionInput, CriticalPath, criterionId, Delivery, DraftPlan, Escalation, Evidence, EvidenceStatus, Member, Mission, nextWorkerName, ObserveQuery, MessageInput, PlanInput, Post, PostInput, PostKind, PROVIDER_OUTAGE_WINDOW_MS, ProposeTaskInput, ProviderOutage, providerQuiescent, PublishInput, RecoveryFallback, RequestStartInput, RuntimeConfig, Snapshot, Task, TaskAmendment, TaskRejection, TaskCeiling, ToolRun, VerificationCleanupFailure, WorkerAdapter, WorkerActivity, Workstream } from './types.ts'
 import { requireArtifactChecks } from './artifact-policy.ts'
 
 /** Release a prelaunch caller even when an adapter ignores cancellation. Its late writes remain fenced. */
@@ -256,18 +256,11 @@ export class SwarmRuntime implements Kernel {
   /**
    * M1a seam 2/7: usage accounting, the budget gate and the owner read models,
    * on the kernel, the notices, the refusals and the declared checks whose
-   * assignment delivery a budget resume writes.
+   * assignment delivery a budget resume writes. Every caller reaches it as
+   * `gates`: the runtime's body, its tick, the adapter's usage callbacks and
+   * the tests.
    */
   private readonly gates = new RuntimeGates(this, this.notices, this.refusals, this.declaredChecks)
-  private ownerInstruments(missionId: string, full: boolean): Record<string, unknown> { return this.gates.ownerInstruments(missionId, full) }
-  private boardWindow(missionId: string, memberId: string, afterSeq: number): Record<string, unknown> { return this.gates.boardWindow(missionId, memberId, afterSeq) }
-  private async usage(memberId: string, tokens: number): Promise<void> { return this.gates.usage(memberId, tokens) }
-  private async usageSnapshot(memberId: string, totalTokens: number, usage?: UsageBuckets, source?: UsageSnapshotSource): Promise<void> { return this.gates.usageSnapshot(memberId, totalTokens, usage, source) }
-  private recordOwnerUsage(sessionId: string, usage: UsageBuckets): void { return this.gates.recordOwnerUsage(sessionId, usage) }
-  private warnBudget(mission: Mission): void { return this.gates.warnBudget(mission) }
-  private blockBudget(mission: Mission): void { return this.gates.blockBudget(mission) }
-  private beginBudgetStop(missionId: string, pauseId: string): void { return this.gates.beginBudgetStop(missionId, pauseId) }
-  private resumeBudgetTasks(mission: Mission): void { return this.gates.resumeBudgetTasks(mission) }
 
   constructor(readonly config: RuntimeConfig, readonly workers: WorkerAdapter, storeOptions: StoreOptions = {}) {
     this.now = typeof config.now === 'function' ? config.now : () => Date.now()
@@ -276,9 +269,9 @@ export class SwarmRuntime implements Kernel {
       activity: (memberId, activity) => this.onActivity(memberId, activity),
       idle: memberId => this.attempts.onIdle(memberId),
       beforeStep: (memberId, hasFreshInput) => this.beforeStep(memberId, hasFreshInput),
-      usage: (memberId, tokens) => this.usage(memberId, tokens),
-      usageSnapshot: (memberId, totalTokens, usage, source) => this.usageSnapshot(memberId, totalTokens, usage, source),
-      ownerUsage: (sessionId, usage) => this.recordOwnerUsage(sessionId, usage),
+      usage: (memberId, tokens) => this.gates.usage(memberId, tokens),
+      usageSnapshot: (memberId, totalTokens, usage, source) => this.gates.usageSnapshot(memberId, totalTokens, usage, source),
+      ownerUsage: (sessionId, usage) => this.gates.recordOwnerUsage(sessionId, usage),
       admitDelivery: (memberId, deliveryId) => {
         const delivery = this.store.get('deliveries', deliveryId)
         if (!delivery || delivery.to !== memberId) return false
@@ -478,8 +471,8 @@ export class SwarmRuntime implements Kernel {
     this.tickGuard('missions', () => { for (const mission of this.store.list('missions')) this.tickGuard(`mission ${mission.id}`, () => {
       if (mission.executionTime !== undefined) executionClock(mission, mission.executionTime.since !== undefined, this.now())
       // Deadline cancellation cannot queue behind a long verification holding the mission queue.
-      if (mission.status === 'active' && this.now() >= mission.deadline) this.blockBudget(mission)
-      else if (mission.status === 'active') this.warnBudget(mission)
+      if (mission.status === 'active' && this.now() >= mission.deadline) this.gates.blockBudget(mission)
+      else if (mission.status === 'active') this.gates.warnBudget(mission)
       if (!terminal(mission)) this.kick(mission.id)
     }) })
   }
@@ -1138,7 +1131,7 @@ export class SwarmRuntime implements Kernel {
       this.store.event(missionId, 'task/proposed', key, task)
       for (const change of checkChanges) this.store.event(missionId, 'task/check-changed', key, { taskId: task.id, reason: 'replacement', ...change })
     })
-    this.warnBudget(this.mission(missionId))
+    this.gates.warnBudget(this.mission(missionId))
     this.notices.warnIntegrationGap(mission, task)
     this.kick(missionId)
     return owner ? task : memberTask(this.boardOf(missionId), task)
@@ -2914,7 +2907,7 @@ export class SwarmRuntime implements Kernel {
       // Board traffic is part of the delta: counts plus the newest few posts,
       // so a worker learns about cross-task posts without a second poll.
       const postAfter = delivered?.postSeq ?? 0
-      const posts = this.boardWindow(missionId, member.id, postAfter)
+      const posts = this.gates.boardWindow(missionId, member.id, postAfter)
       const nextPostSeq = typeof posts.nextAfter === 'number' ? posts.nextAfter : postAfter
       // Record only what this response delivers. A history page swapped in by
       // tools.ts suppresses the event advance so no unseen event is skipped.
@@ -2993,7 +2986,7 @@ export class SwarmRuntime implements Kernel {
       posts: { total: this.store.countPosts(missionId), newest: newest.map(post => postView(post, this.now())),
         ...(postAfter === undefined ? {} : { count: postCount }), ...(postCount > newest.length ? { omitted: postCount - newest.length } : {}) },
       events, ...eventCursor,
-      ...(owner ? this.ownerInstruments(missionId, full) : {}),
+      ...(owner ? this.gates.ownerInstruments(missionId, full) : {}),
       detail: full ? 'Complete task records and evidence claims; tool payloads are read by runId.' : 'Pass nextCursor as cursor for changed board/members/evidence rows and removed ids; mission statistics and open questions remain visible. Missing or expired cursor returns a complete compact board. after pages events independently; taskId/runId/evidenceId reads one record; detail=full expands records.',
       ...(owner ? {} : { note: 'Non-member observer' }),
     }
@@ -3367,7 +3360,7 @@ export class SwarmRuntime implements Kernel {
     }
     // Requests still streaming for other workers will settle against the same pool.
     if (mission.usedSteps >= mission.budget.maxSteps || mission.usedTokens + inFlightEstimate(this.view, this.store.list('members', mission.id).filter(item => item.id !== memberId)) >= mission.budget.maxTokens || this.now() >= mission.deadline) {
-      this.blockBudget(mission); throw new Error('Mission aggregate budget exhausted')
+      this.gates.blockBudget(mission); throw new Error('Mission aggregate budget exhausted')
     }
     mission.usedSteps++; mission.updatedAt = this.now()
     this.commit(mission.id, () => {
@@ -3379,7 +3372,7 @@ export class SwarmRuntime implements Kernel {
         activeTask.attempt.leaseUntil = Math.min(mission.deadline, this.now() + this.config.leaseMs); this.store.put('tasks', activeTask)
       }
     })
-    this.warnBudget(mission)
+    this.gates.warnBudget(mission)
   }
   /**
    * Durable per-task ceiling block. The task stops at its own limit and the owner
@@ -3865,13 +3858,13 @@ export class SwarmRuntime implements Kernel {
     if (mission.status !== 'active') { await this.notices.flushOutbox(missionId, pass); return }
     if (mission.budgetPause) {
       if (!mission.budgetPause.quiesced) {
-        this.beginBudgetStop(missionId, mission.budgetPause.id)
+        this.gates.beginBudgetStop(missionId, mission.budgetPause.id)
         await this.notices.flushOutbox(missionId, pass); return
       }
-      this.resumeBudgetTasks(mission)
+      this.gates.resumeBudgetTasks(mission)
     }
     if (this.completeAutomatic(missionId)) { await this.notices.flushOutbox(missionId, pass); return }
-    if (this.now() >= mission.deadline || mission.usedTokens >= mission.budget.maxTokens || mission.usedSteps >= mission.budget.maxSteps) { this.blockBudget(mission); return }
+    if (this.now() >= mission.deadline || mission.usedTokens >= mission.budget.maxTokens || mission.usedSteps >= mission.budget.maxSteps) { this.gates.blockBudget(mission); return }
     // F2: a submitted code deliverable no live review can accept is repaired
     // before dispatch, so the auto-admitted review can be scheduled this tick.
     this.admitMissingReviews(this.mission(missionId))
