@@ -315,24 +315,34 @@ export class DeclaredChecks {
 
   /**
    * ENV: compare the envelope delivered to one verification attempt with the
-   * environment the host recorded on that artifact's declared checks. Both sides
-   * are host-measured: the runtime constructs the envelope and runs the declared
+   * environment the host recorded on that artifact's declared checks, and make
+   * a divergence durable before the verdict reads the comparison, so a later
+   * reader sees both environments, not only a refusal. Both sides are
+   * host-measured: the runtime constructs the envelope and runs the declared
    * checks itself, so nothing here is inferred from a member's command text. An
    * attempt with no delivered envelope, or with no host check outcome that
    * carries an environment, has nothing to compare and the verdict proceeds as
    * before.
    */
-  reproduction(missionId: string, taskId: string, attemptId: string, checks: ReadonlyArray<{ environment?: CheckEnvironment }>):
-    { envelope: CheckEnvironment; selfRun: CheckEnvironment; source: 'host-check'; at: number; comparison: CheckEnvironmentComparison } | undefined {
+  reproduce(where: { missionId: string; taskId: string; sourceTaskId: string; attemptId: string; memberId: string; verdict: 'accept' | 'reject' },
+    checks: ReadonlyArray<CheckResult>): CheckEnvironmentComparison | undefined {
     if (checks.length === 0) return undefined
-    const envelope = this.deliveredEnvironment(missionId, taskId, attemptId) ?? this.envelope()?.environment
+    const envelope = this.deliveredEnvironment(where.missionId, where.taskId, where.attemptId) ?? this.envelope()?.environment
     if (envelope === undefined) return undefined
     // Declared host checks are the supporting executions. A later unrelated
     // diagnostic cannot substitute its environment for those immutable-artifact checks.
-    const measured = checks.find(check => check.environment !== undefined && compareCheckEnvironments(envelope, check.environment).blocking.length > 0)?.environment
+    const selfRun = checks.find(check => check.environment !== undefined && compareCheckEnvironments(envelope, check.environment).blocking.length > 0)?.environment
       ?? checks.find(check => check.environment !== undefined)?.environment
-    if (measured === undefined) return undefined
-    return { envelope, selfRun: measured, source: 'host-check', at: this.k.now(), comparison: compareCheckEnvironments(envelope, measured) }
+    if (selfRun === undefined) return undefined
+    const comparison = compareCheckEnvironments(envelope, selfRun)
+    if (comparison.blocking.length === 0 && comparison.advisory.length === 0) return comparison
+    const attribution = checks.find(check => check.attribution !== undefined)?.attribution
+    this.k.commit(where.missionId, () => this.k.store.event(where.missionId, 'task/check-envelope', where.memberId, {
+      taskId: where.taskId, sourceTaskId: where.sourceTaskId, verdict: where.verdict, reproduction: 'check-environment-mismatch',
+      envelope, selfRun, selfRunSource: 'host-check', selfRunAt: this.k.now(), blocking: comparison.blocking, advisory: comparison.advisory,
+      ...(attribution === undefined ? {} : { attribution }),
+    }))
+    return comparison
   }
 
   /** The verdict's check outcome: a rejection is the reviewer's to earn. */

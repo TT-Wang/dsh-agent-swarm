@@ -1378,26 +1378,15 @@ export class SwarmRuntime implements Kernel {
         const found = checks.find(item => item.command === check.command && item.exitCode === check.exitCode)
         return found?.attribution === undefined ? {} : { attribution: found.attribution }
       }
-      const failureAttribution = checks.find(check => check.attribution !== undefined)?.attribution
       // ENV: the envelope delivered to this attempt must be reproduced by the
-      // host checks that support it. A blocking divergence is durable before it
-      // is reported, so a later reader sees the environments, not only the refusal.
-      const reproduction = this.declaredChecks.reproduction(missionId, task.id, input.attemptId, checks)
-      if (reproduction !== undefined && (reproduction.comparison.blocking.length > 0 || reproduction.comparison.advisory.length > 0)) {
-        this.commit(missionId, () => this.store.event(missionId, 'task/check-envelope', member.id, {
-          taskId: task.id, sourceTaskId: source.id, verdict: input.verdict, reproduction: 'check-environment-mismatch',
-          envelope: reproduction.envelope, selfRun: reproduction.selfRun, selfRunSource: reproduction.source, selfRunAt: reproduction.at,
-          blocking: reproduction.comparison.blocking, advisory: reproduction.comparison.advisory,
-          ...(failureAttribution === undefined ? {} : { attribution: failureAttribution }),
-        }))
-      }
-      // A failed check still blocks the source with its real failure (the
-      // mismatch is recorded above). An acceptance, though, is refused rather
-      // than validating an artifact under an environment the host check cannot
-      // reproduce.
-      if (passed && reproduction !== undefined && reproduction.comparison.blocking.length > 0) {
+      // host checks that support it; the declared checks record a divergence
+      // before it is reported. A failed check still blocks the source with its
+      // real failure. An acceptance, though, is refused rather than validating
+      // an artifact under an environment the host check cannot reproduce.
+      const comparison = this.declaredChecks.reproduce({ missionId, taskId: task.id, sourceTaskId: source.id, attemptId: input.attemptId, memberId: member.id, verdict: input.verdict }, checks)
+      if (passed && comparison !== undefined && comparison.blocking.length > 0) {
         this.commit(missionId, () => { this.declaredChecks.recordRuns(missionId, { memberId: member.id, taskId: task.id, attemptId: input.attemptId, commit: artifact.commit }, checks) })
-        throw new CheckEnvironmentMismatchError(reproduction.comparison)
+        throw new CheckEnvironmentMismatchError(comparison)
       }
       // F3-A: a rejection must carry the real failure, not only the reviewer's
       // prose. A judgement rejection with no failing check keeps the prose.
