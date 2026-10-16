@@ -324,3 +324,19 @@ test('an ended turn the writer could not record on the row is still closed out: 
   assert.ok(f.workers.deliveries.some(delivery => delivery.memberId === f.author.id && /still open but your turn ended/.test(delivery.content)),
     'and the member is told to finish it')
 })
+
+test('the attempt reporting bound never names an attempt the close-out nudged, though its row holds no idle signal', async t => {
+  const f = await turnEndedUnrecorded(t, { attemptSilenceBoundMs: 1_000 })
+  const nudged = taskOf(f.runtime, f.task.id)
+  assert.deepEqual([nudged.idleSignal, nudged.closeout?.nudges], [undefined, 1], 'the close-out owns the attempt through its delivered nudge alone')
+  f.clock.advance(2_000)
+  const mission = f.runtime.store.get('missions', f.mission.id)
+  assert.equal(f.runtime.scheduling.silentAttempt(nudged, mission), undefined, 'the reporting bound does not name the attempt the close-out owns')
+  assert.equal(f.runtime.scheduling.sweepSilentAttempts(f.mission.id), 0)
+  assert.deepEqual(f.runtime.store.list('deliveries', f.mission.id).filter(delivery => delivery.notice?.dedupKey?.startsWith('attempt-silent:')), [],
+    'and no owner notice reports it')
+  // The pair's other side on the same row: without the delivered nudge the
+  // same silence is past its bound and is named.
+  assert.equal(f.runtime.scheduling.silentAttempt({ ...nudged, closeout: undefined }, mission)?.attemptId, f.attemptId,
+    'the same row without the nudge is named, so the nudge alone keeps the bound quiet')
+})
