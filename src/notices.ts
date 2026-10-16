@@ -9,7 +9,7 @@ import { covered, hasNotice } from './arena.ts'
 import { hostContextOf } from './projection.ts'
 import { formatDiagnostic, missingReviewDiagnostic } from './admission.ts'
 import { guardTerminal, guardTerminalKey, type GuardChainId, type GuardTerminal, type GuardTerminalContext, type RefusalRegistry } from './refusals.ts'
-import { TERMINAL_STATES, holdsOpenAttempt, missionSubject, stopPending, taskSubject, terminal } from './task-graph.ts'
+import { TERMINAL_STATES, holdsAttempt, missionSubject, stopPending, taskSubject, terminal } from './task-graph.ts'
 import { WriterBusyError, id, type SwarmStore } from './store.ts'
 import { awaited, type Kernel, type PassState, type SchedulingPass } from './kernel.ts'
 import { completionError, dependentsOf, eligible, interpret, isolationIssues, newestReviewBlock, noticeSubjectsFor, overdueStop, reviewNeed, reviewPathBlocker, reviewPathStalled, stallRoots, startBlocker, unreviewedSources, waitsLegitimately, type Board, type Interpretation } from './board.ts'
@@ -161,15 +161,18 @@ function ownerDeliveryMoot(mission: Pick<Mission, 'status'>, delivery: Pick<Deli
 
 /**
  * Whether an assignment delivery is still current: its task, read in the
- * delivery's own mission, runs the delivered attempt, owned by the delivery's
- * recipient. A task id that names no task of that mission reads as no task, so
- * the delivery is not current. The one rule the outbox (which marks an
- * assignment that is not current moot, `flushOutbox`) and the host's admission
- * of a queued assignment (`admitDelivery`) both read.
+ * delivery's own mission, still holds the delivered attempt (`holdsAttempt`),
+ * owned by the delivery's recipient. A delivery that names no task or no
+ * attempt, or a task id that names no task of that mission, is not current.
+ * The one rule the outbox (which marks an assignment that is not current moot,
+ * `flushOutbox`) and the host's admission of a queued assignment
+ * (`admitDelivery`) both read.
  */
 export function assignmentCurrent(store: Pick<SwarmStore, 'get'>, delivery: Pick<Delivery, 'missionId' | 'to' | 'taskId' | 'attemptId'>): boolean {
-  const task = delivery.taskId === undefined ? undefined : store.get('tasks', delivery.taskId)
-  return task?.missionId === delivery.missionId && holdsOpenAttempt(task) && task.attempt.id === delivery.attemptId && task.attempt.ownerId === delivery.to
+  const { taskId, attemptId } = delivery
+  if (taskId === undefined || attemptId === undefined) return false
+  const task = store.get('tasks', taskId)
+  return holdsAttempt(task, delivery.missionId, attemptId) && task.attempt.ownerId === delivery.to
 }
 
 /** R17-G3: the stable digest of a recorded reason, so a fact key stays bounded. */

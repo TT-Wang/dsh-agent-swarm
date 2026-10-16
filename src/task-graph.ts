@@ -317,6 +317,22 @@ export function holdsOpenAttempt(task: Task): task is HeldTask {
 }
 
 /**
+ * The row still holds attempt `attemptId`: it exists in `missionId`, is
+ * running, and carries that attempt. The attempt id is the attempt's whole
+ * identity: assignment is the only way a row starts running, and it mints a
+ * fresh id at the row's new epoch, while every later epoch increment drops or
+ * replaces the attempt or touches a row that is not running. So a fencing
+ * transition committed since the caller read the attempt fails this check,
+ * and a caller that passes it writes over no such transition. The attempt
+ * seam's re-reads, the budget resume, a worker tool's authority over its
+ * attempt and an assignment delivery's currency all ask it; the last two put
+ * their owner check on top.
+ */
+export function holdsAttempt(row: Task | undefined, missionId: string, attemptId: string): row is HeldTask {
+  return row !== undefined && row.missionId === missionId && holdsOpenAttempt(row) && row.attempt.id === attemptId
+}
+
+/**
  * The task on which `memberId` holds its open attempt, the one running attempt
  * it owns: the attempt its tool calls, steps, activity and idle turns belong to.
  * A member never holds two: assignment is the only way a row starts running,

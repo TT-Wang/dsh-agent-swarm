@@ -10,7 +10,7 @@
 import { createHash } from 'node:crypto'
 import { id } from './store.ts'
 import { arenaView as projectArenaView, hasNotice, openAsks } from './arena.ts'
-import { TERMINAL_STATES, currentEvidenceIds, holdsOpenAttempt, subjectsOfTasks, terminal } from './task-graph.ts'
+import { TERMINAL_STATES, currentEvidenceIds, holdsAttempt, holdsOpenAttempt, subjectsOfTasks, terminal } from './task-graph.ts'
 import { excerpt } from './declared-checks.ts'
 import { dropAttempt } from './attempts.ts'
 import { executionElapsed } from './resource-time.ts'
@@ -366,7 +366,7 @@ export class RuntimeGates {
         const resume = task.budgetResume
         if (!resume || resume.pauseId !== pause.id) continue
         delete task.budgetResume
-        if (!holdsOpenAttempt(task) || task.attempt.id !== resume.attemptId || task.epoch !== resume.epoch) {
+        if (!holdsAttempt(task, mission.id, resume.attemptId)) {
           // The pause marker outlived its attempt (challenge, handoff or restart):
           // re-pend the work without charging a recovery attempt.
           if (task.status === 'running') { task.status = 'pending'; dropAttempt(task) }
