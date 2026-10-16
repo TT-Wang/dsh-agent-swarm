@@ -461,7 +461,20 @@ export class Attempts {
    * for its row write while that is still in flight.
    */
   turnEnded(open: HeldTask): boolean {
-    return open.idleSignal?.attemptId === open.attempt.id || this.idleSignals.get(open.attempt.ownerId)?.attemptId === open.attempt.id
+    return this.endedOnRow(open) || this.idleSignals.get(open.attempt.ownerId)?.attemptId === open.attempt.id
+  }
+  /**
+   * W6: the idle close-out owns this open attempt: the row records that its
+   * turn ended, or a close-out nudge was already delivered for it. The
+   * close-out nudges, then checkpoints and re-pends with a coded terminal, so
+   * the attempt reporting bound does not name the same attempt.
+   */
+  closeOutOwns(open: HeldTask): boolean {
+    return this.endedOnRow(open) || (open.closeout?.nudges ?? 0) > 0
+  }
+  /** W6: the durable record of `onIdle` on the row, for the attempt it names. */
+  private endedOnRow(open: HeldTask): boolean {
+    return open.idleSignal?.attemptId === open.attempt.id
   }
   onIdle(memberId: string): void {
     if (this.k.closed || this.k.shuttingDown) return

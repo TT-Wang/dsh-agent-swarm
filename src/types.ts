@@ -479,8 +479,9 @@ export interface Task {
   closeout?: { nudges: number; at: number }
   /**
    * S5: durable form of the adapter's "this member ended a turn while still
-   * owning this attempt" signal. The scheduling path re-reads it from the store
-   * (`Attempts.turnEnded`) instead of trusting the in-memory `idleSignals` map, which is now only a
+   * owning this attempt" signal. The attempts seam, which writes it, is its one
+   * reader (`Attempts.turnEnded`, `Attempts.closeOutOwns`): the scheduling path
+   * asks it rather than trusting the in-memory `idleSignals` map, which is now only a
    * cache: a lost cache delays the bounded close-out until lease expiry, it
    * cannot make the close-out wrong. It names its attempt and leaves the row with it.
    */
