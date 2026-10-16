@@ -408,7 +408,8 @@ test('R12: a deadline warning retries its same identity after failed flush and p
 test('R06: in-flight usage triggers durable mission review with a larger recommendation before settled exhaustion', async t => {
   const f = await fixture(t)
   const member = f.runtime.store.get('members', f.member.id)
-  member.accountedTokens = 10000; member.usage = { requests: 1 }; member.activity = { id: 'model', kind: 'model', startedAt: Date.now(), updatedAt: Date.now() }
+  // An average of 10000.5 tokens a request, which the estimate rounds up.
+  member.accountedTokens = 20001; member.usage = { requests: 2 }; member.activity = { id: 'model', kind: 'model', startedAt: Date.now(), updatedAt: Date.now() }
   // The adapter reports that model request as live; the row itself is written directly, with no activity event.
   f.workers.activity = member.activity
   const mission = f.runtime.mission(f.mission.id); mission.usedTokens = 65000
@@ -417,8 +418,8 @@ test('R06: in-flight usage triggers durable mission review with a larger recomme
   const warnings = () => f.runtime.store.events(mission.id, 100).filter(event => event.type === 'mission/budget-warning' && event.data.dimension === 'maxTokens')
   assert.equal(warnings().length, 1)
   assert.equal(warnings()[0].data.used, 65000)
-  assert.equal(warnings()[0].data.inFlightEstimate, 10000)
-  assert.equal(warnings()[0].data.projected, 75000)
+  assert.equal(warnings()[0].data.inFlightEstimate, 10001)
+  assert.equal(warnings()[0].data.projected, 75001)
   assert.ok(warnings()[0].data.suggestedLimit > mission.budget.maxTokens)
   assert.equal(f.runtime.mission(mission.id).status, 'active')
   assert.equal(f.rows().filter(row => row.notice?.dedupKey.startsWith('budget-review:')).length, 1)
