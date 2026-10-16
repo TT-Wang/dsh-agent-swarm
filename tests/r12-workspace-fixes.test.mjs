@@ -52,8 +52,7 @@ test('M2-1: a repeated pass-timeout naming is recorded once, through the ledger'
     boardOf: missionId => ({ missionId, mission, tasks: [], members: [], graph: taskGraphIndex([]) }) })
   // The runtime's own telling, over this store; the publication is outside this test.
   const notices = new Notices(rt, new RefusalRegistry(rt), () => ({ passLive: false, wedged: false }))
-  rt.notices = { tell: notices.tell.bind(notices), expectWedgedRelease() {}, transition() {} }
-  const scheduling = new Scheduling(rt)
+  const scheduling = new Scheduling(rt, { tell: notices.tell.bind(notices), expectWedgedRelease() {}, transition() {} })
   // Two bodies wedge in turn on one naming fact. The first naming's row is the
   // record: the second body is marked named and writes neither row nor event.
   const named = []
@@ -114,8 +113,8 @@ test('stop recovery owns its member until quiescence, including before native st
   const stopping = { id: 'old-task', status: 'blocked', epoch: 3, resumeAfterStop: { epoch: 3, memberId: member.id } }
   const ready = { id: 'new-task', missionId: 'm', title: 'New task', epoch: 0, status: 'pending', dependencies: [], acceptance: [], scope: ['**'], objective: 'New work' }
   let starts = 0
-  const rt = makeRuntimeStub({ store: { list: () => [stopping, ready] }, notices: { interpretation: () => ({ members: [member], tasks: [stopping, ready] }) }, mission: () => ({ status: 'active' }), startWorker: async () => { starts++ }, workers: new FakeWorkers({ autoIdle: true }) })
-  const scheduling = new Scheduling(rt)
+  const rt = makeRuntimeStub({ store: { list: () => [stopping, ready] }, mission: () => ({ status: 'active' }), startWorker: async () => { starts++ }, workers: new FakeWorkers({ autoIdle: true }) })
+  const scheduling = new Scheduling(rt, { interpretation: () => ({ members: [member], tasks: [stopping, ready] }) })
   assert.equal(await scheduling.dispatch({ status: 'active' }, 'm'), true)
   assert.equal(starts, 0)
   const board = { missionId: 'm', tasks: [stopping, ready], members: [member], graph: taskGraphIndex([stopping, ready]), view: { startable: () => true }, records: { list: () => [] }, clock: Date.now }

@@ -246,12 +246,6 @@ export class SwarmRuntime implements Kernel {
   /** M1a seam 5/7: the declared-check execution path and the check environment, on the kernel and the workspace authorization every checkout is created after. */
   private readonly declaredChecks = new DeclaredChecks(this, this.workspaceAdmission)
 
-  /** M1a seam 7/7: pass bookkeeping, the dispatch sweep and the attempt reporting bound; its predicates are the board's. */
-  private readonly scheduling = new Scheduling(this)
-  private openPass(missionId: string): SchedulingPass | undefined { return this.scheduling.openPass(missionId) }
-  private closePass(missionId: string, pass: SchedulingPass): void { return this.scheduling.closePass(missionId, pass) }
-  private checkSchedulingPasses(): void { return this.scheduling.checkSchedulingPasses() }
-
   /**
    * M1a seam 2/7: usage accounting, the budget gate and the owner read models,
    * on the kernel, the notices, the refusals and the declared checks whose
@@ -260,6 +254,14 @@ export class SwarmRuntime implements Kernel {
    * the tests.
    */
   private readonly gates = new RuntimeGates(this, this.notices, this.refusals, this.declaredChecks)
+
+  /**
+   * M1a seam 7/7: pass bookkeeping, the dispatch sweep and the attempt
+   * reporting bound, on the kernel with the runtime's worker start and
+   * assignment, the notices, the attempts whose idle close-out it drives, the
+   * workspace admission and the refusals; its predicates are the board's.
+   */
+  private readonly scheduling: Scheduling = new Scheduling(this, this.notices, this.attempts, this.workspaceAdmission, this.refusals)
 
   constructor(readonly config: RuntimeConfig, readonly workers: WorkerAdapter, storeOptions: StoreOptions = {}) {
     this.now = typeof config.now === 'function' ? config.now : () => Date.now()
@@ -464,7 +466,7 @@ export class SwarmRuntime implements Kernel {
     // pump reads only durable rows and never takes `exclusive`.
     this.tickGuard('outbox', () => this.notices.pumpOutbox())
     this.tickGuard('starts', () => this.sweepStarts())
-    this.tickGuard('passes', () => this.checkSchedulingPasses())
+    this.tickGuard('passes', () => this.scheduling.checkSchedulingPasses())
     this.tickGuard('decisions', () => this.sweepDecisions())
     this.tickGuard('writer-recovery', () => this.refusals.recordWriterBusyRecovery())
     this.tickGuard('missions', () => { for (const mission of this.store.list('missions')) this.tickGuard(`mission ${mission.id}`, () => {
@@ -3709,15 +3711,6 @@ export class SwarmRuntime implements Kernel {
   /** The declared bounds of the live config, read again on every read: a test or the host may change the config after construction. */
   get bounds(): Bounds { return bounds(this.config) }
   /**
-   * R16-D: the durable reporting bound verdict for the live attempt on one task
-   * (`taskId@epoch` + member), or undefined when the attempt is inside its bound
-   * or another guard owns it (F1's operation, the W6 idle close-out, a parked
-   * member, a budget pause). Exposed for the pair tests and the owner read path;
-   * the sweep that acts on it is `sweepDecisions`.
-   */
-  silentAttempt(task: Task, mission: Mission): ReturnType<Scheduling['silentAttempt']> { return this.scheduling.silentAttempt(task, mission) }
-  
-  /**
    * Queue one scheduling body on the mission's serial queue, unless one is
    * already queued or running there (`openPass`): that body re-reads the board
    * when it runs, and the queue could not start a second one before it settles.
@@ -3735,13 +3728,13 @@ export class SwarmRuntime implements Kernel {
    */
   kick(missionId: string, after?: SchedulingPass): void {
     if (this.shuttingDown || this.closed) return
-    const pass = this.openPass(missionId)
+    const pass = this.scheduling.openPass(missionId)
     if (pass === undefined) return
     if (after?.stoppedBefore !== undefined) { pass.sweepFrom = after.stoppedBefore; pass.chainFrom = after.chainFrom }
     this.defer(async () => {
       try { await this.exclusive(missionId, () => this.schedule(missionId, pass)) }
       finally {
-        this.closePass(missionId, pass)
+        this.scheduling.closePass(missionId, pass)
         const mission = this.closed ? undefined : this.store.get('missions', missionId)
         if (mission?.status === 'active' && (pass.stoppedBefore !== undefined || mission.budgetPause?.quiesced)) this.kick(missionId, pass)
       }
