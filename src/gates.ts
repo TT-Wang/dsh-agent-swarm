@@ -12,7 +12,6 @@ import { id } from './store.ts'
 import { arenaView as projectArenaView, hasNotice, openAsks } from './arena.ts'
 import { TERMINAL_STATES, currentEvidenceIds, holdsAttempt, holdsOpenAttempt, subjectsOfTasks, terminal } from './task-graph.ts'
 import { excerpt } from './declared-checks.ts'
-import { dropAttempt } from './attempts.ts'
 import { executionElapsed } from './resource-time.ts'
 import { memberPhaseOf } from './projection.ts'
 import { dispatchable } from './board.ts'
@@ -363,18 +362,11 @@ export class RuntimeGates {
     if (mission.status !== 'active' || !pause?.quiesced) return
     this.rt.commit(mission.id, () => {
       for (const task of this.rt.store.list('tasks', mission.id)) {
+        // A marker leaves the row with the attempt it names, so the rows that
+        // still hold the attempt their marker names are what this pause preserved.
         const resume = task.budgetResume
-        if (!resume || resume.pauseId !== pause.id) continue
+        if (resume?.pauseId !== pause.id || !holdsAttempt(task, mission.id, resume.attemptId)) continue
         delete task.budgetResume
-        if (!holdsAttempt(task, mission.id, resume.attemptId)) {
-          // The pause marker outlived its attempt (challenge, handoff or restart):
-          // re-pend the work without charging a recovery attempt.
-          if (task.status === 'running') { task.status = 'pending'; dropAttempt(task) }
-          // S5: compare-and-swap on the task's own revision (see blockBudget).
-          this.rt.store.putTask(task)
-          this.rt.store.event(mission.id, 'task/budget-resume-skipped', 'runtime', { taskId: task.id, pauseId: pause.id })
-          continue
-        }
         task.attempt.leaseUntil = Math.min(mission.deadline, this.rt.now() + this.rt.config.leaseMs)
         this.rt.store.putTask(task)
         // The resumed attempt is what makes its owner `working`; the status is

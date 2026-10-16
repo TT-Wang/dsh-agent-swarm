@@ -8,7 +8,9 @@
  * back: an owner's `swarm_cancel` was silently undone (task resurrected at the
  * old epoch with a cancelled attempt and a stopped owner) and a latched
  * git-write denial disappeared. This test gates the capture, performs both
- * concurrent transitions, and asserts neither is reverted.
+ * concurrent transitions, and asserts neither is reverted: the cancel stands,
+ * no write after the await is refused as stale, and the denial stays durable
+ * while the expiry fence takes its marker off the row with the attempt (F1).
  */
 import assert from 'node:assert/strict'
 import test from 'node:test'
@@ -96,8 +98,11 @@ test('S1: a cancel committed during a lease-expiry await is not reverted by a st
   assert.equal(after.attempt, undefined, 'the cancelled attempt must not be resurrected')
   assert.equal(after.assigneeId, other.id, 'the cancelled row is otherwise unchanged')
   assert.equal(events('task/lease-expired').filter(event => event.data.taskId === second.id).length, 0, 'a cancelled task never expires its lease')
-  assert.match(taskOf(first.id).gitWriteDenied?.command ?? '', /git commit/, 'the latched git-write denial must survive the interleaving')
+  // F1: the denial is latched on the attempt, so the expiry fence takes it off
+  // the row with that attempt; the durable record of it stays.
+  assert.equal(taskOf(first.id).gitWriteDenied, undefined, 'the denial left the row with the expired attempt it was latched on')
   assert.ok(events('task/git-write-denied').some(event => event.data.taskId === first.id), 'the denial is durable')
+  assert.deepEqual(events('task/stale-revision-refused'), [], 'every write after the await presented the revision the tool run left')
   assert.equal(taskOf(first.id).checkpoint?.commit, 'c'.repeat(40), 'the checkpoint was captured and committed')
 })
 

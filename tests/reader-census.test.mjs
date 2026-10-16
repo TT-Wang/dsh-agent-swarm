@@ -222,7 +222,10 @@ test('every registered event kind has a writer, so a kind cannot be registered a
   // exists only in the registry — is what this check owns, and `historical` is
   // the one recorded exception: the kind still decodes, nothing writes it.
   const historical = Object.entries(EVENTS).filter(([, spec]) => spec.historical === true).map(([kind]) => kind)
-  assert.deepEqual(historical, ['task/cancelled-at-completion'], 'completion no longer withdraws leftover work; a new historical row needs its own reason here')
+  // task/cancelled-at-completion: completion no longer withdraws leftover work.
+  // task/budget-resume-skipped: a budget-resume marker leaves the row with the
+  // attempt it names (F1), so a resume never meets a stale one to skip.
+  assert.deepEqual(historical, ['task/cancelled-at-completion', 'task/budget-resume-skipped'], 'a new historical row needs its own reason here')
   const unwritten = Object.keys(EVENTS).filter(kind => !historical.includes(kind) && writersOf(kind).length === 0)
   assert.deepEqual(unwritten, [], `registered but never emitted: ${unwritten.join(', ')} — delete the row, or mark it historical: true`)
   for (const kind of historical) assert.deepEqual(writersOf(kind), [], `${kind}: marked historical, but a writer reappeared`)

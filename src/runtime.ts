@@ -2,7 +2,7 @@
 import { randomUUID } from 'node:crypto'
 import { isAbsolute, join } from 'node:path'
 import { SwarmStore, WriterBusyError, StoreRecoveryError, id, stageRestore, type PendingRestore, type PostFilter, type StoreOptions } from './store.ts'
-import { Attempts, dropAttempt } from './attempts.ts'
+import { Attempts, clearAttemptMarkers, endAttempt } from './attempts.ts'
 import { PolicyError } from './policy-error.ts'
 export { WorkspaceRevokedError } from './authorization.ts'
 import { recordedClaim, type WorkspaceClaim } from './authorization.ts'
@@ -454,10 +454,8 @@ export class SwarmRuntime implements Kernel {
             const ownerId = task.attempt?.ownerId
             const pauseInduced = mission.budgetPause !== undefined || task.budgetResume !== undefined
             task.status = 'pending'
-            task.epoch++
             task.handoff = `${task.handoff ?? ''}\nRecovered after host restart; inspect prior tool runs and workspace before repeating effects.`
-            dropAttempt(task)
-            delete task.budgetResume
+            endAttempt(task)
             this.store.put('tasks', task)
             this.store.event(mission.id, 'task/restart-repended', 'runtime', {
               taskId: task.id, epoch: task.epoch, ownerId, reason: 'host-restart', pauseInduced,
@@ -1310,8 +1308,8 @@ export class SwarmRuntime implements Kernel {
     // R17-G7: assigning the attempt is what makes the derived status `working`;
     // there is no member status to write and none to fall behind the attempt.
     task.status = 'running'; task.assigneeId = member.id
-    // Close-out and git-denial markers belong to one attempt; a new attempt starts clean.
-    delete task.closeout; delete task.idleSignal; delete task.gitWriteDenied
+    // The attempt-scoped markers belong to one attempt; a new attempt starts clean.
+    clearAttemptMarkers(task)
     // A recorded preparation failure outlives this successful preparation: its
     // `attempts` counter bounds transient retries across re-pends that spend
     // no recovery credit (a worker start failure), and only an owner resume
@@ -2022,10 +2020,13 @@ export class SwarmRuntime implements Kernel {
     // The source side of the same rule: the new owner must stay independent of this task's own reviews.
     const stranded = input.to === undefined ? undefined : strandedReview(this.store.list('tasks', missionId), task.id, { ...task, assigneeId: input.to })
     if (stranded !== undefined) throw new PolicyError('review_independence_required', 'authorization_error', `[review_independence_required] Member ${input.to} is the assignee of review ${stranded.id} of this task; owning this task would make it that review's author. Hand off to another member with \`to\`, or omit \`to\` to release the task.`)
-    task.status = 'blocked'; task.handoff = input.summary; task.epoch++; task.assigneeId = input.to; dropAttempt(task)
+    task.handoff = input.summary; task.assigneeId = input.to
     if (input.to !== undefined) task.plannedAssigneeId = input.to
-    task.resumeAfterStop = { epoch: task.epoch, reason: 'handoff', memberId: member.id, at: this.now() }
-    this.commit(missionId, () => { this.store.put('tasks', task); this.store.event(missionId, 'task/handoff-started', member.id, { taskId: task.id, to: input.to ?? null, summary: input.summary }) })
+    this.commit(missionId, () => {
+      this.attempts.fenceRow(task, { status: 'blocked', reason: 'handoff', memberId: member.id, cause: 'handoff' })
+      this.store.put('tasks', task)
+      this.store.event(missionId, 'task/handoff-started', member.id, { taskId: task.id, to: input.to ?? null, summary: input.summary })
+    })
     this.attempts.resumeStoppedAttempt(missionId, task)
     return { handoff: 'Ownership revoked; reassignment waits for the previous worker to stop. End your turn.' }
   }
@@ -2101,7 +2102,7 @@ export class SwarmRuntime implements Kernel {
     const author = task.attempt?.ownerId ?? task.assigneeId
     if (author !== undefined) { task.assigneeId = author; task.plannedAssigneeId = author; task.assignmentMode = 'pinned' }
     delete task.artifact
-    dropAttempt(task); task.epoch++
+    endAttempt(task)
     // The reason is carried once, in `rejections`; the handoff points at it.
     task.handoff = `${task.handoff ?? ''}\nRejected by review ${review.id} at ${commit}; its reason is rejections[${task.rejections.length - 1}].reason. Rework it from that commit, then resubmit.`.trim()
   }
@@ -2130,7 +2131,7 @@ export class SwarmRuntime implements Kernel {
     const reopened: Task = { ...review, status: 'pending', rejections: [...review.rejections ?? [], archived] }
     const reviewer = review.attempt?.ownerId ?? review.assigneeId
     if (reviewer !== undefined) reopened.assigneeId = reviewer
-    dropAttempt(reopened); reopened.epoch++
+    endAttempt(reopened)
     delete reopened.reviewedCommit; delete reopened.reviewArtifact; delete reopened.output
     delete reopened.usedSteps; delete reopened.recoveryCount; delete reopened.ceiling
     this.store.put('tasks', reopened)
@@ -3343,14 +3344,12 @@ export class SwarmRuntime implements Kernel {
       next.resumeAfterStop = { ...next.resumeAfterStop, reason: 'handoff' }
     }
     if (taskCeilingBlock(next, this.now()) === undefined) delete next.ceiling
-    if (resumes) { delete next.preparationFailure; delete next.verificationRecovery; delete next.closeout; delete next.idleSignal }
+    if (resumes) { delete next.preparationFailure; delete next.verificationRecovery }
     if (rework !== undefined) this.reopenForRework(next, rework)
     // A rejected submission holds no live attempt: its author is not stopped.
     const activeOwner = rework === undefined ? task.attempt?.ownerId : undefined
-    if (activeOwner !== undefined && (structural || (resumes && task.status === 'blocked'))) {
-      next.status = 'blocked'; next.epoch++; dropAttempt(next)
-      next.resumeAfterStop = { epoch: next.epoch, memberId: activeOwner, reason: 'handoff', at: this.now() }
-    } else {
+    const fenced = activeOwner !== undefined && (structural || (resumes && task.status === 'blocked'))
+    if (!fenced) {
       if (structural && !next.resumeAfterStop) next.epoch++ // Fence a preparation already awaiting I/O.
       if (resumes && !next.resumeAfterStop && next.status === 'blocked') next.status = 'pending'
     }
@@ -3361,8 +3360,9 @@ export class SwarmRuntime implements Kernel {
     // now means only the member's own `swarm_wait`, which an owner amendment of
     // one task has no business clearing.
     this.commit(missionId, () => {
+      if (fenced) this.attempts.fenceRow(next, { status: 'blocked', reason: 'handoff', memberId: activeOwner, cause: `owner-${action}` })
       this.store.put('tasks', next)
-      this.store.event(missionId, 'task/amended', 'owner', { taskId, action, reason, changes, epoch: next.epoch, status: next.status, ...(activeOwner !== undefined && (structural || (resumes && task.status === 'blocked')) ? { fencedAttemptId: task.attempt!.id } : {}), previous: Object.fromEntries(Object.keys(changes).map(key => [key, task[key as keyof Task] ?? null])),
+      this.store.event(missionId, 'task/amended', 'owner', { taskId, action, reason, changes, epoch: next.epoch, status: next.status, ...(fenced ? { fencedAttemptId: task.attempt!.id } : {}), previous: Object.fromEntries(Object.keys(changes).map(key => [key, task[key as keyof Task] ?? null])),
         ...(rework === undefined ? {} : { rework: next.rejections!.at(-1), reworkCount: next.reworkCount }) })
       if (rework !== undefined) this.reopenReviewForRework(next, rework, `${taskId} was re-opened for rework by the mission owner`)
     })
@@ -3557,14 +3557,11 @@ export class SwarmRuntime implements Kernel {
   private blockTaskCeiling(mission: Mission, task: Task, ceiling: TaskCeiling): void {
     const ownerId = task.attempt?.ownerId
     const member = ownerId === undefined ? undefined : this.store.get('members', ownerId)
-    task.status = 'blocked'
     task.ceiling = ceiling
-    task.epoch++
-    dropAttempt(task); delete task.budgetResume; delete task.closeout; delete task.idleSignal; delete task.gitWriteDenied
-    if (ownerId !== undefined) task.resumeAfterStop = { epoch: task.epoch, memberId: ownerId, reason: 'resource', at: this.now() }
     task.output = `${task.output ?? ''}\n${ceiling.reason}`.trim()
     if (member !== undefined && memberPhaseOf(member) !== 'stopped') delete member.activity
     this.commit(mission.id, () => {
+      this.attempts.fenceRow(task, { status: 'blocked', reason: 'resource', memberId: ownerId, cause: 'task-ceiling' })
       this.store.put('tasks', task)
       if (member !== undefined) this.store.put('members', member)
       this.store.event(mission.id, 'task/ceiling-exhausted', 'runtime', { taskId: task.id, dimension: ceiling.dimension, limit: ceiling.limit, used: ceiling.used, code: ceiling.code })
@@ -3828,8 +3825,7 @@ export class SwarmRuntime implements Kernel {
       for (const task of this.store.list('tasks', missionId)) {
         if (task.assigneeId !== member.id || !['pending', 'running'].includes(task.status)) continue
         task.output = reason
-        if (task.attempt !== undefined) task.epoch++
-        dropAttempt(task); delete task.closeout; delete task.idleSignal; delete task.gitWriteDenied
+        if (task.attempt !== undefined) endAttempt(task)
         const pinned = task.assigneeId
         delete task.assigneeId
         task.status = 'pending'

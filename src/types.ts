@@ -471,7 +471,7 @@ export interface Task {
   verificationRecovery?: { sourceTaskId: string; commit: string; reason: string; at: number }
   /** Per-command host verification timeout chosen for this task. */
   checkTimeoutMs?: number
-  /** Same-owner resume preserves attempt provenance after budget quiescence. */
+  /** Same-owner resume preserves attempt provenance after budget quiescence; the marker leaves the row with the attempt it names. */
   budgetResume?: { pauseId: string; attemptId: string }
   /** Durable quiescence transition; epoch matching prevents reopening invalidated work. */
   resumeAfterStop?: { epoch: number; memberId?: string; reason: 'handoff' | 'lease-expired' | 'worker-closeout' | 'resource' | 'invalidated'; /** R14-F2(d): when the stop began, so a waited-on stop has a durable bound. */ at?: number; /** Deterministic preservation failures retain the fence until an explicit resume retries them. */ failure?: { message: string; deterministic: boolean } }
@@ -785,8 +785,8 @@ export const OWNER_ONLY_TOOLS: readonly string[] = [
  * refuse its own mission as truncated. One list, both readers.
  */
 export const ATTEMPT_FENCING_EVENTS: readonly EventKind[] = [
-  // `attempt/fenced` is the uniform closer every control path now writes through
-  // `Attempts.fenceForStop`. Mission pause/stop and challenge closed attempts
+  // `attempt/fenced` is the uniform closer every fence writes through
+  // `Attempts.fenceRow`. Mission pause/stop and challenge closed attempts
   // with only their own domain event, so a log this runtime wrote was refused as
   // truncated by its own replay; `task/start-failed` drops the attempt too and
   // had the same gap.
