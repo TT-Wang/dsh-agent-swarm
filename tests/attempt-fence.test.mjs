@@ -15,13 +15,14 @@
  *
  * The budget-resume marker is one of those markers, so it never outlives the
  * attempt it names: a fence during a budget pause takes it, and the resume
- * finds no stale marker to skip; one an older build left behind is inert. Each
- * test here fails on the hand-assembled fences (b462a61), except the last,
- * which pins what the fence is not: an owner resume keeps a running attempt and
- * restarts its idle close-out.
+ * finds no stale marker to skip. A store an older build wrote is settled the
+ * same way once, when it is opened. Each test here fails on the hand-assembled
+ * fences (b462a61), except the last, which pins what the fence is not: an
+ * owner resume keeps a running attempt and restarts its idle close-out.
  */
 import test from 'node:test'
 import assert from 'node:assert/strict'
+import { DatabaseSync } from 'node:sqlite'
 import { FakeClock, FakeWorkers, SwarmRuntime, blockThroughReview, budget, events, setup, taskOf } from './faults/harness.mjs'
 import { orchestratorCommands } from '../lib/trace.js'
 
@@ -156,28 +157,46 @@ test('a fence during a budget pause takes the pause marker with the attempt, so 
   assert.equal(taskOf(f.runtime, task.id).recoveryCount, undefined, 'the fence spent no recovery credit')
 })
 
-test('the budget resume resumes only a row that still holds the attempt its marker names; a marker an older build left behind stays inert until the next assignment', { timeout: 30_000 }, async t => {
-  // The timeout turns a resume that throws on such a row, which re-runs its pass without end, into a failure.
+test('a store an older build wrote is settled once, at open: each row keeps only the markers of the attempt it holds (schema 6)', async t => {
   const f = await fixture(t)
-  const { task } = await f.claim()
-  const older = f.propose({ title: 'Older build row', assigneeId: f.reviewer.id })
-  await f.workers.callbacks.usage(f.author.id, budget.maxTokens + 1)
-  const pauseId = f.runtime.mission(f.mission.id).budgetPause.id
-  // Rows an older build wrote under this pause: a fence dropped the attempt and
-  // left its marker (the row re-pended since), and a running row's marker names
-  // an attempt the row no longer holds.
-  const forge = (id, patch) => f.runtime.commit(f.mission.id, () => f.runtime.store.put('tasks', { ...taskOf(f.runtime, id), ...patch }))
-  forge(older.id, { priorOwnerIds: [f.author.id], budgetResume: { pauseId, attemptId: 'attempt-an-older-fence-dropped' } })
-  forge(task.id, { budgetResume: { pauseId, attemptId: 'attempt-the-row-no-longer-holds' } })
-  const before = [taskOf(f.runtime, older.id), taskOf(f.runtime, task.id)]
-  f.runtime.updateBudget(f.owner, f.mission.id, { ...f.runtime.mission(f.mission.id).budget, maxTokens: budget.maxTokens * 4 })
-  f.runtime.control(f.owner, f.mission.id, 'resume', 'Budget raised')
-  for (let tick = 0; tick < 20 && f.runtime.mission(f.mission.id).budgetPause !== undefined; tick++) { f.clock.advance(10); await f.runtime.tick() }
-  assert.equal(f.runtime.mission(f.mission.id).budgetPause, undefined, 'the resume cleared the pause')
-  assert.deepEqual([...events(f.runtime, f.mission.id, 'task/budget-resumed'), ...events(f.runtime, f.mission.id, 'task/budget-resume-skipped')], [], 'no row held the attempt its marker names, and none is reported')
-  assert.deepEqual([taskOf(f.runtime, older.id), taskOf(f.runtime, task.id)], before, 'the resume wrote neither row')
-  await f.runtime.claim(f.actor(f.reviewer), f.mission.id, older.id)
-  assert.equal(taskOf(f.runtime, older.id).budgetResume, undefined, 'the next assignment starts its attempt without the marker')
+  const { task: held } = await f.claim({ title: 'Held attempt' })
+  f.mark(held.id)
+  const heldRow = taskOf(f.runtime, held.id)
+  const fenced = f.propose({ title: 'Fenced by an older build' })
+  const submitted = f.propose({ title: 'Submitted after an older assignment' })
+  const at = f.clock.now()
+  // What an older build left: a fence took the attempt off the row and kept
+  // its markers, and an assignment carried an earlier attempt's pause and idle
+  // signal into the attempt a submission then kept as its record.
+  const older = [
+    { ...taskOf(f.runtime, fenced.id), priorOwnerIds: [f.author.id], budgetResume: { pauseId: 'budget-pause-earlier', attemptId: 'attempt-fenced' },
+      closeout: { nudges: 2, at }, idleSignal: { attemptId: 'attempt-fenced', at }, gitWriteDenied: { command: 'git commit -m wip', at }, leaseWarned: at },
+    { ...taskOf(f.runtime, submitted.id), status: 'submitted', attempt: { id: 'attempt-submitted', epoch: 2, ownerId: f.author.id, leaseUntil: at },
+      budgetResume: { pauseId: 'budget-pause-earlier', attemptId: 'attempt-earlier' }, idleSignal: { attemptId: 'attempt-earlier', at }, gitWriteDenied: { command: 'git commit -m wip', at } },
+  ]
+  await f.runtime.dispose()
+  const { statePath } = f.runtime.config
+  const write = (rows, version) => {
+    const db = new DatabaseSync(statePath)
+    try { for (const row of rows) db.prepare('UPDATE tasks SET value=? WHERE id=?').run(JSON.stringify(row), row.id); db.exec(`PRAGMA user_version=${version}`) } finally { db.close() }
+  }
+  const read = sql => { const db = new DatabaseSync(statePath, { readOnly: true }); try { return Object.values(db.prepare(sql).get())[0] } finally { db.close() } }
+  write(older, 5)
+  const before = read('SELECT revision FROM state_revision WHERE id=1')
+  const opened = new SwarmRuntime(f.runtime.config, new FakeWorkers())
+  t.after(() => opened.dispose())
+  assert.deepEqual(markersOf(taskOf(opened, fenced.id)), [], 'a row that holds no attempt carries none of its markers')
+  const record = taskOf(opened, submitted.id)
+  assert.deepEqual([record.attempt.id, markersOf(record)], ['attempt-submitted', ['gitWriteDenied']], 'a pause and an idle signal naming another attempt leave; the held attempt keeps its own')
+  assert.deepEqual(taskOf(opened, held.id), heldRow, 'a row whose markers are all its attempt\'s is not rewritten')
+  assert.deepEqual(opened.store.changesSince(before).map(change => change.scopes), [[f.mission.id]], 'the upgrade is one recorded change')
+  assert.equal(read('PRAGMA user_version'), 6)
+  await opened.dispose()
+  // Once: a schema 6 store is not settled again (only an older build writes such a row).
+  write(older.slice(0, 1), 6)
+  const reopened = new SwarmRuntime(f.runtime.config, new FakeWorkers())
+  t.after(() => reopened.dispose())
+  assert.equal(markersOf(taskOf(reopened, fenced.id)).length, MARKERS.length)
 })
 
 test('a failed worker start ends the attempt it was assigned, with every marker', async t => {

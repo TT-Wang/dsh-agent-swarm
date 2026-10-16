@@ -6,7 +6,7 @@
  * (`SwarmRuntime.ownAttempt`), not lease accounting.
  */
 import { id } from './store.ts'
-import { TERMINAL_STATES, blockCauses, holdsAttempt, holdsOpenAttempt, openAttempt, stopPending, taskSubject, terminal, type BlockCause, type HeldTask } from './task-graph.ts'
+import { TERMINAL_STATES, blockCauses, dropForeignMarkers, holdsAttempt, holdsOpenAttempt, openAttempt, stopPending, taskSubject, terminal, type BlockCause, type HeldTask } from './task-graph.ts'
 import { stopFaultKey, type Notices } from './notices.ts'
 import { memberPhaseOf } from './projection.ts'
 import { PolicyError } from './policy-error.ts'
@@ -50,27 +50,17 @@ export function clearCloseout(task: Task): void {
 }
 
 /**
- * The markers one attempt writes while it runs: the budget pause that
- * preserved it, its idle close-out, its denied git write and its lease warning.
- * They leave the row when the attempt does, and a new attempt starts without
- * them. A submission or a verdict keeps the attempt on the row as its record,
- * and these markers with it.
- */
-export function clearAttemptMarkers(task: Task): void {
-  delete task.budgetResume; clearCloseout(task); delete task.gitWriteDenied; delete task.leaseWarned
-}
-
-/**
- * X1 (P0): take the attempt off the row with its markers and remember its
- * owner durably, so the union below can never forget a member who already
- * touched the work. Only the two operations that end an attempt, `endAttempt`
- * and `Attempts.fenceRow`, call it.
+ * X1 (P0): take the attempt off the row with its markers (`dropForeignMarkers`:
+ * a row without an attempt carries none) and remember its owner durably, so the
+ * union below can never forget a member who already touched the work. Only the
+ * two operations that end an attempt, `endAttempt` and `Attempts.fenceRow`,
+ * call it.
  */
 function dropAttempt(task: Task): void {
   const owner = task.attempt?.ownerId
   if (owner !== undefined) task.priorOwnerIds = [...new Set([...(task.priorOwnerIds ?? []), owner])]
   delete task.attempt
-  clearAttemptMarkers(task)
+  dropForeignMarkers(task)
 }
 
 /**

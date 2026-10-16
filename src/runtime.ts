@@ -2,7 +2,7 @@
 import { randomUUID } from 'node:crypto'
 import { isAbsolute, join } from 'node:path'
 import { SwarmStore, WriterBusyError, StoreRecoveryError, id, stageRestore, type PendingRestore, type PostFilter, type StoreOptions } from './store.ts'
-import { Attempts, clearAttemptMarkers, clearCloseout, endAttempt } from './attempts.ts'
+import { Attempts, clearCloseout, endAttempt } from './attempts.ts'
 import { PolicyError } from './policy-error.ts'
 export { WorkspaceRevokedError } from './authorization.ts'
 import { recordedClaim, type WorkspaceClaim } from './authorization.ts'
@@ -1308,8 +1308,6 @@ export class SwarmRuntime implements Kernel {
     // R17-G7: assigning the attempt is what makes the derived status `working`;
     // there is no member status to write and none to fall behind the attempt.
     task.status = 'running'; task.assigneeId = member.id
-    // The attempt-scoped markers belong to one attempt; a new attempt starts clean.
-    clearAttemptMarkers(task)
     // A recorded preparation failure outlives this successful preparation: its
     // `attempts` counter bounds transient retries across re-pends that spend
     // no recovery credit (a worker start failure), and only an owner resume

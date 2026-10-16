@@ -172,9 +172,9 @@ test('a v4 store\'s notice consumption moves onto its delivery once, at open, in
   assert.equal(opened.notices.recordConsumption('owner', 'n1'), false, 'the moved fact is the fact: a later admission cannot move it')
   assert.equal(opened.store.revision(), before + 1, 'the upgrade is one change')
   assert.deepEqual(opened.store.changesSince(before).map(change => change.scopes), [['m']], 'naming the mission whose delivery it rewrote')
-  assert.equal(versionOf(config.statePath), 5)
+  assert.equal(versionOf(config.statePath), 6)
   await opened.dispose()
-  // Once: a v5 store is not upgraded again. A row that still held the old field (only an older build writes one) is left as it is, and nothing is written.
+  // Once: an upgraded store is not upgraded again. A row that still held the old field (only an older build writes one) is left as it is, and nothing is written.
   const db = new DatabaseSync(config.statePath)
   db.prepare('UPDATE deliveries SET value=? WHERE id=?').run(JSON.stringify(consumedNotice), 'n1')
   db.close()
@@ -194,6 +194,6 @@ test('a v4 store\'s notice consumption moves onto its delivery once, at open, in
     await restored.dispose()
   }
   // A store from a later schema fails closed, as a v4 build refuses this one.
-  const future = new DatabaseSync(config.statePath); future.exec('PRAGMA user_version=6'); future.close()
-  assert.throws(() => new SwarmRuntime(config, new FakeWorkers()), /Unsupported swarm schema 6; expected 5/)
+  const future = new DatabaseSync(config.statePath); future.exec('PRAGMA user_version=7'); future.close()
+  assert.throws(() => new SwarmRuntime(config, new FakeWorkers()), /Unsupported swarm schema 7; expected 6/)
 })

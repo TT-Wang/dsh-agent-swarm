@@ -445,7 +445,7 @@ export interface Task {
   /** Initial plan owner; a preferred task fixes this to its first actual owner for recovery. */
   plannedAssigneeId?: string
   attempt?: Attempt
-  /** Lease value already warned about, so a lease-expiring event is emitted once per lease. */
+  /** Lease value already warned about, so a lease-expiring event is emitted once per lease; it leaves the row with the attempt. */
   leaseWarned?: number
   epoch: number
   output?: string
@@ -475,14 +475,14 @@ export interface Task {
   budgetResume?: { pauseId: string; attemptId: string }
   /** Durable quiescence transition; epoch matching prevents reopening invalidated work. */
   resumeAfterStop?: { epoch: number; memberId?: string; reason: 'handoff' | 'lease-expired' | 'worker-closeout' | 'resource' | 'invalidated'; /** R14-F2(d): when the stop began, so a waited-on stop has a durable bound. */ at?: number; /** Deterministic preservation failures retain the fence until an explicit resume retries them. */ failure?: { message: string; deterministic: boolean } }
-  /** Idle close-out nudges already delivered for this attempt; cleared when a new attempt starts. */
+  /** Idle close-out nudges already delivered for this attempt; they leave the row with the attempt. */
   closeout?: { nudges: number; at: number }
   /**
    * S5: durable form of the adapter's "this member ended a turn while still
    * owning this attempt" signal. The scheduling path re-reads it from the store
    * instead of trusting the in-memory `idleSignals` map, which is now only a
    * cache: a lost cache delays the bounded close-out until lease expiry, it
-   * cannot make the close-out wrong. Attempt-scoped, so a stale signal is inert.
+   * cannot make the close-out wrong. It names its attempt and leaves the row with it.
    */
   idleSignal?: { attemptId: string; at: number }
   /** Durable workspace checkpoint captured before an abandoned attempt was reassigned. */
@@ -497,7 +497,7 @@ export interface Task {
    * and the owner notice, and projected by `swarm_observe`.
    */
   recovery?: { epoch: number; previousOwnerId: string; commit: string; preserved: boolean; reason: string; at: number }
-  /** Sandbox denial of a worker-side git write on this attempt; cleared when a new attempt starts. */
+  /** Sandbox denial of a worker-side git write on this attempt; it leaves the row with the attempt. */
   gitWriteDenied?: { command: string; runId?: string; at: number }
   artifact?: Artifact
   /** Captured reviewer-authored record; never a dependency deliverable or independent verdict on its own contents. */

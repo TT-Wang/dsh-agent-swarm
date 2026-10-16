@@ -16,7 +16,7 @@ import { execFileSync } from 'node:child_process'
 import { criterionId, type AutoStart, type Delivery, type DraftPlan, type Evidence, type Member, type Mission, type PlanTask, type Post, type PostKind, type SwarmEvent, type Task, type ToolRun, type Workstream } from './types.ts'
 import type { AdmissionReason, AdmissionRecord, LimitRule } from './scheduler.ts'
 import { PROGRESS_KINDS, type EventKind } from './events.ts'
-import { taskGraphIndex } from './task-graph.ts'
+import { dropForeignMarkers, taskGraphIndex } from './task-graph.ts'
 // R17-G7: one derivation for the derived member status; the store never persists it.
 import { deriveMemberStatus, memberPhaseOf } from './projection.ts'
 
@@ -54,8 +54,8 @@ export interface PostFilter {
   newest?: boolean
   limit?: number
 }
-/** v3 adds the append-only `posts` board table; v4 cites mission criteria by id (`citeCriteria`); v5 records an owner notice's consumption on its delivery (`consumptionOnDelivery`). Older versions are upgraded at open. */
-const SCHEMA_VERSION = 5
+/** v3 adds the append-only `posts` board table; v4 cites mission criteria by id (`citeCriteria`); v5 records an owner notice's consumption on its delivery (`consumptionOnDelivery`); v6 keeps an attempt's markers only with that attempt (`markersWithTheirAttempt`). Older versions are upgraded at open. */
+const SCHEMA_VERSION = 6
 const CHANGE_HISTORY = 1024
 const DEFAULT_BUSY_TIMEOUT_MS = 5000
 const DEFAULT_WRITER_ATTEMPTS = 3
@@ -367,6 +367,7 @@ export class SwarmStore {
         // Each upgrade runs once: for a store older than the version that introduced it.
         if (version < 4) this.citeCriteria()
         if (version < 5) this.consumptionOnDelivery()
+        if (version < 6) this.markersWithTheirAttempt()
         this.db.exec(`PRAGMA user_version=${SCHEMA_VERSION}`)
       })
     } catch (error) {
@@ -478,6 +479,10 @@ export class SwarmStore {
       const { consumedAt, consumptionSource: _signal, ...notice } = delivery.notice as NonNullable<Delivery['notice']> & { consumedAt?: number; consumptionSource?: string }
       if (consumedAt !== undefined) this.upsert('deliveries', { ...delivery, notice, consumedAt })
     }
+  }
+  /** The v6 upgrade, once, in the opening transaction like any other change. A build before v6 could leave an attempt's markers on the row after a fence took the attempt off it, and carry a budget-pause marker into the next attempt; this version takes them off with the attempt (`dropForeignMarkers`), and each row an older build wrote is settled the same way. */
+  private markersWithTheirAttempt(): void {
+    for (const task of this.list('tasks')) if (dropForeignMarkers(task)) this.upsert('tasks', task)
   }
   /** Read a mission's records, or all records for host recovery. */
   list<T extends Table>(table: T, missionId?: string): Tables[T][] {

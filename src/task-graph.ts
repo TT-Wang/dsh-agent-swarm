@@ -342,6 +342,30 @@ export function openAttempt(tasks: readonly Task[], memberId: string): HeldTask 
   return tasks.find((task): task is HeldTask => holdsOpenAttempt(task) && task.attempt.ownerId === memberId)
 }
 
+/**
+ * The markers one attempt writes while it runs: the budget pause that preserved
+ * it, its idle close-out (`closeout`, `idleSignal`), its denied git write and
+ * its lease warning. A submission or a verdict keeps the attempt on the row as
+ * its record, and these markers with it.
+ */
+const ATTEMPT_MARKERS = ['budgetResume', 'closeout', 'idleSignal', 'gitWriteDenied', 'leaseWarned'] as const satisfies readonly (keyof Task)[]
+
+/**
+ * A row carries only the markers of the attempt it holds: none when it holds no
+ * attempt, and no budget pause or idle signal naming another attempt. This
+ * drops the rest and says whether it dropped any. The attempt seam settles a
+ * row through it when an attempt leaves the row, so a new attempt starts
+ * without them; opening a store an older build wrote settles every row once
+ * (its schema 6 upgrade).
+ */
+export function dropForeignMarkers(task: Task): boolean {
+  const held = task.attempt?.id
+  const foreign = held === undefined ? ATTEMPT_MARKERS.filter(marker => task[marker] !== undefined)
+    : (['budgetResume', 'idleSignal'] as const).filter(marker => task[marker] !== undefined && task[marker].attemptId !== held)
+  for (const marker of foreign) delete task[marker]
+  return foreign.length > 0
+}
+
 /** A fenced handle must finish stopping before that member can own new work. */
 export function pendingStopOwner(tasks: readonly Task[], memberId: string): boolean {
   return tasks.some(task => {
