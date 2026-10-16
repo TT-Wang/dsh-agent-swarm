@@ -17,7 +17,7 @@ import { deriveMemberStatus, memberPhaseOf, memberDeliveryHealth, type MissionBo
 export { emptyUsage, addUsage } from './gates.ts'
 export { missionFingerprint, type MissionFingerprintBoard } from './board.ts'
 import { RuntimeGates, emptyUsage, addUsage, BOARD_DELTA_POSTS, postView } from './gates.ts'
-import { DeclaredChecks, MAX_REPORTED_CHECK_FAILURES, excerpt, recoveryExit } from './declared-checks.ts'
+import { DeclaredChecks, MAX_REPORTED_CHECK_FAILURES, checkEnvironmentMismatchMessage, excerpt, recoveryExit } from './declared-checks.ts'
 import { verdictRows } from './trace.ts'
 export { TEMP_RENDEZVOUS_WINDOW_MS, sharedTempPaths, tempRendezvousDecision, type TempMention } from './workspace-admission.ts'
 import { awaitsDelivery } from './arena.ts'
@@ -28,7 +28,7 @@ import { canBorrowTask, canOwnReview, strandedReview } from './assignment.ts'
 import { executionClock, executionElapsed } from './resource-time.ts'
 import { TERMINAL_STATES, blockCauses, currentEvidenceIds, holdsAttempt, holdsOpenAttempt, missionSubject, openAttempt, pendingStopOwner, quiescencePending, selectAcceptedDelivery, stopPending, taskEdges, taskGraphIndex, taskSubject, terminal, uncoveredCriteria, type BlockCause, type HeldTask } from './task-graph.ts'
 import { checkSyntaxDetail, declaredPlanChecks, orderedTasks, pairReviews, planAdvisories, validatePlan } from './plans.ts'
-import { OWNER_ONLY_TOOLS, type Actor, type AutoStart, BoardQuery, Budget, CheckAttribution, CheckEnvelope, CheckEnvironment, CreateMissionInput, CriticalPath, criterionId, Delivery, DraftPlan, Escalation, Evidence, EvidenceStatus, Member, Mission, nextWorkerName, ObserveQuery, MessageInput, PlanInput, Post, PostInput, PostKind, PROVIDER_OUTAGE_WINDOW_MS, ProposeTaskInput, ProviderOutage, providerQuiescent, PublishInput, RecoveryFallback, RequestStartInput, RuntimeConfig, Snapshot, Task, TaskAmendment, TaskRejection, TaskCeiling, ToolRun, UsageBuckets, UsageSnapshotSource, VerificationCleanupFailure, WorkerAdapter, WorkerActivity, Workstream } from './types.ts'
+import { OWNER_ONLY_TOOLS, type Actor, type AutoStart, BoardQuery, Budget, CheckAttribution, CreateMissionInput, CriticalPath, criterionId, Delivery, DraftPlan, Escalation, Evidence, EvidenceStatus, Member, Mission, nextWorkerName, ObserveQuery, MessageInput, PlanInput, Post, PostInput, PostKind, PROVIDER_OUTAGE_WINDOW_MS, ProposeTaskInput, ProviderOutage, providerQuiescent, PublishInput, RecoveryFallback, RequestStartInput, RuntimeConfig, Snapshot, Task, TaskAmendment, TaskRejection, TaskCeiling, ToolRun, UsageBuckets, UsageSnapshotSource, VerificationCleanupFailure, WorkerAdapter, WorkerActivity, Workstream } from './types.ts'
 import { requireArtifactChecks } from './artifact-policy.ts'
 
 /** Release a prelaunch caller even when an adapter ignores cancellation. Its late writes remain fenced. */
@@ -118,63 +118,6 @@ export class ObserveDetailRefusedError extends PolicyError {
   override toString(): string { return `${this.name}: ${this.message}` }
 }
 /**
- * ENV: one field of the declared-check envelope the executed check does not
- * reproduce. `selfRun` names the measured side of the comparison; both sides are
- * environments the host recorded, never an environment read off a command.
- */
-export interface CheckEnvironmentMismatch { field: string; envelope: string; selfRun: string }
-/**
- * ENV: the envelope reproduction comparison. `blocking` divergences mean the
- * declared host checks that support this verification did not run under the
- * environment the envelope promised, so the mismatch is reported instead of
- * accepting the artifact. `advisory` divergences (whether a cache root happened
- * to exist) are recorded but never refuse an acceptance: a check must not depend
- * on the ambient cache staying warm.
- */
-export interface CheckEnvironmentComparison { blocking: CheckEnvironmentMismatch[]; advisory: CheckEnvironmentMismatch[] }
-const checkEnvironmentField = (value: string | boolean | null): string => value === null ? 'absent' : String(value)
-/** ENV: the cache roots as one comparable field; `none` when the environment sets none. */
-const checkCacheRootsField = (roots: Record<string, string>): string =>
-  Object.keys(roots).sort().map(name => `${name}=${roots[name]}`).join(', ') || 'none'
-/** Dependency directories are a set; Git inventory order is not declaration order. */
-const checkDependencyDirsField = (dirs: readonly string[] | undefined): string =>
-  JSON.stringify([...new Set(dirs ?? [])].sort())
-/**
- * ENV: compare the declared envelope the runtime delivered with the environment
- * a host-recorded execution reports. HOME, the user cache roots, the
- * sandbox policy and the dependency links must agree; the scoped check cache
- * roots the envelope itself provides (`checkCacheRoot`, `checkCacheRoots`,
- * `xdgCacheHome`) and the existence flags are compared and REPORTED but stay
- * advisory: they differ by construction on every run, and a check must not
- * depend on the ambient cache staying warm — refusing on them would block every
- * production acceptance.
- */
-export function compareCheckEnvironments(envelope: CheckEnvironment, selfRun: CheckEnvironment): CheckEnvironmentComparison {
-  const blocking: CheckEnvironmentMismatch[] = []
-  const advisory: CheckEnvironmentMismatch[] = []
-  const compare = (field: string, before: string | boolean | null, after: string | boolean | null, into: CheckEnvironmentMismatch[]): void => {
-    const left = checkEnvironmentField(before), right = checkEnvironmentField(after)
-    if (left !== right) into.push({ field, envelope: left, selfRun: right })
-  }
-  compare('home', envelope.home, selfRun.home, blocking)
-  compare('userCacheDir', envelope.userCacheDir, selfRun.userCacheDir, blocking)
-  compare('huggingfaceCacheDir', envelope.huggingfaceCacheDir, selfRun.huggingfaceCacheDir, blocking)
-  compare('sandboxPolicy.mode', envelope.sandboxPolicy?.mode ?? null, selfRun.sandboxPolicy?.mode ?? null, blocking)
-  compare('sandboxPolicy.enforcement', envelope.sandboxPolicy?.enforcement ?? null, selfRun.sandboxPolicy?.enforcement ?? null, blocking)
-  compare('dependencyLinks.mode', envelope.dependencyLinks?.mode ?? null, selfRun.dependencyLinks?.mode ?? null, blocking)
-  compare('dependencyLinks.dirs', checkDependencyDirsField(envelope.dependencyLinks?.dirs), checkDependencyDirsField(selfRun.dependencyLinks?.dirs), blocking)
-  compare('userCacheDirExists', envelope.userCacheDirExists, selfRun.userCacheDirExists, advisory)
-  compare('huggingfaceCacheDirExists', envelope.huggingfaceCacheDirExists, selfRun.huggingfaceCacheDirExists, advisory)
-  // The scoped roots the envelope promises name a placeholder checkout, while
-  // an executed check names the disposable checkout it really received: they
-  // differ on every run by construction. Both are still named with both values
-  // so the record shows the difference, never an empty comparison that hides it.
-  compare('xdgCacheHome', envelope.xdgCacheHome, selfRun.xdgCacheHome, advisory)
-  compare('checkCacheRoot', envelope.checkCacheRoot, selfRun.checkCacheRoot, advisory)
-  compare('checkCacheRoots', checkCacheRootsField(envelope.checkCacheRoots), checkCacheRootsField(selfRun.checkCacheRoots), advisory)
-  return { blocking, advisory }
-}
-/**
  * ENV: a verification whose supporting host checks did not run under the
  * declared-check envelope. The verdict is refused rather than accepting an
  * artifact that was only ever validated under a different environment.
@@ -186,13 +129,6 @@ export class CheckEnvironmentMismatchError extends Error {
     this.name = 'CheckEnvironmentMismatchError'
   }
 }
-/** ENV: the measured envelope plus the environment facts the adapter attaches. */
-type DeclaredCheckEnvelope = CheckEnvelope & {
-  environment?: CheckEnvironment
-  selfRunEnvironment?: CheckEnvironment
-}
-const isDeclaredCheckEnvironment = (value: unknown): value is CheckEnvironment =>
-  typeof value === 'object' && value !== null && 'home' in value && 'sandboxPolicy' in value && 'dependencyLinks' in value && 'checkCacheRoot' in value
 /** The model-visible position already delivered to one member; the next default read starts after it. */
 interface DeliveredCursor { eventSeq: number; runSeq: number; postSeq: number; current?: string }
 type OwnerRows = Record<'board' | 'members' | 'evidence', Array<{ id: string }>>
@@ -319,6 +255,9 @@ export class SwarmRuntime implements Kernel {
    */
   readonly workspaceAdmission = new WorkspaceAdmission(this, this.attempts, this.notices)
 
+  /** M1a seam 5/7: the declared-check execution path and the check environment, on the kernel and the workspace authorization every checkout is created after. */
+  private readonly declaredChecks = new DeclaredChecks(this, this.workspaceAdmission)
+
   /** M1a seam 7/7: pass bookkeeping, the dispatch sweep and the attempt reporting bound; its predicates are the board's. */
   private readonly scheduling = new Scheduling(this)
   private deliveryTarget(actor: Actor, missionId: string): { mission: Mission; task: Task } { return this.scheduling.deliveryTarget(actor, missionId) }
@@ -326,8 +265,6 @@ export class SwarmRuntime implements Kernel {
   private closePass(missionId: string, pass: SchedulingPass): void { return this.scheduling.closePass(missionId, pass) }
   private checkSchedulingPasses(): void { return this.scheduling.checkSchedulingPasses() }
 
-  /** M1a seam 5/7: the declared-check execution path. */
-  private readonly declaredChecks = new DeclaredChecks(this)
   /** M1a seam 2/7: derived fingerprints, usage accounting and the budget gate. */
   private readonly gates = new RuntimeGates(this)
   private ownerInstruments(missionId: string, full: boolean): Record<string, unknown> { return this.gates.ownerInstruments(missionId, full) }
@@ -1217,44 +1154,6 @@ export class SwarmRuntime implements Kernel {
     return owner ? task : this.memberTask(task)
   }
 
-  /** ENV: the adapter's measured envelope, widened to the environment facts it also reports. */
-  private declaredCheckEnvelope(): DeclaredCheckEnvelope | undefined {
-    try { return this.workers.checkEnvelope?.() as DeclaredCheckEnvelope | undefined }
-    catch { return undefined } // reporting the environment must never break a delivery or a verdict
-  }
-  /** ENV: the declared envelope delivered with one attempt's assignment, from the durable delivery. */
-  private deliveredCheckEnvironment(missionId: string, taskId: string, attemptId: string): CheckEnvironment | undefined {
-    for (const delivery of this.store.list('deliveries', missionId)) {
-      if (delivery.kind !== 'assignment' || delivery.taskId !== taskId || delivery.attemptId !== attemptId) continue
-      try {
-        const content = JSON.parse(delivery.content) as { checkEnvironment?: { environment?: unknown } }
-        const environment = content.checkEnvironment?.environment
-        if (isDeclaredCheckEnvironment(environment)) return environment
-      } catch { /* a delivery without the envelope simply has none */ }
-    }
-    return undefined
-  }
-  /**
-   * ENV: compare the envelope delivered to one verification attempt with the
-   * environment the host recorded on that artifact's declared checks. Both sides
-   * are host-measured: the runtime constructs the envelope and runs the declared
-   * checks itself, so nothing here is inferred from a member's command text. An
-   * attempt with no delivered envelope, or with no host check outcome that
-   * carries an environment, has nothing to compare and the verdict proceeds as
-   * before.
-   */
-  private checkEnvironmentReproduction(missionId: string, taskId: string, attemptId: string, checks: ReadonlyArray<{ environment?: CheckEnvironment }>):
-    { envelope: CheckEnvironment; selfRun: CheckEnvironment; source: 'host-check'; at: number; comparison: CheckEnvironmentComparison } | undefined {
-    if (checks.length === 0) return undefined
-    const envelope = this.deliveredCheckEnvironment(missionId, taskId, attemptId) ?? this.declaredCheckEnvelope()?.environment
-    if (envelope === undefined) return undefined
-    // Declared host checks are the supporting executions. A later unrelated
-    // diagnostic cannot substitute its environment for those immutable-artifact checks.
-    const measured = checks.find(check => check.environment !== undefined && compareCheckEnvironments(envelope, check.environment).blocking.length > 0)?.environment
-      ?? checks.find(check => check.environment !== undefined)?.environment
-    if (measured === undefined) return undefined
-    return { envelope, selfRun: measured, source: 'host-check', at: this.now(), comparison: compareCheckEnvironments(envelope, measured) }
-  }
   /**
    * The one writer of an assignment delivery, at a claim and at a budget resume
    * alike. Its worker reads the task as `memberTask` renders it, without the
@@ -1262,20 +1161,10 @@ export class SwarmRuntime implements Kernel {
    * the host runs its declared checks under (ENV). Returns the task as delivered.
    */
   deliverAssignment(task: Task, mission: Mission, instructions = ASSIGNMENT_INSTRUCTIONS): Task {
-    const { preparationFailure: _retried, ...assigned } = this.memberTask(task, mission), envelope = this.declaredCheckEnvelope()
-    const checkEnvironment = envelope?.environment === undefined ? undefined : {
-      note: 'These are the facts the host runs this task\'s declared checks under. Acceptance compares the supporting host checks with this envelope; unrelated diagnostics do not determine the verdict. The scoped cache roots are provided inside the disposable verification checkout; the user cache roots and HOME are what a self-run inherits.',
-      environment: envelope.environment,
-      ...(envelope.selfRunEnvironment === undefined ? {} : { selfRun: envelope.selfRunEnvironment }),
-    }
+    const { preparationFailure: _retried, ...assigned } = this.memberTask(task, mission), checkEnvironment = this.declaredChecks.assignmentEnvironment()
     this.store.put('deliveries', { id: id('msg'), missionId: mission.id, from: 'runtime', to: task.attempt!.ownerId, kind: 'assignment', taskId: task.id, attemptId: task.attempt!.id,
       content: JSON.stringify({ missionId: mission.id, task: assigned, checkEnvironment, instructions }), createdAt: this.now() })
     return assigned
-  }
-  /** ENV: render a blocking mismatch as the refusal the member must act on. */
-  private checkEnvironmentMismatchMessage(comparison: CheckEnvironmentComparison, source: string): string {
-    const fields = comparison.blocking.map(item => `${item.field}: envelope ${item.envelope}, self-run ${item.selfRun}`).join('; ')
-    return `[check_environment_mismatch] This verification's self-run environment (${source}) cannot reproduce the declared-check envelope: ${fields}. Rerun the declared check in the envelope environment, then call \`swarm_verify\` with its \`verdict\` and \`reason\` again; the artifact is not accepted under a different environment.`
   }
 
   /** Check before any workspace mutation, and again immediately before assignment. */
@@ -1504,7 +1393,7 @@ export class SwarmRuntime implements Kernel {
       // ENV: the envelope delivered to this attempt must be reproduced by the
       // host checks that support it. A blocking divergence is durable before it
       // is reported, so a later reader sees the environments, not only the refusal.
-      const reproduction = this.checkEnvironmentReproduction(missionId, task.id, input.attemptId, checks)
+      const reproduction = this.declaredChecks.reproduction(missionId, task.id, input.attemptId, checks)
       if (reproduction !== undefined && (reproduction.comparison.blocking.length > 0 || reproduction.comparison.advisory.length > 0)) {
         this.commit(missionId, () => this.store.event(missionId, 'task/check-envelope', member.id, {
           taskId: task.id, sourceTaskId: source.id, verdict: input.verdict, reproduction: 'check-environment-mismatch',
@@ -1519,7 +1408,7 @@ export class SwarmRuntime implements Kernel {
       // reproduce.
       if (passed && reproduction !== undefined && reproduction.comparison.blocking.length > 0) {
         this.commit(missionId, () => { this.declaredChecks.recordRuns(missionId, { memberId: member.id, taskId: task.id, attemptId: input.attemptId, commit: artifact.commit }, checks) })
-        throw new CheckEnvironmentMismatchError(this.checkEnvironmentMismatchMessage(reproduction.comparison, 'recorded on the declared host checks'))
+        throw new CheckEnvironmentMismatchError(checkEnvironmentMismatchMessage(reproduction.comparison, 'recorded on the declared host checks'))
       }
       // F3-A: a rejection must carry the real failure, not only the reviewer's
       // prose. A judgement rejection with no failing check keeps the prose.

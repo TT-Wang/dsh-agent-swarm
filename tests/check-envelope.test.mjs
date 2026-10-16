@@ -31,7 +31,7 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { mkdir, realpath, rm, stat, writeFile } from 'node:fs/promises'
 import path from 'node:path'
-import { compareCheckEnvironments } from '../lib/runtime.js'
+import { compareCheckEnvironments } from '../lib/declared-checks.js'
 import { checkTempEnvironment, runProcess } from '../lib/workspaces.js'
 import { tempDirectory } from './temp-root.mjs'
 import { subprocessSeam } from './subprocess-seam.mjs'
@@ -427,7 +427,7 @@ test('ENV: a cold user cache is recorded as advisory and never refuses an accept
   // host) do not have one. The paths agree, so this is advisory only.
   const envelope = fixture.workers.workspaces.checkEnvelope()
   const warm = { ...envelope.environment, huggingfaceCacheDirExists: true }
-  const comparison = (await import('../lib/runtime.js')).compareCheckEnvironments(warm, { ...envelope.selfRunEnvironment, huggingfaceCacheDirExists: false })
+  const comparison = compareCheckEnvironments(warm, { ...envelope.selfRunEnvironment, huggingfaceCacheDirExists: false })
   assert.deepEqual(comparison.blocking, [], 'a cache that went cold is not a wrong environment')
   assert.ok(comparison.advisory.some(field => field.field === 'huggingfaceCacheDirExists'), 'the cold cache is still reported')
   const reviewer = fixture.reviews[0]

@@ -2,17 +2,18 @@
  * The declared-check execution path: the bounded timeout window, the host call
  * that runs the task's declared checks, the measured envelope record, the
  * pass/fail classification, the durable tool-run row per check and the rejection
- * text. M1a seam 5/7.
+ * text; and the check environment: the envelope an assignment delivers and its
+ * reproduction by the host checks that support a verdict.
  *
  * Check executions are outside the mission transaction; the verdict records
  * their exact outcomes and retains bounded retry evidence. Explicit execution
  * failures can defer review without converting infrastructure into a code verdict.
  */
-import type { SwarmRuntime } from './runtime.ts'
 import { id } from './store.ts'
 import { openAttempt } from './task-graph.ts'
-import type { Artifact, CheckResult, Member, Task, ToolRun } from './types.ts'
-
+import type { Kernel } from './kernel.ts'
+import type { WorkspaceAdmission } from './workspace-admission.ts'
+import type { Artifact, CheckEnvelope, CheckEnvironment, CheckResult, Member, Task, ToolRun } from './types.ts'
 
 /** Host verification timeout when a task chose none; matches the plugin config default. */
 const DEFAULT_CHECK_TIMEOUT_MS = 60000
@@ -50,6 +51,76 @@ export function recoveryExit(checks: ReadonlyArray<CheckResult>): string {
   return failure?.failureKind === undefined ? RESUME : RECOVERY_EXITS[failure.failureKind](failure)
 }
 
+/**
+ * ENV: one field of the declared-check envelope the executed check does not
+ * reproduce. `selfRun` names the measured side of the comparison; both sides are
+ * environments the host recorded, never an environment read off a command.
+ */
+export interface CheckEnvironmentMismatch { field: string; envelope: string; selfRun: string }
+/**
+ * ENV: the envelope reproduction comparison. `blocking` divergences mean the
+ * declared host checks that support this verification did not run under the
+ * environment the envelope promised, so the mismatch is reported instead of
+ * accepting the artifact. `advisory` divergences (whether a cache root happened
+ * to exist) are recorded but never refuse an acceptance: a check must not depend
+ * on the ambient cache staying warm.
+ */
+export interface CheckEnvironmentComparison { blocking: CheckEnvironmentMismatch[]; advisory: CheckEnvironmentMismatch[] }
+const checkEnvironmentField = (value: string | boolean | null): string => value === null ? 'absent' : String(value)
+/** ENV: the cache roots as one comparable field; `none` when the environment sets none. */
+const checkCacheRootsField = (roots: Record<string, string>): string =>
+  Object.keys(roots).sort().map(name => `${name}=${roots[name]}`).join(', ') || 'none'
+/** Dependency directories are a set; Git inventory order is not declaration order. */
+const checkDependencyDirsField = (dirs: readonly string[] | undefined): string =>
+  JSON.stringify([...new Set(dirs ?? [])].sort())
+/**
+ * ENV: compare the declared envelope the runtime delivered with the environment
+ * a host-recorded execution reports. HOME, the user cache roots, the
+ * sandbox policy and the dependency links must agree; the scoped check cache
+ * roots the envelope itself provides (`checkCacheRoot`, `checkCacheRoots`,
+ * `xdgCacheHome`) and the existence flags are compared and REPORTED but stay
+ * advisory: they differ by construction on every run, and a check must not
+ * depend on the ambient cache staying warm — refusing on them would block every
+ * production acceptance.
+ */
+export function compareCheckEnvironments(envelope: CheckEnvironment, selfRun: CheckEnvironment): CheckEnvironmentComparison {
+  const blocking: CheckEnvironmentMismatch[] = []
+  const advisory: CheckEnvironmentMismatch[] = []
+  const compare = (field: string, before: string | boolean | null, after: string | boolean | null, into: CheckEnvironmentMismatch[]): void => {
+    const left = checkEnvironmentField(before), right = checkEnvironmentField(after)
+    if (left !== right) into.push({ field, envelope: left, selfRun: right })
+  }
+  compare('home', envelope.home, selfRun.home, blocking)
+  compare('userCacheDir', envelope.userCacheDir, selfRun.userCacheDir, blocking)
+  compare('huggingfaceCacheDir', envelope.huggingfaceCacheDir, selfRun.huggingfaceCacheDir, blocking)
+  compare('sandboxPolicy.mode', envelope.sandboxPolicy?.mode ?? null, selfRun.sandboxPolicy?.mode ?? null, blocking)
+  compare('sandboxPolicy.enforcement', envelope.sandboxPolicy?.enforcement ?? null, selfRun.sandboxPolicy?.enforcement ?? null, blocking)
+  compare('dependencyLinks.mode', envelope.dependencyLinks?.mode ?? null, selfRun.dependencyLinks?.mode ?? null, blocking)
+  compare('dependencyLinks.dirs', checkDependencyDirsField(envelope.dependencyLinks?.dirs), checkDependencyDirsField(selfRun.dependencyLinks?.dirs), blocking)
+  compare('userCacheDirExists', envelope.userCacheDirExists, selfRun.userCacheDirExists, advisory)
+  compare('huggingfaceCacheDirExists', envelope.huggingfaceCacheDirExists, selfRun.huggingfaceCacheDirExists, advisory)
+  // The scoped roots the envelope promises name a placeholder checkout, while
+  // an executed check names the disposable checkout it really received: they
+  // differ on every run by construction. Both are still named with both values
+  // so the record shows the difference, never an empty comparison that hides it.
+  compare('xdgCacheHome', envelope.xdgCacheHome, selfRun.xdgCacheHome, advisory)
+  compare('checkCacheRoot', envelope.checkCacheRoot, selfRun.checkCacheRoot, advisory)
+  compare('checkCacheRoots', checkCacheRootsField(envelope.checkCacheRoots), checkCacheRootsField(selfRun.checkCacheRoots), advisory)
+  return { blocking, advisory }
+}
+/** ENV: render a blocking mismatch as the refusal the member must act on. */
+export function checkEnvironmentMismatchMessage(comparison: CheckEnvironmentComparison, source: string): string {
+  const fields = comparison.blocking.map(item => `${item.field}: envelope ${item.envelope}, self-run ${item.selfRun}`).join('; ')
+  return `[check_environment_mismatch] This verification's self-run environment (${source}) cannot reproduce the declared-check envelope: ${fields}. Rerun the declared check in the envelope environment, then call \`swarm_verify\` with its \`verdict\` and \`reason\` again; the artifact is not accepted under a different environment.`
+}
+/** ENV: the measured envelope plus the environment facts the adapter attaches. */
+type DeclaredCheckEnvelope = CheckEnvelope & {
+  environment?: CheckEnvironment
+  selfRunEnvironment?: CheckEnvironment
+}
+const isDeclaredCheckEnvironment = (value: unknown): value is CheckEnvironment =>
+  typeof value === 'object' && value !== null && 'home' in value && 'sandboxPolicy' in value && 'dependencyLinks' in value && 'checkCacheRoot' in value
+
 export class DeclaredChecks {
   /**
    * S15: the attempts of the verification in flight. The key is
@@ -69,11 +140,11 @@ export class DeclaredChecks {
    */
   private readonly checkRuns = new Map<string, CheckResult[][]>()
 
-  constructor(private readonly rt: SwarmRuntime) {}
+  constructor(private readonly k: Kernel, private readonly workspaceAdmission: WorkspaceAdmission) {}
 
   /** The reviewed source a verification task belongs to. */
   private sourceOf(verificationTaskId: string): string {
-    return this.rt.store.get('tasks', verificationTaskId)?.reviewOf ?? verificationTaskId
+    return this.k.store.get('tasks', verificationTaskId)?.reviewOf ?? verificationTaskId
   }
 
   /**
@@ -83,7 +154,7 @@ export class DeclaredChecks {
    * the durable rows must name the verification consistently on both sides.
    */
   private verificationAttempt(member: Member, source: Task): { taskId: string; attemptId: string } | undefined {
-    const open = openAttempt(this.rt.store.list('tasks', member.missionId), member.id)
+    const open = openAttempt(this.k.store.list('tasks', member.missionId), member.id)
     return open?.kind === 'verification' && open.reviewOf === source.id ? { taskId: open.id, attemptId: open.attempt.id } : undefined
   }
 
@@ -102,11 +173,11 @@ export class DeclaredChecks {
   private recordFirstPass(member: Member, source: Task, artifact: Artifact, checks: ReadonlyArray<CheckResult>): boolean {
     const verification = this.verificationAttempt(member, source)
     if (verification === undefined) return false
-    this.rt.commit(member.missionId, () => {
-      let seq = this.rt.store.countToolRuns(member.missionId)
+    this.k.commit(member.missionId, () => {
+      let seq = this.k.store.countToolRuns(member.missionId)
       for (const check of checks) {
-        const run: ToolRun = { id: id('run'), seq: ++seq, missionId: member.missionId, memberId: member.id, taskId: verification.taskId, attemptId: verification.attemptId, tool: 'swarm.host_verification', arguments: { command: check.command, commit: artifact.commit, attempt: 1 }, result: check, isError: check.exitCode !== 0, createdAt: this.rt.now() }
-        this.rt.store.put('tool_runs', run)
+        const run: ToolRun = { id: id('run'), seq: ++seq, missionId: member.missionId, memberId: member.id, taskId: verification.taskId, attemptId: verification.attemptId, tool: 'swarm.host_verification', arguments: { command: check.command, commit: artifact.commit, attempt: 1 }, result: check, isError: check.exitCode !== 0, createdAt: this.k.now() }
+        this.k.store.put('tool_runs', run)
       }
     })
     return true
@@ -118,7 +189,7 @@ export class DeclaredChecks {
    * never pair with an earlier attempt's failure.
    */
   private firstPassRecorded(missionId: string, where: { memberId: string; taskId: string; attemptId: string; commit: string }): boolean {
-    return this.rt.store.list('tool_runs', missionId).some(run => {
+    return this.k.store.list('tool_runs', missionId).some(run => {
       const args = run.arguments
       if (typeof args !== 'object' || args === null) return false
       const named = args as { attempt?: unknown; commit?: unknown }
@@ -132,8 +203,8 @@ export class DeclaredChecks {
    * the worst case of the retry rule below: a failing first pass plus its retry.
    */
   windowFor(source: Task): number {
-    const checkTimeoutMs = source.checkTimeoutMs ?? this.rt.config.checkTimeoutMs ?? DEFAULT_CHECK_TIMEOUT_MS
-    return checkTimeoutMs * Math.max(1, source.checks.length) * 2 + this.rt.config.leaseMs
+    const checkTimeoutMs = source.checkTimeoutMs ?? this.k.config.checkTimeoutMs ?? DEFAULT_CHECK_TIMEOUT_MS
+    return checkTimeoutMs * Math.max(1, source.checks.length) * 2 + this.k.config.leaseMs
   }
 
   /**
@@ -169,8 +240,8 @@ export class DeclaredChecks {
    */
   private async execute(member: Member, source: Task, artifact: Artifact, signal?: AbortSignal): Promise<CheckResult[]> {
     // Every checkout, the retry's included, is created only after the runtime re-validates.
-    await this.rt.workspaceAdmission.assertWorkspaceAuthorized(this.rt.mission(source.missionId))
-    try { return await this.rt.workers.verifyArtifact(member, source, artifact, signal) }
+    await this.workspaceAdmission.assertWorkspaceAuthorized(this.k.mission(source.missionId))
+    try { return await this.k.workers.verifyArtifact(member, source, artifact, signal) }
     catch (error) {
       if (signal?.aborted) throw error
       const code = error instanceof Error && 'code' in error ? String(error.code) : ''
@@ -190,10 +261,61 @@ export class DeclaredChecks {
    * fails closed because the world moved during the check.
    */
   recordEnvelope(missionId: string, taskId: string, sourceTaskId: string, memberId: string): void {
-    const envelope = this.rt.workers.checkEnvelope?.()
+    const envelope = this.k.workers.checkEnvelope?.()
     if (envelope === undefined) return
-    this.rt.commit(missionId, () => this.rt.store.event(missionId, 'task/check-envelope', memberId,
+    this.k.commit(missionId, () => this.k.store.event(missionId, 'task/check-envelope', memberId,
       { taskId, sourceTaskId, ...envelope }))
+  }
+
+  /** ENV: the adapter's measured envelope, widened to the environment facts it also reports. */
+  private envelope(): DeclaredCheckEnvelope | undefined {
+    try { return this.k.workers.checkEnvelope?.() as DeclaredCheckEnvelope | undefined }
+    catch { return undefined } // reporting the environment must never break a delivery or a verdict
+  }
+
+  /** ENV: the facts the host runs a task's declared checks under, as an assignment delivers them; none when the adapter reports no environment. */
+  assignmentEnvironment(): { note: string; environment: CheckEnvironment; selfRun?: CheckEnvironment } | undefined {
+    const envelope = this.envelope()
+    return envelope?.environment === undefined ? undefined : {
+      note: 'These are the facts the host runs this task\'s declared checks under. Acceptance compares the supporting host checks with this envelope; unrelated diagnostics do not determine the verdict. The scoped cache roots are provided inside the disposable verification checkout; the user cache roots and HOME are what a self-run inherits.',
+      environment: envelope.environment,
+      ...(envelope.selfRunEnvironment === undefined ? {} : { selfRun: envelope.selfRunEnvironment }),
+    }
+  }
+
+  /** ENV: the declared envelope delivered with one attempt's assignment, from the durable delivery. */
+  private deliveredEnvironment(missionId: string, taskId: string, attemptId: string): CheckEnvironment | undefined {
+    for (const delivery of this.k.store.list('deliveries', missionId)) {
+      if (delivery.kind !== 'assignment' || delivery.taskId !== taskId || delivery.attemptId !== attemptId) continue
+      try {
+        const content = JSON.parse(delivery.content) as { checkEnvironment?: { environment?: unknown } }
+        const environment = content.checkEnvironment?.environment
+        if (isDeclaredCheckEnvironment(environment)) return environment
+      } catch { /* a delivery without the envelope simply has none */ }
+    }
+    return undefined
+  }
+
+  /**
+   * ENV: compare the envelope delivered to one verification attempt with the
+   * environment the host recorded on that artifact's declared checks. Both sides
+   * are host-measured: the runtime constructs the envelope and runs the declared
+   * checks itself, so nothing here is inferred from a member's command text. An
+   * attempt with no delivered envelope, or with no host check outcome that
+   * carries an environment, has nothing to compare and the verdict proceeds as
+   * before.
+   */
+  reproduction(missionId: string, taskId: string, attemptId: string, checks: ReadonlyArray<{ environment?: CheckEnvironment }>):
+    { envelope: CheckEnvironment; selfRun: CheckEnvironment; source: 'host-check'; at: number; comparison: CheckEnvironmentComparison } | undefined {
+    if (checks.length === 0) return undefined
+    const envelope = this.deliveredEnvironment(missionId, taskId, attemptId) ?? this.envelope()?.environment
+    if (envelope === undefined) return undefined
+    // Declared host checks are the supporting executions. A later unrelated
+    // diagnostic cannot substitute its environment for those immutable-artifact checks.
+    const measured = checks.find(check => check.environment !== undefined && compareCheckEnvironments(envelope, check.environment).blocking.length > 0)?.environment
+      ?? checks.find(check => check.environment !== undefined)?.environment
+    if (measured === undefined) return undefined
+    return { envelope, selfRun: measured, source: 'host-check', at: this.k.now(), comparison: compareCheckEnvironments(envelope, measured) }
   }
 
   /** The verdict's check outcome: a rejection is the reviewer's to earn. */
@@ -227,12 +349,12 @@ export class DeclaredChecks {
         ? [{ attempt: 2, checks }]
         : [{ attempt: 1, checks }]
     const ids: string[] = []
-    let seq = this.rt.store.countToolRuns(missionId)
+    let seq = this.k.store.countToolRuns(missionId)
     for (const [index, entry] of recorded.entries()) {
       const deciding = index === recorded.length - 1
       for (const check of entry.checks) {
-        const run: ToolRun = { id: id('run'), seq: ++seq, missionId, memberId: where.memberId, taskId: where.taskId, attemptId: where.attemptId, tool: 'swarm.host_verification', arguments: { command: check.command, commit: where.commit, attempt: entry.attempt }, result: check, isError: check.exitCode !== 0, createdAt: this.rt.now() }
-        this.rt.store.put('tool_runs', run); if (deciding) ids.push(run.id)
+        const run: ToolRun = { id: id('run'), seq: ++seq, missionId, memberId: where.memberId, taskId: where.taskId, attemptId: where.attemptId, tool: 'swarm.host_verification', arguments: { command: check.command, commit: where.commit, attempt: entry.attempt }, result: check, isError: check.exitCode !== 0, createdAt: this.k.now() }
+        this.k.store.put('tool_runs', run); if (deciding) ids.push(run.id)
       }
     }
     return ids
@@ -259,12 +381,12 @@ export class DeclaredChecks {
     const marker = ' …[output excerpt truncated]'
     const fixed = 1 + heading.length + 2 + heads.reduce((total, head) => total + head.length + 1, 0) + marker.length + omission.length
     let prose = reason
-    if (prose.length + fixed > this.rt.config.maxMessageChars) {
+    if (prose.length + fixed > this.k.config.maxMessageChars) {
       // The check evidence is the part that must never be lost: excerpt the prose to fit.
-      const proseBudget = Math.max(0, this.rt.config.maxMessageChars - fixed - 48)
+      const proseBudget = Math.max(0, this.k.config.maxMessageChars - fixed - 48)
       prose = `${prose.slice(0, proseBudget)} …[reviewer reason truncated]`
     }
-    let remaining = Math.max(0, this.rt.config.maxMessageChars - prose.length - fixed)
+    let remaining = Math.max(0, this.k.config.maxMessageChars - prose.length - fixed)
     const parts: string[] = []
     for (const [index, check] of shown.entries()) {
       const output = check.output.trimEnd()
@@ -275,6 +397,6 @@ export class DeclaredChecks {
       parts.push(`${heads[index]}${excerpt}`)
     }
     const report = `${prose}\n${heading}:\n${parts.join('\n')}${omission}`
-    return report.length <= this.rt.config.maxMessageChars ? report : `${report.slice(0, Math.max(0, this.rt.config.maxMessageChars - marker.length))}${marker}`
+    return report.length <= this.k.config.maxMessageChars ? report : `${report.slice(0, Math.max(0, this.k.config.maxMessageChars - marker.length))}${marker}`
   }
 }
