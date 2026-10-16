@@ -4,8 +4,9 @@
  * driven by the host's admitted `user/message`, for an owner notice, an owner
  * question and any other owner-addressed delivery alike, in an active or a paused
  * mission. The one observer of that message is the owner-reply guard's host
- * subscription: it hands the admission to the writer, then books the turn from
- * the stored field. The notice ledger reads it as the delivery's own field.
+ * subscription: it books the turn from the admission itself, then hands the
+ * admission to the writer, whose failure is dropped and costs the booking
+ * nothing. The notice ledger reads it as the delivery's own field.
  *
  * A store an earlier build wrote recorded a notice's consumption on its notice
  * envelope (`notice.consumedAt`, with `consumptionSource`). Opening it moves that
@@ -92,9 +93,9 @@ test('the owner session\'s admission records consumption on the delivery itself,
   assert.equal(f.runtime.observe(f.owner, f.mission.id, { detail: 'full' }).noticeLedger.find(entry => entry.deliveryId === notice.id).consumedAt, noticeConsumedAt, 'the ledger reads the delivery\'s field')
 })
 
-test('one observer records the admitted question as consumed, then books the turn from the stored field: a question the transport has not acknowledged is booked, and its miss states the admission instant', async t => {
+test('the admission books the question it carries: a question the transport has not acknowledged is booked by its admission alone, and its miss states the consumption the store then holds', async t => {
   const f = await hosted(t)
-  // The transport is held, so the question has no delivery time: only its recorded consumption can book it.
+  // The transport is held, so the question has no delivery time: only its admission can book it.
   f.runtime.notices.pumpOutbox = () => {}
   const question = await f.toOwner('question', 'Which API version?', { flush: false })
   assert.equal(question.deliveredAt, undefined)
@@ -105,12 +106,17 @@ test('one observer records the admitted question as consumed, then books the tur
   f.endTurn()
   assert.equal(f.row(question.id).consumedAt, consumedAt)
   assert.deepEqual(f.missing().map(event => [event.data.deliveryId, event.data.deliveredAt, event.data.consumedAt]), [[question.id, null, consumedAt]],
-    'the turn booked the question its own admission carried, and the miss records the consumption the store holds')
+    'the turn booked the question its own admission carried, and the miss records the consumption the admission wrote')
 })
 
-test('the observer is best-effort: a consumption write that fails never breaks the host\'s emission, and a later admission records it', async t => {
+test('a consumption write that fails is dropped and costs the turn no booking: a question delivered before it and the question it admits are both missed, each as the store holds it', async t => {
   const f = await hosted(t)
+  const delivered = await f.toOwner('question', 'Which API version?')
   const notice = await f.notice('consumption probe')
+  // The transport is held from here, so the second question is seen only through its admission.
+  f.runtime.notices.pumpOutbox = () => {}
+  const admitted = await f.toOwner('question', 'Which branch?', { flush: false })
+  assert.deepEqual([delivered.deliveredAt === undefined, notice.deliveredAt === undefined, admitted.deliveredAt], [false, false, undefined])
   const put = f.runtime.store.put.bind(f.runtime.store)
   let refused = 0
   f.runtime.store.put = (table, row) => {
@@ -118,12 +124,14 @@ test('the observer is best-effort: a consumption write that fails never breaks t
     return put(table, row)
   }
   f.clock.advance(1_000)
-  try { assert.doesNotThrow(() => f.admit(f.owner.sessionId, notice.id), 'the host\'s session event is never broken by its observer') }
-  finally { f.runtime.store.put = put }
-  assert.deepEqual([refused, f.row(notice.id).consumedAt], [1, undefined], 'the failed write recorded nothing')
+  try {
+    assert.doesNotThrow(() => { f.admit(f.owner.sessionId, notice.id); f.admit(f.owner.sessionId, admitted.id) }, 'the host\'s session event is never broken by its observer')
+  } finally { f.runtime.store.put = put }
+  assert.deepEqual([refused, f.row(notice.id).consumedAt, f.row(admitted.id).consumedAt], [2, undefined, undefined], 'each failed write is dropped and recorded nothing')
   f.clock.advance(1_000)
-  f.admit(f.owner.sessionId, notice.id)
-  assert.equal(f.row(notice.id).consumedAt, f.clock.now(), 'the next admission of the same delivery records it')
+  f.endTurn()
+  assert.deepEqual(f.missing().map(event => [event.data.deliveryId, event.data.deliveredAt, event.data.consumedAt]), [[delivered.id, delivered.deliveredAt, null], [admitted.id, null, null]],
+    'the failed writes cost the turn neither the question delivered before it nor the question it admitted')
 })
 
 // Rows as a v4 build wrote them: a consumed notice carries its consumption on the notice envelope, beside the signal that

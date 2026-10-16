@@ -53,7 +53,7 @@ export class OwnerReplyGuard {
     this.removal = ctx.on('session/event', (session, event) => {
       if (this.closed) return
       try { this.observe(String(session.header.id), event.type, event.data) }
-      catch { /* Best-effort observer: it must never break a turn. The next turn re-derives the miss, and a replayed admission records consumption. */ }
+      catch { /* Best-effort observer: it must never break a turn, so a failed write is dropped. */ }
     })
   }
 
@@ -67,17 +67,19 @@ export class OwnerReplyGuard {
    * Drive the guard from one session event. Public on purpose: the cordis
    * listener above is the only production caller, and a test (or a host that
    * carries session events another way) can feed the same two events directly.
-   * An admitted message that carries a swarm delivery is first recorded
-   * consumed (`Notices.recordConsumption`, the one writer of `consumedAt`, which
-   * decides whether this session consumes it); only then does the turn book its
-   * questions, from the stored field.
+   * An admitted message first books the turn, which writes nothing, and then
+   * records the swarm delivery it carries as consumed
+   * (`Notices.recordConsumption`, the one writer of `consumedAt`, which decides
+   * whether this session consumes it). A consumption write that fails is
+   * dropped and costs the turn nothing it booked.
    */
   observe(sessionId: string, type: string, data?: unknown): void {
     if (this.closed) return
     if (type === 'user/message') {
       const source = (data as { source?: { kind?: unknown; deliveryId?: unknown } } | undefined)?.source
-      if (source?.kind === 'swarm' && typeof source.deliveryId === 'string') this.rt.notices.recordConsumption(sessionId, source.deliveryId)
-      this.startTurn(sessionId)
+      const admitted = source?.kind === 'swarm' && typeof source.deliveryId === 'string' ? source.deliveryId : undefined
+      this.startTurn(sessionId, admitted)
+      if (admitted !== undefined) this.rt.notices.recordConsumption(sessionId, admitted)
     } else if (type === 'turn/end') {
       const reason = (data as { reason?: { kind?: string } } | undefined)?.reason?.kind
       if (reason === 'completed') this.endTurn(sessionId)
@@ -96,10 +98,11 @@ export class OwnerReplyGuard {
    * ordinary owner turn is never nudged. The turn starts when its message is
    * observed, on the runtime clock that stamps `deliveredAt`, never on the
    * host's message `createdAt`: two clocks cannot order one question. A
-   * question is seen once the owner consumed it or the transport delivered it;
-   * the question this message carries was recorded consumed just before (`observe`).
+   * question is seen once the transport delivered it, an earlier admission
+   * consumed it, or this message admits it: the admission itself, not the
+   * consumption write it leads to.
    */
-  private startTurn(sessionId: string): void {
+  private startTurn(sessionId: string, admitted?: string): void {
     const at = this.rt.now()
     // Several admitted messages (including the generated context snapshot) can
     // arrive in one step. Merge bookings until turn/end instead of replacing
@@ -107,7 +110,7 @@ export class OwnerReplyGuard {
     const booked = this.bookings.get(sessionId) ?? new Set<string>()
     for (const mission of this.ownerMissions(sessionId)) {
       for (const delivery of openAsks(this.rt.store.list('deliveries', mission.id), 'owner')) {
-        const seenAt = delivery.consumedAt ?? delivery.deliveredAt
+        const seenAt = delivery.id === admitted ? at : delivery.consumedAt ?? delivery.deliveredAt
         if (seenAt === undefined || seenAt > at) continue
         booked.add(delivery.id)
       }

@@ -173,7 +173,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
   // L2: the owner side of the reply protocol. The guard observes owner turns and
   // reports questions the turn did not settle; it never answers on the owner's
   // behalf and never edits a message. Its subscription is the one observer of an
-  // admitted swarm delivery, which it records as consumed before booking the turn.
+  // admitted swarm delivery: it books the turn, then records the delivery consumed.
   const ownerReplies = new OwnerReplyGuard(ctx, runtime, { maxNudges: config.maxOwnerReplyNudges })
   ctx.effect(() => () => ownerReplies.dispose(), 'swarm.owner-reply-guard')
   ctx.inject(['commands'], commands => registerAutomaticStart(commands, runtime))
