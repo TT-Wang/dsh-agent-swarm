@@ -22,7 +22,9 @@
  * does: stop fences, an isolation violation, the silence bounds, completion,
  * and preferred work whose readings show the interpretation's ask order;
  * `dangling` (scripts/replay/dangling-clocked.mjs) is a corrupted store, a
- * dependency and a review source that name no task.
+ * dependency and a review source that name no task; `outage`
+ * (scripts/replay/outage-clocked.mjs) is the one whose adapter adopts a running
+ * session, so an adopting start and an opening start differ in it.
  *
  * Usage: node scripts/replay/oracle.mjs [--only replay,F19] [--runs n] [--stress] [--write] [--out dir]
  *   --runs n   run the whole set n times; every run must produce the same logs
@@ -50,6 +52,7 @@ const SCENARIOS = [
   { id: 'F21', script: 'scripts/replay/f21-clocked.mjs' },
   { id: 'paths', script: 'scripts/replay/paths-clocked.mjs' },
   { id: 'dangling', script: 'scripts/replay/dangling-clocked.mjs' },
+  { id: 'outage', script: 'scripts/replay/outage-clocked.mjs' },
 ]
 
 const args = process.argv.slice(2)
