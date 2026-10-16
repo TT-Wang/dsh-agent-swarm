@@ -554,7 +554,9 @@ function referenceCarried(board, task) {
  * Removing the lineage resolution from the classifier makes these disagree on
  * the cancelled-A / live-A' / B-depends-on-A board, and a non-transitive
  * replacement-coverage helper makes them disagree on the two-hop chain, which is
- * what the mutation proofs exercise.
+ * what the mutation proofs exercise. The graph's plain reads answer an edge that
+ * names no task as no task; pending work holding one (`danglingReference`)
+ * waits on nothing, whatever else it waits on.
  */
 function referenceWaiting(board, task) {
   const tasks = board.tasks
@@ -569,18 +571,19 @@ function referenceWaiting(board, task) {
     const stop = task.resumeAfterStop
     return stop.at !== undefined && Date.now() - stop.at <= board.bounds.stallPassTimeoutMs
   }
+  if (task.status === 'pending' && board.graph.danglingReference(task) !== undefined) return false
   if (task.status === 'pending' && task.reviewOf !== undefined) {
     const source = tasks.find(candidate => candidate.id === task.reviewOf)
-    return source !== undefined && !TERMINAL_STATES.has(source.status) && reviewable(board, source)
+    return !TERMINAL_STATES.has(source.status) && reviewable(board, source)
   }
   if (task.status === 'pending' && task.resumeAfterStop?.epoch === task.epoch
-    && task.dependencies.every(id => tasks.some(candidate => candidate.id === id) && board.graph.effective(id).status === 'accepted')) {
+    && task.dependencies.every(id => board.graph.effective(id)?.status === 'accepted')) {
     const stop = task.resumeAfterStop
     return stop.at !== undefined && Date.now() - stop.at <= board.bounds.stallPassTimeoutMs
   }
   return task.dependencies.some(id => {
-    if (!tasks.some(candidate => candidate.id === id)) return false
-    return !TERMINAL_STATES.has(board.graph.effective(id).status)
+    const tail = board.graph.effective(id)
+    return tail !== undefined && !TERMINAL_STATES.has(tail.status)
   })
 }
 
@@ -599,9 +602,14 @@ test('R16-A1: the waiting classifier is enumerated over every constructed board 
   const owner = { sessionId: 'r16-a1' }
   const mission = f.runtime.create(owner, { title: 'Lineage enumeration', objective: 'Enumerate the classifier', workspace: f.directory, scope: ['src/'], acceptance: ['works'], budget }, { grantRoot: f.directory, source: 'session' })
   const stream = f.runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Main' })
+  // A live member the constructed review paths can be owned by; the boards
+  // below are judged both without a member and with it (\`memberShapes\`).
+  await f.runtime.addMember(owner, mission.id, { name: 'Reviewer', role: 'verification' })
+  await f.runtime.settle(mission.id)
   // Each constructed board is judged over its own rows; the mission and its members are read once.
   const base = f.runtime.boardOf(mission.id)
-  const over = tasks => ({ ...base, tasks, graph: taskGraphIndex(tasks) })
+  assert.equal(base.members.length, 1, 'the live member is on the board')
+  const over = (tasks, members = []) => ({ ...base, members, tasks, graph: taskGraphIndex(tasks) })
   const now = Date.now()
   let seq = 0
   const materialize = (id, status, extra = {}) => {
@@ -618,6 +626,7 @@ test('R16-A1: the waiting classifier is enumerated over every constructed board 
   const subjectStatuses = ['pending', 'blocked', 'running', 'submitted']
   const stopShapes = ['none', 'in-bound', 'expired', 'unbounded']
   const reviewShapes = ['none', 'live', 'terminal', 'missing']
+  const memberShapes = { none: [], live: base.members }
   const mismatches = []
   const naiveDivergences = []
   const naiveWaiting = (task, tasks) => {
@@ -659,27 +668,29 @@ test('R16-A1: the waiting classifier is enumerated over every constructed board 
               f.runtime.store.put('tasks', subject)
             }
             if (reviewShape !== 'none') {
-              subject.reviewOf = sourceId
+              subject.kind = 'verification'; subject.reviewOf = sourceId
               if (reviewShape === 'live') tasks.push(materialize(sourceId, 'submitted'))
               else if (reviewShape === 'terminal') tasks.push(materialize(sourceId, 'cancelled'))
               f.runtime.store.put('tasks', subject)
             }
             tasks.push(subject)
-            const got = waitsLegitimately(over(tasks), subject)
-            const want = referenceWaiting(over(tasks), subject)
-            if (got !== want) mismatches.push({ depStatus, replacement, subjectStatus, stopShape, reviewShape, got, want })
-            const rootTask = { ...subject }
-            const gotRoot = stallRoots(over(tasks)).some(root => root.id === subject.id)
-            const wantRoot = referenceStallRoot(over(tasks), rootTask, f.runtime.bounds.stallPassTimeoutMs)
-            if (gotRoot !== wantRoot) mismatches.push({ kind: 'stallRoot', depStatus, replacement, subjectStatus, stopShape, reviewShape, gotRoot, wantRoot })
-            if (naiveWaiting(subject, tasks) !== want) naiveDivergences.push({ depStatus, replacement, subjectStatus, stopShape, reviewShape })
-            checked += 1
+            for (const [memberShape, members] of Object.entries(memberShapes)) {
+              const got = waitsLegitimately(over(tasks, members), subject)
+              const want = referenceWaiting(over(tasks, members), subject)
+              if (got !== want) mismatches.push({ depStatus, replacement, subjectStatus, stopShape, reviewShape, memberShape, got, want })
+              const rootTask = { ...subject }
+              const gotRoot = stallRoots(over(tasks, members)).some(root => root.id === subject.id)
+              const wantRoot = referenceStallRoot(over(tasks, members), rootTask, f.runtime.bounds.stallPassTimeoutMs)
+              if (gotRoot !== wantRoot) mismatches.push({ kind: 'stallRoot', depStatus, replacement, subjectStatus, stopShape, reviewShape, memberShape, gotRoot, wantRoot })
+              if (naiveWaiting(subject, tasks) !== want) naiveDivergences.push({ depStatus, replacement, subjectStatus, stopShape, reviewShape, memberShape })
+              checked += 1
+            }
           }
         }
       }
     }
   }
-  assert.equal(checked, depStatuses.length * replacementStatuses.length * subjectStatuses.length * stopShapes.length * reviewShapes.length, 'every combination is visited')
+  assert.equal(checked, depStatuses.length * replacementStatuses.length * subjectStatuses.length * stopShapes.length * reviewShapes.length * Object.keys(memberShapes).length, 'every combination is visited')
 
   // R16-A1r/A1r2: the SUBJECT-covered dimension, derived from the runtime's own
   // lineage seam. Every board above gives the subject a dependency edge (or a

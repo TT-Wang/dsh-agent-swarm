@@ -60,8 +60,8 @@ export function guardBoard(runtime, missionId, mission) {
         ...(task.attempt === undefined ? {} : { attempt: { leaseLive: task.attempt.leaseUntil >= now } }),
         ...(exhaustion === undefined ? {} : { ceilingExhausted: true }),
         dependenciesSatisfied: task.dependencies.every(dependency => board.graph.dependencyMet(dependency)),
-        // The scheduler's `unschedulable`: an id that names no task is as dead as a cancelled lineage.
-        dependenciesDead: task.dependencies.some(dependency => [undefined, 'cancelled'].includes(board.graph.effective(dependency)?.status)),
+        // The scheduler's `unschedulable`: an edge that names no task (`danglingReference`) is as dead as a cancelled lineage.
+        dependenciesDead: board.graph.danglingReference(task) !== undefined || task.dependencies.some(dependency => board.graph.effective(dependency)?.status === 'cancelled'),
         ...(task.reviewOf === undefined ? {} : { reviewOf: task.reviewOf }),
         // S4r-D4: `reviewSourceLive` is the SAME predicate the scheduler uses. A
         // review task is live exactly while its source is submitted (`capable`);
