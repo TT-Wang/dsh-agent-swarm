@@ -2,8 +2,9 @@
  * One durable field records that the owner session admitted an owner-addressed
  * delivery: `Delivery.consumedAt`. Its one writer is `Notices.recordConsumption`,
  * driven by the host's admitted `user/message`, for an owner notice and an owner
- * question alike. The owner-reply guard hears the same message and only reads
- * the field; the notice ledger reads it as the delivery's own field.
+ * question alike. The one observer of that message is the owner-reply guard's host
+ * subscription: it hands the admission to the writer, then books the turn from
+ * the stored field. The notice ledger reads it as the delivery's own field.
  *
  * A store an earlier build wrote recorded a notice's consumption on its notice
  * envelope (`notice.consumedAt`, with `consumptionSource`). Opening it moves that
@@ -21,11 +22,13 @@ import { OwnerReplyGuard } from '../lib/owner-reply.js'
 import { noticeLedger } from '../lib/arena.js'
 import { FakeClock, FakeWorkers, SwarmRuntime, makeRuntime } from './faults/harness.mjs'
 
-/** A started runtime whose adapter carries one host context, as production's does: the notices subscribe to it at start. */
+/** A runtime wired to one host context as the plugin wires it (src/index.ts): the owner-reply guard hears the context, then the runtime starts. */
 async function hosted(t) {
   const ctx = new Context(), clock = new FakeClock()
-  const workers = new FakeWorkers({ ctx, async prepareWorkspace(mission, memberId) { return join(mission.workspace, memberId) } })
+  const workers = new FakeWorkers({ async prepareWorkspace(mission, memberId) { return join(mission.workspace, memberId) } })
   const { dir, runtime, budget } = await makeRuntime(t, { workers, clock, config: { maxTasksPerMember: 100 } })
+  const guard = new OwnerReplyGuard(ctx, runtime, { maxNudges: 2 })
+  t.after(() => guard.dispose())
   await runtime.start()
   const owner = { sessionId: 'consumption-owner' }
   const mission = runtime.create(owner, { title: 'Consumption', objective: 'Record what the owner admitted', workspace: dir, scope: ['src/'], acceptance: ['works'], budget }, { grantRoot: dir, source: 'session' })
@@ -34,7 +37,8 @@ async function hosted(t) {
   await runtime.settle(mission.id)
   const row = id => runtime.store.get('deliveries', id)
   const latest = predicate => runtime.store.list('deliveries', mission.id).filter(predicate).at(-1)
-  /** The host admits the delivery into `sessionId`'s model context: one session event every subscriber hears. */
+  const missing = () => runtime.store.events(mission.id, 500).filter(event => event.type === 'owner/reply-missing')
+  /** The host admits the delivery into `sessionId`'s model context: one session event, heard by its one observer. */
   const admit = (sessionId, deliveryId) => ctx.emit('session/event', { header: { id: sessionId } }, { type: 'user/message', data: { source: { kind: 'swarm', deliveryId } } })
   const endTurn = () => ctx.emit('session/event', { header: { id: owner.sessionId } }, { type: 'turn/end', data: { reason: { kind: 'completed' } } })
   const notice = async content => {
@@ -42,18 +46,19 @@ async function hosted(t) {
     await runtime.notices.flushOutbox(mission.id)
     return latest(delivery => delivery.notice?.dedupKey === content)
   }
-  const question = async content => {
-    runtime.message({ sessionId: member.sessionId }, mission.id, { to: 'owner', kind: 'question', content })
-    await runtime.notices.flushOutbox(mission.id)
-    return latest(delivery => delivery.replyExpected === true && delivery.to === 'owner')
+  /** A member's message to the owner; flushed unless the test holds the transport. */
+  const toOwner = async (kind, content, { flush = true } = {}) => {
+    runtime.message({ sessionId: member.sessionId }, mission.id, { to: 'owner', kind, content })
+    if (flush) await runtime.notices.flushOutbox(mission.id)
+    return latest(delivery => delivery.from === member.id && delivery.to === 'owner' && delivery.kind === kind)
   }
-  return { ctx, clock, runtime, owner, mission, member, row, latest, admit, endTurn, notice, question }
+  return { ctx, clock, runtime, owner, mission, member, row, latest, missing, admit, endTurn, notice, toOwner }
 }
 
 test('the owner session\'s admission records consumption on the delivery itself, for a notice and a question alike, once and on the runtime clock', async t => {
   const f = await hosted(t)
   const notice = await f.notice('consumption probe')
-  const question = await f.question('Which API version?')
+  const question = await f.toOwner('question', 'Which API version?')
   f.runtime.message(f.owner, f.mission.id, { to: f.member.id, kind: 'question', content: 'Which branch?' })
   const toMember = f.latest(delivery => delivery.to === f.member.id && delivery.kind === 'question')
   assert.ok(notice.deliveredAt !== undefined && question.deliveredAt !== undefined && toMember !== undefined)
@@ -80,28 +85,38 @@ test('the owner session\'s admission records consumption on the delivery itself,
   assert.equal(f.runtime.observe(f.owner, f.mission.id, { detail: 'full' }).noticeLedger.find(entry => entry.deliveryId === notice.id).consumedAt, consumedAt, 'the ledger reads the delivery\'s field')
 })
 
-test('the owner-reply guard reads consumption and never writes it: its turn books the admitted question, and its miss record reads the one field', async t => {
+test('one observer records the admitted question as consumed, then books the turn from the stored field: a question the transport has not acknowledged is booked, and its miss states the admission instant', async t => {
   const f = await hosted(t)
-  const guard = new OwnerReplyGuard(f.ctx, f.runtime, { maxNudges: 2 })
-  t.after(() => guard.dispose())
-  const question = await f.question('Which API version?')
+  // The transport is held, so the question has no delivery time: only its recorded consumption can book it.
+  f.runtime.notices.pumpOutbox = () => {}
+  const question = await f.toOwner('question', 'Which API version?', { flush: false })
+  assert.equal(question.deliveredAt, undefined)
   f.clock.advance(1_000)
   f.admit(f.owner.sessionId, question.id)
   const consumedAt = f.clock.now()
   f.clock.advance(1_000)
   f.endTurn()
-  const missing = f.runtime.store.events(f.mission.id, 500).filter(event => event.type === 'owner/reply-missing')
-  assert.deepEqual(missing.map(event => [event.data.deliveryId, event.data.consumedAt]), [[question.id, consumedAt]], 'the miss records the consumption the notices wrote')
-  // A guard that hears the admission while the notices do not records no consumption of its own: it still books the
-  // question the message carries, and its miss record states what the one field holds.
-  const solo = new OwnerReplyGuard(new Context(), f.runtime, { maxNudges: 2 })
-  t.after(() => solo.dispose())
-  const second = await f.question('And the schema version?')
-  solo.observe(f.owner.sessionId, 'user/message', { source: { kind: 'swarm', deliveryId: second.id } })
-  solo.observe(f.owner.sessionId, 'turn/end', { reason: { kind: 'completed' } })
-  assert.equal(f.row(second.id).consumedAt, undefined, 'the guard is no writer of consumption')
-  const booked = f.runtime.store.events(f.mission.id, 500).filter(event => event.type === 'owner/reply-missing' && event.data.deliveryId === second.id)
-  assert.deepEqual(booked.map(event => event.data.consumedAt), [null], 'the admitted question is booked, and its miss states no consumption the store does not hold')
+  assert.equal(f.row(question.id).consumedAt, consumedAt)
+  assert.deepEqual(f.missing().map(event => [event.data.deliveryId, event.data.deliveredAt, event.data.consumedAt]), [[question.id, null, consumedAt]],
+    'the turn booked the question its own admission carried, and the miss records the consumption the store holds')
+})
+
+test('the observer is best-effort: a consumption write that fails never breaks the host\'s emission, and a later admission records it', async t => {
+  const f = await hosted(t)
+  const notice = await f.notice('consumption probe')
+  const put = f.runtime.store.put.bind(f.runtime.store)
+  let refused = 0
+  f.runtime.store.put = (table, row) => {
+    if (table === 'deliveries' && row.consumedAt !== undefined) { refused += 1; throw new Error('injected consumption write failure') }
+    return put(table, row)
+  }
+  f.clock.advance(1_000)
+  try { assert.doesNotThrow(() => f.admit(f.owner.sessionId, notice.id), 'the host\'s session event is never broken by its observer') }
+  finally { f.runtime.store.put = put }
+  assert.deepEqual([refused, f.row(notice.id).consumedAt], [1, undefined], 'the failed write recorded nothing')
+  f.clock.advance(1_000)
+  f.admit(f.owner.sessionId, notice.id)
+  assert.equal(f.row(notice.id).consumedAt, f.clock.now(), 'the next admission of the same delivery records it')
 })
 
 // Rows as a v4 build wrote them: a consumed notice carries its consumption on the notice envelope, beside the signal that

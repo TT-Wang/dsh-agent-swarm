@@ -23,7 +23,8 @@
  *    cause — the absence net (absence of a durable transition + elapsed clock,
  *    no subject beyond the mission) and the retained attempt-silence escalation
  *    (`attemptSilenceBoundMs`, default 600,000 ms).
- * 8. CONSUMPTION AS A FACT: recorded from the host's claimed signal with a
+ * 8. CONSUMPTION AS A FACT: recorded from the host's admitted message, which
+ *    its one observer (the owner-reply guard) hands to the notices, with a
  *    compare-and-swap; delivered and consumed stay separate facts and the
  *    `claimedAt` placeholder is gone from the ledger and from the durable row.
  *
@@ -38,6 +39,7 @@ import { Context } from '@deepseek-ai/cordis'
 import ts from 'typescript'
 import { SwarmRuntime } from '../lib/runtime.js'
 import { NOTICE_TEMPLATES, noticeTemplateKey } from '../lib/notices.js'
+import { OwnerReplyGuard } from '../lib/owner-reply.js'
 import { tempDirectory } from './temp-root.mjs'
 import { FakeClock, FakeWorkers, NO_GRANTS } from './faults/harness.mjs'
 import { completionError } from '../lib/board.js'
@@ -56,13 +58,12 @@ async function eventually(fn, message, timeoutMs = 5000) {
   }
 }
 
-/** Always idle, no host checks; `ctx` is the host context the notices subscribe to for consumption. */
-const newWorkers = ctx => new FakeWorkers({ ctx, autoIdle: true, checks: [], artifact: { commit: 'c', baseCommit: 'b', workspace: '/isolated', changedPaths: [] } })
+/** Always idle, no host checks. */
+const newWorkers = () => new FakeWorkers({ autoIdle: true, checks: [], artifact: { commit: 'c', baseCommit: 'b', workspace: '/isolated', changedPaths: [] } })
 
 async function fixture(t, config = {}) {
   const dir = await tempDirectory('swarm-r17-notices-')
-  const ctx = new Context()
-  const runtime = new SwarmRuntime({ statePath: join(dir, 'db.sqlite'), leaseMs: 60000, tickMs: 25, maxMessageChars: 16000, maxEvents: 500, maxTasksPerMember: 9, grants: NO_GRANTS, ...config }, newWorkers(ctx))
+  const runtime = new SwarmRuntime({ statePath: join(dir, 'db.sqlite'), leaseMs: 60000, tickMs: 25, maxMessageChars: 16000, maxEvents: 500, maxTasksPerMember: 9, grants: NO_GRANTS, ...config }, newWorkers())
   t.after(async () => { await runtime.dispose(); await rm(dir, { recursive: true, force: true }) })
   await runtime.start()
   const owner = { sessionId: 'r17-notices-owner' }
@@ -74,7 +75,7 @@ async function fixture(t, config = {}) {
   const propose = (title, input = {}) => runtime.propose(owner, mission.id, { outputs: [], workstreamId: stream.id, title, objective: title, kind: 'implementation', scope: ['src/'], acceptance: ['works'], checks: ['test -d .'], ...input })
   const ownerNotices = () => runtime.store.list('deliveries', mission.id).filter(delivery => delivery.to === 'owner')
   const emit = (content, subjects, options = {}) => runtime.commit(mission.id, () => runtime.notices.notify(mission.id, content, subjects, options))
-  return { dir, ctx, runtime, owner, mission, stream, addMember, propose, ownerNotices, emit }
+  return { dir, runtime, owner, mission, stream, addMember, propose, ownerNotices, emit }
 }
 
 test('R17-G3: repetition is keyed on the fact — same fact once, unrelated board change is not a re-arm, changed fact is new', async t => {
@@ -213,19 +214,23 @@ test('R17-G8: consumption is recorded from the owner session\'s admission with a
 
 test('R17-G8: the admitted owner message records consumption after inbox claim', async t => {
   const f = await fixture(t)
+  // The host context as the plugin wires it: the owner-reply guard is the one observer of an admitted message.
+  const ctx = new Context()
+  const guard = new OwnerReplyGuard(ctx, f.runtime, { maxNudges: 2 })
+  t.after(() => guard.dispose())
   f.emit('host signal probe', [`mission:${f.mission.id}`], { trigger: 'test/host-signal', reason: 'probe' })
   const notice = f.ownerNotices().find(delivery => delivery.notice.dedupKey.startsWith('test/host-signal:'))
   assert.ok(notice)
   await eventually(() => f.runtime.store.get('deliveries', notice.id).deliveredAt !== undefined ? true : undefined, 'the outbox delivers the notice')
   const message = { source: { kind: 'swarm', form: 'relay', missionId: f.mission.id, senderMemberId: 'runtime', deliveryId: notice.id, deliveryKind: 'control' } }
-  f.ctx.emit('agent/inbox/claimed', { message, turn: 1 })
+  ctx.emit('agent/inbox/claimed', { message, turn: 1 })
   assert.equal(f.runtime.store.get('deliveries', notice.id).consumedAt, undefined, 'claim can still be rejected before model admission')
-  f.ctx.emit('session/event', { header: { id: f.owner.sessionId } }, { type: 'user/message', data: message })
+  ctx.emit('session/event', { header: { id: f.owner.sessionId } }, { type: 'user/message', data: message })
   const row = f.runtime.store.get('deliveries', notice.id)
   assert.ok(Number.isSafeInteger(row.consumedAt), 'the host signal recorded consumption')
   // A replayed signal cannot move it (compare-and-swap).
   const recorded = row.consumedAt
-  f.ctx.emit('session/event', { header: { id: f.owner.sessionId } }, { type: 'user/message', data: message })
+  ctx.emit('session/event', { header: { id: f.owner.sessionId } }, { type: 'user/message', data: message })
   assert.equal(f.runtime.store.get('deliveries', notice.id).consumedAt, recorded)
 })
 

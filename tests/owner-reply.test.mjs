@@ -28,12 +28,13 @@ const fakeContext = () => ({ on: () => () => {}, agents: { get: () => undefined 
 
 async function fixture(t, config = {}, host) {
   const { dir: directory, runtime, workers, budget } = await makeRuntime(t, {
-    workers: new FakeWorkers({ ctx: host, async prepareWorkspace(mission, memberId) { return join(mission.workspace, memberId) } }),
+    workers: new FakeWorkers({ async prepareWorkspace(mission, memberId) { return join(mission.workspace, memberId) } }),
     config: { tickMs: 60000, maxMessageChars: 10000, maxEvents: 500, maxTasksPerMember: 100, checkTimeoutMs: undefined, ...config },
     budget: { maxTokens: 100000, maxSteps: 1000, maxWorkers: 4, maxDurationMs: 3600000, maxTasks: 100 },
   })
-  // A hosted runtime subscribes its notices to the host context at start, as the plugin's does.
-  if (host !== undefined) await runtime.start()
+  // Hosted as the plugin builds it (src/index.ts): the guard hears the host context, then the runtime starts.
+  const guard = host === undefined ? undefined : new OwnerReplyGuard(host.ctx, runtime, { maxNudges: host.maxNudges })
+  if (guard !== undefined) { t.after(() => guard.dispose()); await runtime.start() }
   const owner = { sessionId: 'reply-owner' }
   const mission = runtime.create(owner, { title: 'Reply protocol', objective: 'Answer questions', workspace: directory,
     scope: ['src/'], acceptance: ['works'], budget: { ...budget } }, { grantRoot: directory, source: 'session' })
@@ -52,21 +53,19 @@ async function fixture(t, config = {}, host) {
     assert.equal(delivery.deliveredAt === undefined, false, 'the question is delivered, so it has a delivery time')
     return delivery
   }
-  return { directory, runtime, workers, owner, mission, member, asker, events, deliveries, ask }
+  return { directory, runtime, workers, owner, mission, member, asker, events, deliveries, ask, guard }
 }
 
 /**
- * The production wiring of the owner session's events: one host context, which
- * the notices subscribe to at start (they record that the owner consumed a
- * delivery) and the guard listens on (it books and ends the turn).
+ * The production wiring of the owner session's events: one host context, whose
+ * one observer is the guard. An admitted swarm delivery is recorded consumed
+ * (`Notices.recordConsumption`), then the turn is booked; a turn end reports it.
  */
 async function hosted(t, config = {}, maxNudges = 2) {
-  const host = new Context()
-  const f = await fixture(t, config, host)
-  const guard = new OwnerReplyGuard(host, f.runtime, { maxNudges })
-  t.after(() => guard.dispose())
-  const event = (type, data) => host.emit('session/event', { header: { id: f.owner.sessionId } }, { type, data })
-  return { ...f, guard, admit: data => event('user/message', data), endTurn: () => event('turn/end', { reason: { kind: 'completed' } }) }
+  const ctx = new Context()
+  const f = await fixture(t, config, { ctx, maxNudges })
+  const event = (type, data) => ctx.emit('session/event', { header: { id: f.owner.sessionId } }, { type, data })
+  return { ...f, admit: data => event('user/message', data), endTurn: () => event('turn/end', { reason: { kind: 'completed' } }) }
 }
 
 test('L0/L1: a question stays open until its recipient binds an answer, once', async t => {
@@ -302,18 +301,21 @@ test('L2/L3: a stopped asker does not hide the open receipt the owner still owes
 
 
 test('owner receipt books actual consumption before transport acknowledgement and survives context messages', async t => {
-  const f = await hosted(t, {}, 1)
+  const clock = new FakeClock()
+  const f = await hosted(t, { now: clock.now }, 1)
   f.runtime.notices.pumpOutbox = () => {}
   f.runtime.message(f.asker, f.mission.id, { to: 'owner', kind: 'question', content: 'Which version?' })
   const question = f.deliveries().find(row => row.replyExpected)
   assert.equal(question.deliveredAt, undefined)
+  clock.advance(1_000)
   f.admit({ source: { kind: 'swarm', deliveryId: question.id } })
+  const consumedAt = clock.now()
+  clock.advance(1_000)
   f.admit({ source: { kind: 'plugin', plugin: '@deepseek-ai/dsh-system-prompt' } })
   f.endTurn()
-  assert.equal(f.events('owner/reply-missing').length, 1)
-  assert.equal(f.events('owner/reply-missing')[0].data.deliveredAt, null)
-  assert.ok(f.events('owner/reply-missing')[0].data.consumedAt)
-  assert.ok(f.runtime.store.get('deliveries', question.id).consumedAt)
+  assert.deepEqual(f.events('owner/reply-missing').map(event => [event.data.deliveryId, event.data.deliveredAt, event.data.consumedAt]), [[question.id, null, consumedAt]],
+    'the admission recorded consumption before the turn booked it, and a later context message kept the booking')
+  assert.equal(f.runtime.store.get('deliveries', question.id).consumedAt, consumedAt)
   assert.equal(f.runtime.store.get('deliveries', question.id).deliveredAt, undefined, 'consumption never forges a transport acknowledgement')
 })
 

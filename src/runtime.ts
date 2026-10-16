@@ -375,9 +375,6 @@ export class SwarmRuntime implements Kernel {
    * what the host was authorized to do in this process.
    */
   async start(): Promise<void> {
-    // R17-G8: subscribe to the host's claimed signal so real consumption is
-    // recorded from it (one CAS write per delivery), never inferred.
-    this.notices.attach(this.workers)
     const { grants, unresolved } = this.config.grants
     this.store.transaction(() => {
       for (const grant of grants) this.store.event('swarm/install', 'workspace/grant-loaded', 'config', { path: grant.path, ...(grant.note === undefined ? {} : { note: grant.note }), ...(grant.expiresAt === undefined ? {} : { expiresAt: grant.expiresAt }) })
@@ -4082,8 +4079,6 @@ export class SwarmRuntime implements Kernel {
       } finally { if (bound !== undefined) clearTimeout(bound) }
     }
     finally {
-      // R17-G8: and the claimed-signal subscription goes with it.
-      this.notices.dispose()
       this.observeCursors.clear(); this.ownerObserveCursors.clear()
       this.closed = true; this.listeners.clear(); this.store.close()
     }

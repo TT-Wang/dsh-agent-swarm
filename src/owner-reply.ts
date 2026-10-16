@@ -47,6 +47,9 @@ function ownerReplyNudge(missionId: string, delivery: Delivery, booking: Booking
  * The guard never edits the owner's answer and never sends on its behalf: it
  * makes the missing receipt visible and executable, which is the invariant the
  * board already keeps for task state.
+ *
+ * Its host subscription is also the one observer of an admitted swarm delivery
+ * (`observe`), so consumption has one listener, one order and one failure contract.
  */
 export class OwnerReplyGuard {
   private readonly bookings = new Map<string, Map<string, Booking>>()
@@ -57,7 +60,7 @@ export class OwnerReplyGuard {
     this.removal = ctx.on('session/event', (session, event) => {
       if (this.closed) return
       try { this.observe(String(session.header.id), event.type, event.data) }
-      catch { /* An observer must never break a turn; the next turn re-derives the miss. */ }
+      catch { /* Best-effort observer: it must never break a turn. The next turn re-derives the miss, and a replayed admission records consumption. */ }
     })
   }
 
@@ -71,11 +74,18 @@ export class OwnerReplyGuard {
    * Drive the guard from one session event. Public on purpose: the cordis
    * listener above is the only production caller, and a test (or a host that
    * carries session events another way) can feed the same two events directly.
+   * An admitted message that carries a swarm delivery is first recorded
+   * consumed (`Notices.recordConsumption`, the one writer of `consumedAt`, which
+   * decides whether this session consumes it); only then does the turn book its
+   * questions, from the stored field.
    */
   observe(sessionId: string, type: string, data?: unknown): void {
     if (this.closed) return
-    if (type === 'user/message') this.startTurn(sessionId, data)
-    else if (type === 'turn/end') {
+    if (type === 'user/message') {
+      const source = (data as { source?: { kind?: unknown; deliveryId?: unknown } } | undefined)?.source
+      if (source?.kind === 'swarm' && typeof source.deliveryId === 'string') this.rt.notices.recordConsumption(sessionId, source.deliveryId)
+      this.startTurn(sessionId)
+    } else if (type === 'turn/end') {
       const reason = (data as { reason?: { kind?: string } } | undefined)?.reason?.kind
       if (reason === 'completed') this.endTurn(sessionId)
       else this.bookings.delete(sessionId)
@@ -92,23 +102,19 @@ export class OwnerReplyGuard {
    * started and still open. A turn with no such question books nothing, so an
    * ordinary owner turn is never nudged. The turn starts when its message is
    * observed, on the runtime clock that stamps `deliveredAt`, never on the
-   * host's message `createdAt`: two clocks cannot order one question. The
-   * question this message carries is seen now; recording that the owner
-   * consumed it is the notices' own subscription to the same message
-   * (`Notices.recordConsumption`, the one writer of `consumedAt`), which this
-   * guard only reads.
+   * host's message `createdAt`: two clocks cannot order one question. A
+   * question is seen once the owner consumed it or the transport delivered it;
+   * the question this message carries was recorded consumed just before (`observe`).
    */
-  private startTurn(sessionId: string, data?: unknown): void {
+  private startTurn(sessionId: string): void {
     const at = this.rt.now()
-    const source = (data as { source?: { kind?: string; deliveryId?: string } } | undefined)?.source
-    const consumedId = source?.kind === 'swarm' ? source.deliveryId : undefined
     // Several admitted messages (including the generated context snapshot) can
     // arrive in one step. Merge bookings until turn/end instead of replacing
     // the question booked by the preceding relay.
     const booked = this.bookings.get(sessionId) ?? new Map<string, Booking>()
     for (const mission of this.ownerMissions(sessionId)) {
       for (const delivery of openAsks(this.rt.store.list('deliveries', mission.id), 'owner')) {
-        const seenAt = delivery.id === consumedId ? at : delivery.consumedAt ?? delivery.deliveredAt
+        const seenAt = delivery.consumedAt ?? delivery.deliveredAt
         if (seenAt === undefined || seenAt > at) continue
         booked.set(delivery.id, {
           missionId: mission.id, from: delivery.from, content: delivery.content, deliveredAt: delivery.deliveredAt,

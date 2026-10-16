@@ -6,14 +6,13 @@
  */
 import { createHash } from 'node:crypto'
 import { covered, hasNotice } from './arena.ts'
-import { hostContextOf } from './projection.ts'
 import { formatDiagnostic, missingReviewDiagnostic } from './admission.ts'
 import { guardTerminal, guardTerminalKey, type GuardChainId, type GuardTerminal, type GuardTerminalContext, type RefusalRegistry } from './refusals.ts'
 import { TERMINAL_STATES, holdsAttempt, missionSubject, stopPending, taskSubject, terminal } from './task-graph.ts'
 import { WriterBusyError, id, type SwarmStore } from './store.ts'
 import { awaited, type Kernel, type PassState, type SchedulingPass } from './kernel.ts'
 import { completionError, dependentsOf, eligible, interpret, isolationIssues, newestReviewBlock, noticeSubjectsFor, overdueStop, reviewNeed, reviewPathBlocker, reviewPathStalled, stallRoots, startBlocker, unreviewedSources, waitsLegitimately, type Board, type Interpretation } from './board.ts'
-import type { Delivery, Escalation, Member, Mission, NoticeClass, Task, WorkerAdapter } from './types.ts'
+import type { Delivery, Escalation, Member, Mission, NoticeClass, Task } from './types.ts'
 
 /**
  * R15-A1: a notice without a subject is unattributable, so it is refused rather
@@ -443,8 +442,6 @@ export class Notices {
   /** Followups share the existing absence sweep and owner wake budget. */
   obligationFollowupMs = DEFAULT_ABSENCE_BOUND_MS
   maxObligationFollowups = 2
-  /** R17-G8: the host claimed-signal subscription, disposed with the runtime. */
-  private unsubscribeClaimed?: () => void
   /**
    * R17-G5: reentrancy guard for transition-driven generation. The classifier
    * itself commits (its delivery rows), and those commits must not re-enter it.
@@ -638,39 +635,17 @@ export class Notices {
   }
 
   /**
-   * Record admitted context, after pre-step filtering. Inbox claim alone is
-   * insufficient: a stopped mission's queued message can be claimed and then
-   * discarded without ever reaching the owner's model context.
-   */
-  attach(workers: WorkerAdapter): void {
-    if (this.unsubscribeClaimed !== undefined) return
-    const ctx = hostContextOf(workers) as { on?: (name: string, handler: (session: { header: { id: string } }, event: { type: string; data: unknown }) => void) => () => void } | undefined
-    if (ctx === undefined || typeof ctx.on !== 'function') return
-    try {
-      this.unsubscribeClaimed = ctx.on('session/event', (session, event) => {
-        if (event.type !== 'user/message') return
-        const source = (event.data as { source?: { kind?: unknown; deliveryId?: unknown } } | undefined)?.source
-        if (source === undefined || source.kind !== 'swarm' || typeof source.deliveryId !== 'string') return
-        this.recordConsumption(String(session.header.id), source.deliveryId)
-      })
-    } catch { this.unsubscribeClaimed = undefined }
-  }
-
-  /** R17-G8: release the host claimed-signal subscription. Idempotent. */
-  dispose(): void {
-    try { this.unsubscribeClaimed?.() } catch { /* the host fiber may already be gone */ }
-    this.unsubscribeClaimed = undefined
-  }
-
-  /**
    * R17-G8: record that the owner session admitted an owner-addressed delivery,
-   * a notice or a question alike, from the host's admitted message. The one
-   * writer of `Delivery.consumedAt`: a compare-and-swap inside the mission
-   * transaction on the runtime clock, so a delivery is consumed once and a
-   * second signal (a replay, a second pump) cannot move the timestamp. A
-   * message admitted into another session, or a delivery addressed to a
-   * member, records nothing. Delivered, consumed and resolved stay three
-   * separate facts.
+   * a notice or a question alike, from the host's admitted message after
+   * pre-step filtering, which its one observer hands here
+   * (`OwnerReplyGuard.observe`). An inbox claim is not consumption: a stopped
+   * mission's queued message can be claimed and then discarded before it
+   * reaches the owner's model context. The one writer of `Delivery.consumedAt`:
+   * a compare-and-swap inside the mission transaction on the runtime clock, so
+   * a delivery is consumed once and a second signal (a replay, a second pump)
+   * cannot move the timestamp. A message admitted into another session, or a
+   * delivery addressed to a member, records nothing. Delivered, consumed and
+   * resolved stay three separate facts.
    */
   recordConsumption(sessionId: string, deliveryId: string): boolean {
     const delivery = this.k.store.get('deliveries', deliveryId)

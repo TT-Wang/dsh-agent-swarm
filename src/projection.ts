@@ -31,8 +31,7 @@
  * plugin appends NOTHING to a session log, and the one derivation is the read
  * face whether or not a projection registry is mounted.
  */
-import type { Context } from '@deepseek-ai/cordis'
-import type { Delivery, Member, MemberPhase, MemberStatus, WorkerAdapter } from './types.ts'
+import type { Delivery, Member, MemberPhase, MemberStatus } from './types.ts'
 
 /** Current transport trouble, derived from pending delivery rows rather than another health state machine. */
 export function memberDeliveryHealth(deliveries: readonly Delivery[]): Map<string, { pending: number; failed: number; since: number; reason: string }> {
@@ -84,12 +83,4 @@ export function deriveMemberStatus(phase: MemberPhase, ownsLiveAttempt: boolean)
   if (phase === 'stopped') return 'stopped'
   if (phase === 'parked') return 'waiting'
   return ownsLiveAttempt ? 'working' : 'idle'
-}
-
-/** The host context the worker adapter carries, or undefined when it carries none. */
-export function hostContextOf(workers: WorkerAdapter): Context | undefined {
-  const candidate = (workers as unknown as { ctx?: unknown }).ctx
-  if (candidate === null || typeof candidate !== 'object') return undefined
-  const ctx = candidate as Context
-  return typeof ctx.get === 'function' ? ctx : undefined
 }
