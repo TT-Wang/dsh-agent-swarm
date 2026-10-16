@@ -146,6 +146,12 @@ export function taskGraphIndex(tasks: readonly Task[]) {
   }
   const dependencyMet = (id: string): boolean => effective(id)?.status === 'accepted'
   /**
+   * Every prerequisite of `task` is met (`dependencyMet`). A worker tool's
+   * authority over its attempt, the worker step guard, a pending task's
+   * legitimate wait and a cancel's stranded dependents all ask it here.
+   */
+  const dependenciesMet = (task: Pick<Task, 'dependencies'>): boolean => task.dependencies.every(dependencyMet)
+  /**
    * The first edge of `task` (`taskEdges`) that names no task of the mission.
    * No work can ever meet such an edge, so the board's readers share this one
    * rule: readiness refuses the task naming it, `unschedulable` holds the
@@ -219,7 +225,7 @@ export function taskGraphIndex(tasks: readonly Task[]) {
       return identities(id).has(sourceId) || covers(endpoint, sourceId, seen)
     })
   }
-  return { byId, lineage, effective, identities, dependencyMet, danglingReference, effectiveDependencies, unfinishedDependencies,
+  return { byId, lineage, effective, identities, dependencyMet, dependenciesMet, danglingReference, effectiveDependencies, unfinishedDependencies,
     reviewSource, covers, replacementDescendants, liveReplacement, replacedLineage, criteriaOf, checklist }
 }
 

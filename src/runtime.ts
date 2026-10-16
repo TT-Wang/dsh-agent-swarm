@@ -771,8 +771,7 @@ export class SwarmRuntime implements Kernel {
     const { member } = this.active(actor, missionId)
     const task = this.task(missionId, taskId)
     if (!member || task.status !== 'running' || !task.attempt || task.attempt.id !== attemptId || task.attempt.ownerId !== member.id || task.attempt.leaseUntil < this.now()) throw new PolicyError('task_attempt_stale', 'authorization_error', 'Stale or unauthorized task attempt; stop work and observe the current assignment')
-    const board = this.boardOf(missionId)
-    if (!task.dependencies.every(dep => board.graph.dependencyMet(dep))) throw new PolicyError('task_prerequisite_revoked', 'tool_error', 'A task prerequisite is no longer accepted; stop work')
+    if (!this.boardOf(missionId).graph.dependenciesMet(task)) throw new PolicyError('task_prerequisite_revoked', 'tool_error', 'A task prerequisite is no longer accepted; stop work')
     return { task, member }
   }
   /**
@@ -2317,7 +2316,7 @@ export class SwarmRuntime implements Kernel {
       for (const dependent of board.tasks) {
         if (dependent.id === task.id || dependent.status !== 'pending') continue
         const references = dependent.dependencies.some(dependency => board.graph.lineage(dependency).some(row => row.id === task.id))
-        if (references && dependent.dependencies.some(dependency => !board.graph.dependencyMet(dependency))) strandedDependents.push(dependent.id)
+        if (references && !board.graph.dependenciesMet(dependent)) strandedDependents.push(dependent.id)
       }
       this.store.event(missionId, 'task/cancelled', key, { taskId: task.id, reason: input.reason, previousStatus,
         ...(attempt === undefined ? {} : { attemptId: attempt.id, ownerId: attempt.ownerId }),
@@ -3514,7 +3513,7 @@ export class SwarmRuntime implements Kernel {
     const board = this.boardOf(member.missionId)
     const active = board.tasks.find(t => t.status === 'running' && t.attempt?.ownerId === memberId)
     // A sandbox Git refusal is diagnostic; reads, edits, and checks remain available.
-    if (active && !active.dependencies.every(dep => board.graph.dependencyMet(dep))) return 'A prerequisite was invalidated; stop work and inspect the challenge'
+    if (active && !board.graph.dependenciesMet(active)) return 'A prerequisite was invalidated; stop work and inspect the challenge'
     if (active?.reviewOf && board.graph.reviewSource(active)?.status !== 'submitted') return 'The reviewed source is no longer submitted; await a fresh review assignment'
     if (active?.attempt && active.attempt.leaseUntil < this.now()) return 'Task lease expired; await reassignment'
     if (!active && !tool.startsWith('swarm_')) return 'Claim an assigned task before executing workspace tools'

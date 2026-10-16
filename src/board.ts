@@ -688,7 +688,7 @@ export function waitsLegitimately(board: Board, task: Task): boolean {
     const source = board.graph.reviewSource(task)
     if (source !== undefined) return !TERMINAL_STATES.has(source.status) && reviewable(board, source)
     if (board.graph.unfinishedDependencies(task).length > 0) return true
-    if (!task.dependencies.every(dependency => board.graph.dependencyMet(dependency))) return false
+    if (!board.graph.dependenciesMet(task)) return false
     // A preparation failure the host will not retry is a block cause the owner
     // repairs (`blockCauses` owns that distinction). One carrying `retryAt` is the
     // host's own bounded back-off: a live wait until one tick past `retryAt`.
