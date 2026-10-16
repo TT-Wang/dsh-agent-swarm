@@ -1,4 +1,4 @@
-import type { Member, Snapshot, SwarmEvent, Task, WorkerActivity } from '../types.ts'
+import { providerQuiescent, type Member, type Snapshot, type SwarmEvent, type Task, type WorkerActivity } from '../types.ts'
 import { recentProgress, type ConnectionState } from './progress.ts'
 
 type LiveWorkState = 'observed' | 'quiet' | 'waiting' | 'idle' | 'stale' | 'paused' | 'stopped' | 'complete'
@@ -79,13 +79,13 @@ function currentActivity(member: Member, task: Task | undefined): WorkerActivity
   // Unscoped native operations can occur while a worker prepares to claim work.
   return activity
 }
-function restingState(snapshot: Snapshot, member: Member): { state: LiveWorkState; label: string } | undefined {
+function restingState(snapshot: Snapshot, member: Member, now: number): { state: LiveWorkState; label: string } | undefined {
   if (snapshot.mission.status === 'completed') return { state: 'complete', label: 'Collaboration completed' }
   if (snapshot.mission.status === 'stopped' || member.phase === 'stopped' || member.status === 'stopped') return { state: 'stopped', label: 'Stopped' }
   if (snapshot.mission.status === 'paused' || snapshot.mission.budgetPause) return { state: 'paused', label: 'Mission paused' }
   if (snapshot.mission.status === 'staged') return { state: 'waiting', label: 'Preparing collaboration' }
   if (snapshot.mission.status === 'blocked') return { state: 'waiting', label: 'Mission needs attention' }
-  if (member.providerOutage) return { state: 'waiting', label: 'Waiting for provider recovery' }
+  if (providerQuiescent(member, now)) return { state: 'waiting', label: 'Waiting for provider recovery' }
   if (member.phase === 'parked' || member.status === 'waiting') return { state: 'waiting', label: 'Waiting for work' }
   return undefined
 }
@@ -105,7 +105,7 @@ export function projectLiveWork(snapshot: Snapshot, options: LiveWorkOptions): L
   let lastObservedWorkingCount = 0
   const rows = snapshot.members.filter(member => member.missionId === snapshot.mission.id).map((member): LiveWorkRow => {
     const task = running.get(member.id)
-    const resting = restingState(snapshot, member)
+    const resting = restingState(snapshot, member, now)
     const activity = resting ? undefined : currentActivity(member, task)
     const referenceTime = connected ? now : observedAt ?? activity?.updatedAt ?? now
     const ageMs = activity ? Math.max(0, referenceTime - activity.updatedAt) : undefined

@@ -108,7 +108,7 @@ export const PROVIDER_OUTAGE_WINDOW_MS = 5 * 60_000
  * R11-01: the member's route is quiescent only inside the outage window of its
  * last classified outage: the window reading of `Member.providerOutage` (the
  * field states both of its readings). The start failure's classification,
- * start pacing and re-routing ask it.
+ * start pacing, re-routing and the live-work panel ask it.
  */
 export function providerQuiescent(member: Pick<Member, 'providerOutage'>, now: number): MemberProviderOutage | undefined {
   const outage = member.providerOutage
@@ -303,13 +303,13 @@ export interface Member {
    * R11-01: the last provider outage classified for this member, kept until a
    * start opens the member's session. It is read two ways:
    * - Present, it is an outage not yet proved recovered: the opening start
-   *   (`recordStarted`) records `provider/recovered` and deletes it, a report of
-   *   its class within 30 s of it writes no second `provider/outage` event
-   *   (`recordProviderOutage`), and the live-work panel shows the member as
-   *   waiting for provider recovery.
+   *   (`recordStarted`) records `provider/recovered` and deletes it, and a
+   *   report of its class within 30 s of it writes no second `provider/outage`
+   *   event (`recordProviderOutage`).
    * - Inside its window it is quiescence (`providerQuiescent`): a start failure
    *   is the outage, spending no recovery credit and not counted, starts are
-   *   paced to one probe per window, and re-routed work prefers other members.
+   *   paced to one probe per window, re-routed work prefers other members, and
+   *   the live-work panel shows the member as waiting for provider recovery.
    */
   providerOutage?: MemberProviderOutage
   /** S5c: consecutive `workers.start` failures and the last one's error, cleared by the next successful start; a restart continues the count. */
