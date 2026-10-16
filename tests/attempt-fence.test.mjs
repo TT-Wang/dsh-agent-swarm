@@ -79,6 +79,33 @@ test('a handoff fences its attempt: every marker goes and attempt/fenced precede
   assertFenced(f, task.id, attemptId, 'handoff', 'task/handoff-started')
 })
 
+test('a challenge that fences a dependent whose handoff stop is still in flight keeps that barrier, makes it invalidated, and the dependent stays blocked', async t => {
+  const f = await fixture(t)
+  const source = f.propose({ title: 'Accepted prerequisite' })
+  f.runtime.commit(f.mission.id, () => {
+    f.runtime.store.put('tasks', { ...taskOf(f.runtime, source.id), status: 'accepted', artifact: { ...f.workers.artifact }, evidenceIds: ['e-source'] })
+    f.runtime.store.put('evidence', { id: 'e-source', missionId: f.mission.id, taskId: source.id, workstreamId: f.stream.id, authorId: f.reviewer.id,
+      claim: 'the prerequisite holds', outcome: 'supported', status: 'verified', toolRunIds: [], supersedes: [], challenges: [], createdAt: f.clock.now() })
+  })
+  const { task, attemptId } = await f.claim({ title: 'Dependent', dependencies: [source.id] })
+  // The handoff's stop stays in flight until the test releases it.
+  let release
+  const stopping = new Promise(resolve => { release = resolve })
+  const stop = f.workers.stop.bind(f.workers)
+  f.workers.stop = async id => { await stopping; return await stop(id) }
+  f.runtime.handoff(f.actor(f.author), f.mission.id, { taskId: task.id, attemptId, summary: 'Passing the work on' })
+  const barrier = taskOf(f.runtime, task.id).resumeAfterStop
+  assert.deepEqual([barrier.reason, barrier.memberId, barrier.epoch], ['handoff', f.author.id, taskOf(f.runtime, task.id).epoch])
+  f.runtime.challenge(f.owner, f.mission.id, { evidenceId: 'e-source', reason: 'counterexample', toolRunIds: [] })
+  const challenged = taskOf(f.runtime, task.id)
+  assert.deepEqual([challenged.status, challenged.resumeAfterStop], ['blocked', { ...barrier, reason: 'invalidated' }], 'the barrier keeps its epoch, owner and start, and becomes invalidated')
+  release()
+  await f.runtime.settle(f.mission.id)
+  const settled = taskOf(f.runtime, task.id)
+  assert.ok(f.workers.stopped.includes(f.author.id), 'the barrier stopped the handle it owed')
+  assert.deepEqual([settled.resumeAfterStop, settled.status], [undefined, 'blocked'], 'the acknowledged stop leaves the invalidated work blocked instead of re-pending it')
+})
+
 test('an expired lease fences its attempt: every marker goes and attempt/fenced precedes task/lease-expired', async t => {
   const f = await fixture(t)
   const { task, attemptId } = await f.claim()
