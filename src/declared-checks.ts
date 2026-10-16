@@ -292,18 +292,32 @@ export class DeclaredChecks {
   }
 
   /**
-   * The one writer of an assignment delivery, at a claim and at a budget resume
-   * alike. Its worker reads the task as `memberTask` renders it, without the
-   * preparation record (this attempt's workspace was prepared), beside the
-   * facts the host runs its declared checks under (ENV), which `reproduce`
-   * reads back from this delivery at the verdict, and the caller's
-   * instructions. Returns the task as delivered.
+   * The one writer of an assignment delivery, at a claim and, through
+   * `redeliverAssignment`, at a budget resume. Its worker reads the task as
+   * `memberTask` renders it, without the preparation record (this attempt's
+   * workspace was prepared), beside the facts the host runs its declared
+   * checks under (ENV), which `reproduce` reads back from this delivery at the
+   * verdict, and the caller's instructions. Returns the task as delivered.
    */
   deliverAssignment(task: Task, instructions: string): Task {
     const { preparationFailure: _retried, ...assigned } = memberTask(this.k.boardOf(task.missionId), task)
     this.k.store.put('deliveries', { id: id('msg'), missionId: task.missionId, from: 'runtime', to: task.attempt!.ownerId, kind: 'assignment', taskId: task.id, attemptId: task.attempt!.id,
       content: JSON.stringify({ missionId: task.missionId, task: assigned, ...this.assignmentFields(), instructions }), createdAt: this.k.now() })
     return assigned
+  }
+
+  /**
+   * A budget resume hands the same attempt its assignment again. The task's
+   * assignment still unsent is superseded by it and settled first, so the
+   * worker is handed only the resume.
+   */
+  redeliverAssignment(task: Task, instructions: string): void {
+    for (const delivery of this.k.store.list('deliveries', task.missionId)) {
+      if (delivery.kind === 'assignment' && delivery.taskId === task.id && !delivery.deliveredAt) {
+        delivery.deliveredAt = this.k.now(); this.k.store.put('deliveries', delivery)
+      }
+    }
+    this.deliverAssignment(task, instructions)
   }
 
   /** ENV: the facts the host runs a task's declared checks under, as the fields an assignment delivery carries; none when the adapter reports no environment. */

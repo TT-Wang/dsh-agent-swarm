@@ -6,9 +6,9 @@
  *
  * `RuntimeGates` stands on the kernel and three seams below it, each called one
  * hop: the notices a warning and the budget terminal go through, the refusals a
- * budget block records and the declared checks, whose assignment delivery a
- * budget resume writes. Every caller reaches it as `runtime.gates`, so a test
- * that patches `runtime.gates.<method>` intercepts them all.
+ * budget block records and the declared checks, which hand a budget-resumed
+ * attempt its assignment again. Every caller reaches it as `runtime.gates`, so
+ * a test that patches `runtime.gates.<method>` intercepts them all.
  */
 import { createHash } from 'node:crypto'
 import { id } from './store.ts'
@@ -364,12 +364,7 @@ export class RuntimeGates {
         this.k.store.putTask(task)
         // The resumed attempt is what makes its owner `working`; the status is
         // derived from that on every read, so there is nothing to write here.
-        for (const delivery of this.k.store.list('deliveries', mission.id)) {
-          if (delivery.kind === 'assignment' && delivery.taskId === task.id && !delivery.deliveredAt) {
-            delivery.deliveredAt = this.k.now(); this.k.store.put('deliveries', delivery)
-          }
-        }
-        this.declaredChecks.deliverAssignment(task, 'Resume this same task and attempt after the primary agent adjusted the mission budget. The previous worker activity has fully stopped. Your previously recorded host tool-run IDs from this attempt remain valid. Inspect the saved workspace and evidence, continue unfinished work, and use this exact attemptId. Do not repeat completed effects or claim a new task.')
+        this.declaredChecks.redeliverAssignment(task, 'Resume this same task and attempt after the primary agent adjusted the mission budget. The previous worker activity has fully stopped. Your previously recorded host tool-run IDs from this attempt remain valid. Inspect the saved workspace and evidence, continue unfinished work, and use this exact attemptId. Do not repeat completed effects or claim a new task.')
         this.k.store.event(mission.id, 'task/budget-resumed', 'runtime', { taskId: task.id, attemptId: task.attempt.id, pauseId: pause.id })
       }
       delete mission.budgetPause
