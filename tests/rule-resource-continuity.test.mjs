@@ -236,3 +236,31 @@ test('a budget resume hands the worker only the resume: the assignment the pause
   assert.notEqual(settled.deliveredAt, undefined, 'the held assignment is settled, superseded by the resume')
   assert.deepEqual(f.workers.deliveries.filter(delivery => delivery.kind === 'assignment').map(delivery => delivery.id), [resumed.id], 'the worker is handed only the resume')
 })
+
+test('an owner\'s budget raise resumes a budget wait only when no dimension is still exhausted', async t => {
+  const clock = new FakeClock(), f = await setup({ clock, budget: { maxTokens: 40, maxSteps: 100 } })
+  t.after(f.cleanup)
+  await f.workers.callbacks.usage(f.author.id, 40)
+  const status = () => f.runtime.mission(f.mission.id).status
+  assert.deepEqual([status(), f.runtime.mission(f.mission.id).budgetPause !== undefined], ['blocked', true], 'the token ceiling paused the mission')
+  const raise = (allocation, reason) => f.runtime.updateBudget(f.owner, f.mission.id, { ...sharedBudget, maxSteps: 100, ...allocation }, reason)
+  raise({ maxTokens: 40 }, 'The same token ceiling')
+  assert.equal(status(), 'blocked', 'the tokens are still exhausted')
+  raise({ maxTokens: 100_000, deadlineAt: clock.now() }, 'More tokens, but the deadline is now')
+  assert.equal(status(), 'blocked', 'the duration is exhausted')
+  raise({ maxTokens: 100_000, deadlineAt: clock.now() + 600_000 }, 'More tokens and time')
+  assert.equal(status(), 'active', 'nothing is exhausted, so the budget wait resumes')
+})
+
+test('an admission refused on the budget names the exhausted dimension: the deadline before the tokens before the steps', async t => {
+  const clock = new FakeClock(), f = await setup({ clock })
+  t.after(f.cleanup)
+  const mission = f.runtime.mission(f.mission.id), { maxTokens, maxSteps } = mission.budget, now = clock.now()
+  const blocked = ({ usedTokens = maxTokens - 1, usedSteps = maxSteps - 1, deadline = now + 1 }) => f.runtime.refusals.budgetBlocked({ ...mission, usedTokens, usedSteps, deadline })
+  const duration = `mission duration budget exhausted (deadline ${new Date(now).toISOString()})`
+  const tokens = `token budget exhausted (${maxTokens}/${maxTokens})`, steps = `step budget exhausted (${maxSteps}/${maxSteps})`
+  assert.deepEqual([
+    blocked({}), blocked({ usedSteps: maxSteps }), blocked({ usedTokens: maxTokens }), blocked({ deadline: now }),
+    blocked({ usedTokens: maxTokens, usedSteps: maxSteps }), blocked({ usedTokens: maxTokens, usedSteps: maxSteps, deadline: now }),
+  ], [undefined, steps, tokens, duration, tokens, duration])
+})
