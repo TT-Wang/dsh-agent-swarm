@@ -20,7 +20,9 @@
  * variant (scripts/replay/f21-clocked.mjs), because its wedge ends at a real
  * timer; `paths` (scripts/replay/paths-clocked.mjs) reaches what none of them
  * does: stop fences, an isolation violation, the silence bounds, completion,
- * and preferred work whose readings show the interpretation's ask order.
+ * and preferred work whose readings show the interpretation's ask order;
+ * `dangling` (scripts/replay/dangling-clocked.mjs) is a corrupted store, a
+ * dependency and a review source that name no task.
  *
  * Usage: node scripts/replay/oracle.mjs [--only replay,F19] [--runs n] [--stress] [--write] [--out dir]
  *   --runs n   run the whole set n times; every run must produce the same logs
@@ -47,6 +49,7 @@ const SCENARIOS = [
   { id: 'F19', script: 'tests/faults/f19-no-silent-state.mjs' },
   { id: 'F21', script: 'scripts/replay/f21-clocked.mjs' },
   { id: 'paths', script: 'scripts/replay/paths-clocked.mjs' },
+  { id: 'dangling', script: 'scripts/replay/dangling-clocked.mjs' },
 ]
 
 const args = process.argv.slice(2)
