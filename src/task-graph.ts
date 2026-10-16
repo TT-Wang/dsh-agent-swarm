@@ -236,6 +236,18 @@ export const uncoveredCriteria = (criteria: readonly string[], covered: Readonly
 /** Reuse only while the indexed task rows remain unchanged within one synchronous read. */
 export type TaskGraphIndex = ReturnType<typeof taskGraphIndex>
 
+/**
+ * One projection per reader. A member reads this wherever the runtime hands it
+ * a task, in its assignment, in `swarm_observe` and in the result of its own
+ * propose, claim, submit and verify: `acceptance` is its derived checklist over
+ * the mission's criteria and the board's graph, which holds the text of every
+ * criterion it cites, never the bare ids. The owner reads the stored row at
+ * every exit and resolves its `covers` through the mission's criteria.
+ */
+export function memberTask(board: { readonly mission: Pick<Mission, 'acceptance'>; readonly graph: TaskGraphIndex }, { covers: _cited, ...task }: Task): Task {
+  return { ...task, acceptance: board.graph.checklist(task.id, board.mission.acceptance) }
+}
+
 /** A single delivery predicate; withdrawn integration rows carry history, not an obligation. */
 export function selectAcceptedDelivery(tasks: readonly Task[]): Task {
   const graph = taskGraphIndex(tasks)

@@ -26,7 +26,7 @@ import { validScope, scopeSubset } from './scope.ts'
 import { AdmissionError, assertDeclaredOutputs, assertScopeSelectors, citedCovers, dependencyAssumptions, formatDiagnostic, isNoopCheck, loadPackageScripts, normalizeReviewDependencies, normalizeScopeSelectors, normalizeTaskCeilings, reconcileTaskAdmission, requireHostChecks, taskCeilingBlock, taskGraphDefects, TaskGraphAdmissionError, type TaskGraphNode } from './admission.ts'
 import { canBorrowTask, canOwnReview, strandedReview } from './assignment.ts'
 import { executionClock, executionElapsed } from './resource-time.ts'
-import { TERMINAL_STATES, blockCauses, currentEvidenceIds, holdsAttempt, holdsOpenAttempt, missionSubject, openAttempt, pendingStopOwner, quiescencePending, selectAcceptedDelivery, stopPending, taskEdges, taskGraphIndex, taskSubject, terminal, uncoveredCriteria, type BlockCause, type HeldTask } from './task-graph.ts'
+import { TERMINAL_STATES, blockCauses, currentEvidenceIds, holdsAttempt, holdsOpenAttempt, memberTask, missionSubject, openAttempt, pendingStopOwner, quiescencePending, selectAcceptedDelivery, stopPending, taskEdges, taskGraphIndex, taskSubject, terminal, uncoveredCriteria, type BlockCause, type HeldTask } from './task-graph.ts'
 import { checkSyntaxDetail, declaredPlanChecks, orderedTasks, pairReviews, planAdvisories, validatePlan } from './plans.ts'
 import { OWNER_ONLY_TOOLS, type Actor, type AutoStart, BoardQuery, Budget, CheckAttribution, CreateMissionInput, CriticalPath, criterionId, Delivery, DraftPlan, Escalation, Evidence, EvidenceStatus, Member, Mission, nextWorkerName, ObserveQuery, MessageInput, PlanInput, Post, PostInput, PostKind, PROVIDER_OUTAGE_WINDOW_MS, ProposeTaskInput, ProviderOutage, providerQuiescent, PublishInput, RecoveryFallback, RequestStartInput, RuntimeConfig, Snapshot, Task, TaskAmendment, TaskRejection, TaskCeiling, ToolRun, UsageBuckets, UsageSnapshotSource, VerificationCleanupFailure, WorkerAdapter, WorkerActivity, Workstream } from './types.ts'
 import { requireArtifactChecks } from './artifact-policy.ts'
@@ -647,8 +647,6 @@ export class SwarmRuntime implements Kernel {
   readonly view: AdapterView = { startable: memberId => this.workers.isIdle(memberId), activity: memberId => this.workers.currentActivity(memberId) }
   /** One mission's board as the store holds it now: a decision reads it where it decides. */
   boardOf(missionId: string): Board { return readBoard(this.store, missionId, this.now, this.bounds, this.view) }
-  /** One projection per reader. A member reads this wherever the runtime hands it a task, in its assignment, in `swarm_observe` and in the result of its own propose, claim, submit and verify: `acceptance` is its derived checklist, which holds the text of every criterion it cites, never the bare ids. The owner reads the stored row at every exit and resolves its `covers` through the mission's criteria. */
-  private memberTask({ covers: _cited, ...task }: Task, mission = this.mission(task.missionId), graph = taskGraphIndex(this.store.list('tasks', task.missionId))): Task { return { ...task, acceptance: graph.checklist(task.id, mission.acceptance) } }
   participant(actor: Actor, missionId: string): { mission: Mission; member?: Member; key: string; owner: boolean } {
     const mission = this.mission(missionId)
     if (mission.ownerSessionId === actor.sessionId) return { mission, key: 'owner', owner: true }
@@ -1139,7 +1137,7 @@ export class SwarmRuntime implements Kernel {
     this.warnBudget(this.mission(missionId))
     this.notices.warnIntegrationGap(mission, task)
     this.kick(missionId)
-    return owner ? task : this.memberTask(task)
+    return owner ? task : memberTask(this.boardOf(missionId), task)
   }
 
   /**
@@ -1150,7 +1148,7 @@ export class SwarmRuntime implements Kernel {
    * under (ENV). Returns the task as delivered.
    */
   deliverAssignment(task: Task, mission: Mission, instructions = ASSIGNMENT_INSTRUCTIONS): Task {
-    const { preparationFailure: _retried, ...assigned } = this.memberTask(task, mission)
+    const { preparationFailure: _retried, ...assigned } = memberTask(this.boardOf(mission.id), task)
     this.store.put('deliveries', { id: id('msg'), missionId: mission.id, from: 'runtime', to: task.attempt!.ownerId, kind: 'assignment', taskId: task.id, attemptId: task.attempt!.id,
       content: JSON.stringify({ missionId: mission.id, task: assigned, ...this.declaredChecks.assignmentFields(), instructions }), createdAt: this.now() })
     return assigned
@@ -1315,7 +1313,7 @@ export class SwarmRuntime implements Kernel {
           ...(missingReview === undefined ? {} : { reviewPath: { missing: true, reason: missingReview } }) })
       })
       this.kick(missionId)
-      return this.memberTask(task)
+      return memberTask(this.boardOf(missionId), task)
     })
   }
   /**
@@ -1405,7 +1403,7 @@ export class SwarmRuntime implements Kernel {
           this.notices.notify(missionId, reason, this.notices.interpretation(missionId).subjectsOf([source, task]), { from: member.id, trigger: 'task/verification-deferred', reason })
         })
         this.kick(missionId)
-        return this.memberTask(task)
+        return memberTask(this.boardOf(missionId), task)
       }
       const runIds: string[] = []
       const released = new Set<string>()
@@ -1495,7 +1493,7 @@ export class SwarmRuntime implements Kernel {
       // A verdict closes a unit of work for both sessions: let the adapter trim history it no longer needs.
       for (const memberId of new Set([source.attempt?.ownerId, member.id])) if (memberId) this.workers.compactAtBoundary(memberId)
       this.kick(missionId)
-      return this.memberTask(task)
+      return memberTask(this.boardOf(missionId), task)
     })
   }
   /**
@@ -2852,7 +2850,7 @@ export class SwarmRuntime implements Kernel {
     const taskRef = (task: Task) => ({ id: task.id, title: task.title, kind: task.kind, status: task.status, ...(task.assigneeId ? { assigneeId: task.assigneeId } : {}), ...(task.assignmentMode ? { assignmentMode: task.assignmentMode } : {}), ...(task.attempt ? { attemptOwner: task.attempt.ownerId } : {}),
       ...(task.reviewOf ? { reviewOf: task.reviewOf } : {}), ...(task.dependencies.length ? { dependencies: task.dependencies } : {}), ...(task.replaces?.length ? { replaces: task.replaces } : {}), ...(task.artifact ? { artifact: task.artifact.commit } : {}), ...(task.reviewArtifact ? { reviewArtifact: task.reviewArtifact.commit } : {}),
       ...(task.recovery ? { recovery: task.recovery } : {}) })
-    const taskRecord = (task: Task, outputLimit: number) => ({ ...(member ? this.memberTask(task, mission, graph) : task), ...(task.output !== undefined ? { output: excerpt(task.output, outputLimit) } : {}), ...(task.handoff !== undefined ? { handoff: excerpt(task.handoff, outputLimit) } : {}) })
+    const taskRecord = (task: Task, outputLimit: number) => ({ ...(member ? memberTask(board, task) : task), ...(task.output !== undefined ? { output: excerpt(task.output, outputLimit) } : {}), ...(task.handoff !== undefined ? { handoff: excerpt(task.handoff, outputLimit) } : {}) })
     const evidenceOf = (task: Task, full = false) => task.evidenceIds.map(evidenceId => this.store.get('evidence', evidenceId)).filter((item): item is Evidence => item !== undefined).map(item => evidenceRef(item, full))
     // A task's reference to another (a dependency, a review source) whose id
     // names no task in this mission renders as `{ id, status: 'missing' }`, the
