@@ -157,6 +157,28 @@ test('a fence during a budget pause takes the pause marker with the attempt, so 
   assert.equal(taskOf(f.runtime, task.id).recoveryCount, undefined, 'the fence spent no recovery credit')
 })
 
+test('a lease the sweep fences after a budget pause landed during its checkpoint capture spends no recovery credit', async t => {
+  const f = await fixture(t)
+  const { task, attemptId } = await f.claim()
+  await f.runtime.settle(f.mission.id)
+  // The owner is quiescent, so the sweep captures a checkpoint before it fences the expired lease.
+  f.workers.idle.add(f.author.id)
+  let reached, release
+  const capturing = new Promise(resolve => { reached = resolve })
+  const gate = new Promise(resolve => { release = resolve })
+  f.workers.captureGate = () => { reached(); return gate }
+  f.clock.advance(f.runtime.config.leaseMs + 1)
+  const ticking = f.runtime.tick()
+  await capturing
+  // Usage accounting commits outside the mission queue: the pause lands while the sweep awaits.
+  await f.workers.callbacks.usage(f.author.id, budget.maxTokens + 1)
+  assert.equal(taskOf(f.runtime, task.id).budgetResume?.attemptId, attemptId, 'the pause preserved the attempt the sweep is about to fence')
+  release()
+  await ticking
+  assert.equal(events(f.runtime, f.mission.id, 'task/lease-expired').length, 1, 'the sweep fenced the expired lease')
+  assert.equal(taskOf(f.runtime, task.id).recoveryCount, undefined, 'a lease fenced while the pause holds spends no recovery credit')
+})
+
 test('a store an older build wrote is settled once, at open: each row keeps only the markers of the attempt it holds (schema 6)', async t => {
   const f = await fixture(t)
   const { task: held } = await f.claim({ title: 'Held attempt' })

@@ -624,11 +624,12 @@ export class Attempts {
           const expiring = this.k.task(missionId, task.id)
           if (!holdsAttempt(expiring, missionId, attemptId)) continue
           // A lease that expired while the task was budget-paused is host policy, not
-          // a recovery failure, and the plan's intended owner must survive it. A
-          // lease that expired while its owner was parked is the same class of
-          // host-induced stop (R10-15): the park, not the worker, caused the stall,
-          // so it must not spend a recovery credit.
-          const pauseInduced = expiring.budgetResume !== undefined || parked
+          // a recovery failure, and the plan's intended owner must survive it. The
+          // pause is the mission's, read after the checkpoint await above, which
+          // it can land during. A lease that expired while its owner was parked is
+          // the same class of host-induced stop (R10-15): the park, not the
+          // worker, caused the stall, so it must not spend a recovery credit.
+          const pauseInduced = this.k.mission(missionId).budgetPause !== undefined || parked
           if (!pauseInduced) expiring.recoveryCount = (expiring.recoveryCount ?? 0) + 1
           const planned = expiring.plannedAssigneeId === undefined ? undefined : this.k.store.get('members', expiring.plannedAssigneeId)
           if (planned !== undefined && planned.status !== 'stopped') expiring.assigneeId = planned.id

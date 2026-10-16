@@ -452,7 +452,7 @@ export class SwarmRuntime implements Kernel {
             // only the generic `mission/recovered` row. The old attempt is
             // fenced and the next epoch records the handoff reason.
             const ownerId = task.attempt?.ownerId
-            const pauseInduced = mission.budgetPause !== undefined || task.budgetResume !== undefined
+            const pauseInduced = mission.budgetPause !== undefined
             task.status = 'pending'
             task.handoff = `${task.handoff ?? ''}\nRecovered after host restart; inspect prior tool runs and workspace before repeating effects.`
             endAttempt(task)
