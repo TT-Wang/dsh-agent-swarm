@@ -51,6 +51,14 @@ export function dropAttempt(task: Task): void {
   delete task.attempt
 }
 
+/**
+ * A re-read row still holds the attempt the caller read earlier: the same
+ * epoch, still running, the same attempt. A fencing transition committed in
+ * between fails it, so the caller never writes over that transition.
+ */
+const holdsAttempt = (row: Task, epoch: number, attemptId: string | undefined): boolean =>
+  row.epoch === epoch && row.status === 'running' && row.attempt?.id === attemptId
+
 /** W6: bounded idle close-outs before the workspace is checkpointed and re-pended. */
 const DEFAULT_IDLE_CLOSEOUTS = 2
 /** Renewal allowance per model output token, so a long model call keeps its lease. */
@@ -391,8 +399,7 @@ export class Attempts {
     // warning or write a whole record over a row that moved epoch, status or
     // attempt (cancel, handoff, challenge, beforeStep, recordToolRun).
     const current = this.k.store.get('tasks', task.id)
-    if (current === undefined || current.missionId !== mission.id || current.epoch !== task.epoch
-      || current.status !== 'running' || current.attempt?.id !== task.attempt?.id) return
+    if (current === undefined || current.missionId !== mission.id || !holdsAttempt(current, task.epoch, task.attempt?.id)) return
     task = current
     if (!task.attempt || task.attempt.leaseUntil >= this.k.now() + this.k.config.leaseMs / 2) return
     // A live operation is liveness for its full duration: match by member and
@@ -554,8 +561,7 @@ export class Attempts {
           // and then expired in the same pass (the documented "a live operation is
           // liveness for its full duration" invariant).
           const renewed = this.k.store.get('tasks', task.id)
-          if (renewed === undefined || renewed.missionId !== missionId || renewed.epoch !== task.epoch
-            || renewed.status !== 'running' || renewed.attempt?.id !== attemptId) continue
+          if (renewed === undefined || renewed.missionId !== missionId || !holdsAttempt(renewed, task.epoch, attemptId)) continue
           task = renewed
           if (task.attempt === undefined || task.attempt.leaseUntil >= this.k.now()) continue
           // W6: capture a durable checkpoint before any reassignment when the old
@@ -567,7 +573,7 @@ export class Attempts {
               try {
                 const checkpoint = await awaited(pass, this.k.workers.captureArtifact(owner, task), this.k.now)
                 const current = this.k.task(missionId, task.id)
-                if (current.epoch === task.epoch && current.status === 'running' && current.attempt?.id === attemptId) {
+                if (holdsAttempt(current, task.epoch, attemptId)) {
                   // S1 (P0): commit the row re-read after the await, never the
                   // pre-await object, so a concurrent transition is not reverted.
                   current.checkpoint = { commit: checkpoint.commit, at: this.k.now() }
@@ -577,7 +583,7 @@ export class Attempts {
                 // Auditable and non-fatal: the workspace stays untouched and
                 // prepareTask refuses a dirty workspace rather than losing it.
                 const current = this.k.task(missionId, task.id)
-                if (current.epoch === task.epoch && current.status === 'running' && current.attempt?.id === attemptId) {
+                if (holdsAttempt(current, task.epoch, attemptId)) {
                   const reason = `Lease-expiry checkpoint failed for ${task.id}: ${error instanceof Error ? error.message : String(error)}. The member workspace is preserved; recovery will refuse a dirty workspace instead of losing it.`
                   this.k.commit(missionId, () => {
                     this.k.store.event(missionId, 'task/checkpoint-failed', 'runtime', { taskId: task.id, ownerId: oldOwner, reason })
@@ -595,7 +601,7 @@ export class Attempts {
           // fencing transition) committed during it must win over lease recovery:
           // re-read and only transition the record that still owns this attempt.
           const expiring = this.k.task(missionId, task.id)
-          if (expiring.epoch !== task.epoch || expiring.status !== 'running' || expiring.attempt?.id !== attemptId) continue
+          if (!holdsAttempt(expiring, task.epoch, attemptId)) continue
           // A lease that expired while the task was budget-paused is host policy, not
           // a recovery failure, and the plan's intended owner must survive it. A
           // lease that expired while its owner was parked is the same class of
