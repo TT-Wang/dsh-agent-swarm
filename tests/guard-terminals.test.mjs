@@ -283,7 +283,7 @@ test('R12-F9: the admissibility guard fires on the two real precedents', () => {
   // refused at submission ("Artifact changes path outside task scope").
   const t3b = reconcileTaskAdmission({
     objective: 'Resume from your own artifact `09883f3` and finish the guard chain.',
-    scope: SCOPE, acceptance: ACCEPTANCE, dependencies: [], replaces: [],
+    scope: SCOPE, acceptance: ACCEPTANCE, edges: { dependencies: [] }, replaces: [],
   }, 'task')
   assert.equal(t3b.length, 1, 'the T3b precedent must be refused')
   assert.equal(t3b[0].code, DEPENDENCY_ASSUMPTION_CODE)
@@ -298,7 +298,7 @@ test('R12-F9: the admissibility guard fires on the two real precedents', () => {
   // the bare mission baseline; repaired by hand with git archive + a hash check.
   const int2 = dependencyAssumptions({
     objective: 'The assembly is already in its worktree; verify the integration.',
-    acceptance: ACCEPTANCE, dependencies: [],
+    acceptance: ACCEPTANCE, edges: { dependencies: [] },
   }, 'task')
   assert.equal(int2.length, 1, 'the INT2 precedent must be refused')
   assert.equal(int2[0].code, DEPENDENCY_ASSUMPTION_CODE)
@@ -306,42 +306,46 @@ test('R12-F9: the admissibility guard fires on the two real precedents', () => {
   assert.deepEqual(lintRefusal(`[${int2[0].code}] ${int2[0].location}: ${int2[0].message}`), [])
 })
 
-test('R12-F9: a legitimately self-contained task is not refused, and a declared dependency satisfies the guard', () => {
+test('R12-F9: a legitimately self-contained task is not refused, and a declared dependency or review source satisfies the guard', () => {
   // The counter-case: no dependency is legitimate when the task really is
   // self-contained.
   const selfContained = reconcileTaskAdmission({
     objective: 'Implement the guard in src/admission.ts and cover it in tests/guard-terminals.test.mjs.',
-    scope: SCOPE, acceptance: ACCEPTANCE, dependencies: [], replaces: [],
+    scope: SCOPE, acceptance: ACCEPTANCE, edges: { dependencies: [] }, replaces: [],
   }, 'task')
   assert.deepEqual(selfContained, [], 'a self-contained task with no dependencies is admitted')
 
   // A factual sentence about the baseline is not a claim about prepared content.
   assert.deepEqual(dependencyAssumptions({
     objective: 'Add the new validator; the baseline already contains src/admission.ts and its tests.',
-    dependencies: [],
+    edges: { dependencies: [] },
   }, 'task'), [])
 
-  // A task that does carry the content through a dependency is admitted.
+  // A task that does carry the content through a dependency is admitted, and
+  // so is one that carries it through its review source, the other edge.
   assert.deepEqual(dependencyAssumptions({
     objective: 'Resume from the artifact produced by task_source and finish the guard.',
-    dependencies: ['task_source'],
+    edges: { dependencies: ['task_source'] },
+  }, 'task'), [])
+  assert.deepEqual(dependencyAssumptions({
+    objective: 'Review the submitted artifact `09883f3` already in your worktree.',
+    edges: { dependencies: [], reviewOf: 'task_source' },
   }, 'task'), [])
 
-  // A call site that does not know the dependency set must never guess: the
-  // guard only fires when the caller passes the set (the hand-off note names the
-  // two call sites that must start passing it).
+  // A call site that does not know the task's edges must never guess: the
+  // guard only fires when the caller passes them.
   assert.deepEqual(dependencyAssumptions({ objective: 'Resume from your own artifact `09883f3`.' }, 'task'), [])
 
   // A plain repair names the blocked task in `replaces`; without a claim that
   // its content is already available, that is not a missing dependency.
   assert.deepEqual(dependencyAssumptions({
     objective: 'Repair the blocked guard implementation and keep its acceptance criteria verbatim.',
-    dependencies: [], replaces: ['task_blocked'],
+    edges: { dependencies: [] }, replaces: ['task_blocked'],
   }, 'task'), [])
 })
 
 test('R12-F9: the diagnostic distinguishes "add the dependency" from "state how you will obtain it"', () => {
-  const task = { objective: 'Continue from the checkpoint of task_source and finish the seam.', dependencies: [] }
+  const task = { objective: 'Continue from the checkpoint of task_source and finish the seam.', edges: { dependencies: [] } }
   const known = dependencyAssumptions(task, 'task', { knownContents: new Set(['task_source']) })
   assert.equal(known.length, 1)
   assert.match(known[0].message, /exists in this mission/)
@@ -351,7 +355,7 @@ test('R12-F9: the diagnostic distinguishes "add the dependency" from "state how 
   // A hex commit may be an ancestor of the mission baseline: the guard checks
   // only the mission's task ids, so the text must not assert the commit's
   // absence from the baseline, which nothing verified.
-  const hex = dependencyAssumptions({ objective: 'Resume from your own artifact `09883f3` and finish the guard.', dependencies: [] }, 'task', { knownContents: new Set(['task_source']) })
+  const hex = dependencyAssumptions({ objective: 'Resume from your own artifact `09883f3` and finish the guard.', edges: { dependencies: [] } }, 'task', { knownContents: new Set(['task_source']) })
   assert.equal(hex.length, 1)
   assert.equal(hex[0].path, '09883f3')
   assert.doesNotMatch(hex[0].message, /not in the mission baseline|worktree will not contain it/, 'no unverified provenance claim')

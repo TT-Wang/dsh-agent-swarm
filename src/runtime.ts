@@ -1102,14 +1102,12 @@ export class SwarmRuntime implements Kernel {
     // at the production admission point, so a plan error is rejected here
     // instead of at submit. The check preflight hints are advisory and belong
     // to the draft UI (`planAdvisories`); nothing here would read them.
-    const refused = reconcileTaskAdmission({ objective: input.objective, acceptance }, 'task', {
-      // R12-F9: the guard needs the content-carrying edges (the declared
-      // dependencies plus a review source, which `prepareTask` merges into the
-      // worktree like a dependency) and the durable identities this mission
-      // already holds, so the diagnostic can say whether the named content exists
-      // here (add the dependency that carries it) or must be obtained (state how).
-      dependencies: taskEdges({ dependencies: input.dependencies ?? [], reviewOf: input.reviewOf }),
-      replaces: input.replaces,
+    // R12-F9: the guard needs the content-carrying edges (the declared
+    // dependencies plus a review source, which `prepareTask` merges into the
+    // worktree like a dependency) and the durable identities this mission
+    // already holds, so the diagnostic can say whether the named content exists
+    // here (add the dependency that carries it) or must be obtained (state how).
+    const refused = reconcileTaskAdmission({ objective: input.objective, acceptance, edges: { dependencies: input.dependencies ?? [], reviewOf: input.reviewOf }, replaces: input.replaces }, 'task', {
       knownContents: new Set(this.store.list('tasks', missionId).map(task => task.id)),
     })
     if (refused.length) throw new Error(refused.map(formatDiagnostic).join('\n'))
@@ -3295,9 +3293,7 @@ export class SwarmRuntime implements Kernel {
       // dependency, or the review source `prepareTask` merges like one) brings
       // into its worktree; this amendment would otherwise strip that edge from
       // an admitted task, so it is refused here, before anything is written.
-      const assumed = dependencyAssumptions({ objective: task.objective, acceptance: task.acceptance }, `task ${JSON.stringify(task.id)}`, {
-        dependencies: taskEdges({ dependencies: next.dependencies, reviewOf: task.reviewOf }),
-        replaces: task.replaces,
+      const assumed = dependencyAssumptions({ objective: task.objective, acceptance: task.acceptance, edges: { dependencies: next.dependencies, reviewOf: task.reviewOf }, replaces: task.replaces }, `task ${JSON.stringify(task.id)}`, {
         knownContents: new Set(this.store.list('tasks', missionId).map(row => row.id)),
         amendment: true,
       })
