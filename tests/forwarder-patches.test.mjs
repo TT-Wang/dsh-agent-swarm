@@ -9,6 +9,11 @@
  * a live runtime, and the member must exist on the object the path reaches.
  * A path that reaches no object on a live runtime is not checked: assigning
  * through it throws when the test runs, so it cannot pass silently.
+ *
+ * The other half: a patch on `runtime.<seam>.<member>` reaches a seam's own
+ * calls only because every seam holds the very objects the runtime exposes.
+ * Each seam stands on the runtime itself (`k`) and on its named collaborators,
+ * and none holds a copy of a seam under any name.
  */
 import test from 'node:test'
 import assert from 'node:assert/strict'
@@ -17,7 +22,7 @@ import { join, relative } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import ts from 'typescript'
 import { sourceTree } from './source-semantics.mjs'
-import { makeRuntime } from './faults/harness.mjs'
+import { FakeClock, makeRuntime, setup, taskOf } from './faults/harness.mjs'
 
 const PROJECT = fileURLToPath(new URL('../', import.meta.url))
 
@@ -112,4 +117,42 @@ test('the scan resolves paths through a runtime and its seams, and names a membe
     'a seam read into a local is a path from the runtime; a parameter or a value a call returned is not')
   assert.deepEqual(unpatched(runtime, found), ['probe.mjs:1 runtime.pumpOutbox', 'probe.mjs:3 rt.scheduling.escalateGuardTerminal'],
     'a deleted runtime forwarder and a method its seam lost are named; a path that reaches nothing throws when it runs')
+})
+
+/** The seams in the order the runtime builds them, each with the collaborators it is constructed on beside the kernel. */
+const SEAMS = {
+  refusals: [],
+  notices: ['refusals'],
+  attempts: ['notices'],
+  workspaceAdmission: ['attempts', 'notices'],
+  declaredChecks: ['workspaceAdmission'],
+  gates: ['notices', 'refusals', 'declaredChecks'],
+  scheduling: ['notices', 'attempts', 'workspaceAdmission', 'refusals'],
+}
+
+test('every seam stands on the runtime and holds the very seam objects the runtime exposes, and no copy of one', async t => {
+  const { runtime } = await makeRuntime(t)
+  const names = new Map(Object.keys(SEAMS).map(name => [runtime[name], name]))
+  const classes = Object.keys(SEAMS).map(name => runtime[name].constructor)
+  for (const [name, collaborators] of Object.entries(SEAMS)) {
+    const held = Object.entries(runtime[name])
+      .filter(([, value]) => value instanceof runtime.constructor || classes.some(seam => value instanceof seam))
+      .map(([key, value]) => [key, value === runtime ? 'runtime' : names.get(value) ?? `a copy of a ${value.constructor.name}`])
+    assert.deepEqual(Object.fromEntries(held), Object.fromEntries([['k', 'runtime'], ...collaborators.map(collaborator => [collaborator, collaborator])]),
+      `${name} holds the runtime as its kernel and the runtime's own ${collaborators.join(', ') || 'nothing else'}`)
+  }
+})
+
+test('a patch on the runtime\'s refusal registry intercepts the dispatch sweep\'s admission', async t => {
+  const f = await setup({ clock: new FakeClock() })
+  t.after(() => f.cleanup())
+  const task = f.propose()
+  await f.runtime.settle(f.mission.id)
+  const asked = [], assertAdmission = f.runtime.refusals.assertAdmission
+  f.runtime.refusals.assertAdmission = function (row, member) { asked.push([row.id, member.id]); return assertAdmission.call(this, row, member) }
+  f.workers.idle.add(f.author.id)
+  f.runtime.kick(f.mission.id)
+  await f.runtime.settle(f.mission.id)
+  assert.equal(taskOf(f.runtime, task.id).status, 'running', 'the sweep dispatched the task')
+  assert.deepEqual(asked, [[task.id, f.author.id], [task.id, f.author.id]], 'before the preparation and again inside the assignment, both through the patched registry')
 })
