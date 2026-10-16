@@ -2,7 +2,7 @@
 import { randomUUID } from 'node:crypto'
 import { isAbsolute, join } from 'node:path'
 import { SwarmStore, WriterBusyError, StoreRecoveryError, id, stageRestore, type PendingRestore, type PostFilter, type StoreOptions } from './store.ts'
-import { Attempts, clearAttemptMarkers, endAttempt } from './attempts.ts'
+import { Attempts, clearAttemptMarkers, clearCloseout, endAttempt } from './attempts.ts'
 import { PolicyError } from './policy-error.ts'
 export { WorkspaceRevokedError } from './authorization.ts'
 import { recordedClaim, type WorkspaceClaim } from './authorization.ts'
@@ -3344,7 +3344,8 @@ export class SwarmRuntime implements Kernel {
       next.resumeAfterStop = { ...next.resumeAfterStop, reason: 'handoff' }
     }
     if (taskCeilingBlock(next, this.now()) === undefined) delete next.ceiling
-    if (resumes) { delete next.preparationFailure; delete next.verificationRecovery }
+    // A resume is not a fence: a running attempt keeps running, with a fresh idle close-out.
+    if (resumes) { delete next.preparationFailure; delete next.verificationRecovery; clearCloseout(next) }
     if (rework !== undefined) this.reopenForRework(next, rework)
     // A rejected submission holds no live attempt: its author is not stopped.
     const activeOwner = rework === undefined ? task.attempt?.ownerId : undefined

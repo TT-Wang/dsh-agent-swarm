@@ -41,13 +41,22 @@ export function stopOutcome(causes: ReadonlySet<BlockCause>, reason: StopReason)
 }
 
 /**
+ * The idle close-out of the row's open attempt: the nudges it delivered and the
+ * turn end that armed it. Cleared, the attempt's next idle turn is nudged from
+ * the first nudge again; an owner resume of a running attempt clears it so.
+ */
+export function clearCloseout(task: Task): void {
+  delete task.closeout; delete task.idleSignal
+}
+
+/**
  * The markers one attempt writes while it runs: the budget pause that
- * preserved it, its idle close-out nudges and turn-end signal, its denied git
- * write and its lease warning. None of them means anything once that attempt
- * ends, so they leave the row with it, and a new attempt starts without them.
+ * preserved it, its idle close-out, its denied git write and its lease warning.
+ * None of them means anything once that attempt ends, so they leave the row
+ * with it, and a new attempt starts without them.
  */
 export function clearAttemptMarkers(task: Task): void {
-  delete task.budgetResume; delete task.closeout; delete task.idleSignal; delete task.gitWriteDenied; delete task.leaseWarned
+  delete task.budgetResume; clearCloseout(task); delete task.gitWriteDenied; delete task.leaseWarned
 }
 
 /**

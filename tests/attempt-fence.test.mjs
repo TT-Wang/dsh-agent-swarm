@@ -16,7 +16,8 @@
  * The budget-resume marker is one of those markers, so it never outlives the
  * attempt it names: a fence during a budget pause takes it, and the resume
  * finds no stale marker to skip. Each test here fails on the hand-assembled
- * fences (b462a61).
+ * fences (b462a61), except the last, which pins what the fence is not: an
+ * owner resume keeps a running attempt and restarts its idle close-out.
  */
 import test from 'node:test'
 import assert from 'node:assert/strict'
@@ -183,4 +184,24 @@ test('a rework ends the rejected attempt and its review\'s, with every marker', 
     assert.deepEqual([row.attempt, markersOf(row)], [undefined, []], `${id}: the re-opened row carries nothing of its finished attempt`)
   }
   assert.equal(taskOf(f.runtime, task.id).reworkCount, 1, 'the source was re-opened for rework')
+})
+
+test('an owner resume is not a fence: the running attempt keeps running, and its idle close-out restarts from the first nudge', async t => {
+  const f = await fixture(t)
+  const { task, attemptId } = await f.claim()
+  const closeOut = () => f.runtime.attempts.closeOutIdleAttempt(f.runtime.mission(f.mission.id), f.member(), taskOf(f.runtime, task.id))
+  const nudges = () => events(f.runtime, f.mission.id, 'task/closeout-nudged').filter(event => event.data.taskId === task.id).map(event => event.data.nudges)
+  // The worker ends its turn with the attempt open, and the close-out spends every nudge it allows.
+  f.runtime.attempts.onIdle(f.author.id)
+  await closeOut(); await closeOut()
+  assert.deepEqual([nudges(), taskOf(f.runtime, task.id).closeout?.nudges], [[1, 2], 2], 'the close-out spent its nudges')
+  f.runtime.controlTask(f.owner, f.mission.id, task.id, 'resume', {}, 'Retry after the environment repair')
+  const resumed = taskOf(f.runtime, task.id)
+  assert.deepEqual([resumed.status, resumed.attempt?.id, resumed.closeout, resumed.idleSignal], ['running', attemptId, undefined, undefined], 'the resume keeps the attempt and forgets its close-out')
+  // The next idle turn is nudged from the first nudge again, instead of abandoning the attempt.
+  await closeOut()
+  await f.runtime.settle(f.mission.id)
+  assert.deepEqual(nudges(), [1, 2, 1])
+  assert.equal(taskOf(f.runtime, task.id).attempt?.id, attemptId, 'the attempt is still held')
+  assert.deepEqual([...events(f.runtime, f.mission.id, 'attempt/fenced'), ...events(f.runtime, f.mission.id, 'task/closeout-abandoned')], [], 'nothing fenced or abandoned the attempt')
 })
