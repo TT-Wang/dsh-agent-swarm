@@ -238,9 +238,11 @@ test('captured review report survives deferred checks and reassignment without l
   f.runtime.controlTask(f.owner, f.mission.id, review.id, 'resume', { assigneeId: nextReviewer.id }, 'Host repaired; reviewer unavailable')
   // The first reviewer's attempt ended with its deferred verdict, so the resume
   // owes it no stop: the review re-pends at once, and the next reviewer's
-  // preparation recovers the saved record from that reviewer's worktree (the
-  // same-task recovery).
+  // preparation recovers the saved record by capturing that reviewer's
+  // worktree as it stands (the cross-owner capture of a finished attempt,
+  // docs/known-limitations.md).
   assert.equal(f.runtime.task(f.mission.id, review.id).resumeAfterStop, undefined, 'the resume owes no stop')
+  assert.deepEqual(f.workers.stopped, [], 'the first reviewer is not stopped')
   assert.equal(f.runtime.task(f.mission.id, review.id).status, 'pending', 'saved review record is not a rejected deliverable exhaustion gate')
   const nextActor = { sessionId: nextReviewer.sessionId }
   const resumed = await f.runtime.claim(nextActor, f.mission.id, review.id)
