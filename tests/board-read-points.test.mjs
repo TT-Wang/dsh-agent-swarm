@@ -19,8 +19,8 @@
  *    choice again with the predicate that chose it (`eligible`), so a stop the
  *    member came to owe during the sweep's preparation (an owner resume that
  *    fences its attempt elsewhere) leaves the work pending while the stop is
- *    owed, with no preparation failure and no owner notice, and the sweep
- *    after the stop dispatches it;
+ *    owed, with no preparation failure and no owner notice, also when the
+ *    preparation throws, and the sweep after the stop dispatches it;
  *  - one board asks the adapter about one member twice and gets two answers:
  *    the view is called through and never memoized, because a handle's answer
  *    changes as its turns start and end;
@@ -222,6 +222,35 @@ test('the dispatch sweep decides its choice again after preparing: a stop an own
   assert.deepEqual([dispatched.status, dispatched.attempt?.ownerId, dispatched.epoch, dispatched.preparationFailure, ofDependent('task/claimed').length], ['running', f.author.id, f.dependent.epoch + 1, undefined, 1],
     'the sweep after the stop dispatched the dependent to the author once')
   assert.deepEqual([...ofDependent('task/preparation-failed'), ...ofDependent('task/blocked')], [], 'and its preparation never failed')
+})
+
+test('a preparation that throws after the member came to owe a stop during it records no failure: the work stays pending, and the sweep after the stop prepares it again', async t => {
+  const f = await fixture(t)
+  const owed = await owedStop(f)
+  // The first preparation fails deterministically once its gate opens.
+  let fault = new Error('deterministic preparation fault')
+  const gated = f.workers.prepareTask
+  f.workers.prepareTask = async (...args) => { await gated(...args); if (fault !== undefined) { const thrown = fault; fault = undefined; throw thrown } }
+  const told = new Set(notices(f).map(delivery => delivery.id))
+  const ofDependent = type => events(f.runtime, f.mission.id, type).filter(event => event.data.taskId === f.dependent.id)
+  const preparations = () => f.workers.prepared.filter(row => row.taskId === f.dependent.id).length
+  f.workers.idle.add(f.author.id)
+  f.runtime.kick(f.mission.id)
+  await f.entered.promise
+  owed.resume()
+  f.gate.resolve()
+  await owed.swept.promise
+  assert.equal(fault, undefined, 'the preparation threw')
+  const waiting = taskOf(f.runtime, f.dependent.id)
+  assert.deepEqual([waiting.status, waiting.attempt, waiting.epoch, waiting.preparationFailure], ['pending', undefined, f.dependent.epoch, undefined],
+    'the choice no longer stood, so its failure is not the task\'s: the work stays pending at its epoch')
+  assert.deepEqual([...ofDependent('task/preparation-failed'), ...ofDependent('task/blocked')], [], 'no failure or block was recorded')
+  assert.deepEqual(notices(f).filter(delivery => !told.has(delivery.id)), [], 'and the owner is told nothing')
+  owed.stopped.resolve()
+  await f.runtime.settle(f.mission.id)
+  const dispatched = taskOf(f.runtime, f.dependent.id)
+  assert.deepEqual([dispatched.status, dispatched.attempt?.ownerId, dispatched.epoch, dispatched.preparationFailure, preparations()], ['running', f.author.id, f.dependent.epoch + 1, undefined, 2],
+    'the sweep after the stop prepared the work again and dispatched it')
 })
 
 test('a board asks the adapter at every ask: two asks about one member on one board reach the adapter twice', async t => {
