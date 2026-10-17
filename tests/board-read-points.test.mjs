@@ -26,7 +26,10 @@
  *    takes its work in the same pass; one whose turn ends stranded during the
  *    sweep is startable, so it keeps its work and the assignment wakes its
  *    input. Either way the owner is asked no dispatch question (the case S11
- *    found, when an ask drained the inbox).
+ *    found, when an ask drained the inbox). The drain step is the sweep's
+ *    first adapter call, so the sweep's guard comes before it: a pause that
+ *    lands while lease recovery awaits a capture wakes nothing of the paused
+ *    mission, whose stranded input the first sweep after the resume wakes.
  *
  * A notice that reads only rows reads the board and asks the adapter nothing:
  * tests/notice-board-reads.test.mjs.
@@ -249,4 +252,31 @@ test('a preferred member whose turn ends stranded while the sweep starts the aut
   assert.deepEqual([row.status, row.attempt?.ownerId], ['running', f.reviewer.id], 'the reviewer\'s idle handle is startable at every ask, so it keeps the work preferred to it')
   assert.deepEqual(workers.woken, [['delivery', f.reviewer.id]], 'and the assignment\'s waking delivery carried its stranded input')
   assert.deepEqual(dispatchQuestions(f), [], 'and the owner was asked no dispatch question about it')
+})
+
+test('a pause that lands while lease recovery awaits a capture halts the sweep before its drain step, and the first sweep after the resume wakes the stranded input', async t => {
+  const workers = new InboxWorkers()
+  const f = await setup({ clock: new FakeClock(), workers })
+  t.after(() => f.cleanup())
+  for (const member of [f.author, f.reviewer]) workers.idle.add(member.id)
+  const work = f.propose()
+  await f.runtime.settle(f.mission.id)
+  assert.equal(taskOf(f.runtime, work.id).status, 'running')
+  // The author's lease expires, and the next body's lease recovery awaits its checkpoint capture.
+  const capturing = deferred(), gate = deferred()
+  workers.captureGate = () => { capturing.resolve(); return gate.promise }
+  f.clock.advance(f.runtime.config.leaseMs + 1)
+  const ticking = f.runtime.tick()
+  await capturing.promise
+  // During that await the owner pauses the mission, and the reviewer's turn ends with input no driver will claim.
+  f.runtime.control(f.owner, f.mission.id, 'pause', 'Owner paused')
+  workers.stranded.add(f.reviewer.id)
+  gate.resolve()
+  await ticking
+  await f.runtime.settle(f.mission.id)
+  assert.equal(f.runtime.mission(f.mission.id).status, 'paused')
+  assert.deepEqual(workers.woken, [], 'the halted sweep woke nothing of the paused mission')
+  f.runtime.control(f.owner, f.mission.id, 'resume', 'Owner resumed')
+  await f.runtime.settle(f.mission.id)
+  assert.deepEqual(workers.woken, [['drain', f.reviewer.id]], 'the first sweep of the resumed mission woke the reviewer\'s stranded input')
 })

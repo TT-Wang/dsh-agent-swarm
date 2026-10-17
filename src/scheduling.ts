@@ -64,7 +64,7 @@ export class Scheduling {
    * The dispatch sweep of one serialized pass (M1a: moved out of `schedule`
    * unchanged). It returns false when the pass must be abandoned exactly where
    * the original early returns did: on shutdown or on a mission that stopped
-   * being active during an adapter await. It runs only inside the mission's
+   * being active during an adapter await (`halted`). It runs only inside the mission's
    * serial queue, so no other pass body runs while it awaits.
    *
    * A body also returns false at the next member boundary when the member it
@@ -100,10 +100,12 @@ export class Scheduling {
         // (`WorkerAdapter.drainStrandedInbox`): the handle of a member that takes
         // work (`takesWork`) and that a decision asks about (`asksHandle`). Every
         // ask below then reads the handles that step left, and asking drains nothing.
+        // It is the sweep's first adapter call, so the sweep's guard comes first.
+        if (this.halted(missionId)) return false
         for (const member of order) if (takesWork(tasks, member) && asksHandle(member)) this.k.workers.drainStrandedInbox(member.id)
         let memberSince = this.k.now()
         for (const [index, member] of order.entries()) {
-          if (this.k.shuttingDown || this.k.mission(missionId).status !== 'active') return false
+          if (this.halted(missionId)) return false
           if (pass !== undefined && index > 0 && this.k.now() - memberSince >= this.k.bounds.stallPassTimeoutMs) {
             pass.stoppedBefore = member.id
             // A chain whose start member is gone restarts from this body's first one.
@@ -130,10 +132,10 @@ export class Scheduling {
           catch (error) {
             // Disposing the adapter cancels in-flight starts. This is recoverable host
             // shutdown, not a permanent worker failure to persist across restart.
-            if (this.k.shuttingDown || this.k.mission(missionId).status !== 'active') return false
+            if (this.halted(missionId)) return false
             continue
           }
-          if (this.k.shuttingDown || this.k.mission(missionId).status !== 'active') return false
+          if (this.halted(missionId)) return false
           // R10-09/S3: a parked member is dispatchable. The adapter's idle
           // precondition can be false for a parked agent (a non-idle handle); an
           // assignment is exactly the fresh input that unparks it, so the runtime
@@ -174,7 +176,7 @@ export class Scheduling {
             const { graph } = this.k.boardOf(missionId)
             try { await awaited(pass, this.k.workers.prepareTask(member, { ...task, epoch: task.epoch + 1 }, graph.effectiveDependencies(task), graph.reviewSource(task)), this.k.now) }
             finally { if (pass !== undefined) delete pass.preparing }
-            if (this.k.shuttingDown || this.k.mission(missionId).status !== 'active') return false
+            if (this.halted(missionId)) return false
             const fresh = this.k.task(missionId, task.id)
             if (fresh.epoch !== task.epoch || fresh.assigneeId !== task.assigneeId || fresh.plannedAssigneeId !== task.plannedAssigneeId
               || fresh.assignmentMode !== task.assignmentMode || !ready(this.k.boardOf(missionId), fresh, member)) continue
@@ -189,7 +191,7 @@ export class Scheduling {
             // Admission control already wrote the durable refusal; the task stays
             // pending and a later tick re-evaluates it when a slot frees up.
             if (error instanceof AdmissionRefusedError) continue
-            if (this.k.shuttingDown || this.k.mission(missionId).status !== 'active') return false
+            if (this.halted(missionId)) return false
             // A withdrawn authorization was fenced where it was detected, which
             // blocked this task, so the changed-task rule below skips it.
             const fresh = this.k.task(missionId, task.id)
@@ -218,7 +220,7 @@ export class Scheduling {
             })
           }
           } catch (error) {
-            if (this.k.shuttingDown || this.k.mission(missionId).status !== 'active') return false
+            if (this.halted(missionId)) return false
             // The terminal of this member's chain, opened by this failure of the work
             // its request names: the same throw over that work on a later pass is the
             // request the owner already holds; other work or another failure is another.
@@ -229,6 +231,16 @@ export class Scheduling {
         }
     return true
   }
+
+  /**
+   * The sweep's guard, asked before each of its adapter calls that follows an
+   * await or opens the sweep: it goes on only while the runtime is up and the
+   * mission is active. A pause, a stop or a budget block commits outside the
+   * mission queue, so one can land while the body awaits (lease recovery's
+   * capture, a worker start, a preparation); a halted sweep asks and wakes
+   * nothing more, and the body is abandoned.
+   */
+  private halted(missionId: string): boolean { return this.k.shuttingDown || this.k.mission(missionId).status !== 'active' }
 
   /**
    * The adapter reported from inside a member's `prepareTask` call (a recovery
