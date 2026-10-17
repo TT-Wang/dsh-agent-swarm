@@ -26,7 +26,8 @@
  *    takes its work in the same pass; one whose turn ends stranded during the
  *    sweep is startable, so it keeps its work and the assignment wakes its
  *    input. Either way the owner is asked no dispatch question (the case S11
- *    found, when an ask drained the inbox). The drain step covers the board's
+ *    found, when an ask drained the inbox). A member that owes a stop, like a
+ *    parked one, is never drained. The drain step covers the board's
  *    members, not the body's order: a chained body whose order leaves out a
  *    preferred member stranded since the previous body still drains it, so its
  *    borrower takes the work in that body. The drain step is the sweep's
@@ -334,4 +335,32 @@ test('a chained body drains the stranded preferred member its order leaves out, 
   const row = taskOf(f.runtime, work.id)
   assert.deepEqual([row.status, row.attempt?.ownerId], ['running', third.id], 'so the third member\'s ask read the author busy and it borrowed the work')
   assert.deepEqual(dispatchQuestions(f), [], 'and the owner was asked no dispatch question about it')
+})
+
+test('the sweep\'s drain step leaves the stranded input of a member that owes a stop', async t => {
+  const workers = new InboxWorkers()
+  const f = await setup({ clock: new FakeClock(), workers })
+  t.after(() => f.cleanup())
+  const earlier = f.propose({ title: 'Earlier work' })
+  await f.runtime.settle(f.mission.id)
+  // The author's stop waits on `release`, so the stop it owes stays in flight through the next sweep.
+  const release = deferred(), stop = workers.stop.bind(workers)
+  workers.stop = async id => { if (id === f.author.id) await release.promise; return stop(id) }
+  // The sweep's first worker start comes after its drain step.
+  const swept = deferred(), start = workers.start.bind(workers)
+  workers.start = async spec => { swept.resolve(); return start(spec) }
+  for (const member of [f.author, f.reviewer]) { workers.idle.add(member.id); workers.stranded.add(member.id) }
+  // A stop the author owes on the earlier work, as a fence of its attempt there writes it.
+  f.runtime.commit(f.mission.id, () => {
+    const row = taskOf(f.runtime, earlier.id)
+    f.runtime.store.put('tasks', { ...row, status: 'blocked', resumeAfterStop: { epoch: row.epoch, memberId: f.author.id, reason: 'handoff', at: f.clock.now() } })
+  })
+  const ticking = f.runtime.tick()
+  try {
+    await swept.promise
+    assert.deepEqual(workers.woken, [['drain', f.reviewer.id]], 'the sweep woke the reviewer\'s stranded input')
+    assert.ok(workers.stranded.has(f.author.id), 'and left the input of the author, which owes a stop')
+  } finally { release.resolve() }
+  await ticking
+  await f.runtime.settle(f.mission.id)
 })
