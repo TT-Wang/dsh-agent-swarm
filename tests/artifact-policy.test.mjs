@@ -219,7 +219,6 @@ test('out-of-scope review report is refused before the source verdict changes', 
 test('captured review report survives deferred checks and reassignment without locking recovery', async t => {
   const f = await fixture(t)
   f.runtime.kick = () => {}
-  f.workers.checkpointTask = (...args) => f.workspaces.checkpointTask(...args)
   const task = await f.runtime.claim(f.a, f.mission.id, f.propose({ checks: ['test -s report.md'] }).id)
   await writeFile(path.join(f.author.workspace, 'report.md'), 'Source remains immutable')
   await f.readEvidence(f.author, f.a, task, 'report.md')
@@ -237,11 +236,11 @@ test('captured review report survives deferred checks and reassignment without l
   f.runtime.updateBudget(f.owner, f.mission.id, { ...f.runtime.mission(f.mission.id).budget, maxWorkers: 3 }, 'Replacement reviewer availability')
   const nextReviewer = await f.runtime.addMember(f.owner, f.mission.id, { role: 'independent replacement reviewer' })
   f.runtime.controlTask(f.owner, f.mission.id, review.id, 'resume', { assigneeId: nextReviewer.id }, 'Host repaired; reviewer unavailable')
-  // The stop barrier checkpoints the reviewer's workspace with real git before it
-  // re-pends the review; wait for the barrier itself, however long git takes,
-  // instead of reading a status the barrier has not decided yet.
-  await f.runtime.settle(f.mission.id)
-  assert.equal(f.runtime.task(f.mission.id, review.id).resumeAfterStop, undefined, 'the stop barrier settled')
+  // The first reviewer's attempt ended with its deferred verdict, so the resume
+  // owes it no stop: the review re-pends at once, and the next reviewer's
+  // preparation recovers the saved record from that reviewer's worktree (the
+  // same-task recovery).
+  assert.equal(f.runtime.task(f.mission.id, review.id).resumeAfterStop, undefined, 'the resume owes no stop')
   assert.equal(f.runtime.task(f.mission.id, review.id).status, 'pending', 'saved review record is not a rejected deliverable exhaustion gate')
   const nextActor = { sessionId: nextReviewer.sessionId }
   const resumed = await f.runtime.claim(nextActor, f.mission.id, review.id)

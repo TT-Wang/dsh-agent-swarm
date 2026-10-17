@@ -3178,16 +3178,13 @@ export class SwarmRuntime implements Kernel {
     // close-out restarts from the first nudge; the turn end that armed it stays.
     if (resumes) { delete next.preparationFailure; delete next.verificationRecovery; delete next.closeout }
     if (rework !== undefined) this.reopenForRework(next, rework)
-    // A rejected submission holds no live attempt: its author is not stopped.
-    // Any other attempt the row holds owes its owner's stop, a blocked row's
-    // too (a verification-deferred review), so the fence below names that
-    // owner itself instead of reading the open attempt as `fenceForStop` does.
-    const activeOwner = rework === undefined ? task.attempt?.ownerId : undefined
-    const fenced = activeOwner !== undefined && (structural || (resumes && task.status === 'blocked'))
-    if (!fenced) {
-      if (structural && !next.resumeAfterStop) next.epoch++ // Fence a preparation already awaiting I/O.
-      if (resumes && !next.resumeAfterStop && next.status === 'blocked') next.status = 'pending'
-    }
+    // The decision ends the attempt the row holds when it changes running work
+    // structurally, or resumes a blocked row whose attempt ended in its
+    // submission or its verdict (a rework ended its own above). `fenceForStop`
+    // reads from the row who owes a stop, so only running work's handle does,
+    // and a resumed row re-pends at once unless a stop is still owed.
+    const fenced = holdsOpenAttempt(next) ? structural : resumes && next.status === 'blocked' && next.attempt !== undefined
+    if (structural && !fenced && !next.resumeAfterStop) next.epoch++ // Fence a preparation already awaiting I/O.
     this.assertEffectiveTaskGraph({ ...next, status: 'pending' }, this.store.list('tasks', missionId).filter(row => row.id !== taskId))
     next.handoff = `${next.handoff ?? ''}\nOwner ${action}: ${reason}`.trim()
     // R20: raising a ceiling no longer has a host park to consume. The exhausted
@@ -3195,7 +3192,8 @@ export class SwarmRuntime implements Kernel {
     // now means only the member's own `swarm_wait`, which an owner amendment of
     // one task has no business clearing.
     this.commit(missionId, () => {
-      if (fenced) this.attempts.fenceRow(next, { status: 'blocked', reason: 'handoff', memberId: activeOwner, cause: `owner-${action}` })
+      if (fenced) this.attempts.fenceForStop(next, { status: 'blocked', cause: `owner-${action}` })
+      if (resumes && !next.resumeAfterStop && next.status === 'blocked') next.status = 'pending'
       this.store.put('tasks', next)
       this.store.event(missionId, 'task/amended', 'owner', { taskId, action, reason, changes, epoch: next.epoch, status: next.status, previous: Object.fromEntries(Object.keys(changes).map(key => [key, task[key as keyof Task] ?? null])),
         ...(rework === undefined ? {} : { rework: next.rejections!.at(-1), reworkCount: next.reworkCount }) })
