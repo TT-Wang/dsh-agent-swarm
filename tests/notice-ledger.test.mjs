@@ -1707,6 +1707,54 @@ test('every exit a failed dispatch\'s request names, performed through the owner
   assert.deepEqual((await remind(f, request)).map(delivery => delivery.subjects), [request.subjects], 'which is reminded while the task it names is stuck')
 })
 
+/**
+ * The first link of one member's dispatch chain, the adapter's drain step, throws on every sweep (a session append
+ * failing while the adapter wakes that member's stranded input). The member is not stepped in that sweep, and the
+ * chain's guard terminal is the throw's one record. `repair` lets the drain step pass.
+ */
+const failingDrain = (f, member, failure) => {
+  let broken = true
+  f.workers.drainStrandedInbox = id => { if (broken && id === member.id) throw new Error(failure) }
+  return { repair: () => { broken = false } }
+}
+
+test('every exit a failed drain step\'s request names, performed through the owner\'s registered tools: each lets the task it names run, and the request is never told twice over that work', async t => {
+  /** The author's drain step throws on every sweep until `fault.repair()`; its task stays pending and the chain's request names it. */
+  const board = async () => {
+    const f = await setup({ clock: new FakeClock(), workers: new FakeWorkers({ autoIdle: true }), budget: LONG })
+    t.after(f.cleanup)
+    const fault = failingDrain(f, f.author, 'session append failed while waking stranded input')
+    const task = f.propose({ title: 'Work for the author' })
+    await quiet(f)
+    assert.equal(taskOf(f.runtime, task.id).status, 'pending', 'the author is not stepped while its drain step throws')
+    const [request, ...others] = terminalRows(f, 'attempt_lease')
+    assert.deepEqual([others.length, request.subjects, namedTools(request.content)], [0, [subjectOf(f, task)], ['swarm_control']], 'one request, naming the work that waits')
+    return { f, task, request, fault, tool: await ownerTools(f) }
+  }
+  // The reassignment moves the task off the failing member without repairing it: that member then fails holding no work, which is told once at the mission root.
+  const exits = {
+    '`action: resume` after repair': { then: [], perform: async ({ task, fault, tool }) => { fault.repair(); await tool('swarm_control', { taskId: task.id, action: 'resume', reason: 'Repaired' }) } },
+    '`action: amend`, `changes.assigneeId` and `reason` to fence and reassign it': { then: [f => [`mission:${f.mission.id}`]], perform: ({ f, task, tool }) => tool('swarm_control', { taskId: task.id, action: 'amend', changes: { assigneeId: f.reviewer.id }, reason: 'Reassign' }) },
+  }
+  for (const [exit, { then, perform }] of Object.entries(exits)) {
+    const fixture = await board()
+    const { f, task, request } = fixture
+    assert.ok(request.content.includes(exit), `the request names: ${exit}`)
+    nextWindow(f)
+    await perform(fixture)
+    await quiet(f)
+    assert.equal(taskOf(f.runtime, task.id).status, 'running', `${exit} lets the task run`)
+    assert.deepEqual([terminalRows(f, 'attempt_lease').map(delivery => delivery.subjects), relevant(f, request), (await remind(f, request)).length], [[request.subjects, ...then.map(subjects => subjects(f))], true, 0],
+      'the request stays the record the owner can read, it is not told again over the task, and nothing reminds the owner of a task that moved on')
+  }
+  // The resume without the repair: the drain step throws again, the task waits, under the same request.
+  const { f, task, request, tool } = await board()
+  await tool('swarm_control', { taskId: task.id, action: 'resume', reason: 'Retry' })
+  await quiet(f)
+  assert.deepEqual([taskOf(f.runtime, task.id).status, terminalRows(f, 'attempt_lease').length], ['pending', 1], 'the same failure is the request the owner holds')
+  assert.deepEqual((await remind(f, request)).map(delivery => delivery.subjects), [request.subjects], 'which is reminded while the task it names waits')
+})
+
 /** The breaches the isolation invariant lists on one fixture's board, by their text. */
 const violationsOf = f => isolationIssues(f.runtime.boardOf(f.mission.id)).map(issue => issue.message)
 
