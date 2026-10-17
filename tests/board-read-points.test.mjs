@@ -30,6 +30,8 @@
  *    first adapter call, so the sweep's guard comes before it: a pause that
  *    lands while lease recovery awaits a capture wakes nothing of the paused
  *    mission, whose stranded input the first sweep after the resume wakes.
+ *    Each drain is a link of its member's chain (Round 14): one that throws
+ *    ends that chain with its guard terminal, and the sweep goes on.
  *
  * A notice that reads only rows reads the board and asks the adapter nothing:
  * tests/notice-board-reads.test.mjs.
@@ -37,7 +39,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { isolationViolation, ready } from '../lib/board.js'
-import { FakeClock, FakeWorkers, setup, taskOf } from './faults/harness.mjs'
+import { FakeClock, FakeWorkers, events, setup, taskOf } from './faults/harness.mjs'
 
 const deferred = () => { let resolve; return { promise: new Promise(r => { resolve = r }), resolve: value => resolve(value) } }
 
@@ -279,4 +281,25 @@ test('a pause that lands while lease recovery awaits a capture halts the sweep b
   f.runtime.control(f.owner, f.mission.id, 'resume', 'Owner resumed')
   await f.runtime.settle(f.mission.id)
   assert.deepEqual(workers.woken, [['drain', f.reviewer.id]], 'the first sweep of the resumed mission woke the reviewer\'s stranded input')
+})
+
+test('a member whose drain step throws ends its own chain with its guard terminal, once, and the sweep still dispatches the others', async t => {
+  const workers = new InboxWorkers()
+  const f = await setup({ clock: new FakeClock(), workers })
+  t.after(() => f.cleanup())
+  // Waking the author's stranded input throws on every sweep (a session append failing inside the wake).
+  const failure = 'session append failed while waking stranded input'
+  const drain = workers.drainStrandedInbox.bind(workers)
+  workers.drainStrandedInbox = id => { if (id === f.author.id && workers.stranded.has(id)) throw new Error(failure); drain(id) }
+  for (const member of [f.author, f.reviewer]) workers.idle.add(member.id)
+  workers.stranded.add(f.author.id)
+  const work = f.propose({ title: 'Work for the reviewer', assigneeId: f.reviewer.id })
+  await f.runtime.settle(f.mission.id)
+  for (let tick = 0; tick < 3; tick += 1) { f.clock.advance(f.runtime.config.tickMs); await f.runtime.tick(); await f.runtime.settle(f.mission.id) }
+  const row = taskOf(f.runtime, work.id)
+  assert.deepEqual([row.status, row.attempt?.ownerId], ['running', f.reviewer.id], 'the reviewer, whose own chain is fine, still gets its work')
+  const terminals = f.runtime.store.list('deliveries', f.mission.id).filter(delivery => delivery.to === 'owner' && delivery.notice?.dedupKey.startsWith('guard-terminal:attempt_lease:'))
+  assert.deepEqual(terminals.map(delivery => delivery.notice.reason), [`Error: ${failure}`], 'the author\'s chain ended in its guard terminal, told once however often the throw recurs')
+  assert.deepEqual(events(f.runtime, f.mission.id, 'mission/stalled').filter(event => event.data.cause === 'guard-terminal').map(event => [event.data.memberId, event.data.detail]),
+    [[f.author.id, `Error: ${failure}`]], 'and its one stall event names the author and the failure')
 })

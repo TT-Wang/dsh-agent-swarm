@@ -100,9 +100,13 @@ export class Scheduling {
         // (`WorkerAdapter.drainStrandedInbox`): the handle of a member that takes
         // work (`takesWork`) and that a decision asks about (`asksHandle`). Every
         // ask below then reads the handles that step left, and asking drains nothing.
-        // It is the sweep's first adapter call, so the sweep's guard comes first.
+        // It is the sweep's first adapter call, so the sweep's guard comes first,
+        // and each drain is a link of its member's chain (`chainFailed`).
         if (this.halted(missionId)) return false
-        for (const member of order) if (takesWork(tasks, member) && asksHandle(member)) this.k.workers.drainStrandedInbox(member.id)
+        for (const member of order) if (takesWork(tasks, member) && asksHandle(member)) {
+          try { this.k.workers.drainStrandedInbox(member.id) }
+          catch (error) { if (!this.chainFailed(missionId, member, error)) return false }
+        }
         let memberSince = this.k.now()
         for (const [index, member] of order.entries()) {
           if (this.halted(missionId)) return false
@@ -115,14 +119,7 @@ export class Scheduling {
           memberSince = this.k.now()
           progressed(pass, this.k.now())
           if (!takesWork(this.k.store.list('tasks', missionId), member)) continue
-          // Round 14: one member's guard chain must never abort the whole sweep.
-          // Before this, a guard that threw here (the field evidence: "Member has
-          // uncommitted commits" while an owner tried to preserve a cut-off
-          // attempt) propagated out of `dispatch`, the scheduler only wrote it to
-          // stderr, and every later tick re-entered the same throw: a dead end
-          // with no durable record and no exit. The throw is now the terminal
-          // element's input: escalate with a coded decision request, then keep
-          // dispatching the other members.
+          // Round 14: the member's step is a link of its chain (`chainFailed`).
           try {
           // The isolation invariant is decided on the board, a refusal is
           // recorded, and only then is the member skipped or started.
@@ -220,15 +217,32 @@ export class Scheduling {
             })
           }
           } catch (error) {
-            if (this.halted(missionId)) return false
-            // The terminal of this member's chain, opened by this failure of the work
-            // its request names: the same throw over that work on a later pass is the
-            // request the owner already holds; other work or another failure is another.
-            const detail = String(error), subjects = noticeSubjectsFor(this.k.boardOf(missionId), { memberId: member.id })
-            this.notices.emitGuardTerminal(missionId, 'attempt_lease', { memberId: member.id, detail, subjects, localKey: factKey(missionId, { trigger: `dispatch-failed:${member.id}`, reason: detail, subjects }) })
+            if (!this.chainFailed(missionId, member, error)) return false
             continue
           }
         }
+    return true
+  }
+
+  /**
+   * Round 14: one member's guard chain must never abort the whole sweep. Each
+   * link the sweep runs for a member (its drain step, then its step) ends here
+   * when it throws. Before this, a guard that threw (the field evidence: "Member
+   * has uncommitted commits" while an owner tried to preserve a cut-off attempt)
+   * propagated out of `dispatch`, the scheduler only wrote it to stderr, and
+   * every later tick re-entered the same throw: a dead end with no durable
+   * record and no exit. The throw is the terminal element's input: escalate
+   * with a coded decision request, and the sweep keeps dispatching the other
+   * members (true). On a halted sweep (`halted`) the throw is the halt's, not a
+   * failure of the chain, and the body is abandoned (false).
+   */
+  private chainFailed(missionId: string, member: Member, error: unknown): boolean {
+    if (this.halted(missionId)) return false
+    // The terminal of this member's chain, opened by this failure of the work
+    // its request names: the same throw over that work on a later pass is the
+    // request the owner already holds; other work or another failure is another.
+    const detail = String(error), subjects = noticeSubjectsFor(this.k.boardOf(missionId), { memberId: member.id })
+    this.notices.emitGuardTerminal(missionId, 'attempt_lease', { memberId: member.id, detail, subjects, localKey: factKey(missionId, { trigger: `dispatch-failed:${member.id}`, reason: detail, subjects }) })
     return true
   }
 
