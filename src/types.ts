@@ -787,7 +787,7 @@ export const OWNER_ONLY_TOOLS: readonly string[] = [
  */
 export const ATTEMPT_FENCING_EVENTS: readonly EventKind[] = [
   // `attempt/fenced` is the uniform closer every fence writes through
-  // `Attempts.fenceForStop`. Mission pause/stop and challenge closed attempts
+  // `Attempts.fenceRow`. Mission pause/stop and challenge closed attempts
   // with only their own domain event, so a log this runtime wrote was refused as
   // truncated by its own replay; `task/start-failed` drops the attempt too and
   // had the same gap.

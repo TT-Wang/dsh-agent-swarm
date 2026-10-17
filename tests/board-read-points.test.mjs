@@ -20,11 +20,10 @@
  *  - the assignment asserts the admission again: a stop the member came to owe
  *    during a claim's preparation refuses it. The dispatch sweep decides its
  *    choice again with the predicate that chose it (`eligible`), so a stop the
- *    member came to owe during the sweep's preparation (recorded by a commit
- *    outside the mission queue, as for the claim) leaves the work pending
- *    while the stop is owed, with no preparation failure and no owner notice,
- *    also when the preparation throws, and the sweep after the stop
- *    dispatches it;
+ *    member came to owe during the sweep's preparation (an owner resume that
+ *    fences its attempt elsewhere) leaves the work pending while the stop is
+ *    owed, with no preparation failure and no owner notice, also when the
+ *    preparation throws, and the sweep after the stop dispatches it;
  *  - one board asks the adapter about one member twice and gets two answers:
  *    the view is called through and never memoized, because a handle's answer
  *    changes as its turns start and end;
@@ -87,32 +86,29 @@ async function fixture(t) {
 }
 
 /**
- * Earlier work, ranked below the dependent and blocked, and a stop barrier the
- * adapter holds at its stop until `stopped` resolves. `owe` records on that
- * work, by a commit outside the mission queue, the stop a fence of the
- * author's attempt there writes, and starts its barrier as a fencing site
- * does: the author owes its stop until the barrier completes. No owner control
- * can be this commit: since F2 only a handle holding an open attempt owes a
- * stop, and the sweep chose the author holding none. `swept` resolves when the
- * next pass closes.
+ * Earlier work, ranked below the dependent, blocked while it still holds the
+ * author's attempt, and a stop barrier the adapter holds at its stop until
+ * `stopped` resolves. `resume` is the owner's resume of that work, which
+ * fences the attempt: the author owes its stop until the barrier completes.
+ * `swept` resolves when the next pass closes.
  */
 async function owedStop(f) {
   const earlier = f.propose({ title: 'Earlier work', priority: 10 })
   await f.runtime.settle(f.mission.id)
-  f.runtime.commit(f.mission.id, () => f.runtime.store.put('tasks', { ...taskOf(f.runtime, earlier.id), status: 'blocked' }))
+  f.runtime.commit(f.mission.id, () => {
+    const row = taskOf(f.runtime, earlier.id)
+    f.runtime.store.put('tasks', { ...row, status: 'blocked', epoch: row.epoch + 1, attempt: { id: 'attempt-held', epoch: row.epoch + 1, ownerId: f.author.id, leaseUntil: f.clock.now() + 60_000 } })
+  })
   const stopped = deferred(), swept = deferred()
   const stop = f.workers.stop.bind(f.workers)
   f.workers.stop = async id => { await stopped.promise; return stop(id) }
   const closePass = f.runtime.scheduling.closePass.bind(f.runtime.scheduling)
   f.runtime.scheduling.closePass = (missionId, pass) => { closePass(missionId, pass); swept.resolve() }
-  const owe = () => {
-    f.runtime.commit(f.mission.id, () => {
-      const row = taskOf(f.runtime, earlier.id)
-      f.runtime.store.put('tasks', { ...row, epoch: row.epoch + 1, resumeAfterStop: { epoch: row.epoch + 1, memberId: f.author.id, reason: 'handoff', at: f.clock.now() } })
-    })
-    f.runtime.attempts.resumeStoppedAttempt(f.mission.id, taskOf(f.runtime, earlier.id))
+  const resume = () => {
+    f.runtime.controlTask(f.owner, f.mission.id, earlier.id, 'resume', {}, 'condition repaired')
+    assert.equal(taskOf(f.runtime, earlier.id).resumeAfterStop?.memberId, f.author.id, 'the resume fenced the author\'s attempt, so the author owes its stop')
   }
-  return { earlier, stopped, swept, owe }
+  return { earlier, stopped, swept, resume }
 }
 
 const notices = f => f.runtime.store.list('deliveries', f.mission.id).filter(delivery => delivery.notice !== undefined)
@@ -247,7 +243,7 @@ test('the assignment asserts admission again after preparing: a stop the member 
   assert.deepEqual(f.runtime.store.events(f.mission.id, 5_000).filter(event => event.type === 'task/claimed'), [], 'nothing was claimed')
 })
 
-test('the dispatch sweep decides its choice again after preparing: a stop the member came to owe during the preparation leaves the work pending with no owner notice, and the sweep after the stop dispatches it', async t => {
+test('the dispatch sweep decides its choice again after preparing: a stop an owner resume makes the member owe during the preparation leaves the work pending with no owner notice, and the sweep after the stop dispatches it', async t => {
   const f = await fixture(t)
   const owed = await owedStop(f)
   const told = new Set(notices(f).map(delivery => delivery.id))
@@ -255,7 +251,7 @@ test('the dispatch sweep decides its choice again after preparing: a stop the me
   f.workers.idle.add(f.author.id)
   f.runtime.kick(f.mission.id)
   await f.entered.promise
-  owed.owe()
+  owed.resume()
   f.gate.resolve()
   await owed.swept.promise
   // The sweep is over and the author still owes its stop.
@@ -286,7 +282,7 @@ test('a preparation that throws after the member came to owe a stop during it re
   f.workers.idle.add(f.author.id)
   f.runtime.kick(f.mission.id)
   await f.entered.promise
-  owed.owe()
+  owed.resume()
   f.gate.resolve()
   await owed.swept.promise
   assert.equal(fault, undefined, 'the preparation threw')
