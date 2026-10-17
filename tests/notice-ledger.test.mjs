@@ -1604,6 +1604,43 @@ test('a wedged pass\'s naming of several tasks is outstanding for the work still
   }
 })
 
+test('a wake summary reminds and spends only the constituents with reminders left: one that spent its own stays unnamed while it is unresolved, and one resolved for a while and then reopened is reminded from its own first', async t => {
+  const f = await setup({ clock: new FakeClock(), budget: LONG })
+  t.after(f.cleanup)
+  const limit = f.runtime.notices.maxObligationFollowups
+  const [spent, reopened] = ['Spent work', 'Reopened work'].map(title => f.propose({ title }))
+  await quiet(f)
+  /** Row surgery as a verdict or a withdrawal writes it: a blocked task waits on nothing but the owner, a cancelled one is resolved. */
+  const status = (task, value) => f.runtime.store.transaction(() => f.runtime.store.put('tasks', { ...taskOf(f.runtime, task.id), status: value }))
+  for (const task of [spent, reopened]) status(task, 'blocked')
+  // One wake window: its first fact takes the individual wake, and the two decisions are carried by its summary.
+  f.runtime.notices.wakeBudget = 1
+  nextWindow(f)
+  f.runtime.store.transaction(() => {
+    f.runtime.notices.notify(f.mission.id, 'A fact that takes the window\'s individual wake', [`mission:${f.mission.id}`], { noticeClass: 'progress', trigger: 'test/progress' })
+    f.runtime.notices.notify(f.mission.id, 'The spent decision', [subjectOf(f, spent)], { noticeClass: 'stall', trigger: 'test/stall' })
+    f.runtime.notices.notify(f.mission.id, 'The reopened decision', [subjectOf(f, reopened)], { noticeClass: 'stall', trigger: 'test/stall' })
+  })
+  f.runtime.notices.wakeBudget = 0
+  const summary = ownerRows(f).find(delivery => delivery.notice.dedupKey.startsWith('wake-budget:'))
+  assert.deepEqual(summary.notice.aggregatedFacts.map(part => part.subjects), [[subjectOf(f, spent)], [subjectOf(f, reopened)]], 'the summary carries both decisions')
+  const counts = () => f.runtime.store.get('deliveries', summary.id).notice.aggregatedFacts.map(part => part.followupCount ?? 0)
+  // While the second decision is resolved, every reminder is the first one's, until it has spent its own.
+  status(reopened, 'cancelled')
+  for (let reminder = 1; reminder <= limit; reminder += 1) {
+    assert.deepEqual((await remind(f, summary)).map(delivery => [delivery.subjects, delivery.content.includes('The spent decision'), delivery.content.includes('The reopened decision')]), [[[subjectOf(f, spent)], true, false]],
+      `reminder ${reminder} names the unresolved constituent alone`)
+  }
+  assert.deepEqual(counts(), [limit, 0], 'the first constituent spent its reminders, and the resolved one spent none')
+  assert.deepEqual(await remind(f, summary), [], 'a constituent that spent its reminders is not reminded again, though it is unresolved')
+  // The second decision reopens: it is reminded from its own first reminder, and the spent one is neither named nor charged.
+  status(reopened, 'blocked')
+  const [reminder, ...more] = await remind(f, summary)
+  assert.deepEqual([more.length, reminder.subjects], [0, [subjectOf(f, reopened)]], 'one reminder, naming the reopened constituent alone')
+  assert.ok(reminder.content.includes(`reminder 1 of ${limit}`) && reminder.content.includes('The reopened decision') && !reminder.content.includes('The spent decision'), 'its ordinal and its prior notice are that constituent\'s own')
+  assert.deepEqual(counts(), [limit, 1], 'and it spends only that constituent\'s allowance')
+})
+
 test('a wedged pass\'s naming fact is the unfinished work and the counted start failures, under the key older builds wrote: other unfinished work under unchanged failures names the next body, and a held fact on a moved board digest names none', async t => {
   const { f, one, two } = await twoUnreached(t)
   const scheduling = f.runtime.scheduling
