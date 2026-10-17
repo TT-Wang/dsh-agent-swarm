@@ -22,6 +22,7 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { FakeClock, blockThroughReview, events, setup, taskOf } from './faults/harness.mjs'
 import { orchestratorCommands } from '../lib/trace.js'
+import { stopPending } from '../lib/task-graph.js'
 
 const PASS = [{ command: 'test -d .', exitCode: 0, output: 'ok' }]
 const TIMEOUT = [{ command: 'test -d .', exitCode: 124, failureKind: 'timeout', output: '[swarm] Execution timed out after 30000ms' }]
@@ -132,4 +133,67 @@ test('a structural amendment of running work still fences it, with the stop owed
   await f.runtime.settle(f.mission.id)
   assert.deepEqual(f.workers.stopped, [f.author.id], 'the barrier stopped the handle that held the open attempt')
   assert.equal(taskOf(f.runtime, work.id).status, 'pending', 'and re-pended the work after it')
+})
+
+/**
+ * A stop is owed only when `stopPending` says so: a marker at an older epoch
+ * than its row belongs to a fence a later epoch replaced, and obliges nothing.
+ * A store the pre-F2 build wrote holds such a marker on a deferred review when
+ * the owner resumed the review while it was rejecting (which laid a stop on
+ * the reviewer), reworked its source before that stop finished (which
+ * re-opened the review at the next epoch), and the reviewer then claimed it
+ * again and deferred. Each owner control asks the same question of that row as
+ * of one without a marker.
+ */
+const markEarlierEpoch = (f, taskId) => f.runtime.commit(f.mission.id, () => {
+  const row = taskOf(f.runtime, taskId)
+  f.runtime.store.put('tasks', { ...row, resumeAfterStop: { epoch: row.epoch - 1, memberId: f.reviewer.id, reason: 'handoff', at: f.clock.now() } })
+})
+
+test('an owner resume re-pends a deferred review whose stop marker is of an earlier epoch: that marker obliges nothing', async t => {
+  const f = await fixture(t)
+  const { source, review } = await f.deferredReview()
+  markEarlierEpoch(f, review.id)
+  const before = taskOf(f.runtime, review.id)
+  assert.equal(stopPending(before), false, 'the marker is of an earlier epoch')
+
+  f.runtime.controlTask(f.owner, f.mission.id, review.id, 'resume', {}, 'The host check deadline was repaired')
+  const row = taskOf(f.runtime, review.id)
+  assert.deepEqual([row.status, row.attempt, row.epoch, stopPending(row)], ['pending', undefined, before.epoch + 1, false], 'the review re-pends at once, owing no stop')
+  assert.deepEqual(events(f.runtime, f.mission.id, 'task/amended').filter(event => event.data.taskId === review.id).map(event => event.data.status), ['pending'])
+  await f.runtime.settle(f.mission.id)
+  assert.deepEqual(f.workers.stopped, [], 'no handle was stopped')
+  assert.equal(taskOf(f.runtime, review.id).status, 'pending', 'no barrier decides it later')
+
+  const retaken = await f.runtime.claim(f.actor(f.reviewer), f.mission.id, review.id)
+  const accepted = await f.runtime.verify(f.actor(f.reviewer), f.mission.id, { taskId: review.id, attemptId: retaken.attempt.id, verdict: 'accept', reason: 'Host checks pass after the repair' })
+  assert.equal(accepted.status, 'accepted')
+  assert.equal(taskOf(f.runtime, source.id).status, 'accepted', 'the dispatchable review decides its source')
+})
+
+test('a structural amendment of pending work whose stop marker is of an earlier epoch fences a preparation already awaiting I/O', async t => {
+  const f = await fixture(t)
+  const work = f.propose({ title: 'Pending work' })
+  f.runtime.commit(f.mission.id, () => f.runtime.store.put('tasks', { ...taskOf(f.runtime, work.id), epoch: 1 }))
+  markEarlierEpoch(f, work.id)
+  const before = taskOf(f.runtime, work.id)
+  assert.deepEqual([before.status, stopPending(before)], ['pending', false])
+  let entered, release
+  const preparing = new Promise(resolve => { entered = resolve })
+  const gate = new Promise(resolve => { release = resolve })
+  const prepare = f.workers.prepareTask.bind(f.workers)
+  f.workers.prepareTask = async (...args) => { entered(); await gate; return prepare(...args) }
+
+  const claim = f.runtime.claim(f.actor(f.author), f.mission.id, work.id)
+  await preparing
+  f.runtime.controlTask(f.owner, f.mission.id, work.id, 'amend', { checks: ['test -e .'] }, 'Tighten the host check')
+  assert.equal(taskOf(f.runtime, work.id).epoch, before.epoch + 1, 'the amendment moves the epoch the preparation was chosen at')
+  release()
+  await assert.rejects(claim, error => error.code === 'task_changed_during_preparation', 'the preparation awaiting I/O is fenced')
+  const row = taskOf(f.runtime, work.id)
+  assert.deepEqual([row.status, row.attempt, row.checks], ['pending', undefined, ['test -e .']])
+
+  f.workers.prepareTask = prepare
+  const claimed = await f.runtime.claim(f.actor(f.author), f.mission.id, work.id)
+  assert.deepEqual([claimed.status, claimed.checks], ['running', ['test -e .']], 'the amended work is claimed at its new epoch')
 })

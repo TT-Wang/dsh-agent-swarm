@@ -3170,7 +3170,7 @@ export class SwarmRuntime implements Kernel {
     if (resumes && this.taskBlockCauses(next).has('recovery-exhausted')) throw new PolicyError('task_recovery_exhausted', 'budget_error', 'Raise maxRecoveryAttempts before resuming exhausted automatic recovery')
     // An explicit owner recovery keeps the stop barrier but records the desired
     // pending state now, so a still-running checkpoint cannot forget the resume.
-    if (resumes && next.status === 'blocked' && next.artifact === undefined && next.resumeAfterStop?.reason === 'invalidated') {
+    if (resumes && next.status === 'blocked' && next.artifact === undefined && stopPending(next) && next.resumeAfterStop.reason === 'invalidated') {
       next.resumeAfterStop = { ...next.resumeAfterStop, reason: 'handoff' }
     }
     if (taskCeilingBlock(next, this.now()) === undefined) delete next.ceiling
@@ -3184,7 +3184,7 @@ export class SwarmRuntime implements Kernel {
     // reads from the row who owes a stop, so only running work's handle does,
     // and a resumed row re-pends at once unless a stop is still owed.
     const fenced = holdsOpenAttempt(next) ? structural : resumes && next.status === 'blocked' && next.attempt !== undefined
-    if (structural && !fenced && !next.resumeAfterStop) next.epoch++ // Fence a preparation already awaiting I/O.
+    if (structural && !fenced && !stopPending(next)) next.epoch++ // Fence a preparation already awaiting I/O.
     this.assertEffectiveTaskGraph({ ...next, status: 'pending' }, this.store.list('tasks', missionId).filter(row => row.id !== taskId))
     next.handoff = `${next.handoff ?? ''}\nOwner ${action}: ${reason}`.trim()
     // R20: raising a ceiling no longer has a host park to consume. The exhausted
@@ -3193,7 +3193,7 @@ export class SwarmRuntime implements Kernel {
     // one task has no business clearing.
     this.commit(missionId, () => {
       if (fenced) this.attempts.fenceForStop(next, { status: 'blocked', cause: `owner-${action}` })
-      if (resumes && !next.resumeAfterStop && next.status === 'blocked') next.status = 'pending'
+      if (resumes && !stopPending(next) && next.status === 'blocked') next.status = 'pending'
       this.store.put('tasks', next)
       this.store.event(missionId, 'task/amended', 'owner', { taskId, action, reason, changes, epoch: next.epoch, status: next.status, previous: Object.fromEntries(Object.keys(changes).map(key => [key, task[key as keyof Task] ?? null])),
         ...(rework === undefined ? {} : { rework: next.rejections!.at(-1), reworkCount: next.reworkCount }) })
