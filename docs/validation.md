@@ -9,9 +9,10 @@ Current **0.7.0** working-tree checks and the historical **0.6.0** baseline are 
 
 ## Batch 15: decide-then-act X1, X2, X3, F1, S7, S8, S9, S11, the full-log oracle record (2026-10-17)
 
-**Head**: `7782a37` and this record (documentation only), branch `batch15/kernel` on `b462a61`, not merged; this
-entry is written in the batch's first integrator repair round. `src` against `b462a61`: +1068 −934, net +134 (the
-round itself: +9 for comments, +9 for S7, −17 for the idle close-out; net +1).
+**Head**: `9234211` and this record (documentation only), branch `batch15/kernel` on `b462a61`, not merged; this
+entry is written in the batch's first integrator repair round and extended in its second. `src` against `b462a61`:
++1068 −934, net +134 (the first round: +9 for comments, +9 for S7, −17 for the idle close-out; net +1; the second
+round changes no `src`).
 
 **The full-log oracle at the head against `b462a61`** (`npm run test:oracle`, its logs recorded at `b462a61` before
 any `src` move; the head reproduces them identically over three runs). F5, F12, F18, F21 and outage are identical. The
@@ -60,6 +61,33 @@ worktree on that host's link farm, typecheck, build, `test:harness` and the five
 files that name the close-out, the silence bound or `controlTask` ran 809/809, and the 20 that name the check
 envelope 223/223. Each touched test file passed three rounds of two concurrent copies, and each regression test of
 the two fixes fails on a `b462a61` build.
+
+**Integrator repair round 2** (`9234211`).
+
+- `9234211` (tests only): the `owner_reply_missing` nudge's two printed `swarm_message` calls hold the call-exit
+  contract against the published schemas, and each is performed as printed through the owner's registered tools,
+  the answer on one question and the dismiss on another: the answer reaches the member that asked, both questions
+  are settled, and the next owner turn nudges neither. A mutant whose nudge names the delivery's `to` as the asker
+  fails only this test; it passes on `b462a61`, since `d287f79` was a refactor. `assertNamedCalls` drops a bare
+  value such as `true` as it drops a quoted one, so a call that passes `dismiss: true` can be checked.
+- Stopped for the owner: the idle close-out's turn end has three records: the row's `idleSignal`, written outside
+  any transaction and again inside `onIdle`'s commit, and `Attempts.idleSignals`, which alone holds a turn end whose
+  row write the writer refused. The right model records it once, inside the commit, and `turnEnded` reads only the
+  row; a refused write then records no turn end, so no nudge comes, the attempt reporting bound names the attempt
+  and the lease expiry frees it, as for any refused commit. Measured on a scratch mutant of `9234211` (−12 `src`
+  lines), the oracle differs only at F13 lines 21 and 27: the task row and attempt 2's assignment content hold
+  `revision` 10, not 13, because each `onIdle` writes the row once. Deleting only the out-of-transaction write gives
+  the same F13 log. Of the 19 test files that name the close-out, its signal or the reporting bound, 382 of 387
+  tests pass; the 5 that fail are `worker-closeout`'s two busy-writer cases, which pin the map, and the three that
+  name it: `in-memory-gates`' census entry `src/attempts.ts:1` and its probe, and `scheduling-pass`' S5 clear. That
+  entry's `cache-only` label, and the map's doc in `src/attempts.ts`, are false while a refused write is the map's
+  alone, and the change deletes both.
+
+Gate at `9234211` (`src` and the environment as at `7782a37`): on 0.1.5-rc.3 `npm run typecheck`, `npm run build`,
+`npm run test:oracle` (11 scenarios identical to the recorded logs), `npm run test:harness`, `npm run test:replay`
+(digest unchanged), `node scripts/faults/run.mjs` (24/24) and both web smokes (`passed: true`) passed. The 20 files
+that import `tests/refusal-inventory.mjs` passed 407/407, and `tests/owner-reply.test.mjs` passed 15/15 in three
+rounds of two concurrent copies.
 
 ## Round-30 simplification batch 11: one notice ledger (2026-10-14)
 
