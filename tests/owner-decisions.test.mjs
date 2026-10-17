@@ -15,8 +15,9 @@
  * 4. The dispatcher's per-(task, assignee) question: the notice names the member
  *    whose handle holds the task, never a false admission cause; an open attempt
  *    stays silent because the close-out path is already nudging it.
- * 5. A member holding a pending `nextStep` inbox item is drained or stays
- *    dispatchable, with the pair test showing the naive predicate stranding it.
+ * 5. A member holding a pending `nextStep` inbox item stays dispatchable and is
+ *    drained by the adapter's drain step, never by a question, with the pair
+ *    test showing the naive predicate stranding it.
  *
  * Every guard in this round names the guards it can co-fire with and each pair
  * below exercises the pair, not just one side.
@@ -41,7 +42,7 @@ const boardOver = (f, tasks) => ({ ...f.runtime.boardOf(f.mission.id), tasks, gr
 const budget = { ...sharedBudget, maxTokens: 100000, maxSteps: 100, maxTasks: 20, maxExperiments: 2 }
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
 
-/** `options`: hangStart, hangStop, an `idle(memberId)` predicate (always idle without one) and an `onDeliver` hook. */
+/** `options`: hangStart, hangStop, an `idle(memberId)` predicate (always idle without one), a `drain(memberId)` step and an `onDeliver` hook. */
 class Workers extends FakeWorkers {
   artifact = { commit: 'c', baseCommit: 'b', workspace: '/isolated', changedPaths: [] }
   checks = []
@@ -51,6 +52,7 @@ class Workers extends FakeWorkers {
   async deliver(member, delivery) { this.delivered.push({ memberId: member.id, deliveryId: delivery.id }); if (this.options.onDeliver) await this.options.onDeliver(member, delivery) }
   async stop() { if (this.options.hangStop === true) return new Promise(() => {}) }
   isIdle(memberId) { return this.options.idle === undefined ? true : this.options.idle(memberId) }
+  drainStrandedInbox(memberId) { this.options.drain?.(memberId) }
 }
 
 /** A runtime on a fresh fixture state, or, with `reopen` (an earlier fixture's config), on that same state file. */
@@ -248,8 +250,8 @@ test('R15-A4 pair: an open attempt stays silent — the close-out path already n
   assert.deepEqual(f.notices().filter(delivery => delivery.notice?.class === 'decision'), [], 'an open attempt is not silence, so it owes no decision')
 })
 
-test('R15-A5: the stranded-inbox hatch drains or stays dispatchable, and the naive predicate strands it', async t => {
-  // Unit: the decision function the adapter now uses.
+test('R15-A5: a stranded member stays dispatchable and the sweep\'s drain step wakes its input, and the naive predicate strands it', async t => {
+  // Unit: the decision function the adapter now uses (`isIdle` answers `startable`, the drain step acts on `drain`).
   assert.deepEqual(strandedInboxDecision({ stopping: false, observations: 0, status: 'idle', hasPending: false }), { startable: true, drain: false })
   assert.deepEqual(strandedInboxDecision({ stopping: false, observations: 0, status: 'idle', hasPending: true }), { startable: true, drain: true }, 'an idle handle holding queued input is startable and is drained')
   assert.deepEqual(strandedInboxDecision({ stopping: true, observations: 0, status: 'idle', hasPending: true }), { startable: false, drain: false }, 'a stopping handle is never startable')
@@ -271,17 +273,19 @@ test('R15-A5: the stranded-inbox hatch drains or stays dispatchable, and the nai
   assert.ok(strandedQuestion, 'the stranded holder is named even when the adapter refuses to start it')
   assert.match(strandedQuestion.content, new RegExp(strandedMember.id), 'the notice names the member whose handle holds the task')
 
+  // The adapter's contract: `isIdle` is a question, and only the drain step,
+  // which the dispatch sweep runs before it decides, wakes stranded input.
   const fixedState = { pending: new Set(), drained: [] }
-  const fixed = await scenario(t, { workers: new Workers({ idle: memberId => {
-    const decision = strandedInboxDecision({ stopping: false, observations: 0, status: 'idle', hasPending: fixedState.pending.has(memberId) })
-    if (decision.drain) { fixedState.drained.push(memberId); fixedState.pending.delete(memberId) }
-    return decision.startable
-  } }) })
+  const decide = memberId => strandedInboxDecision({ stopping: false, observations: 0, status: 'idle', hasPending: fixedState.pending.has(memberId) })
+  const fixed = await scenario(t, { workers: new Workers({
+    idle: memberId => decide(memberId).startable,
+    drain: memberId => { if (decide(memberId).drain) { fixedState.drained.push(memberId); fixedState.pending.delete(memberId) } },
+  }) })
   const drained = await fixed.addMember('Drained')
   fixedState.pending.add(drained.id)
   const task = fixed.propose('Dispatched after the drain', { assigneeId: drained.id })
   await sleep(250)
-  assert.deepEqual(fixedState.drained, [drained.id], 'the queued item was drained through the hatch')
+  assert.deepEqual(fixedState.drained, [drained.id], 'the queued item was drained once, by the sweep\'s drain step')
   assert.equal(fixed.runtime.store.get('tasks', task.id).status, 'running', 'and the member stayed dispatchable')
 })
 
@@ -449,10 +453,10 @@ test('R15-D3: the off-pass sweep does not invent a cause the dispatcher branch s
   assert.deepEqual(fallthrough, [], 'the off-pass sweep never emits the pass-scoped fall-through for a dispatchable board')
 })
 
-test('R15-D4: the real adapter drains a stranded nextStep item through isIdle', async t => {
+test('R15-D4: the real adapter answers isIdle as a question and wakes a stranded nextStep item only in its drain step', async t => {
   // The shipped guard must be exercised on the real adapter surface: a stubbed
   // Harness context is enough to construct it, and the resident is injected so
-  // the decision runs through HarnessWorkers.isIdle itself.
+  // the decision runs through HarnessWorkers.isIdle and drainStrandedInbox themselves.
   const ctx = { on: () => () => {}, get: () => undefined, logger: { error: () => {}, warn: () => {}, info: () => {} } }
   const adapterRoot = await tempDirectory('swarm-adapter-')
   const adapter = new HarnessWorkers(ctx, { workspacesRoot: join(adapterRoot, 'ws'), checkTimeoutMs: 1000, maxCheckOutputBytes: 1000 })
@@ -474,16 +478,22 @@ test('R15-D4: the real adapter drains a stranded nextStep item through isIdle', 
     session: {},
   }
   adapter.residents.set('member_adapter', { ...resident, handle: { agent, dispose: async () => {} } })
-  assert.equal(adapter.isIdle('member_adapter'), true, 'an idle handle holding queued input is startable')
-  assert.deepEqual(sent, [{ id: 'msg_stranded', target: 'next-step', wakeup: true }], 'the stranded item is re-woken with its original identity')
+  assert.deepEqual([adapter.isIdle('member_adapter'), adapter.isIdle('member_adapter')], [true, true], 'an idle handle holding queued input is startable, at every ask')
+  assert.deepEqual([sent, pending.map(message => message.id)], [[], ['msg_stranded']], 'and asking woke nothing: the item is still pending')
+  adapter.drainStrandedInbox('member_adapter')
+  assert.deepEqual(sent, [{ id: 'msg_stranded', target: 'next-step', wakeup: true }], 'the drain step re-wakes the stranded item with its original identity')
   assert.deepEqual(pending, [], 'and it is no longer pending')
   // Pair: in-flight observations are work, not a stranded queue, and a stopping
-  // resident is never startable.
+  // resident is never startable; the drain step wakes neither.
+  pending.push({ id: 'msg_held', role: 'user', content: [], source: { kind: 'swarm', form: 'relay', missionId: 'mission_adapter', senderMemberId: 'owner', deliveryId: 'd2', deliveryKind: 'control' } })
   const busy = { ...resident, observations: new Set([Promise.resolve()]), handle: { agent, dispose: async () => {} } }
   adapter.residents.set('member_busy', busy)
   assert.equal(adapter.isIdle('member_busy'), false, 'in-flight observations are work')
   adapter.residents.set('member_stopping', { ...resident, stopping: Promise.resolve(), handle: { agent, dispose: async () => {} } })
   assert.equal(adapter.isIdle('member_stopping'), false, 'a stopping resident is never startable')
+  adapter.drainStrandedInbox('member_busy')
+  adapter.drainStrandedInbox('member_stopping')
+  assert.deepEqual([sent.length, pending.map(message => message.id)], [1, ['msg_held']], 'the drain step leaves the input of a busy or stopping handle pending')
 })
 
 test('R15-B: the sidebar phase, recovery age and pending decision come from durable facts', () => {

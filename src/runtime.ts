@@ -640,8 +640,8 @@ export class SwarmRuntime implements Kernel {
   mission(missionId: string): Mission { return readMission(this.store, missionId, this.now) }
   /**
    * The adapter's answers a decision asks, called through to the adapter on
-   * every ask and never memoized: asking whether a handle is idle can drain a
-   * stranded inbox item.
+   * every ask and never memoized: a handle's answer changes as its turns start
+   * and end.
    */
   readonly view: AdapterView = { startable: memberId => this.workers.isIdle(memberId), activity: memberId => this.workers.currentActivity(memberId) }
   /** One mission's board as the store holds it now: a decision reads it where it decides. */

@@ -1098,7 +1098,20 @@ export interface WorkerAdapter {
    * `checks`; a command that parses has no entry, so callers pair by `index`.
    */
   checkSyntaxPreflight(checks: readonly string[], cwd: string, signal?: AbortSignal): Promise<CheckSyntaxIssue[]>
+  /**
+   * Whether the member's handle could take an assignment now. A question:
+   * asking it changes nothing, so a decision may ask it any number of times. An
+   * idle handle holding input no driver will claim is startable: an
+   * assignment's waking delivery carries that input with it.
+   */
   isIdle(memberId: string): boolean
+  /**
+   * R15-A5: wake the input an idle handle holds that no driver will claim (a
+   * stranded inbox), so it is consumed instead of stranding the member. The
+   * adapter's own step, run by the runtime at one point: the start of each
+   * dispatch sweep, for each member whose handle the sweep asks about.
+   */
+  drainStrandedInbox(memberId: string): void
   /**
    * Capture the member worktree plus `deliverables` and the task's declared
    * `outputs`; with `requireOutputs` (submit and verify) a declared output that

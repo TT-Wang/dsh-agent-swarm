@@ -335,19 +335,20 @@ export class ScopedEnvironment {
 
 /** The plugin fiber owns every worker; user/coordinator session disposal does not own them. */
 /**
- * R15-A5: the adapter's startability decision for one owned handle, exported so
- * the hatch is testable without a running Harness host (the adapter itself needs
- * the native agent services). The rules, in order:
+ * R15-A5: the adapter's decision for one owned handle, exported so it is
+ * testable without a running Harness host (the adapter itself needs the native
+ * agent services). `isIdle` answers `startable`, and `drainStrandedInbox` acts
+ * on `drain`. The rules, in order:
  *
  * 1. a stopping handle or one with in-flight observations is not startable;
  * 2. a handle that is not `idle` is working, not startable;
  * 3. an idle handle with pending inbox input has no driver left to claim it
- *    (`drain: true`): it is startable, and the caller re-wakes the pending tail so
- *    the item is consumed instead of stranding the member.
+ *    (`drain: true`): it is startable, and the drain step re-wakes the pending
+ *    tail so the item is consumed instead of stranding the member.
  *
- * Co-firing guards, named: the parked-member hatch (`member.status === 'waiting'`
- * makes the runtime skip this call entirely), the W6 open-attempt close-out
- * (`dispatch` owns a member with a running attempt before it dispatches) and
+ * Co-firing guards, named: the parked-member hatch (the runtime never asks
+ * about a parked member's handle, nor drains it), the W6 open-attempt close-out
+ * (`dispatch` handles a member with a running attempt before it dispatches) and
  * `removeRevokedPending` (discards a revoked assignment before the drain).
  */
 export function strandedInboxDecision(input: { stopping: boolean; observations: number; status: string; hasPending: boolean }): { startable: boolean; drain: boolean } {
@@ -1058,47 +1059,40 @@ export class HarnessWorkers implements WorkerAdapter {
     })()
   }
 
-  /**
-   * R15-A5: whether the adapter could start this member right now.
-   *
-   * An idle handle holding pending inbox input cannot consume it: the native
-   * driver that would claim the item has ended (a rejected pre-step, a revoked
-   * assignment) and nothing re-wakes it, so `hasPending` used to strand the
-   * member — every dispatch sweep skipped it and the assignment that would have
-   * drained it was never delivered. The round-14 workaround (one owner message
-   * per stalled member) is not a mechanism.
-   *
-   * The hatch drains the stranded tail through the same public `send` API
-   * `continueAfterRejectedStep` uses (original identity, `wakeup: true`) and then
-   * reports the member startable, so the drained input and any fresh assignment
-   * are both delivered by the native inbox.
-   *
-   * Co-firing guards, named: the parked-member hatch (`member.status ===
-   * 'waiting'`, which makes the runtime treat this member as startable without
-   * asking), the W6 open-attempt close-out (`dispatch` handles a member with a
-   * running attempt before it dispatches, so this hatch cannot hand one member
-   * two assignments) and `removeRevokedPending` (a revoked assignment is
-   * discarded before the tail is re-woken).
-   */
-  isIdle(memberId: string): boolean {
+  /** R15-A5: the decision for one member's live handle (`strandedInboxDecision`), or undefined while it has none: never opened, stopping, aborted, or the adapter closing. */
+  private handleDecision(memberId: string): { resident: Resident; agent: Agent; startable: boolean; drain: boolean } | undefined {
     const resident = this.residents.get(memberId)
-    if (resident?.handle === undefined || this.closing || resident.stopping !== undefined || resident.abort.signal.aborted) return false
+    if (resident?.handle === undefined || this.closing || resident.stopping !== undefined || resident.abort.signal.aborted) return undefined
     const agent = resident.handle.agent
-    const decision = strandedInboxDecision({
+    return { resident, agent, ...strandedInboxDecision({
       stopping: resident.stopping !== undefined, observations: resident.observations.size,
       status: agent.status, hasPending: agent.inbox.nextStep.length > 0 || agent.inbox.nextTurn.length > 0,
-    })
-    if (decision.drain) this.drainStrandedInbox(resident, agent)
-    return decision.startable
+    }) }
   }
 
   /**
-   * R15-A5: re-wake the pending tail of an idle handle so a queued item cannot
-   * strand the member. Removal first keeps FIFO and exactly-once delivery: a
-   * message a live driver already claimed fails `remove` and is left alone.
+   * R15-A5: whether the adapter could start this member right now. A question:
+   * an idle handle holding pending input is startable, and asking wakes nothing.
+   * Reporting it busy stranded the member (round 14): every dispatch sweep
+   * skipped it, so the assignment whose waking delivery would carry that input
+   * was never delivered.
    */
-  private drainStrandedInbox(resident: Resident, agent: Agent): void {
-    if (this.closing || resident.stopping !== undefined || resident.abort.signal.aborted) return
+  isIdle(memberId: string): boolean { return this.handleDecision(memberId)?.startable === true }
+
+  /**
+   * R15-A5: the drain step. An idle handle holding pending input cannot
+   * consume it: the native driver that would claim the item has ended (a
+   * rejected pre-step, a revoked assignment, input restored at activation) and
+   * nothing re-wakes it. This re-wakes the stranded tail through the same public
+   * `send` API `continueAfterRejectedStep` uses (original identity, `wakeup:
+   * true`). Removal first keeps FIFO and exactly-once delivery: a message a live
+   * driver already claimed fails `remove` and is left alone, and a revoked
+   * assignment is discarded first (`removeRevokedPending`).
+   */
+  drainStrandedInbox(memberId: string): void {
+    const handle = this.handleDecision(memberId)
+    if (handle?.drain !== true) return
+    const { resident, agent } = handle
     this.removeRevokedPending(resident, agent)
     for (const target of ['next-step', 'next-turn'] as const) {
       const pending = target === 'next-step' ? agent.inbox.nextStep : agent.inbox.nextTurn

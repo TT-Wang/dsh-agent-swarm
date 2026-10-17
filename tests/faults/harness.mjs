@@ -183,8 +183,9 @@ export function runNode(args, options = {}) {
  *
  * Every required adapter method has a behaviour-neutral answer, the one the
  * runtime gave before these methods were required: `inspectArtifact` keeps the
- * stored artifact, `checkpointTask`, `compactAtBoundary` and
- * `invalidateComposition` do nothing, `checkSyntaxPreflight` finds no issue and
+ * stored artifact, `checkpointTask`, `compactAtBoundary`,
+ * `invalidateComposition` and `drainStrandedInbox` (no handle here holds input)
+ * do nothing, `checkSyntaxPreflight` finds no issue and
  * the delivery pair refuses with `delivery_unsupported`. They answer
  * synchronously, so each awaited call takes a single microtask. (A stop whose
  * recorded owner has no member row is refused as unconfirmable, as it is for the
@@ -227,6 +228,7 @@ export class FakeWorkers {
   async deliver(member, delivery) { this.deliveries.push({ memberId: member.id, ...json(delivery) }) }
   async stop(id) { this.stopped.push(id) }
   isIdle(id) { return this.autoIdle || this.idle.has(id) }
+  drainStrandedInbox() {}
   async captureArtifact(member, task) {
     this.captured.push({ memberId: member.id, taskId: task.id, epoch: task.epoch, attemptId: task.attempt?.id })
     if (this.captureGate) await this.captureGate()

@@ -17,13 +17,16 @@
  *  - the assignment asserts the admission again: a stop the member came to owe
  *    during a claim's preparation refuses it;
  *  - one board asks the adapter about one member twice and gets two answers:
- *    the view is called through and never memoized, because asking whether a
- *    handle is idle can drain a stranded inbox item (R15-A5);
- *  - a preferred member whose stranded inbox the dispatch sweep drains leaves
- *    its work to the borrower in the same pass, as it did before S11 (the
- *    sweep's member step still builds the interpretation, whose asks precede
- *    the borrower's eligibility ask, until the adapter separates isIdle's
- *    question from its drain).
+ *    the view is called through and never memoized, because a handle's answer
+ *    changes as its turns start and end;
+ *  - a stranded inbox (R15-A5: input an idle handle holds that no driver will
+ *    claim) is woken by the adapter's drain step, which the dispatch sweep runs
+ *    once before it decides anything, never by a question. A preferred member
+ *    stranded before the sweep is busy at every ask of it, so the borrower
+ *    takes its work in the same pass; one whose turn ends stranded during the
+ *    sweep is startable, so it keeps its work and the assignment wakes its
+ *    input. Either way the owner is asked no dispatch question (the case S11
+ *    found, when an ask drained the inbox).
  *
  * A notice that reads only rows reads the board and asks the adapter nothing:
  * tests/notice-board-reads.test.mjs.
@@ -31,7 +34,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { isolationViolation, ready } from '../lib/board.js'
-import { FakeClock, setup, taskOf } from './faults/harness.mjs'
+import { FakeClock, FakeWorkers, setup, taskOf } from './faults/harness.mjs'
 
 const deferred = () => { let resolve; return { promise: new Promise(r => { resolve = r }), resolve: value => resolve(value) } }
 
@@ -169,29 +172,81 @@ test('a board asks the adapter at every ask: two asks about one member on one bo
   assert.deepEqual(asked, [f.author.id, f.author.id], 'each ask reached the adapter')
 })
 
-test('a preferred member the dispatch sweep drains leaves its work to the borrower in the same pass, and the owner is asked nothing', async t => {
-  const f = await setup({ clock: new FakeClock() })
+/**
+ * A Harness-like adapter (`HarnessWorkers`, R15-A5): a member's handle is idle
+ * while it is in `idle`, and an idle handle can hold input no driver will claim
+ * (`stranded`). `isIdle` is a question, so asking changes nothing; only the
+ * drain step wakes stranded input, whose turn then runs (the handle is busy),
+ * and an assignment's waking delivery carries it with the assignment. `woken`
+ * records which of the two consumed each member's stranded input.
+ */
+class InboxWorkers extends FakeWorkers {
+  stranded = new Set()
+  woken = []
+  drainStrandedInbox(id) {
+    if (!this.isIdle(id) || !this.stranded.delete(id)) return
+    this.idle.delete(id)
+    this.woken.push(['drain', id])
+  }
+  async deliver(member, delivery) {
+    if (this.stranded.delete(member.id)) this.woken.push(['delivery', member.id])
+    await super.deliver(member, delivery)
+  }
+}
+
+const dispatchQuestions = f => f.runtime.store.list('deliveries', f.mission.id)
+  .filter(delivery => delivery.to === 'owner' && delivery.notice?.dedupKey.startsWith('dispatch-question:')).map(delivery => delivery.content)
+
+test('the dispatch sweep has the adapter wake a stranded inbox before it decides, and leaves a parked member\'s', async t => {
+  const workers = new InboxWorkers()
+  const f = await setup({ clock: new FakeClock(), workers })
+  t.after(() => f.cleanup())
+  // The reviewer is parked: the parked-member hatch never asks about its handle.
+  f.runtime.commit(f.mission.id, () => f.runtime.store.put('members', { ...f.runtime.store.get('members', f.reviewer.id), phase: 'parked' }))
+  await f.runtime.settle(f.mission.id)
+  // Both handles are idle and hold input no driver will claim; there is no work to hand them.
+  for (const member of [f.author, f.reviewer]) { workers.idle.add(member.id); workers.stranded.add(member.id) }
+  await f.runtime.tick()
+  await f.runtime.settle(f.mission.id)
+  assert.deepEqual(workers.woken, [['drain', f.author.id]], 'the sweep woke the author\'s stranded input, once')
+  assert.deepEqual([...workers.stranded], [f.reviewer.id], 'and left the parked reviewer\'s for the work that unparks it')
+})
+
+test('a preferred member whose handle holds stranded input when the sweep starts is drained first, so the borrower takes its work in the same pass and the owner is asked nothing', async t => {
+  const workers = new InboxWorkers()
+  const f = await setup({ clock: new FakeClock(), workers })
   t.after(() => f.cleanup())
   const work = f.propose({ title: 'Preferred to the reviewer', assigneeId: f.reviewer.id, assignmentMode: 'preferred' })
   await f.runtime.settle(f.mission.id)
-  // The Harness adapter's idleness question drains a stranded inbox item
-  // (`HarnessWorkers.isIdle`, R15-A5): the first ask about an idle handle that
-  // holds one answers that it can start and wakes it, so every later ask
-  // answers busy. The reviewer's handle is left that way while the sweep
-  // starts the author, the member it steps through first.
-  let stranded = false
-  f.workers.isIdle = memberId => {
-    if (memberId === f.author.id) return true
-    if (memberId !== f.reviewer.id || !stranded) return false
-    stranded = false
-    return true
-  }
+  for (const member of [f.author, f.reviewer]) workers.idle.add(member.id)
+  workers.stranded.add(f.reviewer.id)
+  await f.runtime.tick()
+  await f.runtime.settle(f.mission.id)
+  assert.deepEqual(workers.woken, [['drain', f.reviewer.id]], 'the sweep woke the reviewer\'s stranded input before it decided anything')
+  const row = taskOf(f.runtime, work.id)
+  assert.deepEqual([row.status, row.attempt?.ownerId], ['running', f.author.id], 'so every ask of the sweep read the reviewer busy, and the author borrowed its work')
+  assert.deepEqual(dispatchQuestions(f), [], 'and the owner was asked no dispatch question about it')
+})
+
+test('a preferred member whose turn ends stranded while the sweep starts the author keeps its work, and the owner is asked nothing', async t => {
+  const workers = new InboxWorkers()
+  const f = await setup({ clock: new FakeClock(), workers })
+  t.after(() => f.cleanup())
+  const work = f.propose({ title: 'Preferred to the reviewer', assigneeId: f.reviewer.id, assignmentMode: 'preferred' })
+  await f.runtime.settle(f.mission.id)
+  // The author's handle is idle. The reviewer's is busy until the sweep starts
+  // the author, the member it steps through first, and then ends its turn with
+  // input left in its inbox: after the sweep's drain step, so no step drains it.
+  workers.idle.add(f.author.id)
   const start = f.runtime.startWorker.bind(f.runtime)
-  f.runtime.startWorker = async (mission, member, options) => { await start(mission, member, options); if (member.id === f.author.id) stranded = true }
+  f.runtime.startWorker = async (mission, member, options) => {
+    await start(mission, member, options)
+    if (member.id === f.author.id && !workers.idle.has(f.reviewer.id)) { workers.idle.add(f.reviewer.id); workers.stranded.add(f.reviewer.id) }
+  }
   await f.runtime.tick()
   await f.runtime.settle(f.mission.id)
   const row = taskOf(f.runtime, work.id)
-  assert.deepEqual([row.status, row.attempt?.ownerId], ['running', f.author.id], 'the author borrowed the work its drained preferred member cannot start')
-  assert.deepEqual(f.runtime.store.list('deliveries', f.mission.id).filter(delivery => delivery.to === 'owner' && delivery.notice?.dedupKey.startsWith('dispatch-question:')).map(delivery => delivery.content), [],
-    'and the owner was asked no dispatch question about it')
+  assert.deepEqual([row.status, row.attempt?.ownerId], ['running', f.reviewer.id], 'the reviewer\'s idle handle is startable at every ask, so it keeps the work preferred to it')
+  assert.deepEqual(workers.woken, [['delivery', f.reviewer.id]], 'and the assignment\'s waking delivery carried its stranded input')
+  assert.deepEqual(dispatchQuestions(f), [], 'and the owner was asked no dispatch question about it')
 })

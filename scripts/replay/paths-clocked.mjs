@@ -16,14 +16,15 @@
  *     terminal mission and its accepted task stay immutable.
  *  5. Preference. Two untouched tasks preferred to different members wait
  *     behind a member that prefers neither, with nothing running. Every
- *     interpretation of that board (built by each member step of the dispatch
- *     sweep, as by the board classifiers) asks the adapter whether each
- *     preferred member can start, once for the dispatchable work and again for
- *     the stall, so the order in which it evaluates its sets is in the trace; the
- *     sweep then asks again for each member it would hand work to. A read of
- *     rows alone (the sweep's member order, the integration gap the second
- *     proposal opens) reads the board and asks nothing. Once every handle can
- *     start, each preferred member takes its own task.
+ *     interpretation of that board (built by the board classifiers) asks the
+ *     adapter whether each preferred member can start, once for the
+ *     dispatchable work and again for the stall, so the order in which it
+ *     evaluates its sets is in the trace. Each member step of the dispatch sweep
+ *     reads the board and asks only where it decides: for each member it would
+ *     hand work to, after the sweep's drain step. A read of rows alone (the
+ *     sweep's member order, the integration gap the second proposal opens)
+ *     asks nothing. Once every handle can start, each preferred member takes
+ *     its own task.
  *  6. A pump that ages out mid-tick. An owner notice's delivery hangs, so the
  *     pump that started it stays in flight; a body wedges in its start. The
  *     tick's outbox guard joins that pump one millisecond inside its bound, the

@@ -254,6 +254,31 @@ test('a start of a running worker adopts its session and opens nothing; an agent
   await f.adapter.deliver(f.member, { ...message(f.member, 'finding-two'), kind: 'finding', content: 'A later finding.' })
 })
 
+test('input restored at activation is stranded until the drain step wakes it: asking whether the worker is idle wakes nothing', async t => {
+  const f = await fixture(t, undefined, {
+    beforeChunks: (_action, options, count) => count === 1 ? new Promise((_resolve, reject) => {
+      options.signal.addEventListener('abort', () => reject(options.signal.reason), { once: true })
+    }) : undefined,
+  })
+  await f.adapter.deliver(f.member, message(f.member))
+  await eventually(() => f.requests.length === 1, 'the assignment turn never reached the provider', 10000)
+  await f.adapter.deliver(f.member, { ...message(f.member, 'finding-one'), kind: 'finding', content: 'A finding for the next step.' })
+  await f.agentLoop.dispose()
+  await f.ctx.plugin(AgentLoop, { agents: [] })
+  await f.adapter.start(f.spec)
+  const agent = f.ctx.agents.get(SessionId(f.member.sessionId))
+  // The journal appends the input the reload cleared without a wake, so no driver will claim it.
+  assert.deepEqual([agent.status, agent.inbox.nextStep.map(item => item.id)], ['idle', ['swarm:finding-one']], 'the restored input is stranded on an idle handle')
+  assert.deepEqual([f.adapter.isIdle(f.member.id), f.adapter.isIdle(f.member.id)], [true, true], 'the handle is startable, at every ask')
+  await agent.whenIdle()
+  assert.deepEqual([f.requests.length, agent.inbox.nextStep.map(item => item.id)], [1, ['swarm:finding-one']], 'and asking woke nothing')
+  f.adapter.drainStrandedInbox(f.member.id)
+  await agent.whenIdle()
+  assert.equal(f.requests.length, 2, 'the drain step woke the stranded input into a model turn')
+  assert.match(JSON.stringify(f.requests[1].messages), /A finding for the next step\./, 'which carried it to the provider')
+  assert.deepEqual(agent.inbox.nextStep, [], 'and nothing is left pending')
+})
+
 test('input a worker conversation received natively and had not consumed survives a stop and restart', async t => {
   // A worker conversation also opens natively: a user's steer or a hook's
   // context reaches the same inbox without passing through deliver().

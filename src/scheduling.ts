@@ -9,7 +9,7 @@
  */
 import { id } from './store.ts'
 import { TERMINAL_STATES, holdsOpenAttempt, openAttempt, pendingStopOwner, quiescencePending, subjectsOfTasks, taskSubject, terminal } from './task-graph.ts'
-import { eligible, interpret, isolationViolation, noticeSubjectsFor, overdueStop, ready, startBlocker, unschedulable } from './board.ts'
+import { eligible, isolationViolation, noticeSubjectsFor, overdueStop, ready, startBlocker, unschedulable } from './board.ts'
 import { factKey, type Notices } from './notices.ts'
 import { AdmissionRefusedError } from './scheduler.ts'
 import { awaited, formatSpan, progressed, type Kernel, type PassState, type SchedulingPass } from './kernel.ts'
@@ -90,11 +90,18 @@ export class Scheduling {
         // dispatcher would act on differently, and it reads the board again
         // after each await, so it is never staler than the per-step store reads
         // it replaces.
-        const members = this.k.boardOf(missionId).members
+        const { members, tasks } = this.k.boardOf(missionId)
         const from = pass?.sweepFrom === undefined ? -1 : members.findIndex(member => member.id === pass.sweepFrom)
         const rotation = from > 0 ? [...members.slice(from), ...members.slice(0, from)] : members
         const end = pass?.chainFrom === undefined ? -1 : rotation.findIndex((member, index) => index > 0 && member.id === pass.chainFrom)
         const order = end > 0 ? rotation.slice(0, end) : rotation
+        // R15-A5: before it decides anything, the sweep has the adapter wake the
+        // input each handle it asks about holds that no driver will claim
+        // (`WorkerAdapter.drainStrandedInbox`): a live member's that owes no
+        // stop and is not parked (the parked-member hatch never asks about its
+        // handle). Every ask below then reads the handles that step left, and
+        // asking drains nothing.
+        for (const member of order) if (memberPhaseOf(member) === 'active' && !pendingStopOwner(tasks, member.id)) this.k.workers.drainStrandedInbox(member.id)
         let memberSince = this.k.now()
         for (const [index, member] of order.entries()) {
           if (this.k.shuttingDown || this.k.mission(missionId).status !== 'active') return false
@@ -130,22 +137,18 @@ export class Scheduling {
           }
           if (this.k.shuttingDown || this.k.mission(missionId).status !== 'active') return false
           // R10-09/S3: a parked member is dispatchable. The adapter's idle
-          // precondition can be false for a parked agent (a pending inbox item or a
-          // non-idle handle); an assignment is exactly the fresh input that unparks
-          // it, so the runtime must not let that precondition leave the board silent.
+          // precondition can be false for a parked agent (a non-idle handle); an
+          // assignment is exactly the fresh input that unparks it, so the runtime
+          // must not let that precondition leave the board silent.
           const parkedMember = memberPhaseOf(member) === 'parked'
           // R15-A4/A5: the sweep and the owner-facing explanation ask the same
           // question (`startBlocker`), so a member the sweep skipped is never
           // described to the owner with a cause the sweep did not test. The
           // parked-member hatch keeps priority: a parked member is dispatchable.
           if (startBlocker(this.k.view, member) !== undefined) continue
-          // Built for its adapter asks alone (no judged field is read): they come
-          // before this member's eligibility asks, and an ask can drain a stranded
-          // inbox (R15-A5), so their order is behaviour (board-read-points' drain
-          // case) until A1 separates isIdle's question from its drain.
-          const view = interpret(this.k.boardOf(missionId))
-          if (pendingStopOwner(view.tasks, member.id)) continue
-          const open = openAttempt(view.tasks, member.id)
+          const board = this.k.boardOf(missionId)
+          if (pendingStopOwner(board.tasks, member.id)) continue
+          const open = openAttempt(board.tasks, member.id)
           if (open !== undefined) {
             // W6: the worker ended its turn with an open attempt. Nudge within a
             // bounded retry, then checkpoint the workspace and re-pend the task
@@ -154,7 +157,7 @@ export class Scheduling {
             if (!parkedMember && this.attempts.turnEnded(open)) await this.attempts.closeOutIdleAttempt(mission, member, open, pass)
             continue
           }
-          const choices = view.tasks.filter(t => eligible(view, t, member)).sort((a, b) => b.priority - a.priority || a.createdAt - b.createdAt)
+          const choices = board.tasks.filter(t => eligible(board, t, member)).sort((a, b) => b.priority - a.priority || a.createdAt - b.createdAt)
           // R12-F9 (a task whose text assumes prior work no content-carrying edge
           // provides) is refused where a dependency set is written: plan
           // validation, propose() and the owner's `changes.dependencies`
