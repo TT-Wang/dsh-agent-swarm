@@ -333,10 +333,10 @@ export class ScopedEnvironment {
   }
 }
 
-/** The plugin fiber owns every worker; user/coordinator session disposal does not own them. */
 /** R15-A5: the state of an owned handle. `isIdle` answers whether it is not `busy`; the drain step acts on `stranded`. */
 export type HandleState = 'busy' | 'idle' | 'stranded'
 
+/** The plugin fiber owns every worker; user/coordinator session disposal does not own them. */
 /**
  * R15-A5: the adapter's decision for one owned handle, exported so it is
  * testable without a running Harness host (the adapter itself needs the native

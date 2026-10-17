@@ -238,10 +238,10 @@ export class Scheduling {
    * tried to preserve a cut-off attempt) propagated out of `dispatch`, the
    * scheduler only wrote it to stderr, and every later tick re-entered the
    * same throw: a dead end with no durable record and no exit. The throw is
-   * the terminal element's input: escalate
-   * with a coded decision request, and the sweep keeps dispatching the other
-   * members (true). On a halted sweep (`halted`) the throw is the halt's, not a
-   * failure of the chain, and the body is abandoned (false).
+   * the terminal element's input: escalate with a coded decision request, and
+   * the sweep keeps dispatching the other members (true). On a halted sweep
+   * (`halted`) the throw is the halt's, not a failure of the chain, and the
+   * body is abandoned (false).
    */
   private chainFailed(missionId: string, member: Member, error: unknown): boolean {
     if (this.halted(missionId)) return false
