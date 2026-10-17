@@ -125,12 +125,10 @@ export class RefusalRegistry {
   /**
    * The refusal of new work for a member still owed its previous attempt's
    * stop, or undefined when it owes none: the one statement of that rule, which
-   * a claim, a worker start and an admission all meet as an admission refusal
-   * (`stop_owed`).
+   * a claim, a worker start and an admission all meet.
    */
-  stopOwed(missionId: string, memberId: string): AdmissionRefusedError | undefined {
-    return pendingStopOwner(this.k.store.list('tasks', missionId), memberId)
-      ? new AdmissionRefusedError({ reason: 'stop_owed', admitted: false, detail: 'Worker is waiting for its previous attempt to stop' }) : undefined
+  stopOwed(missionId: string, memberId: string): Error | undefined {
+    return pendingStopOwner(this.k.store.list('tasks', missionId), memberId) ? new Error('Worker is waiting for its previous attempt to stop') : undefined
   }
 
   /**

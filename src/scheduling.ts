@@ -9,7 +9,7 @@
  */
 import { id } from './store.ts'
 import { TERMINAL_STATES, holdsOpenAttempt, openAttempt, pendingStopOwner, quiescencePending, subjectsOfTasks, taskSubject, terminal } from './task-graph.ts'
-import { asksHandle, eligible, isolationViolation, noticeSubjectsFor, overdueStop, ready, startBlocker, takesWork, unschedulable } from './board.ts'
+import { asksHandle, eligible, isolationViolation, noticeSubjectsFor, overdueStop, startBlocker, takesWork, unschedulable } from './board.ts'
 import { factKey, type Notices } from './notices.ts'
 import { AdmissionRefusedError } from './scheduler.ts'
 import { awaited, formatSpan, progressed, type Kernel, type PassState, type SchedulingPass } from './kernel.ts'
@@ -179,9 +179,8 @@ export class Scheduling {
             try { await awaited(pass, this.k.workers.prepareTask(member, { ...task, epoch: task.epoch + 1 }, graph.effectiveDependencies(task), graph.reviewSource(task)), this.k.now) }
             finally { if (pass !== undefined) delete pass.preparing }
             if (this.halted(missionId)) return false
-            const fresh = this.k.task(missionId, task.id)
-            if (fresh.epoch !== task.epoch || fresh.assigneeId !== task.assigneeId || fresh.plannedAssigneeId !== task.plannedAssigneeId
-              || fresh.assignmentMode !== task.assignmentMode || !ready(this.k.boardOf(missionId), fresh, member)) continue
+            const fresh = this.stillDispatchable(missionId, task, member)
+            if (fresh === undefined) continue
             // S7: decide the isolation invariant again on the board the external
             // preparation await left. A state change during it (a member added into
             // this worktree, a second running task admitted) is refused and
@@ -190,16 +189,14 @@ export class Scheduling {
             if (violation !== undefined) { this.workspaceAdmission.recordIsolation(prepared, violation); continue }
             this.k.assign(fresh, member)
           } catch (error) {
-            // An admission refusal is transient (a full slot, a busy writer, a
-            // stop the member is still owed): the task stays pending and a later
-            // sweep re-evaluates it.
+            // Admission control already wrote the durable refusal; the task stays
+            // pending and a later tick re-evaluates it when a slot frees up.
             if (error instanceof AdmissionRefusedError) continue
             if (this.halted(missionId)) return false
             // A withdrawn authorization was fenced where it was detected, which
             // blocked this task, so the changed-task rule below skips it.
-            const fresh = this.k.task(missionId, task.id)
-            if (fresh.epoch !== task.epoch || fresh.assigneeId !== task.assigneeId || fresh.plannedAssigneeId !== task.plannedAssigneeId
-              || fresh.assignmentMode !== task.assignmentMode || !ready(this.k.boardOf(missionId), fresh, member)) continue
+            const fresh = this.stillDispatchable(missionId, task, member)
+            if (fresh === undefined) continue
             // Retry only identified transient host failures, with durable bounded
             // backoff. Repeating unchanged deterministic work is not recovery.
             const reason = `Workspace or worker preparation failed: ${String(error).slice(0, Math.max(0, this.k.config.maxMessageChars - 650))}`
@@ -228,6 +225,21 @@ export class Scheduling {
           }
         }
     return true
+  }
+
+  /**
+   * The sweep's choice decided again on the board an await left: the row it
+   * chose, read fresh, while that row is unchanged (its epoch and assignment)
+   * and the member is still eligible for it (`eligible`, the predicate that
+   * chose it); otherwise undefined, and the choice is dropped. Other mutators
+   * commit outside the mission queue during the sweep's awaits, so a stop the
+   * member came to owe during one leaves the work pending for the sweep after
+   * the stop, like a row that changed.
+   */
+  private stillDispatchable(missionId: string, chosen: Task, member: Member): Task | undefined {
+    const fresh = this.k.task(missionId, chosen.id)
+    return fresh.epoch === chosen.epoch && fresh.assigneeId === chosen.assigneeId && fresh.plannedAssigneeId === chosen.plannedAssigneeId
+      && fresh.assignmentMode === chosen.assignmentMode && eligible(this.k.boardOf(missionId), fresh, member) ? fresh : undefined
   }
 
   /**

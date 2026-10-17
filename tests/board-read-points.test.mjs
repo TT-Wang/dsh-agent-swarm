@@ -15,9 +15,11 @@
  *    (`RefusalRegistry.assertAdmission`): a refused admission is recorded and no
  *    workspace is prepared for the work it refused;
  *  - the assignment asserts the admission again: a stop the member came to owe
- *    during a claim's preparation refuses it, and during the dispatch sweep's
- *    it is a transient refusal (`stop_owed`): the work stays pending, the
- *    owner is told nothing, and the sweep after the stop dispatches it;
+ *    during a claim's preparation refuses it. The dispatch sweep decides its
+ *    choice again with the predicate that chose it (`eligible`), so a stop the
+ *    member came to owe during the sweep's preparation leaves the work
+ *    pending, with no preparation failure, and the sweep after the stop
+ *    dispatches it;
  *  - one board asks the adapter about one member twice and gets two answers:
  *    the view is called through and never memoized, because a handle's answer
  *    changes as its turns start and end;
@@ -46,7 +48,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { isolationViolation, ready } from '../lib/board.js'
-import { AdmissionRefusedError } from '../lib/scheduler.js'
 import { FakeClock, FakeWorkers, events, setup, taskOf } from './faults/harness.mjs'
 
 const deferred = () => { let resolve; return { promise: new Promise(r => { resolve = r }), resolve: value => resolve(value) } }
@@ -162,13 +163,13 @@ test('the assignment asserts admission again after preparing: a stop the member 
     f.runtime.store.put('tasks', { ...row, status: 'blocked', resumeAfterStop: { epoch: row.epoch, memberId: f.author.id, reason: 'handoff', at: f.clock.now() } })
   })
   f.gate.resolve()
-  await assert.rejects(claim, error => error instanceof AdmissionRefusedError && error.reason === 'stop_owed', 'the assignment refuses a member that owes a stop as admission control')
+  await assert.rejects(claim, /^Error: Worker is waiting for its previous attempt to stop$/, 'the assignment refuses a member that owes a stop')
   const row = taskOf(f.runtime, f.dependent.id)
   assert.deepEqual([row.status, row.attempt, row.epoch], ['pending', undefined, f.dependent.epoch], 'no attempt was assigned')
   assert.deepEqual(f.runtime.store.events(f.mission.id, 5_000).filter(event => event.type === 'task/claimed'), [], 'nothing was claimed')
 })
 
-test('a stop the member came to owe during the dispatch sweep\'s preparation is a transient refusal: the work stays pending, the owner is told nothing, and the sweep after the stop dispatches it', async t => {
+test('the dispatch sweep decides its choice again after preparing: a stop the member came to owe during the preparation leaves the work pending, and the sweep after the stop dispatches it', async t => {
   const f = await fixture(t)
   // The work the stop re-pends ranks below the dependent, so the sweep after the stop chooses the dependent.
   const earlier = f.propose({ title: 'Earlier work', priority: 10 })
@@ -179,8 +180,8 @@ test('a stop the member came to owe during the dispatch sweep\'s preparation is 
   f.runtime.kick(f.mission.id)
   await f.entered.promise
   // As in the claim above: a stop the author owes on other work, recorded
-  // during the preparation by a commit outside the mission queue, is seen only
-  // by the admission the assignment asserts again.
+  // during the preparation by a commit outside the mission queue. The sweep's
+  // decision after the await asks `eligible` again, which sees it.
   f.runtime.commit(f.mission.id, () => {
     const row = taskOf(f.runtime, earlier.id)
     f.runtime.store.put('tasks', { ...row, status: 'blocked', resumeAfterStop: { epoch: row.epoch, memberId: f.author.id, reason: 'handoff', at: f.clock.now() } })
@@ -192,8 +193,7 @@ test('a stop the member came to owe during the dispatch sweep\'s preparation is 
     'the refused work stays pending at its epoch, with no preparation failure recorded')
   const ofDependent = type => events(f.runtime, f.mission.id, type).filter(event => event.data.taskId === f.dependent.id)
   assert.deepEqual([...ofDependent('task/preparation-failed'), ...ofDependent('task/blocked'), ...ofDependent('task/claimed')], [], 'nothing failed, blocked or claimed it')
-  assert.deepEqual(notices(), told, 'the owner is told nothing: the stop ends the refusal by itself')
-  assert.deepEqual(f.runtime.admissionLedger(f.owner, f.mission.id, { reason: 'stop_owed' }), [], 'and no admission row records it')
+  assert.deepEqual(notices(), told, 'the owner is told nothing: the stop ends the wait by itself')
   // The next tick drives the stop barrier, whose completion re-pends the
   // stopped work and kicks the pass whose sweep dispatches the dependent.
   await f.runtime.tick()

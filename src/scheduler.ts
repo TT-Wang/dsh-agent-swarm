@@ -7,9 +7,6 @@
  *
  * Every admission decision becomes a durable row whose `reason` is one of
  * `admitted` | `queue_full` | `budget_exceeded` | `lease_conflict` | `writer_busy`.
- * A member still owed its previous attempt's stop is refused before any
- * decision (`stop_owed`, `RefusalRegistry.stopOwed`): the stop ends that
- * refusal by itself, so it is typed like the others and no row records it.
  * Limits are hierarchical — scope, then task class, then agent — and a candidate
  * is admitted only when every level has a free slot; the strictest matching rule
  * at each level wins. There is no in-memory wait queue: refused candidates stay
@@ -23,7 +20,7 @@
  */
 import { errorChain, isQuotaExceededError } from '@deepseek-ai/dsh-llm'
 import type { ProviderOutage } from './types.ts'
-const ADMISSION_REASONS = ['admitted', 'queue_full', 'budget_exceeded', 'lease_conflict', 'writer_busy', 'stop_owed'] as const
+const ADMISSION_REASONS = ['admitted', 'queue_full', 'budget_exceeded', 'lease_conflict', 'writer_busy'] as const
 export type AdmissionReason = (typeof ADMISSION_REASONS)[number]
 
 /**
