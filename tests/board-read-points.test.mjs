@@ -18,9 +18,9 @@
  *    during a claim's preparation refuses it. The dispatch sweep decides its
  *    choice again with the predicate that chose it (`eligible`), so a stop the
  *    member came to owe during the sweep's preparation (an owner resume that
- *    fences its attempt elsewhere) leaves the work pending, with no
- *    preparation failure and no notice about the wait, and the pass the stop
- *    barrier's completion kicks dispatches it;
+ *    fences its attempt elsewhere) leaves the work pending while the stop is
+ *    owed, with no preparation failure and no owner notice, and the sweep
+ *    after the stop dispatches it;
  *  - one board asks the adapter about one member twice and gets two answers:
  *    the view is called through and never memoized, because a handle's answer
  *    changes as its turns start and end;
@@ -81,6 +81,34 @@ async function fixture(t) {
   }
   return { ...f, dependent, entered, gate, challenge }
 }
+
+/**
+ * Earlier work, ranked below the dependent, blocked while it still holds the
+ * author's attempt, and a stop barrier the adapter holds at its stop until
+ * `stopped` resolves. `resume` is the owner's resume of that work, which
+ * fences the attempt: the author owes its stop until the barrier completes.
+ * `swept` resolves when the next pass closes.
+ */
+async function owedStop(f) {
+  const earlier = f.propose({ title: 'Earlier work', priority: 10 })
+  await f.runtime.settle(f.mission.id)
+  f.runtime.commit(f.mission.id, () => {
+    const row = taskOf(f.runtime, earlier.id)
+    f.runtime.store.put('tasks', { ...row, status: 'blocked', epoch: row.epoch + 1, attempt: { id: 'attempt-held', epoch: row.epoch + 1, ownerId: f.author.id, leaseUntil: f.clock.now() + 60_000 } })
+  })
+  const stopped = deferred(), swept = deferred()
+  const stop = f.workers.stop.bind(f.workers)
+  f.workers.stop = async id => { await stopped.promise; return stop(id) }
+  const closePass = f.runtime.scheduling.closePass.bind(f.runtime.scheduling)
+  f.runtime.scheduling.closePass = (missionId, pass) => { closePass(missionId, pass); swept.resolve() }
+  const resume = () => {
+    f.runtime.controlTask(f.owner, f.mission.id, earlier.id, 'resume', {}, 'condition repaired')
+    assert.equal(taskOf(f.runtime, earlier.id).resumeAfterStop?.memberId, f.author.id, 'the resume fenced the author\'s attempt, so the author owes its stop')
+  }
+  return { earlier, stopped, swept, resume }
+}
+
+const notices = f => f.runtime.store.list('deliveries', f.mission.id).filter(delivery => delivery.notice !== undefined)
 
 test('dispatch reads the board again after preparing: a prerequisite challenged during the preparation is not assigned', async t => {
   const f = await fixture(t)
@@ -170,44 +198,30 @@ test('the assignment asserts admission again after preparing: a stop the member 
   assert.deepEqual(f.runtime.store.events(f.mission.id, 5_000).filter(event => event.type === 'task/claimed'), [], 'nothing was claimed')
 })
 
-test('the dispatch sweep decides its choice again after preparing: a stop an owner resume makes the member owe during the preparation leaves the work pending, and the pass the stop barrier kicks dispatches it', async t => {
+test('the dispatch sweep decides its choice again after preparing: a stop an owner resume makes the member owe during the preparation leaves the work pending with no owner notice, and the sweep after the stop dispatches it', async t => {
   const f = await fixture(t)
-  // Earlier work, ranked below the dependent, is blocked while it still holds
-  // the author's attempt. The owner resumes it during the preparation, which
-  // fences that attempt: the author owes its stop until the barrier completes.
-  const earlier = f.propose({ title: 'Earlier work', priority: 10 })
-  await f.runtime.settle(f.mission.id)
-  f.runtime.commit(f.mission.id, () => {
-    const row = taskOf(f.runtime, earlier.id)
-    f.runtime.store.put('tasks', { ...row, status: 'blocked', epoch: row.epoch + 1, attempt: { id: 'attempt-held', epoch: row.epoch + 1, ownerId: f.author.id, leaseUntil: f.clock.now() + 60_000 } })
-  })
-  const notices = () => f.runtime.store.list('deliveries', f.mission.id).filter(delivery => delivery.notice !== undefined)
-  const told = new Set(notices().map(delivery => delivery.id))
+  const owed = await owedStop(f)
+  const told = new Set(notices(f).map(delivery => delivery.id))
+  const ofDependent = type => events(f.runtime, f.mission.id, type).filter(event => event.data.taskId === f.dependent.id)
   f.workers.idle.add(f.author.id)
   f.runtime.kick(f.mission.id)
   await f.entered.promise
-  f.runtime.controlTask(f.owner, f.mission.id, earlier.id, 'resume', {}, 'condition repaired')
-  assert.equal(taskOf(f.runtime, earlier.id).resumeAfterStop?.memberId, f.author.id, 'the resume fenced the author\'s attempt, so the author owes its stop')
+  owed.resume()
   f.gate.resolve()
-  // No tick: the resume's kick met the open pass, so the one pass after the
-  // stop is the one the barrier's completion kicks.
-  await f.runtime.settle(f.mission.id)
-  assert.equal(taskOf(f.runtime, earlier.id).resumeAfterStop, undefined, 'the stop completed')
-  const dispatched = taskOf(f.runtime, f.dependent.id)
-  assert.deepEqual([dispatched.status, dispatched.attempt?.ownerId, dispatched.epoch, dispatched.preparationFailure], ['running', f.author.id, f.dependent.epoch + 1, undefined],
-    'the dependent was assigned to the author once, with no preparation failure')
-  const ofDependent = type => events(f.runtime, f.mission.id, type).filter(event => event.data.taskId === f.dependent.id)
+  await owed.swept.promise
+  // The sweep is over and the author still owes its stop.
+  const waiting = taskOf(f.runtime, f.dependent.id)
+  assert.deepEqual([waiting.status, waiting.attempt, waiting.epoch, waiting.preparationFailure], ['pending', undefined, f.dependent.epoch, undefined],
+    'the work stays pending at its epoch, with no preparation failure')
   assert.deepEqual([...ofDependent('task/preparation-failed'), ...ofDependent('task/blocked'), ...ofDependent('mission/stalled')], [], 'nothing failed, blocked or stalled it')
-  const [released] = events(f.runtime, f.mission.id, 'task/handoff-ready'), [claimed] = ofDependent('task/claimed')
-  assert.ok(released?.data.taskId === earlier.id && claimed?.seq > released.seq, 'the dependent was claimed after the barrier released the author')
-  // The owner is told nothing about the wait. The one notice is the stop
-  // barrier's own: its release commits before the pass it kicks is open, so
-  // that publication asks the dispatch question about the work the release
-  // made dispatchable, the dependent at the epoch it waited at. 6d5da9d asks
-  // it on this path too, about the re-pended earlier work. Opening the
-  // barrier's pass before its release publishes is a change of its own.
-  assert.deepEqual(notices().filter(delivery => !told.has(delivery.id)).map(delivery => delivery.notice.dedupKey),
-    [`dispatch-question:${f.mission.id}:${f.dependent.id}@${f.dependent.epoch}`], 'the only notice is the barrier\'s dispatch question')
+  assert.deepEqual(notices(f).filter(delivery => !told.has(delivery.id)), [], 'and the owner is told nothing: the stop ends the wait by itself')
+  owed.stopped.resolve()
+  await f.runtime.settle(f.mission.id)
+  assert.equal(taskOf(f.runtime, owed.earlier.id).resumeAfterStop, undefined, 'the stop completed')
+  const dispatched = taskOf(f.runtime, f.dependent.id)
+  assert.deepEqual([dispatched.status, dispatched.attempt?.ownerId, dispatched.epoch, dispatched.preparationFailure, ofDependent('task/claimed').length], ['running', f.author.id, f.dependent.epoch + 1, undefined, 1],
+    'the sweep after the stop dispatched the dependent to the author once')
+  assert.deepEqual([...ofDependent('task/preparation-failed'), ...ofDependent('task/blocked')], [], 'and its preparation never failed')
 })
 
 test('a board asks the adapter at every ask: two asks about one member on one board reach the adapter twice', async t => {
