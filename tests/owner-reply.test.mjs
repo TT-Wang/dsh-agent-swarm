@@ -21,10 +21,15 @@ import { join } from 'node:path'
 import { Context } from '@deepseek-ai/cordis'
 import { OwnerReplyGuard } from '../lib/owner-reply.js'
 import { FakeClock, FakeWorkers, makeRuntime } from './faults/harness.mjs'
+import { assertNamedCalls, ownerTools } from './refusal-inventory.mjs'
 import { openAsks } from '../lib/arena.js'
 
 /** A context stub: the guard only reads `on` (events) and `agents` (block mode). */
 const fakeContext = () => ({ on: () => () => {}, agents: { get: () => undefined }, get: () => undefined })
+
+/** The `swarm_message` calls a text prints, in order, each as the arguments it passes. */
+const printedMessageCalls = text => [...text.matchAll(/swarm_message\((\{[^()]*\})\)/g)]
+  .map(([, args]) => JSON.parse(args.replace(/([{,]\s*)(\w+):/g, '$1"$2":')))
 
 async function fixture(t, config = {}, host) {
   const { dir: directory, runtime, workers, budget } = await makeRuntime(t, {
@@ -155,7 +160,7 @@ test('L2/L3: an owner turn that leaves a question open is recorded, nudged with 
   const nudge = f.deliveries().filter(item => item.to === 'owner' && item.notice?.dedupKey?.startsWith('owner-reply-missing:'))
   assert.equal(nudge.length, 1)
   assert.match(nudge[0].content, /\[owner_reply_missing\]/)
-  assert.match(nudge[0].content, new RegExp(`replyTo: "${ask.id}"`), 'the nudge carries the exact call')
+  assert.match(nudge[0].content, new RegExp(`replyTo: "${ask.id}"`), 'the nudge names the question its calls settle')
   assert.match(nudge[0].content, /only that call writes the receipt/)
   assert.equal(openAsks(f.runtime.store.list('deliveries', f.mission.id), 'owner').length, 1, 'the receipt is still open')
   await f.runtime.notices.flushOutbox(f.mission.id)
@@ -199,6 +204,38 @@ test('L2/L3: an owner turn that leaves a question open is recorded, nudged with 
   const view = f.runtime.observe(f.owner, f.mission.id, {})
   assert.equal(view.openAsks.count, 0)
   assert.match(view.openAsks.note, /replyTo/)
+})
+
+test('L2/L3: each call the nudge prints, performed through the owner\'s registered tools, reaches the asker and settles its question', async t => {
+  const clock = new FakeClock()
+  const f = await fixture(t, { now: clock.now })
+  const answered = await f.ask('Which API version should I target?')
+  const dismissed = await f.ask('Do you want the migration note too?')
+  const guard = new OwnerReplyGuard(fakeContext(), f.runtime, { maxNudges: 2 })
+  t.after(() => guard.dispose())
+  const ownerTurn = () => {
+    clock.advance(1_000)
+    guard.observe(f.owner.sessionId, 'user/message', {})
+    guard.observe(f.owner.sessionId, 'turn/end', { reason: { kind: 'completed' } })
+  }
+  const nudges = () => f.deliveries().filter(row => row.to === 'owner' && row.notice?.dedupKey?.startsWith('owner-reply-missing:'))
+  ownerTurn()
+  assert.deepEqual(nudges().map(row => row.notice.questionId).sort(), [answered.id, dismissed.id].sort(), 'the turn left both questions open, so each is nudged')
+  const tool = await ownerTools(f)
+  // The answer exit on the first question's nudge, the dismiss exit on the second's: each performed as printed, with the owner's words.
+  for (const [question, exit, content] of [[answered, 0, 'target v2'], [dismissed, 1, 'not needed']]) {
+    const nudge = nudges().find(row => row.notice.questionId === question.id)
+    await assertNamedCalls(nudge.content, ['swarm_message', 'swarm_message'])
+    const calls = printedMessageCalls(nudge.content)
+    assert.deepEqual(calls.map(call => call.dismiss === true), [false, true], 'the nudge prints the answer, then the dismiss')
+    await tool('swarm_message', { ...calls[exit], content })
+  }
+  assert.deepEqual(f.deliveries().filter(row => row.from === 'owner' && row.inReplyTo !== undefined).map(row => [row.to, row.inReplyTo, row.content]),
+    [[f.member.id, answered.id, 'target v2']], 'the answer reached the member that asked, bound to its question; the dismissal sent nothing')
+  assert.deepEqual([answered.id, dismissed.id].map(id => f.runtime.store.get('deliveries', id)).map(row => [row.state, row.answeredBy]),
+    [['answered', 'owner'], ['dismissed', 'owner']], 'each call settled its question')
+  ownerTurn()
+  assert.deepEqual([f.events('owner/reply-missing').length, nudges().length], [2, 2], 'the next turn books neither settled question, so neither is nudged again')
 })
 
 test('L2: the turn boundary and the consumption stamp are on the runtime clock, so a clock ahead of the host still nudges', async t => {
