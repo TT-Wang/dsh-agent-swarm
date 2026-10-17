@@ -1109,7 +1109,9 @@ export interface WorkerAdapter {
    * R15-A5: wake the input an idle handle holds that no driver will claim (a
    * stranded inbox), so it is consumed instead of stranding the member. The
    * adapter's own step, run by the runtime at one point: the start of each
-   * dispatch sweep, for each member whose handle the sweep asks about.
+   * dispatch sweep of an active mission, for each member of the board whose
+   * handle a decision may ask about. A throw ends that member's chain in the
+   * sweep (its guard terminal); the sweep goes on.
    */
   drainStrandedInbox(memberId: string): void
   /**

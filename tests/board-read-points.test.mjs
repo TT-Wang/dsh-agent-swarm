@@ -26,7 +26,10 @@
  *    takes its work in the same pass; one whose turn ends stranded during the
  *    sweep is startable, so it keeps its work and the assignment wakes its
  *    input. Either way the owner is asked no dispatch question (the case S11
- *    found, when an ask drained the inbox). The drain step is the sweep's
+ *    found, when an ask drained the inbox). The drain step covers the board's
+ *    members, not the body's order: a chained body whose order leaves out a
+ *    preferred member stranded since the previous body still drains it, so its
+ *    borrower takes the work in that body. The drain step is the sweep's
  *    first adapter call, so the sweep's guard comes before it: a pause that
  *    lands while lease recovery awaits a capture wakes nothing of the paused
  *    mission, whose stranded input the first sweep after the resume wakes.
@@ -302,4 +305,33 @@ test('a member whose drain step throws ends its own chain with its guard termina
   assert.deepEqual(terminals.map(delivery => delivery.notice.reason), [`Error: ${failure}`], 'the author\'s chain ended in its guard terminal, told once however often the throw recurs')
   assert.deepEqual(events(f.runtime, f.mission.id, 'mission/stalled').filter(event => event.data.cause === 'guard-terminal').map(event => [event.data.memberId, event.data.detail]),
     [[f.author.id, `Error: ${failure}`]], 'and its one stall event names the author and the failure')
+})
+
+test('a chained body drains the stranded preferred member its order leaves out, so the borrower in that order takes the work', async t => {
+  const workers = new InboxWorkers()
+  const f = await setup({ clock: new FakeClock(), workers })
+  t.after(() => f.cleanup())
+  const third = await f.runtime.addMember(f.owner, f.mission.id, { name: 'Third', role: 'implementation', maxOutputTokens: 5_000 })
+  await f.runtime.settle(f.mission.id)
+  // The author and the reviewer are busy and the third member is idle. The
+  // reviewer's start holds the first body for a whole bound, and meanwhile the
+  // author's turn ends with input no driver will claim. That body stops before
+  // the third member, and the chained body that follows sweeps the third alone.
+  workers.idle.add(third.id)
+  const start = workers.start.bind(workers)
+  workers.start = async spec => {
+    await start(spec)
+    if (spec.member.id !== f.reviewer.id || workers.stranded.has(f.author.id)) return
+    f.clock.advance(f.runtime.config.stallPassTimeoutMs)
+    workers.idle.add(f.author.id); workers.stranded.add(f.author.id)
+  }
+  const bodies = [], closePass = f.runtime.scheduling.closePass.bind(f.runtime.scheduling)
+  f.runtime.scheduling.closePass = (missionId, pass) => { bodies.push([pass.sweepFrom, pass.stoppedBefore]); return closePass(missionId, pass) }
+  const work = f.propose({ title: 'Preferred to the author', assignmentMode: 'preferred' })
+  await f.runtime.settle(f.mission.id)
+  assert.deepEqual(bodies.slice(0, 2), [[undefined, third.id], [third.id, undefined]], 'the first body stopped before the third member, and the chained body swept from it')
+  assert.deepEqual(workers.woken, [['drain', f.author.id]], 'the chained body drained the author, whom its order leaves out')
+  const row = taskOf(f.runtime, work.id)
+  assert.deepEqual([row.status, row.attempt?.ownerId], ['running', third.id], 'so the third member\'s ask read the author busy and it borrowed the work')
+  assert.deepEqual(dispatchQuestions(f), [], 'and the owner was asked no dispatch question about it')
 })

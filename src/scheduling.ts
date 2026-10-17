@@ -96,14 +96,17 @@ export class Scheduling {
         const end = pass?.chainFrom === undefined ? -1 : rotation.findIndex((member, index) => index > 0 && member.id === pass.chainFrom)
         const order = end > 0 ? rotation.slice(0, end) : rotation
         // R15-A5: before it decides anything, the sweep has the adapter wake the
-        // input each handle it asks about holds that no driver will claim
-        // (`WorkerAdapter.drainStrandedInbox`): the handle of a member that takes
-        // work (`takesWork`) and that a decision asks about (`asksHandle`). Every
-        // ask below then reads the handles that step left, and asking drains nothing.
-        // It is the sweep's first adapter call, so the sweep's guard comes first,
-        // and each drain is a link of its member's chain (`chainFailed`).
+        // input each handle it may ask about holds that no driver will claim
+        // (`WorkerAdapter.drainStrandedInbox`): the handle of each board member
+        // that takes work (`takesWork`) and that a decision asks about
+        // (`asksHandle`). A borrower's eligibility asks about its preferred
+        // member, which a chained body's `order` can leave out, so the set is the
+        // board's, not the body's. Every ask below then reads the handles that
+        // step left, and asking drains nothing. It is the sweep's first adapter
+        // call, so the sweep's guard comes first, and each drain is a link of its
+        // member's chain (`chainFailed`).
         if (this.halted(missionId)) return false
-        for (const member of order) if (takesWork(tasks, member) && asksHandle(member)) {
+        for (const member of members) if (takesWork(tasks, member) && asksHandle(member)) {
           try { this.k.workers.drainStrandedInbox(member.id) }
           catch (error) { if (!this.chainFailed(missionId, member, error)) return false }
         }
