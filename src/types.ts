@@ -1111,7 +1111,7 @@ export interface WorkerAdapter {
    * adapter's own step, run by the runtime at one point: the start of each
    * dispatch sweep of an active mission, for each member of the board whose
    * handle a decision may ask about. A throw ends that member's chain in the
-   * sweep (its guard terminal); the sweep goes on.
+   * sweep: its guard terminal, and no step for that member; the sweep goes on.
    */
   drainStrandedInbox(memberId: string): void
   /**
