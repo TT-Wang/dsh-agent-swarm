@@ -569,10 +569,10 @@ test('G1: grant expiry is judged at the runtime clock\'s instant by admission an
   const input = workspace => ({ title: 'Expiring grant', objective: 'Fence at expiry', workspace, scope: ['src/'], acceptance: ['works'], budget: { ...budget } })
   const grant = { grantRoot: grantedPath, source: 'grant' }
   const mission = runtime.create(owner, input(projectPath), grant)
-  await runtime.assertWorkspaceAuthorized(runtime.mission(mission.id))
+  await runtime.workspaceAdmission.assertWorkspaceAuthorized(runtime.mission(mission.id))
   clock.advance(10_000)
   assert.throws(() => runtime.create(owner, input(secondPath), grant), /not inside a currently authorizedWorkspaces root/, 'admission refuses the expired grant')
-  await assert.rejects(runtime.assertWorkspaceAuthorized(runtime.mission(mission.id)), /was removed from authorizedWorkspaces or has expired/, 'the dispatch fence refuses it at the same instant')
+  await assert.rejects(runtime.workspaceAdmission.assertWorkspaceAuthorized(runtime.mission(mission.id)), /was removed from authorizedWorkspaces or has expired/, 'the dispatch fence refuses it at the same instant')
   assert.equal(runtime.store.events(mission.id, 200).filter(event => event.type === 'mission/workspace-revoked').length, 1, 'the admitted mission is fenced once')
 })
 
@@ -1028,6 +1028,6 @@ test('A restart with the same configuration, and a root configured through a sym
   const restarted = new SwarmRuntime(wired(await loadWorkspaceGrants(configured), config), workspaceWorkers())
   t.after(async () => { await restarted.dispose() })
   await restarted.addMember(owner, mission.id, { name: 'Second', role: 'implementation' })
-  await restarted.assertWorkspaceAuthorized(restarted.mission(mission.id))
+  await restarted.workspaceAdmission.assertWorkspaceAuthorized(restarted.mission(mission.id))
   assert.equal(revokedEvents(restarted, mission.id).length, 0)
 })

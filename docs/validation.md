@@ -7,6 +7,88 @@ Current **0.7.0** working-tree checks and the historical **0.6.0** baseline are 
 | `0.1.5-rc.3` (npm `latest`, default host) | `a4c74a91e06b00fe0b0937bde982170c526cc842` |
 | `0.1.7-rc.1` (npm `next`) | `46a7f68b0922371ce7144b668b90e377d8e799f4` |
 
+## Batch 15: decide-then-act X1, X2, X3, F1, S7, S8, S9, S11, the full-log oracle record (2026-10-17)
+
+**Head**: `9234211` and this record (documentation only), branch `batch15/kernel` on `b462a61`, not merged; this
+entry is written in the batch's first integrator repair round and extended in its second. `src` against `b462a61`:
++1068 −934, net +134 (the first round: +9 for comments, +9 for S7, −17 for the idle close-out; net +1; the second
+round changes no `src`).
+
+**The full-log oracle at the head against `b462a61`** (`npm run test:oracle`, its logs recorded at `b462a61` before
+any `src` move; the head reproduces them identically over three runs). F5, F12, F18, F21 and outage are identical. The
+other six scenarios differ by exactly the deltas of three owner-approved behaviour slices, measured by diffing each
+log at `b462a61` with the head's, row by row and field by field:
+
+- X1 (`2f0da10`): the fall-through also names withdrawing the stuck work with `swarm_cancel(taskId, reason)`. Six
+  `fallthrough:` owner deliveries change their `content` and no other field, five in F19 and one in dangling.
+- F1 (`cf054c6`, `3a4b84b`): one `attempt/fenced` event lands immediately before each fenced closer, seven in all:
+  replay 1 (`lease-expired`), F2 1 (`lease-expired`), F13 1 (`closeout-abandoned`) and F19 4 (`lease-expired` twice,
+  `task-ceiling` twice); every later event index moves by the events inserted before it. A row an attempt was
+  fenced from no longer keeps that attempt's `leaseWarned` (replay, F2 and F19 twice), and neither does what renders
+  the row next: the following assignment's task (replay, F2, F19) and, in replay, the output of the `swarm_submit`
+  tool span (1341 to 1313 bytes). F19's budget-resume marker loses `epoch` (`3a4b84b`).
+- S11 (`161a6c5`, `634640f`): paths loses 15 `isIdle` trace entries (307 to 292), 10 from the dispatch sweep's member
+  order and 5 from the integration-gap warning the second proposal opens, both now board reads. Each part was
+  measured on a scratch mutant of the head that builds the interpretation there again: 302 with the member order,
+  297 with the warning. Every event, row, delivery and other adapter call is identical and in order. `161a6c5` had
+  also removed the 23 entries of each member step's interpretation; `634640f` put them back
+  (`tests/board-read-points.test.mjs`, the drain case), and the step says why until A1.
+
+No other difference exists, so X2, X3, S7, S8, S9 and this round's two fixes add none: the oracle's adapters report
+no check envelope, and no scenario resumes a running task or meets a busy writer at `onIdle`.
+
+**Integrator repair round 1** (`5e43f3d` to `7782a37`).
+
+- `5e43f3d`: the dispatch member step states why it builds the interpretation (its asks precede the member's
+  eligibility asks, and an ask can drain a stranded inbox), and `interpret`'s docs name it as the one builder
+  outside the classifiers until A1.
+- `345bcf2`: both readers of the in-flight estimate are pinned with a quarter-token average (401 over 4, 40001 over
+  4), so a round-to-nearest mutant of `inFlightEstimate` fails each, as a round-down one does.
+- `12d90c4`: a verdict reads the adapter's environment report once, through the best-effort `envelope()`;
+  `recordEnvelope` records it and hands its environment to `reproduce`. A report that throws no longer rejects
+  `swarm_verify`. Stopped for the owner: deleting `reproduce`'s fallback, so that an attempt delivered no envelope
+  has nothing to compare; R22 (`tests/rule-workspace-recovery.test.mjs`) pins that fallback.
+- `7782a37`: the idle close-out has one question, `Attempts.turnEnded`, which the attempt reporting bound asks too
+  (`closeOutOwns` and its nudge half are deleted), and an owner resume restarts only the nudge count, keeping the
+  turn end on the row. Before it, after an owner resume or a busy writer at `onIdle`, the next pass nudged an
+  attempt that the tick had just named to the owner as silent.
+
+Gate at `7782a37`: on 0.1.5-rc.3 `npm run typecheck`, `npm run build`, `npm run test:harness`, `npm run test:replay`
+(digest `sha256:61a921e64088b78b957cd6aeaa563d5436d4a6eae4b0130725d1f3c74c6f971e`, unchanged),
+`node scripts/faults/run.mjs` (24/24) and both web smokes (`passed: true`) passed. On 0.1.7-rc.1, in a detached
+worktree on that host's link farm, typecheck, build, `test:harness` and the five touched test files with
+`tests/board-read-points.test.mjs` (99/99) passed. The behavioral suite was not run whole: at their own steps the 49
+files that name the close-out, the silence bound or `controlTask` ran 809/809, and the 20 that name the check
+envelope 223/223. Each touched test file passed three rounds of two concurrent copies, and each regression test of
+the two fixes fails on a `b462a61` build.
+
+**Integrator repair round 2** (`9234211`).
+
+- `9234211` (tests only): the `owner_reply_missing` nudge's two printed `swarm_message` calls hold the call-exit
+  contract against the published schemas, and each is performed as printed through the owner's registered tools,
+  the answer on one question and the dismiss on another: the answer reaches the member that asked, both questions
+  are settled, and the next owner turn nudges neither. A mutant whose nudge names the delivery's `to` as the asker
+  fails only this test; it passes on `b462a61`, since `d287f79` was a refactor. `assertNamedCalls` drops a bare
+  value such as `true` as it drops a quoted one, so a call that passes `dismiss: true` can be checked.
+- Stopped for the owner: the idle close-out's turn end has three records: the row's `idleSignal`, written outside
+  any transaction and again inside `onIdle`'s commit, and `Attempts.idleSignals`, which alone holds a turn end whose
+  row write the writer refused. The right model records it once, inside the commit, and `turnEnded` reads only the
+  row; a refused write then records no turn end, so no nudge comes, the attempt reporting bound names the attempt
+  and the lease expiry frees it, as for any refused commit. Measured on a scratch mutant of `9234211` (−12 `src`
+  lines), the oracle differs only at F13 lines 21 and 27: the task row and attempt 2's assignment content hold
+  `revision` 10, not 13, because each `onIdle` writes the row once. Deleting only the out-of-transaction write gives
+  the same F13 log. Of the 19 test files that name the close-out, its signal or the reporting bound, 382 of 387
+  tests pass; the 5 that fail are `worker-closeout`'s two busy-writer cases, which pin the map, and the three that
+  name it: `in-memory-gates`' census entry `src/attempts.ts:1` and its probe, and `scheduling-pass`' S5 clear. That
+  entry's `cache-only` label, and the map's doc in `src/attempts.ts`, are false while a refused write is the map's
+  alone, and the change deletes both.
+
+Gate at `9234211` (`src` and the environment as at `7782a37`): on 0.1.5-rc.3 `npm run typecheck`, `npm run build`,
+`npm run test:oracle` (11 scenarios identical to the recorded logs), `npm run test:harness`, `npm run test:replay`
+(digest unchanged), `node scripts/faults/run.mjs` (24/24) and both web smokes (`passed: true`) passed. The 20 files
+that import `tests/refusal-inventory.mjs` passed 407/407, and `tests/owner-reply.test.mjs` passed 15/15 in three
+rounds of two concurrent copies.
+
 ## Round-30 simplification batch 11: one notice ledger (2026-10-14)
 
 **Head**: `5209de7` and this record (documentation only), branch `batch11/ledger` on `29a0268`, 124 commits.

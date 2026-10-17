@@ -7,7 +7,6 @@ export interface AssignmentCandidate {
   epoch?: number
   attempt?: unknown
   resumeAfterStop?: unknown
-  budgetResume?: unknown
   reviewOf?: string
   priorOwnerIds?: readonly string[]
   checkpoint?: unknown
@@ -48,7 +47,7 @@ export function canBorrowTask(task: AssignmentCandidate): boolean {
   // Old rows without ownership history retain the conservative epoch guard.
   const untouched = task.priorOwnerIds === undefined ? task.epoch === 0 : task.priorOwnerIds.length === 0
   return task.assignmentMode === 'preferred' && task.status === 'pending' && untouched && task.checkpoint === undefined
-    && task.attempt === undefined && task.resumeAfterStop === undefined && task.budgetResume === undefined
+    && task.attempt === undefined && task.resumeAfterStop === undefined
 }
 
 /**

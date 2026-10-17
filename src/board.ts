@@ -5,8 +5,8 @@
  * with its execution clock applied, its tasks, its members and the task graph
  * over them (`graph`, whose lineage queries a decision asks of it). The
  * scheduling and review-admission decisions below are functions of it, and so
- * are the stall classifiers, F(S) and the interpretation every notice
- * generator reads (`interpret`), so a reader builds the board where it decides
+ * are the stall classifiers, F(S) and the interpretation the board classifiers
+ * read (`interpret`), so a reader builds the board where it decides
  * and every predicate it asks sees those rows; none re-reads a row. Three
  * inputs are not rows and are never snapshotted: the clock (`clock`, read where
  * a decision needs the time), the adapter (`view`, asked where a decision needs
@@ -19,10 +19,10 @@ import { PolicyError } from './policy-error.ts'
 import { executionClock } from './resource-time.ts'
 import { assignmentAllows, authorIdsOf, canBorrowTask, canOwnReview, strandedReview } from './assignment.ts'
 import { memberPhaseOf } from './projection.ts'
-import { recoveryExit } from './declared-checks.ts'
+import { recoveryExit } from './check-results.ts'
 import { scopeKeysOverlap } from './scheduler.ts'
 import { TERMINAL_STATES, blockCauses, completionExempt, holdsOpenAttempt, missionSubject, openAttempt, pendingStopOwner, quiescencePending, selectAcceptedDelivery, stopPending, subjectsOfTasks, taskGraphIndex, taskSubject, terminal, uncoveredCriteria, type HeldTask, type TaskGraphIndex } from './task-graph.ts'
-import { providerQuiescent, type CheckResult, type Delivery, type Evidence, type Member, type Mission, type RuntimeConfig, type Task } from './types.ts'
+import { providerQuiescent, type CheckResult, type Delivery, type Evidence, type Member, type Mission, type RuntimeConfig, type Task, type WorkerActivity } from './types.ts'
 
 /**
  * S1: the bound on one scheduling pass before the runtime names it wedged, in
@@ -113,6 +113,8 @@ function declaredBound(value: number | undefined, fallback: number): number {
 export interface AdapterView {
   /** Whether the member's worker handle can take an assignment now (`WorkerAdapter.isIdle`). */
   startable(memberId: string): boolean
+  /** What the member's worker handle is doing now (`WorkerAdapter.currentActivity`). */
+  activity(memberId: string): WorkerActivity | undefined
 }
 
 /**
@@ -180,6 +182,32 @@ export function readBoard(store: Pick<SwarmStore, 'get' | 'list' | 'latestTaskEv
 export function startBlocker(view: AdapterView, member: Member): 'handle-busy' | undefined {
   if (memberPhaseOf(member) === 'parked') return undefined
   return view.startable(member.id) ? undefined : 'handle-busy'
+}
+
+/**
+ * The tokens `members` are spending in model requests that have reported no
+ * usage yet, each estimated at its worker's average request, rounded up: the
+ * budget gate's and the owner's in-flight token projection, read where they
+ * read it. A request counts only while its worker reports it.
+ */
+export function inFlightEstimate(view: AdapterView, members: readonly Member[]): number {
+  let total = 0
+  for (const member of members) {
+    if (memberPhaseOf(member) === 'stopped') continue
+    if (view.activity(member.id)?.kind !== 'model') continue
+    const requests = member.usage?.requests ?? 0
+    if (requests > 0) total += Math.ceil((member.accountedTokens ?? 0) / requests)
+  }
+  return total
+}
+
+/**
+ * The members the budget gate's step projection counts with a model request in
+ * flight, one step each: a live member whose worker reports a model operation
+ * or, when its worker reports none, whose durable activity records one (R06).
+ */
+export function stepsInFlight(view: AdapterView, members: readonly Member[]): Member[] {
+  return members.filter(member => memberPhaseOf(member) !== 'stopped' && (view.activity(member.id) ?? member.activity)?.kind === 'model')
 }
 
 export function ready(board: Board, task: Task, member: Member): boolean {
@@ -368,9 +396,10 @@ export interface IsolationIssue { memberIds: string[]; message: string }
  *    per worktree and refuses a second whose scope overlaps.
  * It asserts the isolation the runtime already has; it never weakens
  * per-member worktrees, it refuses a dispatch that would lose them. Dispatch
- * admission refuses a listed member (`WorkspaceAdmission.isolationAllows`), and
- * the workspace terminal a breach raised is outstanding while the invariant
- * still lists it (`Notices.openGuardTerminal`).
+ * refuses a listed member (`isolationViolation`) and records the refusal
+ * (`WorkspaceAdmission.recordIsolation`), and the workspace terminal a breach
+ * raised is outstanding while the invariant still lists it
+ * (`Notices.openGuardTerminal`).
  */
 export function isolationIssues(board: Pick<Board, 'members' | 'tasks'>): IsolationIssue[] {
   const violations: IsolationIssue[] = []
@@ -400,6 +429,11 @@ export function isolationIssues(board: Pick<Board, 'members' | 'tasks'>): Isolat
     }
   }
   return violations
+}
+
+/** The dispatch's isolation decision for one member: the first breach on the board that lists it, or undefined when the invariant admits its dispatch. */
+export function isolationViolation(board: Pick<Board, 'members' | 'tasks'>, member: Pick<Member, 'id'>): IsolationIssue | undefined {
+  return isolationIssues(board).find(issue => issue.memberIds.includes(member.id))
 }
 
 /* ----------------------------------------------------------------------- *
@@ -805,9 +839,15 @@ export function fingerprintBoard(board: Board): MissionFingerprintBoard {
 }
 
 /* ----------------------------------------------------------------------- *
- * R17-G1: the interpretation, the one reading of a board every owner-facing
- * generator and the dispatch sweep consume.
+ * R17-G1: the interpretation, the one judgement of a board the board
+ * classifiers read. A reader of rows alone reads the board; until A1 the one
+ * other builder is the dispatch sweep's member step (`interpret`).
  * ----------------------------------------------------------------------- */
+
+/** Whether a durably parked member holds this task's open attempt (the R10-15 holder family): rows alone, so asking asks the adapter nothing. */
+export function heldByParkedMember(members: readonly Member[], task: Task): task is HeldTask {
+  return holdsOpenAttempt(task) && members.some(member => member.id === task.attempt.ownerId && memberPhaseOf(member) === 'parked')
+}
 
 /** One board, and what the dispatcher's predicates answer over it. */
 export interface Interpretation extends Board {
@@ -821,40 +861,34 @@ export interface Interpretation extends Board {
   unschedulable: Task[]
   /** The scheduler's stalled predicate for this board. */
   stalled: boolean
-  /** Running tasks whose owning member is durably parked (the R10-15 holder family). */
-  parkedHolders: Array<{ task: HeldTask; member: Member }>
-  implementations: Task[]
-  /** Latest task, evidence or owner-decision progress; telemetry does not reset this clock. */
-  lastTransitionAt: number
-  subjectsOf: (tasks: readonly Pick<Task, 'id' | 'epoch'>[]) => string[]
 }
 
 /**
- * R17-G1: the ONE shared interpretation of a board. Every owner-facing
- * generator reads it instead of re-reading raw rows and re-deriving its own
- * answer: it is the board, so the dispatcher's own predicates (`eligible`,
- * `reviewable`, `completionError`) are asked of it directly, and beside it what
- * they answer over it once (`dispatchable`, `unschedulable`, `stalled`), so a
- * notice can never describe a board the dispatcher would act on differently. A
- * value of the board alone: it writes nothing, holds no cache, and asks the
- * adapter exactly where its predicates ask it.
+ * R17-G1: the ONE shared interpretation of a board. Every board classifier
+ * (`Notices.ensureWitness`, the absence net, the obligation follow-ups and the
+ * relevance of a board fact) reads it instead of re-reading raw rows and
+ * re-deriving its own answer: it is the board, so the dispatcher's own
+ * predicates (`eligible`, `reviewable`, `completionError`) are asked of it
+ * directly, and beside it what they answer over it once (`dispatchable`,
+ * `unschedulable`, `stalled`), so a notice can never describe a board the
+ * dispatcher would act on differently. A value of the board alone: it writes
+ * nothing, holds no cache, and asks the adapter exactly where its predicates
+ * ask it. A reader of rows alone (the sweep's member order, a notice naming the
+ * tasks it is about with `subjectsOfTasks`) reads the board, and asks the
+ * adapter nothing. One caller outside the classifiers builds it: each member
+ * step of the dispatch sweep, which reads none of its judged fields, so that
+ * its asks come before that member's eligibility asks (an ask can drain a
+ * stranded inbox, R15-A5). A1 separates isIdle's question from its drain and
+ * deletes that call with this sentence.
  */
 export function interpret(board: Board): Interpretation {
-  const { mission, tasks, members } = board
   return {
     ...board,
-    nonTerminal: tasks.filter(task => !TERMINAL_STATES.has(task.status)),
+    nonTerminal: board.tasks.filter(task => !TERMINAL_STATES.has(task.status)),
     stallRoots: stallRoots(board),
     dispatchable: dispatchable(board),
     unreviewed: unreviewedSources(board),
     unschedulable: unschedulable(board),
     stalled: stalled(board),
-    parkedHolders: tasks.filter(holdsOpenAttempt).flatMap(task => {
-      const member = members.find(candidate => candidate.id === task.attempt.ownerId)
-      return member !== undefined && memberPhaseOf(member) === 'parked' ? [{ task, member }] : []
-    }),
-    implementations: tasks.filter(task => task.kind === 'implementation'),
-    lastTransitionAt: board.records.progressAt(mission),
-    subjectsOf: list => subjectsOfTasks(list, mission),
   }
 }

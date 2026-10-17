@@ -8,7 +8,7 @@ import { scrubbedParentEnv, type SubprocessHandle, type SubprocessSpawnSpec } fr
 import { withinScope } from './scope.js'
 import { PolicyError } from './policy-error.js'
 import { captureGitSnapshot } from './git-snapshot.js'
-import { unexecutedCheck } from './declared-checks.js'
+import { unexecutedCheck } from './check-results.js'
 import type { Artifact, CheckAttribution, CheckEnvelope, CheckEnvironment, CheckResult, CheckSyntaxIssue, Member, Mission, RecoveryFallback, Task, VerificationCleanupFailure, WorkspaceBaseline } from './types.js'
 
 /** Full-repository path inventories are metadata, not user-visible check output. */

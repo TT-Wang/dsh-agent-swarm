@@ -108,7 +108,7 @@ export const PROVIDER_OUTAGE_WINDOW_MS = 5 * 60_000
  * R11-01: the member's route is quiescent only inside the outage window of its
  * last classified outage: the window reading of `Member.providerOutage` (the
  * field states both of its readings). The start failure's classification,
- * start pacing and re-routing ask it.
+ * start pacing, re-routing and the live-work panel ask it.
  */
 export function providerQuiescent(member: Pick<Member, 'providerOutage'>, now: number): MemberProviderOutage | undefined {
   const outage = member.providerOutage
@@ -303,13 +303,13 @@ export interface Member {
    * R11-01: the last provider outage classified for this member, kept until a
    * start opens the member's session. It is read two ways:
    * - Present, it is an outage not yet proved recovered: the opening start
-   *   (`recordStarted`) records `provider/recovered` and deletes it, a report of
-   *   its class within 30 s of it writes no second `provider/outage` event
-   *   (`recordProviderOutage`), and the live-work panel shows the member as
-   *   waiting for provider recovery.
+   *   (`recordStarted`) records `provider/recovered` and deletes it, and a
+   *   report of its class within 30 s of it writes no second `provider/outage`
+   *   event (`recordProviderOutage`).
    * - Inside its window it is quiescence (`providerQuiescent`): a start failure
    *   is the outage, spending no recovery credit and not counted, starts are
-   *   paced to one probe per window, and re-routed work prefers other members.
+   *   paced to one probe per window, re-routed work prefers other members, and
+   *   the live-work panel shows the member as waiting for provider recovery.
    */
   providerOutage?: MemberProviderOutage
   /** S5c: consecutive `workers.start` failures and the last one's error, cleared by the next successful start; a restart continues the count. */
@@ -445,7 +445,7 @@ export interface Task {
   /** Initial plan owner; a preferred task fixes this to its first actual owner for recovery. */
   plannedAssigneeId?: string
   attempt?: Attempt
-  /** Lease value already warned about, so a lease-expiring event is emitted once per lease. */
+  /** Lease value already warned about, so a lease-expiring event is emitted once per lease; it leaves the row with the attempt. */
   leaseWarned?: number
   epoch: number
   output?: string
@@ -471,18 +471,19 @@ export interface Task {
   verificationRecovery?: { sourceTaskId: string; commit: string; reason: string; at: number }
   /** Per-command host verification timeout chosen for this task. */
   checkTimeoutMs?: number
-  /** Same-owner resume preserves attempt provenance after budget quiescence. */
-  budgetResume?: { pauseId: string; attemptId: string; epoch: number }
+  /** Same-owner resume preserves attempt provenance after budget quiescence; the marker leaves the row with the attempt it names. */
+  budgetResume?: { pauseId: string; attemptId: string }
   /** Durable quiescence transition; epoch matching prevents reopening invalidated work. */
   resumeAfterStop?: { epoch: number; memberId?: string; reason: 'handoff' | 'lease-expired' | 'worker-closeout' | 'resource' | 'invalidated'; /** R14-F2(d): when the stop began, so a waited-on stop has a durable bound. */ at?: number; /** Deterministic preservation failures retain the fence until an explicit resume retries them. */ failure?: { message: string; deterministic: boolean } }
-  /** Idle close-out nudges already delivered for this attempt; cleared when a new attempt starts. */
+  /** Idle close-out nudges already delivered for this attempt; an owner resume restarts them, and they leave the row with the attempt. */
   closeout?: { nudges: number; at: number }
   /**
    * S5: durable form of the adapter's "this member ended a turn while still
-   * owning this attempt" signal. The scheduling path re-reads it from the store
-   * instead of trusting the in-memory `idleSignals` map, which is now only a
+   * owning this attempt" signal. The attempts seam, which writes it, is its one
+   * reader (`Attempts.turnEnded`): the scheduling path
+   * asks it rather than trusting the in-memory `idleSignals` map, which is now only a
    * cache: a lost cache delays the bounded close-out until lease expiry, it
-   * cannot make the close-out wrong. Attempt-scoped, so a stale signal is inert.
+   * cannot make the close-out wrong. It names its attempt and leaves the row with it.
    */
   idleSignal?: { attemptId: string; at: number }
   /** Durable workspace checkpoint captured before an abandoned attempt was reassigned. */
@@ -497,7 +498,7 @@ export interface Task {
    * and the owner notice, and projected by `swarm_observe`.
    */
   recovery?: { epoch: number; previousOwnerId: string; commit: string; preserved: boolean; reason: string; at: number }
-  /** Sandbox denial of a worker-side git write on this attempt; cleared when a new attempt starts. */
+  /** Sandbox denial of a worker-side git write on this attempt; it leaves the row with the attempt. */
   gitWriteDenied?: { command: string; runId?: string; at: number }
   artifact?: Artifact
   /** Captured reviewer-authored record; never a dependency deliverable or independent verdict on its own contents. */
@@ -689,7 +690,11 @@ export interface Delivery {
   topic?: string
   createdAt: number
   deliveredAt?: number
-  /** Actual host message consumption, independent of transport acknowledgement timing. */
+  /**
+   * When the owner session admitted this owner-addressed delivery, a notice or
+   * a question alike: actual host message consumption, independent of transport
+   * acknowledgement timing. Written once, only by `Notices.recordConsumption`.
+   */
   consumedAt?: number
   deliveryFailure?: { reason: string; at: number }
   taskId?: string
@@ -781,8 +786,8 @@ export const OWNER_ONLY_TOOLS: readonly string[] = [
  * refuse its own mission as truncated. One list, both readers.
  */
 export const ATTEMPT_FENCING_EVENTS: readonly EventKind[] = [
-  // `attempt/fenced` is the uniform closer every control path now writes through
-  // `Attempts.fenceForStop`. Mission pause/stop and challenge closed attempts
+  // `attempt/fenced` is the uniform closer every fence writes through
+  // `Attempts.fenceRow`. Mission pause/stop and challenge closed attempts
   // with only their own domain event, so a log this runtime wrote was refused as
   // truncated by its own replay; `task/start-failed` drops the attempt too and
   // had the same gap.

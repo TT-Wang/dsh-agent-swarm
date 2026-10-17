@@ -164,8 +164,8 @@ test('the notice ledger records sent, queued and claimed with the state fingerpr
 
   // R17-G8: consumption is a separate fact, recorded once from the host's
   // claimed signal (the adapter maps the delivery id), with a compare-and-swap.
-  assert.equal(f.runtime.notices.recordConsumption(deliveredEntry.deliveryId), true, 'the host claimed signal records consumption')
-  assert.equal(f.runtime.notices.recordConsumption(deliveredEntry.deliveryId), false, 'a second signal cannot move the timestamp')
+  assert.equal(f.runtime.notices.recordConsumption(f.owner.sessionId, deliveredEntry.deliveryId), true, 'the host claimed signal records consumption')
+  assert.equal(f.runtime.notices.recordConsumption(f.owner.sessionId, deliveredEntry.deliveryId), false, 'a second signal cannot move the timestamp')
   const consumed = ledger().find(row => row.deliveryId === deliveredEntry.deliveryId)
   assert.ok(consumed.consumedAt >= consumed.deliveredAt, 'consumption is recorded after delivery, as its own fact')
   assert.equal(consumed.state, 'claimed', 'the transport state stays transport: consumption never rewrites it')

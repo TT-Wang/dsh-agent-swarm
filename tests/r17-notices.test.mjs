@@ -3,8 +3,9 @@
  *
  * Each claim is pinned by a test that fails on the pre-change tree:
  *
- * 1. ONE DERIVATION: every owner-facing notice generator consumes the shared
- *    interpretation (`Notices.interpretation`), and the enumeration below names
+ * 1. ONE DERIVATION: every board classifier consumes the shared
+ *    interpretation (`interpret` over the board), every other notice reads
+ *    the board itself, and the enumeration below names
  *    every `notify(` site in the source tree with its trigger and its reason for
  *    not passing an explicit fact marker, so a new site fails this file.
  * 2. FACT-ONLY TEMPLATES: every body of a reviewed family is built by the one
@@ -23,7 +24,8 @@
  *    cause — the absence net (absence of a durable transition + elapsed clock,
  *    no subject beyond the mission) and the retained attempt-silence escalation
  *    (`attemptSilenceBoundMs`, default 600,000 ms).
- * 8. CONSUMPTION AS A FACT: recorded from the host's claimed signal with a
+ * 8. CONSUMPTION AS A FACT: recorded from the host's admitted message, which
+ *    its one observer (the owner-reply guard) hands to the notices, with a
  *    compare-and-swap; delivered and consumed stay separate facts and the
  *    `claimedAt` placeholder is gone from the ledger and from the durable row.
  *
@@ -38,9 +40,10 @@ import { Context } from '@deepseek-ai/cordis'
 import ts from 'typescript'
 import { SwarmRuntime } from '../lib/runtime.js'
 import { NOTICE_TEMPLATES, noticeTemplateKey } from '../lib/notices.js'
+import { OwnerReplyGuard } from '../lib/owner-reply.js'
 import { tempDirectory } from './temp-root.mjs'
 import { FakeClock, FakeWorkers, NO_GRANTS } from './faults/harness.mjs'
-import { completionError } from '../lib/board.js'
+import { completionError, interpret } from '../lib/board.js'
 
 const ROOT = dirname(dirname(fileURLToPath(import.meta.url)))
 const budget = { maxTokens: 100000, maxSteps: 100, maxWorkers: 3, maxDurationMs: 600000, maxTasks: 20, maxExperiments: 2 }
@@ -56,13 +59,12 @@ async function eventually(fn, message, timeoutMs = 5000) {
   }
 }
 
-/** Always idle, no host checks; `ctx` is the host context the notices subscribe to for consumption. */
-const newWorkers = ctx => new FakeWorkers({ ctx, autoIdle: true, checks: [], artifact: { commit: 'c', baseCommit: 'b', workspace: '/isolated', changedPaths: [] } })
+/** Always idle, no host checks. */
+const newWorkers = () => new FakeWorkers({ autoIdle: true, checks: [], artifact: { commit: 'c', baseCommit: 'b', workspace: '/isolated', changedPaths: [] } })
 
 async function fixture(t, config = {}) {
   const dir = await tempDirectory('swarm-r17-notices-')
-  const ctx = new Context()
-  const runtime = new SwarmRuntime({ statePath: join(dir, 'db.sqlite'), leaseMs: 60000, tickMs: 25, maxMessageChars: 16000, maxEvents: 500, maxTasksPerMember: 9, grants: NO_GRANTS, ...config }, newWorkers(ctx))
+  const runtime = new SwarmRuntime({ statePath: join(dir, 'db.sqlite'), leaseMs: 60000, tickMs: 25, maxMessageChars: 16000, maxEvents: 500, maxTasksPerMember: 9, grants: NO_GRANTS, ...config }, newWorkers())
   t.after(async () => { await runtime.dispose(); await rm(dir, { recursive: true, force: true }) })
   await runtime.start()
   const owner = { sessionId: 'r17-notices-owner' }
@@ -74,7 +76,7 @@ async function fixture(t, config = {}) {
   const propose = (title, input = {}) => runtime.propose(owner, mission.id, { outputs: [], workstreamId: stream.id, title, objective: title, kind: 'implementation', scope: ['src/'], acceptance: ['works'], checks: ['test -d .'], ...input })
   const ownerNotices = () => runtime.store.list('deliveries', mission.id).filter(delivery => delivery.to === 'owner')
   const emit = (content, subjects, options = {}) => runtime.commit(mission.id, () => runtime.notices.notify(mission.id, content, subjects, options))
-  return { dir, ctx, runtime, owner, mission, stream, addMember, propose, ownerNotices, emit }
+  return { dir, runtime, owner, mission, stream, addMember, propose, ownerNotices, emit }
 }
 
 test('R17-G3: repetition is keyed on the fact — same fact once, unrelated board change is not a re-arm, changed fact is new', async t => {
@@ -188,23 +190,24 @@ test('R17-G5: the sampling path is an absence net — absence and elapsed clock 
   assert.ok(lastAt > 0)
 })
 
-test('R17-G8: consumption is recorded from the host claimed signal with a CAS; delivered and consumed stay separate', async t => {
-  const f = await fixture(t)
+test('R17-G8: consumption is recorded from the owner session\'s admission with a CAS; delivered and consumed stay separate', async t => {
+  const f = await clockedFixture(t)
   f.emit('ledger probe', [`mission:${f.mission.id}`], { trigger: 'test/consumption', reason: 'probe' })
   const notice = f.ownerNotices().find(delivery => delivery.notice.dedupKey.startsWith('test/consumption:'))
   assert.ok(notice)
   assert.equal(notice.deliveredAt, undefined)
-  // The host can claim the item while the adapter call is still in flight, so
-  // consumption is not gated on our transported timestamp; delivery follows.
-  await eventually(() => f.runtime.store.get('deliveries', notice.id).deliveredAt !== undefined ? true : undefined, 'the outbox delivers the notice')
-  assert.equal(f.runtime.notices.recordConsumption(notice.id, { at: 1_700_000_000_000, source: 'agent/inbox/claimed' }), true)
-  assert.equal(f.runtime.notices.recordConsumption(notice.id), false, 'the compare-and-swap refuses a second signal')
+  await f.runtime.notices.flushOutbox(f.mission.id)
+  f.clock.advance(1_000)
+  assert.equal(f.runtime.notices.recordConsumption('another-session', notice.id), false, 'only the owner session consumes an owner notice')
+  assert.equal(f.runtime.notices.recordConsumption(f.owner.sessionId, notice.id), true)
+  const consumedAt = f.clock.now()
+  f.clock.advance(1_000)
+  assert.equal(f.runtime.notices.recordConsumption(f.owner.sessionId, notice.id), false, 'the compare-and-swap refuses a second signal')
   const row = f.runtime.store.get('deliveries', notice.id)
-  assert.equal(row.notice.consumedAt, 1_700_000_000_000, 'the recorded instant is the host signal, not the delivery time')
-  assert.equal(row.notice.consumptionSource, 'agent/inbox/claimed')
-  assert.notEqual(row.notice.consumedAt, row.deliveredAt, 'consumed is its own fact, never the transport timestamp')
+  assert.equal(row.consumedAt, consumedAt, 'the recorded instant is the admission on the runtime clock, not the delivery time')
+  assert.notEqual(row.consumedAt, row.deliveredAt, 'consumed is its own fact, never the transport timestamp')
   const entry = f.runtime.observe(f.owner, f.mission.id, { detail: 'full' }).noticeLedger.find(item => item.deliveryId === notice.id)
-  assert.equal(entry.consumedAt, 1_700_000_000_000)
+  assert.equal(entry.consumedAt, consumedAt)
   assert.equal(entry.deliveredAt, row.deliveredAt)
   assert.equal('claimedAt' in entry, false, 'the claimedAt placeholder is gone from the ledger')
   assert.equal('claimedAt' in row.notice, false, 'and gone from the durable row')
@@ -212,21 +215,24 @@ test('R17-G8: consumption is recorded from the host claimed signal with a CAS; d
 
 test('R17-G8: the admitted owner message records consumption after inbox claim', async t => {
   const f = await fixture(t)
+  // The host context as the plugin wires it: the owner-reply guard is the one observer of an admitted message.
+  const ctx = new Context()
+  const guard = new OwnerReplyGuard(ctx, f.runtime, { maxNudges: 2 })
+  t.after(() => guard.dispose())
   f.emit('host signal probe', [`mission:${f.mission.id}`], { trigger: 'test/host-signal', reason: 'probe' })
   const notice = f.ownerNotices().find(delivery => delivery.notice.dedupKey.startsWith('test/host-signal:'))
   assert.ok(notice)
   await eventually(() => f.runtime.store.get('deliveries', notice.id).deliveredAt !== undefined ? true : undefined, 'the outbox delivers the notice')
   const message = { source: { kind: 'swarm', form: 'relay', missionId: f.mission.id, senderMemberId: 'runtime', deliveryId: notice.id, deliveryKind: 'control' } }
-  f.ctx.emit('agent/inbox/claimed', { message, turn: 1 })
-  assert.equal(f.runtime.store.get('deliveries', notice.id).notice.consumedAt, undefined, 'claim can still be rejected before model admission')
-  f.ctx.emit('session/event', { header: { id: f.owner.sessionId } }, { type: 'user/message', data: message })
+  ctx.emit('agent/inbox/claimed', { message, turn: 1 })
+  assert.equal(f.runtime.store.get('deliveries', notice.id).consumedAt, undefined, 'claim can still be rejected before model admission')
+  ctx.emit('session/event', { header: { id: f.owner.sessionId } }, { type: 'user/message', data: message })
   const row = f.runtime.store.get('deliveries', notice.id)
-  assert.ok(Number.isSafeInteger(row.notice.consumedAt), 'the host signal recorded consumption')
-  assert.equal(row.notice.consumptionSource, 'user/message')
+  assert.ok(Number.isSafeInteger(row.consumedAt), 'the host signal recorded consumption')
   // A replayed signal cannot move it (compare-and-swap).
-  const recorded = row.notice.consumedAt
-  f.ctx.emit('session/event', { header: { id: f.owner.sessionId } }, { type: 'user/message', data: message })
-  assert.equal(f.runtime.store.get('deliveries', notice.id).notice.consumedAt, recorded)
+  const recorded = row.consumedAt
+  ctx.emit('session/event', { header: { id: f.owner.sessionId } }, { type: 'user/message', data: message })
+  assert.equal(f.runtime.store.get('deliveries', notice.id).consumedAt, recorded)
 })
 
 /**
@@ -249,7 +255,7 @@ const subjectOf = task => `${task.id}@${task.epoch}`
 const DECISIONS = {
   'stall-root': ['allocation with swarm_budget', 'swarm_propose with replaces', 'swarm_cancel to withdraw'],
   'board-stall': ['assignee with swarm_control', 'review with swarm_propose', 'explicitly with swarm_cancel', 'swarm_control stop'],
-  fallthrough: ['review with swarm_propose', 'decide with swarm_control'],
+  fallthrough: ['review with swarm_propose', 'decide with swarm_control', 'stuck work with swarm_cancel(taskId, reason)'],
   parked: ['held by a parked member', 'without spending a recovery attempt'],
   'integration-gap': ['integration task depending on every branch'],
   'coverage-complete': ['stays active until you decide', 'swarm_control complete', 'more work with swarm_propose'],
@@ -281,7 +287,7 @@ test('R17-G2a: the stall-root body replays from the blocked row alone', async t 
   const stranding = blockTask(f, f.propose('Blocked work', { assigneeId: member.id }))
   const lone = blockTask(f, f.propose('Blocked alone', { assigneeId: member.id }))
   dependOn(f, f.propose('Waits on the blocked work'), stranding)
-  f.runtime.notices.notifyStallRoots(f.runtime.notices.interpretation(f.mission.id))
+  f.runtime.notices.notifyStallRoots(interpret(f.runtime.boardOf(f.mission.id)))
   for (const task of [stranding, lone]) {
     const root = f.runtime.store.get('tasks', task.id)
     const notice = ownerNotice(f, `stall-root:${f.mission.id}:${subjectOf(root)}`)
@@ -308,7 +314,7 @@ test('R17-G2b: the W3 stall body replays from the unschedulable rows alone', asy
   dependOn(f, waiting, prerequisite)
   dependOn(f, prerequisite, waiting)
   const stall = () => {
-    const view = f.runtime.notices.interpretation(f.mission.id)
+    const view = interpret(f.runtime.boardOf(f.mission.id))
     f.runtime.notices.notifyBoard(view)
     return { view, reason: completionError(view), notice: f.ownerNotices().filter(delivery => delivery.notice.dedupKey.startsWith('board-stall:')).at(-1) }
   }
@@ -386,7 +392,7 @@ test('R17-G2d: the integration-gap and coverage-complete bodies replay from the 
     f.runtime.store.put('tasks', { ...accepted, status: 'accepted', covers: f.mission.acceptance.map((_, index) => `c${index + 1}`), artifact: { commit: 'c', baseCommit: 'b', workspace: '/isolated', changedPaths: [] } })
     f.runtime.store.put('tasks', { ...withdrawn, status: 'cancelled' })
   })
-  f.runtime.notices.notifyBoard(f.runtime.notices.interpretation(f.mission.id))
+  f.runtime.notices.notifyBoard(interpret(f.runtime.boardOf(f.mission.id)))
   const coverage = ownerNotice(f, 'coverage-complete:')
   assert.ok(coverage, 'the coverage-complete notice was reported')
   assert.deepEqual(coverage.notice.statement, { family: 'coverage-complete', counts: {} }, 'the body is the coverage-complete template and states no count')
@@ -457,25 +463,6 @@ test('R17-G2f: the review-blocked body replays from the submitted source row and
   assertDecision(notice, 'review-blocked')
 })
 
-test('R17-G8: the admitted owner message records consumption after inbox claim', async t => {
-  const f = await fixture(t)
-  f.emit('host signal probe', [`mission:${f.mission.id}`], { trigger: 'test/host-signal', reason: 'probe' })
-  const notice = f.ownerNotices().find(delivery => delivery.notice.dedupKey.startsWith('test/host-signal:'))
-  assert.ok(notice)
-  await eventually(() => f.runtime.store.get('deliveries', notice.id).deliveredAt !== undefined ? true : undefined, 'the outbox delivers the notice')
-  const message = { source: { kind: 'swarm', form: 'relay', missionId: f.mission.id, senderMemberId: 'runtime', deliveryId: notice.id, deliveryKind: 'control' } }
-  f.ctx.emit('agent/inbox/claimed', { message, turn: 1 })
-  assert.equal(f.runtime.store.get('deliveries', notice.id).notice.consumedAt, undefined, 'claim can still be rejected before model admission')
-  f.ctx.emit('session/event', { header: { id: f.owner.sessionId } }, { type: 'user/message', data: message })
-  const row = f.runtime.store.get('deliveries', notice.id)
-  assert.ok(Number.isSafeInteger(row.notice.consumedAt), 'the host signal recorded consumption')
-  assert.equal(row.notice.consumptionSource, 'user/message')
-  // A replayed signal cannot move it (compare-and-swap).
-  const recorded = row.notice.consumedAt
-  f.ctx.emit('session/event', { header: { id: f.owner.sessionId } }, { type: 'user/message', data: message })
-  assert.equal(f.runtime.store.get('deliveries', notice.id).notice.consumedAt, recorded)
-})
-
 test('R17-G2g: the review-blocked notice beside running work is the template too, with its statement and recorded reason', async t => {
   const f = await clockedFixture(t)
   const author = await f.addMember('Ada')
@@ -507,7 +494,7 @@ test('R17-G2: every reviewed notice body replays from the rows it cites', async 
   const row = f.runtime.store.get('tasks', blocked.id)
   row.status = 'blocked'; row.epoch += 1; row.output = 'blocked for repair'
   f.runtime.store.put('tasks', row)
-  await f.runtime.notices.notifyStallRoots(f.runtime.notices.interpretation(f.mission.id))
+  await f.runtime.notices.notifyStallRoots(interpret(f.runtime.boardOf(f.mission.id)))
 
   const deliveries = f.ownerNotices().filter(delivery => noticeTemplateKey(delivery) !== undefined)
   assert.ok(deliveries.length >= 1, 'a reviewed template was emitted')

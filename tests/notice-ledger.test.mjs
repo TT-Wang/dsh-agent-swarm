@@ -15,8 +15,8 @@ import { createHash } from 'node:crypto'
 import { writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { FakeClock, FakeWorkers, MISSION_ACCEPTANCE, acceptThroughReview, blockThroughReview, eventually, events, setup, taskOf } from './faults/harness.mjs'
-import { BOARD_RUNNING, completionError, isolationIssues, reviewNeed } from '../lib/board.js'
-import { ownerTools } from './refusal-inventory.mjs'
+import { BOARD_RUNNING, completionError, interpret, isolationIssues, reviewNeed } from '../lib/board.js'
+import { assertNamedCalls, ownerTools } from './refusal-inventory.mjs'
 import { NOTICE_TEMPLATES, factKey, noticeFamily, noticeTemplateKey } from '../lib/notices.js'
 
 const ownerRows = f => f.runtime.store.list('deliveries', f.mission.id).filter(delivery => delivery.to === 'owner' && delivery.notice !== undefined)
@@ -25,17 +25,81 @@ const coverageRow = f => ownerRows(f).find(delivery => /is ready to complete/.te
 /** The W3 stall's own events: the board classifier's `mission/stalled`, which carries no cause. */
 const boardStallEvents = f => events(f.runtime, f.mission.id, 'mission/stalled').filter(event => event.data.cause === undefined)
 const ticks = async (f, count) => { for (let tick = 0; tick < count; tick += 1) { f.clock.advance(f.runtime.config.tickMs); await f.runtime.tick() } }
-/** A board stalled on work only the reviewer may take, dead once the reviewer is gone: its one stuck subject. */
-const deadAssigneeBoard = async t => {
+/**
+ * The boards a decision names stuck work on. Each holds one stuck task
+ * (`stuck`), on a board with nothing else to do (`running` false: the W3 stall
+ * names it) or beside unrelated work a third member keeps running (the
+ * fall-through names it), and is judged once by the tick that follows.
+ */
+const stuckBoard = async (t, running, strand) => {
   const f = await setup({ clock: new FakeClock() })
   t.after(f.cleanup)
-  const dead = f.propose({ title: 'Reviewer-only work', kind: 'research', checks: [], assigneeId: f.reviewer.id })
-  f.runtime.commit(f.mission.id, () => f.runtime.store.put('members', { ...f.runtime.store.get('members', f.reviewer.id), phase: 'stopped' }))
+  const board = await strand(f)
+  if (running) {
+    const runner = await f.runtime.addMember(f.owner, f.mission.id, { name: 'Runner', role: 'implementation', maxOutputTokens: 5_000 })
+    await f.runtime.claim(f.actor(runner), f.mission.id, f.propose({ title: 'Unrelated work', kind: 'research', checks: [], assigneeId: runner.id }).id)
+  }
   await f.runtime.settle(f.mission.id)
   await ticks(f, 1)
-  return { f, dead }
+  return { f, ...board }
+}
+/** Work only the reviewer may take, dead once the reviewer is gone. */
+const deadAssigneeBoard = (t, running = false) => stuckBoard(t, running, f => {
+  const stuck = f.propose({ title: 'Reviewer-only work', kind: 'research', checks: [], assigneeId: f.reviewer.id })
+  f.runtime.commit(f.mission.id, () => f.runtime.store.put('members', { ...f.runtime.store.get('members', f.reviewer.id), phase: 'stopped' }))
+  return { stuck }
+})
+/** A dependent a cancellation stranded: its prerequisite is withdrawn. */
+const strandedBoard = (t, running) => stuckBoard(t, running, f => {
+  const prerequisite = f.propose({ title: 'Prerequisite', kind: 'research', checks: [] })
+  const stuck = f.propose({ title: 'Dependent', kind: 'research', checks: [], dependencies: [prerequisite.id] })
+  const cancelled = f.runtime.cancel(f.owner, f.mission.id, { taskId: prerequisite.id, reason: 'Not needed' })
+  return { stuck, prerequisite, cancelled }
+})
+/**
+ * Pending work holding an id that names no task (T1, tests/dangling-reference.test.mjs): `edge` is its
+ * dependency or its review source. The row is written as only a corrupted store holds it (no runtime path
+ * admits a dangling edge), and the owner then withdraws the work it was copied from while it stands.
+ */
+const danglingBoard = (t, running, edge) => stuckBoard(t, running, f => {
+  const template = f.propose({ title: 'Template' })
+  const stuck = { ...taskOf(f.runtime, template.id), id: 'task_dangling', status: 'pending', epoch: 0, attempt: undefined, assigneeId: undefined,
+    plannedAssigneeId: undefined, artifact: undefined, evidenceIds: [], output: undefined, ...edge }
+  f.runtime.store.transaction(() => f.runtime.store.put('tasks', stuck))
+  f.runtime.cancel(f.owner, f.mission.id, { taskId: template.id, reason: 'Leave the dangling row alone' })
+  return { stuck }
+})
+/** A submission an older build left without an artifact, which the host's review admission does not review, past its review grace. */
+const legacyBoard = (t, running) => stuckBoard(t, running, async f => {
+  const stuck = f.propose()
+  const claimed = await f.runtime.claim(f.actor(f.author), f.mission.id, stuck.id)
+  await f.runtime.submit(f.actor(f.author), f.mission.id, { taskId: stuck.id, attemptId: claimed.attempt.id, output: 'candidate' })
+  f.runtime.store.transaction(() => { const row = taskOf(f.runtime, stuck.id); delete row.artifact; f.runtime.store.put('tasks', row) })
+  f.clock.advance(Math.max(f.runtime.config.tickMs, 1_000))
+  return { stuck }
+})
+/** An owner-assembled mission whose one task is accepted: coverage-complete, and the owner's to complete. */
+const coverageBoard = async t => {
+  const f = await setup({ clock: new FakeClock() })
+  t.after(f.cleanup)
+  const task = f.propose()
+  await acceptThroughReview(f, task)
+  await f.runtime.settle(f.mission.id)
+  await ticks(f, 1)
+  return { f, task }
+}
+/** Work no pass reached, held by a scheduling body the tick watchdog finds past its bound and names. */
+const unreachedBoard = async t => {
+  const f = await setup({ clock: new FakeClock() })
+  t.after(f.cleanup)
+  const stuck = f.propose({ title: 'Never reached' })
+  await f.runtime.settle(f.mission.id)
+  wedgedBody(t, f, 'operation_wedge_exit')
+  return { f, stuck }
 }
 const relevant = (f, delivery) => f.runtime.notices.ownerDeliveryRelevant(f.runtime.mission(f.mission.id), f.runtime.store.get('deliveries', delivery.id))
+/** The swarm_* tools a text names, once each. */
+const namedTools = text => [...new Set(text.match(/\bswarm_\w+/g))].sort()
 /** The one field: key prefix, family and, for a templated body, its template and statement. */
 const names = delivery => ({ prefix: delivery.notice.dedupKey.split(':')[0], family: noticeFamily(delivery),
   template: noticeTemplateKey(delivery), statement: delivery.notice.statement?.family })
@@ -205,7 +269,7 @@ test('a W3 stall is told once per identity: a board that changes and returns to 
 })
 
 test('a board fact is told under its own identity: the W3 stall\'s stuck work at its epochs and its diagnostic, coverage-complete\'s terminal work; a new identity is a new row, and the old one is no longer outstanding', async t => {
-  const { f, dead } = await deadAssigneeBoard(t)
+  const { f, stuck: dead } = await deadAssigneeBoard(t)
   const stalls = () => ownerRows(f).filter(delivery => noticeFamily(delivery) === 'board-stall')
   const [first] = stalls()
   assert.deepEqual(first?.subjects, [`${dead.id}@${taskOf(f.runtime, dead.id).epoch}`], 'the stalled board named its stuck work')
@@ -231,11 +295,7 @@ test('a board fact is told under its own identity: the W3 stall\'s stuck work at
   assert.deepEqual([relevant(f, fenced), relevant(f, diagnosed)], [false, true])
   assert.deepEqual(boardStallEvents(f).map(event => event.data.noticeKey), stalls().map(delivery => delivery.notice.dedupKey), 'each stall has its one event')
 
-  const c = await setup({ clock: new FakeClock() })
-  t.after(c.cleanup)
-  await acceptThroughReview(c, c.propose())
-  await c.runtime.settle(c.mission.id)
-  await ticks(c, 1)
+  const { f: c } = await coverageBoard(t)
   const coverages = () => ownerRows(c).filter(delivery => noticeFamily(delivery) === 'coverage-complete')
   const [covered] = coverages()
   assert.ok(covered, 'the coverage-complete board told the owner')
@@ -249,41 +309,96 @@ test('a board fact is told under its own identity: the W3 stall\'s stuck work at
   assert.deepEqual([relevant(c, covered), relevant(c, recovered)], [false, true])
 })
 
-test('every exit a W3 stall and a coverage-complete decision name, performed through the owner\'s registered tools, retires that decision', async t => {
-  const toolsNamed = text => [...new Set(text.match(/\bswarm_\w+/g))].sort()
-  const proposal = f => ({ workstreamId: f.stream.id, title: 'More work', objective: 'Do the work the decision asks for', kind: 'research', scope: ['**'], outputs: [], acceptance: MISSION_ACCEPTANCE, checks: [] })
-  // The stall names the stuck work's amendment, a repair, a withdrawal and the mission stop (and a budget change, which names no tool).
-  const stallExits = {
-    'amend the existing task dependencies or assignee with swarm_control': ({ f, dead, tool }) => tool('swarm_control', { taskId: dead.id, action: 'amend', changes: { assigneeId: f.author.id }, reason: 'Reassign to a live member' }),
-    'admit a repair or review with swarm_propose': ({ f, tool }) => tool('swarm_propose', proposal(f)),
-    'withdraw it explicitly with swarm_cancel': ({ dead, tool }) => tool('swarm_cancel', { taskId: dead.id, reason: 'No longer required' }),
-    'Use swarm_control stop': ({ tool }) => tool('swarm_control', { action: 'stop', reason: 'Stop the mission' }),
-  }
-  for (const [exit, perform] of Object.entries(stallExits)) {
-    const { f, dead } = await deadAssigneeBoard(t)
-    const stall = ownerRows(f).find(delivery => noticeFamily(delivery) === 'board-stall')
-    assert.deepEqual(toolsNamed(stall.content), ['swarm_cancel', 'swarm_control', 'swarm_propose'], 'the stall names these tools')
-    assert.ok(stall.content.includes(exit), `the stall names: ${exit}`)
-    assert.equal(relevant(f, stall), true)
-    await perform({ f, dead, tool: await ownerTools(f) })
-    assert.equal(relevant(f, stall), false, `${exit} retires the stall`)
-  }
-  const coverageExits = {
-    'Use swarm_control complete': ({ tool }) => tool('swarm_control', { action: 'complete', reason: 'The deliverable is accepted' }),
-    'admit more work with swarm_propose': ({ f, tool }) => tool('swarm_propose', proposal(f)),
-  }
-  for (const [exit, perform] of Object.entries(coverageExits)) {
-    const f = await setup({ clock: new FakeClock() })
-    t.after(f.cleanup)
-    await acceptThroughReview(f, f.propose())
-    await f.runtime.settle(f.mission.id)
-    await ticks(f, 1)
-    const coverage = coverageRow(f)
-    assert.deepEqual(toolsNamed(coverage.content), ['swarm_control', 'swarm_propose'], 'coverage-complete names these tools')
-    assert.ok(coverage.content.includes(exit), `coverage-complete names: ${exit}`)
-    assert.equal(relevant(f, coverage), true)
-    await perform({ f, tool: await ownerTools(f) })
-    assert.equal(relevant(f, coverage), false, `${exit} retires coverage-complete`)
+/**
+ * What an exit does is its board's, and the words that name it are its
+ * family's: the W3 stall and the fall-through name the same stuck work, so one
+ * table of stuck work serves both. Performed, an exit retires the decision
+ * (`outstanding: false`), or is admitted and leaves it outstanding, or is
+ * refused with its code and changes nothing.
+ */
+const RETIRES = { outstanding: false }, STANDS = { outstanding: true }
+const refused = code => ({ refused: code, outstanding: true })
+const EXIT_WORDS = {
+  // The W3 stall also names a budget change, which names no tool.
+  'board-stall': { amend: 'amend the existing task dependencies or assignee with swarm_control', propose: 'admit a repair or review with swarm_propose',
+    withdraw: 'withdraw it explicitly with swarm_cancel', stop: 'Use swarm_control stop' },
+  // The fall-through's one swarm_control decision covers the amendment and the mission stop.
+  fallthrough: { amend: 'decide with swarm_control', propose: 'admit a repair or review with swarm_propose',
+    withdraw: 'withdraw the stuck work with swarm_cancel(taskId, reason)', stop: 'decide with swarm_control' },
+  'coverage-complete': { complete: 'Use swarm_control complete', propose: 'admit more work with swarm_propose' },
+  'scheduling-pass': { propose: 'admit a repair with swarm_propose', withdraw: 'withdraw the blocking work with swarm_cancel' },
+}
+const REASON = 'Follow the exit the decision names'
+const work = (f, fields = {}) => ({ workstreamId: f.stream.id, title: 'More work', objective: 'Do the work the decision asks for', kind: 'research', scope: ['**'], outputs: [],
+  acceptance: MISSION_ACCEPTANCE, checks: [], ...fields })
+const amend = changes => ({ f, stuck, tool }) => tool('swarm_control', { action: 'amend', taskId: stuck.id, changes: changes(f), reason: REASON })
+/** A repair of the board's `held` task, for the author: work that replaces it, an implementation unless `fields` say otherwise. */
+const repair = (held, fields) => board => board.tool('swarm_propose', work(board.f, { title: 'Repair', kind: 'implementation', checks: ['test -d .'], assigneeId: board.f.author.id, ...fields,
+  replaces: [board[held].id] }))
+const withdraw = ({ stuck, tool }) => tool('swarm_cancel', { taskId: stuck.id, reason: REASON })
+const stop = ({ tool }) => tool('swarm_control', { action: 'stop', reason: REASON })
+const complete = ({ tool }) => tool('swarm_control', { action: 'complete', reason: REASON })
+const more = ({ f, tool }) => tool('swarm_propose', work(f))
+/** A review of the stuck submission: admitted, but it never reaches a verdict, since swarm_verify needs the captured artifact (docs/known-limitations.md). */
+const review = async ({ f, stuck, tool }) => {
+  const admitted = await tool('swarm_propose', { workstreamId: f.stream.id, title: 'Review the source', objective: 'Independently review the submitted artifact', kind: 'verification',
+    scope: ['**'], outputs: [], acceptance: MISSION_ACCEPTANCE, reviewOf: stuck.id, assigneeId: f.reviewer.id })
+  const claimed = await f.runtime.claim(f.actor(f.reviewer), f.mission.id, admitted.id)
+  await assert.rejects(f.runtime.verify(f.actor(f.reviewer), f.mission.id, { taskId: admitted.id, attemptId: claimed.attempt.id, verdict: 'accept', reason: 'Independent host checks pass' }),
+    /Only independent verification of a submitted artifact/, 'the admitted review never reaches a verdict')
+}
+/** The withdrawal of the stuck submission, after which the repair it admits reaches a verdict. */
+const withdrawThenRepair = async board => {
+  await withdraw(board)
+  await acceptThroughReview(board.f, await repair('stuck')(board))
+}
+/** Stuck work, and what each exit the W3 stall and the fall-through name does to it: the same on a board with nothing else to do and beside running work. */
+const STUCK = {
+  'a dead assignee': [deadAssigneeBoard, [['amend', RETIRES, amend(f => ({ assigneeId: f.author.id }))],
+    ['propose', refused('replacement_source_not_blocked'), repair('stuck')], ['withdraw', RETIRES, withdraw], ['stop', RETIRES, stop]]],
+  'a dependent a cancellation stranded': [strandedBoard, [['amend', RETIRES, amend(() => ({ dependencies: [] }))],
+    ['propose', RETIRES, repair('prerequisite', { kind: 'research', checks: [] })], ['withdraw', RETIRES, withdraw], ['stop', RETIRES, stop]]],
+  'a dependency that names no task': [(t, running) => danglingBoard(t, running, { dependencies: ['task_missing'] }), [['amend', RETIRES, amend(() => ({ dependencies: [] }))],
+    ['propose', refused('replacement_source_not_blocked'), repair('stuck')], ['withdraw', RETIRES, withdraw], ['stop', RETIRES, stop]]],
+  // T1: neither the repair nor an amendment can clear it, so only the withdrawal and the mission stop retire its decision.
+  'a review whose source names no task': [(t, running) => danglingBoard(t, running, { kind: 'verification', reviewOf: 'task_missing_source', covers: undefined }), [
+    ['amend', refused('task_graph_invalid'), amend(f => ({ assigneeId: f.author.id }))], ['propose', refused('replacement_source_verification'), repair('stuck')],
+    ['withdraw', RETIRES, withdraw], ['stop', RETIRES, stop]]],
+  'a submission an older build left without an artifact': [legacyBoard, [
+    ['amend', refused('artifact_policy_immutable'), amend(f => ({ assigneeId: f.reviewer.id }))], ['amend', refused('artifact_policy_immutable'), amend(() => ({ dependencies: [] }))],
+    ['propose', refused('replacement_source_not_blocked'), repair('stuck')], ['propose', RETIRES, review], ['withdraw', RETIRES, withdrawThenRepair], ['stop', RETIRES, stop]]],
+}
+
+test('every exit a board decision names, performed through the owner\'s registered tools, does what its board decides: it retires the decision, is admitted and leaves it outstanding, or is refused and changes nothing; every kind of stuck work the W3 stall or the fall-through names is cleared by its withdrawal with swarm_cancel, which both name', async t => {
+  const decisions = [
+    ...Object.entries(STUCK).flatMap(([board, [build, exits]]) => [['board-stall', false], ['fallthrough', true]].map(([family, running]) => [family, board, t => build(t, running), exits])),
+    ['coverage-complete', 'an accepted deliverable', coverageBoard, [['complete', RETIRES, complete], ['propose', RETIRES, more]]],
+    ['scheduling-pass', 'work a wedged pass never reached', unreachedBoard, [['propose', STANDS, more], ['withdraw', RETIRES, withdraw]]],
+  ]
+  for (const [family, board, build, exits] of decisions) {
+    const words = EXIT_WORDS[family]
+    assert.deepEqual([...new Set(exits.map(([exit]) => exit))].sort(), Object.keys(words).sort(), `${family} on ${board}: every exit it names is performed`)
+    for (const [exit, outcome, perform] of exits) {
+      await t.test(`${family} on ${board}: ${words[exit]}`, async t => {
+        const { f, ...held } = await build(t)
+        const decision = ownerRows(f).find(delivery => noticeFamily(delivery) === family)
+        assert.ok(decision, `the board told the owner its ${family}`)
+        assert.deepEqual(namedTools(decision.content), namedTools(Object.values(words).join(' ')), 'every tool it names is an exit performed here')
+        assert.ok(decision.content.includes(words[exit]), `it names: ${words[exit]}`)
+        // An exit written as a call is checked against that tool's published schema.
+        const calls = [...decision.content.matchAll(/(swarm_\w+)\(/g)].map(([, tool]) => tool)
+        if (calls.length > 0) await assertNamedCalls(decision.content, calls)
+        assert.equal(relevant(f, decision), true, 'it is outstanding')
+        const before = held.stuck && taskOf(f.runtime, held.stuck.id)
+        const performed = perform({ f, ...held, tool: await ownerTools(f) })
+        if (outcome.refused === undefined) await performed
+        else {
+          assert.equal((await performed.then(value => assert.fail(`not refused: ${JSON.stringify(value)}`), error => error)).code, outcome.refused)
+          assert.deepEqual(taskOf(f.runtime, held.stuck.id), before, 'the refused exit changes nothing')
+        }
+        assert.equal(relevant(f, decision), outcome.outstanding, outcome.outstanding ? 'it is still outstanding' : 'it retires the decision')
+      })
+    }
   }
 })
 
@@ -323,7 +438,7 @@ test('D3: a submission whose review need ripened, beside a dependent that waits 
     await f.runtime.settle(f.mission.id)
     f.clock.advance(grace(f))
     const need = reviewNeed(f.runtime.boardOf(f.mission.id), taskOf(f.runtime, source.id))
-    assert.deepEqual([need.ripe, need.recorded, f.runtime.notices.interpretation(f.mission.id).stalled], [true, false, false], `deliverable ${index}: before the next pass the need is ripe, the admission has yet to process it, and the board is not stalled by it`)
+    assert.deepEqual([need.ripe, need.recorded, interpret(f.runtime.boardOf(f.mission.id)).stalled], [true, false, false], `deliverable ${index}: before the next pass the need is ripe, the admission has yet to process it, and the board is not stalled by it`)
     return { source, dependent }
   }
   const admitted = (f, source) => f.runtime.store.list('tasks', f.mission.id).find(task => task.reviewOf === source.id)
@@ -429,7 +544,7 @@ test('coverage-complete is told whenever completion is allowed, whatever the sta
   await eventually(() => !f.runtime.scheduling.passState(f.mission.id).passLive, 'the last pass ends')
   await ticks(f, 1)
   await eventually(() => !f.runtime.scheduling.passState(f.mission.id).passLive, 'the tick\'s pass ends')
-  const view = f.runtime.notices.interpretation(f.mission.id)
+  const view = interpret(f.runtime.boardOf(f.mission.id))
   assert.deepEqual([completionError(view), view.stalled, taskOf(f.runtime, experiment.id).status], [undefined, false, 'blocked'], 'completion is allowed on a board the stall predicate calls live')
   assert.equal(ownerRows(f).filter(delivery => noticeFamily(delivery) === 'coverage-complete').length, 1, 'coverage-complete is told')
 })
@@ -542,7 +657,7 @@ test('a board whose only unfinished work is a submission and its dead host revie
   f.runtime.control(f.owner, f.mission.id, 'resume', 'Carry on')
   await f.runtime.settle(f.mission.id)
   await ticks(f, 150)
-  assert.equal(f.runtime.notices.interpretation(f.mission.id).stalled, true, 'the board is stalled on the submission and its dead review')
+  assert.equal(interpret(f.runtime.boardOf(f.mission.id)).stalled, true, 'the board is stalled on the submission and its dead review')
   const told = ownerRows(f).filter(delivery => !before.includes(delivery.id))
   assert.deepEqual(told.map(delivery => noticeFamily(delivery)).sort(), ['board-stall', 'review-blocked'], 'the owner is told by the admission, and by the W3 stall of that board beside it: one more wording of the open item R20')
   const [decision] = told.filter(delivery => noticeFamily(delivery) === 'review-blocked')
@@ -604,7 +719,7 @@ test('D1: an unreviewable source, its review pending for a stopped reviewer and 
   f.runtime.cancel(f.owner, f.mission.id, { taskId: source.id, reason: 'Not needed' })
   await f.runtime.settle(f.mission.id)
   await ticks(f, 2)
-  const view = f.runtime.notices.interpretation(f.mission.id)
+  const view = interpret(f.runtime.boardOf(f.mission.id))
   const reason = completionError(view)
   const subjects = [subjectOf(f, dead)]
   assert.deepEqual(view.unschedulable.map(task => task.id), [dead.id], 'the dispatcher counts the dead dependent alone')
@@ -722,12 +837,7 @@ test('a queued W3 stall is withheld once its board can progress, and coverage-co
   stalled.runtime.notices.absenceNet(stalled.mission.id)
   assert.equal(stallReminder(2), undefined, 'and its reminders end with it')
 
-  const f = await setup({ clock: new FakeClock() })
-  t.after(f.cleanup)
-  const task = f.propose()
-  await acceptThroughReview(f, task)
-  await f.runtime.settle(f.mission.id)
-  await ticks(f, 1)
+  const { f, task } = await coverageBoard(t)
   const coverage = coverageRow(f)
   assert.ok(coverage, 'the coverage-complete board told the owner')
   await f.runtime.notices.flushOutbox(f.mission.id)
@@ -778,11 +888,7 @@ test('a mission blocked on its budget keeps its board decision: a told W3 stall 
   await ticks(stalled, 3)
   assert.deepEqual([relevant(stalled, stall), told()], [false, 1], 'the stall under its new identity is not told while the mission is blocked')
 
-  const covered = await setup({ clock: new FakeClock() })
-  t.after(covered.cleanup)
-  await acceptThroughReview(covered, covered.propose())
-  await covered.runtime.settle(covered.mission.id)
-  await ticks(covered, 1)
+  const { f: covered } = await coverageBoard(t)
   const coverage = coverageRow(covered)
   assert.ok(coverage, 'the coverage-complete board told the owner')
   await block(covered)
@@ -962,14 +1068,8 @@ test('P3: a start that adopts the member\'s running session ends its counted sta
 
 test('a cancellation that strands a dependent leaves it to the board classifier: one decision names it at its epoch, the fall-through beside running work and the W3 stall on a board with nothing else to do', async t => {
   for (const running of [true, false]) {
-    const f = await setup({ clock: new FakeClock() })
-    t.after(f.cleanup)
-    if (running) await f.runtime.claim(f.actor(f.reviewer), f.mission.id, f.propose({ title: 'Unrelated work', kind: 'research', checks: [], assigneeId: f.reviewer.id }).id)
-    const prerequisite = f.propose({ title: 'Prerequisite', kind: 'research', checks: [] })
-    const dependent = f.propose({ title: 'Dependent', kind: 'research', checks: [], dependencies: [prerequisite.id] })
-    const cancelled = f.runtime.cancel(f.owner, f.mission.id, { taskId: prerequisite.id, reason: 'Not needed' })
+    const { f, stuck: dependent, cancelled } = await strandedBoard(t, running)
     assert.deepEqual(cancelled.strandedDependents, [dependent.id], `running=${running}: the cancellation reports the dependent it strands`)
-    await f.runtime.settle(f.mission.id)
     await ticks(f, 20)
     const subject = `${dependent.id}@${taskOf(f.runtime, dependent.id).epoch}`
     const decisions = ownerRows(f).filter(delivery => (delivery.subjects ?? []).includes(subject) && delivery.notice.trigger !== 'owner-decision-unresolved')
@@ -1003,7 +1103,7 @@ test('the dispatch question is one emitter among the board\'s: a dependent a can
     f.runtime.cancel(f.owner, f.mission.id, { taskId: prerequisite.id, reason: 'Not needed' })
     await quiet(f)
     await ticks(f, 10)
-    assert.deepEqual([taskOf(f.runtime, ready.id).status, f.runtime.notices.interpretation(f.mission.id).dispatchable.map(task => task.id)], ['pending', [ready.id]], `${board}: the ready work is dispatchable and was not dispatched`)
+    assert.deepEqual([taskOf(f.runtime, ready.id).status, interpret(f.runtime.boardOf(f.mission.id)).dispatchable.map(task => task.id)], ['pending', [ready.id]], `${board}: the ready work is dispatchable and was not dispatched`)
     const namings = task => ownerRows(f).filter(delivery => (delivery.subjects ?? []).includes(subjectOf(f, task)) && delivery.notice.trigger !== 'owner-decision-unresolved' && !delivery.notice.dedupKey.startsWith('guard-terminal:'))
     assert.deepEqual(namings(dependent).map(delivery => noticeFamily(delivery)), ['fallthrough'], `${board}: the fall-through names the stranded dependent, once`)
     assert.deepEqual([namings(dependent)[0].subjects, relevant(f, namings(dependent)[0])], [[subjectOf(f, dependent)], true], `${board}: it names the dependent alone, and is outstanding`)
@@ -1111,6 +1211,19 @@ test('a wedged pass\'s naming is outstanding while the work it named is unfinish
 const terminalRows = (f, chain) => ownerRows(f).filter(delivery => delivery.notice.dedupKey.startsWith(`guard-terminal:${chain}:`))
 /** Each told fact's stall event names its row: the events of one cause, as the keys of the rows they were written with. */
 const stallEventKeys = (f, cause) => events(f.runtime, f.mission.id, 'mission/stalled').filter(event => event.data.cause === cause).map(event => event.data.noticeKey)
+/**
+ * A guard of one member's dispatch chain that throws on every pass: the member holds no isolated worktree, so the
+ * sweep's isolation decision refuses it, and recording that refusal throws `failure()`; the sweep's own guard
+ * terminal is then the throw's one record. `repair` gives the member its worktree back, and its chain passes.
+ */
+const failingDispatch = (f, member, failure) => {
+  const workspace = f.runtime.store.get('members', member.id).workspace
+  const provision = path => f.runtime.store.transaction(() => f.runtime.store.put('members', { ...f.runtime.store.get('members', member.id), workspace: path }))
+  const recordIsolation = f.runtime.workspaceAdmission.recordIsolation.bind(f.runtime.workspaceAdmission)
+  f.runtime.workspaceAdmission.recordIsolation = (board, violation) => { if (violation.memberIds.includes(member.id)) throw new Error(failure()); return recordIsolation(board, violation) }
+  provision('')
+  return { repair: () => provision(workspace) }
+}
 
 test('L-25: a guard terminal is one request per fact that opened it: the task budget and the experiment budget refused on one board are two, and a repeat on another board is none', async t => {
   const f = await setup({ clock: new FakeClock(), budget: { maxTasks: 1, maxExperiments: 0 } })
@@ -1148,8 +1261,7 @@ test('L-25: a failed dispatch is one request per member, the work it names and t
   t.after(f.cleanup)
   // A guard of the author's dispatch chain throws on every pass.
   let failure = 'worktree probe failed: EIO'
-  const isolationAllows = f.runtime.isolationAllows.bind(f.runtime)
-  f.runtime.isolationAllows = (missionId, member) => { if (member.id === f.author.id) throw new Error(failure); return isolationAllows(missionId, member) }
+  failingDispatch(f, f.author, () => failure)
   const task = f.propose({ title: 'Work for the author' })
   await f.runtime.settle(f.mission.id)
   await ticks(f, 2)
@@ -1195,7 +1307,6 @@ const remind = async (f, row) => {
   f.runtime.notices.absenceNet(f.mission.id)
   return reminders(f, row).slice(before)
 }
-const namedTools = text => [...new Set(text.match(/\bswarm_\w+/g))].sort()
 /** A mission long enough for a test that keeps scheduling after a reminder interval. */
 const LONG = { maxDurationMs: 86_400_000 }
 
@@ -1522,26 +1633,6 @@ test('a wedged pass\'s naming fact is the unfinished work and the counted start 
   assert.equal(told()[0].at(-1), key([one], `pass-timeout ${f.author.id}:2`), 'each member\'s counted consecutive start failures follow the cause in the reason the key digests')
 })
 
-test('every exit a wedged pass\'s naming names, performed through the owner\'s registered tools: withdrawing the work it named retires it, and a repair beside that work leaves it outstanding', async t => {
-  const exits = {
-    'admit a repair with swarm_propose': { retires: false, perform: ({ f, tool }) => tool('swarm_propose', { workstreamId: f.stream.id, title: 'Repair', objective: 'Repair the unreached work', kind: 'research', scope: ['**'], outputs: [], acceptance: MISSION_ACCEPTANCE, checks: [] }) },
-    'withdraw the blocking work with swarm_cancel': { retires: true, perform: ({ task, tool }) => tool('swarm_cancel', { taskId: task.id, reason: 'No longer needed' }) },
-  }
-  for (const [exit, { retires, perform }] of Object.entries(exits)) {
-    const f = await setup({ clock: new FakeClock() })
-    t.after(f.cleanup)
-    const task = f.propose({ title: 'Never reached' })
-    await f.runtime.settle(f.mission.id)
-    wedgedBody(t, f, 'operation_wedge_exit')
-    const [naming] = wedgeRows(f)
-    assert.deepEqual(namedTools(naming.content), ['swarm_cancel', 'swarm_propose'], 'the naming names these tools')
-    assert.ok(naming.content.includes(exit), `the naming names: ${exit}`)
-    assert.equal(relevant(f, naming), true)
-    await perform({ f, task, tool: await ownerTools(f) })
-    assert.equal(relevant(f, naming), !retires, retires ? `${exit} retires the naming` : `${exit} leaves the work it named unfinished, so the naming stays outstanding`)
-  }
-})
-
 /** The digest a key carries for a recorded reason. */
 const sha16 = text => createHash('sha256').update(text).digest('hex').slice(0, 16)
 
@@ -1551,8 +1642,7 @@ test('L-25: a failed dispatch\'s request is the failure of the work it names: th
   const tool = await ownerTools(f)
   // A guard of the author's dispatch chain throws on every pass, whatever work the author holds.
   const failure = 'Member has uncommitted commits'
-  const isolationAllows = f.runtime.isolationAllows.bind(f.runtime)
-  f.runtime.isolationAllows = (missionId, member) => { if (member.id === f.author.id) throw new Error(failure); return isolationAllows(missionId, member) }
+  failingDispatch(f, f.author, () => failure)
   const opener = subjects => factKey(f.mission.id, { trigger: `dispatch-failed:${f.author.id}`, reason: `Error: ${failure}`, subjects })
   const told = () => terminalRows(f, 'attempt_lease').map(delivery => [delivery.notice.dedupKey.split(':').slice(3).join(':'), delivery.subjects, delivery.notice.reason])
   const request = subjects => [opener(subjects), subjects, `Error: ${failure}`]
@@ -1582,13 +1672,11 @@ test('L-25: a failed dispatch\'s request is the failure of the work it names: th
 })
 
 test('every exit a failed dispatch\'s request names, performed through the owner\'s registered tools: each lets the task it names run, the request is never told twice over that work, and its reminders follow the task', async t => {
-  /** The author's dispatch chain throws on every pass while `fault.on`; its task stays pending and the chain's request names it. */
+  /** The author's dispatch chain throws on every pass until `fault.repair()`; its task stays pending and the chain's request names it. */
   const board = async () => {
     const f = await setup({ clock: new FakeClock(), workers: new FakeWorkers({ autoIdle: true }), budget: LONG })
     t.after(f.cleanup)
-    const fault = { on: true }
-    const isolationAllows = f.runtime.isolationAllows.bind(f.runtime)
-    f.runtime.isolationAllows = (missionId, member) => { if (fault.on && member.id === f.author.id) throw new Error('worktree probe failed: EIO'); return isolationAllows(missionId, member) }
+    const fault = failingDispatch(f, f.author, () => 'worktree probe failed: EIO')
     const task = f.propose({ title: 'Work for the author' })
     await quiet(f)
     const [request] = terminalRows(f, 'attempt_lease')
@@ -1597,7 +1685,7 @@ test('every exit a failed dispatch\'s request names, performed through the owner
   }
   // The reassignment moves the task off the failing member without repairing it: that member then fails holding no work, which is told once at the mission root.
   const exits = {
-    '`action: resume` after repair': { then: [], perform: async ({ task, fault, tool }) => { fault.on = false; await tool('swarm_control', { taskId: task.id, action: 'resume', reason: 'Repaired' }) } },
+    '`action: resume` after repair': { then: [], perform: async ({ task, fault, tool }) => { fault.repair(); await tool('swarm_control', { taskId: task.id, action: 'resume', reason: 'Repaired' }) } },
     '`action: amend`, `changes.assigneeId` and `reason` to fence and reassign it': { then: [f => [`mission:${f.mission.id}`]], perform: ({ f, task, tool }) => tool('swarm_control', { taskId: task.id, action: 'amend', changes: { assigneeId: f.reviewer.id }, reason: 'Reassign' }) },
   }
   for (const [exit, { then, perform }] of Object.entries(exits)) {
@@ -1772,10 +1860,7 @@ test('the fall-through names stuck work at its epoch, once, beside an open reque
 
 test('P1d: a member\'s blocked task is named by its stall root beside an open member-scoped request: a real handoff whose old owner never stops, beside the new assignee\'s failing dispatch; a dead end beside a failing dispatch; a dead end beside an isolation request', async t => {
   /** The author's dispatch chain throws on every pass: its request names all of the author's unfinished work. */
-  const failDispatch = f => {
-    const isolationAllows = f.runtime.isolationAllows.bind(f.runtime)
-    f.runtime.isolationAllows = (missionId, member) => { if (member.id === f.author.id) throw new Error('worktree probe failed: EIO'); return isolationAllows(missionId, member) }
-  }
+  const failDispatch = f => failingDispatch(f, f.author, () => 'worktree probe failed: EIO')
   const deadEnd = (f, assigneeId) => {
     const dead = f.propose({ title: 'Dead end', assigneeId, kind: 'research', checks: [] })
     f.runtime.commit(f.mission.id, () => f.runtime.store.put('tasks', { ...taskOf(f.runtime, dead.id), status: 'blocked', epoch: taskOf(f.runtime, dead.id).epoch + 1, output: 'blocked for repair' }))

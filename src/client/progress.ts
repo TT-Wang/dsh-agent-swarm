@@ -1,9 +1,10 @@
 import { EVENT_PANEL_LABELS, type EventKind } from '../events.ts'
 import type { Evidence, Member, Snapshot, Task, WorkerActivity } from '../types.ts'
 import { TERMINAL_STATES, completionExempt, missionSubject, stopPending, taskSubject } from '../task-graph.ts'
-import type { LiveWorkRow } from './live-work.ts'
 
 export type ConnectionState = 'connecting' | 'connected' | 'reconnecting' | 'paused'
+/** What the progress line reads of one member's live-work row: the member, its running task and its reported operation. */
+export interface ObservedWork { member: Member; task?: Task; activity?: WorkerActivity }
 interface CurrentProgress { label: string; note?: string; member?: Member; task?: Task; activity?: WorkerActivity; observedAt?: number; stale: boolean }
 const activityLabels = { model: 'Agent is thinking', tool: 'Running a tool', verification: 'Running verification', retry: 'Waiting to retry' } as const
 const statusLabels: Record<string, string> = { staged: 'Preparing collaboration', paused: 'Mission paused', blocked: 'Mission needs attention', stopped: 'Mission stopped', completed: 'Collaboration completed' }
@@ -34,7 +35,7 @@ export function memberActivity(member: Member, tasks: readonly Task[] | Readonly
 }
 
 /** A transport refresh is not work. Only native activity and persisted task state drive this projection. */
-export function currentProgress(snapshot: Snapshot, connection: ConnectionState = 'connected', rows?: readonly LiveWorkRow[]): CurrentProgress {
+export function currentProgress(snapshot: Snapshot, connection: ConnectionState = 'connected', rows?: readonly ObservedWork[]): CurrentProgress {
   const { mission } = snapshot
   const stale = connection !== 'connected'
   if (statusLabels[mission.status]) return { label: statusLabels[mission.status]!, note: mission.reason, stale }

@@ -219,11 +219,11 @@ test('usage buckets accumulate per worker without double counting and owner usag
 
 test('in-flight requests are estimated from each worker’s average and gate new steps before the pool overruns', async t => {
   const f = await manual(t, { maxTokens: 500 })
-  await f.workers.callbacks.usageSnapshot(f.a.id, 400, { uncachedInputTokens: 100, cacheReadTokens: 300, cacheWriteTokens: 0, outputTokens: 0, reasoningTokens: 0, requests: 2 })
+  await f.workers.callbacks.usageSnapshot(f.a.id, 401, { uncachedInputTokens: 101, cacheReadTokens: 300, cacheWriteTokens: 0, outputTokens: 0, reasoningTokens: 0, requests: 4 })
   // The reviewer has an average too but no request open: only the builder's average is in flight.
   await f.workers.callbacks.usageSnapshot(f.b.id, 60, { uncachedInputTokens: 60, cacheReadTokens: 0, cacheWriteTokens: 0, outputTokens: 0, reasoningTokens: 0, requests: 2 })
   f.workers.reportActivity(f.a.id, { id: 'op', kind: 'model', startedAt: Date.now(), updatedAt: Date.now() })
-  assert.equal(f.runtime.observe(f.owner, f.mission.id).mission.inFlightTokensEstimate, 200)
+  assert.equal(f.runtime.observe(f.owner, f.mission.id).mission.inFlightTokensEstimate, 101, 'an average of 100.25 tokens a request is estimated up, at 101, never rounded to the nearest token')
   await assert.rejects(f.workers.callbacks.beforeStep(f.b.id), /budget exhausted/)
   assert.equal(f.runtime.snapshot(f.owner, f.mission.id).mission.status, 'blocked')
 })

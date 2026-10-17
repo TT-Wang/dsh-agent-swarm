@@ -157,8 +157,8 @@ export async function sessionTools(f, sessionId) {
 /** The owner's registered tools. */
 export const ownerTools = f => sessionTools(f, f.owner.sessionId)
 
-/** The `swarm_*(...)` calls a text names, in order, each with the parameter names it gives (a given value is dropped). */
-const namedCallParams = text => [...text.matchAll(/(swarm_\w+)\(([^()]*)\)/g)].map(([, tool, args]) => [tool, args.replace(/"[^"]*"/g, '').match(/[A-Za-z]\w*/g) ?? []])
+/** The `swarm_*(...)` calls a text names, in order, each with the parameter names it gives (a given value, quoted or bare like `true`, is dropped). */
+const namedCallParams = text => [...text.matchAll(/(swarm_\w+)\(([^()]*)\)/g)].map(([, tool, args]) => [tool, args.replace(/"[^"]*"/g, '').replace(/:\s*[^\s,{}]+/g, ':').match(/[A-Za-z]\w*/g) ?? []])
 
 /** The contract of an exit written as calls: an imperative verb, and at least one `swarm_*(...)` call, each a registered tool whose own schema declares every parameter it names. */
 export function callExitViolations(text, index) {

@@ -2,7 +2,8 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { join } from 'node:path'
-import { FakeClock, FakeWorkers, eventually, makeRuntime } from './faults/harness.mjs'
+import { FakeClock, FakeWorkers, eventually, events, makeRuntime, setup, taskOf } from './faults/harness.mjs'
+import { WriterBusyError } from '../lib/store.js'
 
 const deferred = () => { let resolve; const promise = new Promise(done => { resolve = done }); return { promise, resolve } }
 
@@ -286,4 +287,66 @@ test('a failed lease-expiry checkpoint is audited and wakes the owner', async t 
   }, 'lease recovery proceeds after the audited checkpoint failure', 2500)
   assert.equal(resumed.attempt.ownerId, f.author.id)
   assert.equal(f.workers.captured.length, 0)
+})
+
+/**
+ * The author ended its turn on an open attempt, on the fake clock, but the
+ * writer refused the row write that records it (`Task.idleSignal`): only the
+ * attempt seam's in-memory signal holds the ended turn, the cache that stands
+ * in for a row write which did not land.
+ */
+async function turnEndedUnrecorded(t, config = {}) {
+  const f = await setup({ clock: new FakeClock(), config })
+  t.after(() => f.cleanup())
+  const task = f.propose({ title: 'Turn ended' })
+  const claimed = await f.runtime.claim(f.actor(f.author), f.mission.id, task.id)
+  await f.runtime.settle(f.mission.id)
+  const put = f.runtime.store.put
+  f.runtime.store.put = function (table, value) {
+    if (table === 'tasks' && value.idleSignal !== undefined) throw new WriterBusyError('SQLite writer stayed busy after 1 attempt(s): database is locked', 1)
+    return put.call(this, table, value)
+  }
+  assert.throws(() => f.workers.callbacks.idle(f.author.id), WriterBusyError, 'the writer refused the row write that records the ended turn')
+  delete f.runtime.store.put
+  assert.equal(taskOf(f.runtime, task.id).idleSignal, undefined, 'the row does not record the ended turn')
+  return { ...f, task, attemptId: claimed.attempt.id }
+}
+
+/** The author's handle is idle and a pass runs, so the idle close-out acts on the ended turn. */
+async function closeOutPass(f) {
+  f.workers.idle.add(f.author.id)
+  f.runtime.kick(f.mission.id)
+  await f.runtime.settle(f.mission.id)
+}
+
+test('an ended turn the writer could not record on the row is still closed out: the next pass nudges on the attempt seam\'s own signal', async t => {
+  const f = await turnEndedUnrecorded(t)
+  await closeOutPass(f)
+  const row = taskOf(f.runtime, f.task.id)
+  assert.deepEqual([row.status, row.attempt?.id, row.idleSignal, row.closeout?.nudges], ['running', f.attemptId, undefined, 1],
+    'the pass nudged the open attempt that its row alone does not name')
+  assert.deepEqual(events(f.runtime, f.mission.id, 'task/closeout-nudged').map(event => event.data.taskId), [f.task.id])
+  assert.ok(f.workers.deliveries.some(delivery => delivery.memberId === f.author.id && /still open but your turn ended/.test(delivery.content)),
+    'and the member is told to finish it')
+})
+
+test('the attempt reporting bound never names an attempt whose turn ended, though only the attempt seam records it, before the close-out\'s first nudge or after it', async t => {
+  const f = await turnEndedUnrecorded(t, { attemptSilenceBoundMs: 1_000 })
+  // The reviewer holds an attempt too, and never ends a turn on it.
+  const other = f.propose({ title: 'Never idle', assigneeId: f.reviewer.id })
+  const { attempt } = await f.runtime.claim(f.actor(f.reviewer), f.mission.id, other.id)
+  await f.runtime.settle(f.mission.id)
+  const named = () => f.runtime.store.list('deliveries', f.mission.id).filter(delivery => delivery.notice?.dedupKey?.startsWith('attempt-silent:'))
+    .map(delivery => delivery.notice.dedupKey.split(':')[1])
+  f.clock.advance(2_000)
+  assert.equal(f.runtime.scheduling.sweepSilentAttempts(f.mission.id), 1, 'past the bound, before any nudge, one attempt is named')
+  assert.deepEqual(named(), [attempt.id], 'the attempt whose owner never ended a turn, never the one the close-out is about to nudge')
+  await closeOutPass(f)
+  const nudged = taskOf(f.runtime, f.task.id)
+  assert.deepEqual([nudged.idleSignal, nudged.closeout?.nudges], [undefined, 1], 'the close-out nudged the attempt its row does not name')
+  f.clock.advance(2_000)
+  assert.equal(f.runtime.scheduling.silentAttempt(nudged, f.runtime.store.get('missions', f.mission.id)), undefined,
+    'after the nudge, the reporting bound still leaves the attempt to the close-out')
+  f.runtime.scheduling.sweepSilentAttempts(f.mission.id)
+  assert.deepEqual(named(), [attempt.id], 'and no owner notice ever names it')
 })

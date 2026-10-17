@@ -6,9 +6,10 @@
  * (`guardTerminal`, `guardTerminalKey`) is pure; `Notices.emitGuardTerminal`
  * tells it.
  */
-import { admissionRowId, decideAdmission, defaultLimitRules, scopeKeysOverlap, type AdmissionCandidate, type AdmissionDecision, type AdmissionRecord, type AdmissionUsage, type LimitRule } from './scheduler.ts'
+import { AdmissionRefusedError, admissionRowId, decideAdmission, defaultLimitRules, scopeKeysOverlap, type AdmissionCandidate, type AdmissionDecision, type AdmissionRecord, type AdmissionUsage, type LimitRule } from './scheduler.ts'
 import { WriterBusyError } from './store.ts'
-import { openAttempt } from './task-graph.ts'
+import { openAttempt, pendingStopOwner } from './task-graph.ts'
+import { exhaustedDimensions } from './resource-time.ts'
 import { PolicyError } from './policy-error.ts'
 import type { Kernel } from './kernel.ts'
 import type { Budget, Member, Mission, Task } from './types.ts'
@@ -98,11 +99,12 @@ export class RefusalRegistry {
     }
   }
 
-  /** Budget dimensions that must refuse a new lease; undefined when the mission can admit. */
+  /** The exhausted budget dimension that refuses a new lease, the deadline named first; undefined when the mission can admit. */
   budgetBlocked(mission: Mission): string | undefined {
-    if (this.k.now() >= mission.deadline) return `mission duration budget exhausted (deadline ${new Date(mission.deadline).toISOString()})`
-    if (mission.usedTokens >= mission.budget.maxTokens) return `token budget exhausted (${mission.usedTokens}/${mission.budget.maxTokens})`
-    if (mission.usedSteps >= mission.budget.maxSteps) return `step budget exhausted (${mission.usedSteps}/${mission.budget.maxSteps})`
+    const exhausted = exhaustedDimensions(mission, this.k.now())
+    if (exhausted.includes('maxDurationMs')) return `mission duration budget exhausted (deadline ${new Date(mission.deadline).toISOString()})`
+    if (exhausted.includes('maxTokens')) return `token budget exhausted (${mission.usedTokens}/${mission.budget.maxTokens})`
+    if (exhausted.includes('maxSteps')) return `step budget exhausted (${mission.usedSteps}/${mission.budget.maxSteps})`
     return undefined
   }
 
@@ -118,6 +120,38 @@ export class RefusalRegistry {
     if (blocked !== undefined) signals.budgetExceeded = blocked
     if (usage.agent > 0) signals.leaseConflict = `member ${member.id} already owns a running lease`
     return { candidate, decision: decideAdmission(candidate, this.admissionRulesFor(mission), usage, signals) }
+  }
+
+  /**
+   * The refusal of new work for a member still owed its previous attempt's
+   * stop, or undefined when it owes none: the one statement of that rule, which
+   * a claim, a worker start and an admission all meet.
+   */
+  stopOwed(missionId: string, memberId: string): Error | undefined {
+    return pendingStopOwner(this.k.store.list('tasks', missionId), memberId) ? new Error('Worker is waiting for its previous attempt to stop') : undefined
+  }
+
+  /**
+   * The admission of one task to one member, asserted before any workspace
+   * mutation and again inside the assignment: a member still owed its previous
+   * attempt's stop is refused, the mission's queued writer-busy refusals are
+   * recorded first, and a refused decision is recorded and thrown as
+   * `AdmissionRefusedError`.
+   */
+  assertAdmission(task: Task, member: Member): { candidate: AdmissionCandidate; decision: AdmissionDecision; latencyMs: number } {
+    const owed = this.stopOwed(task.missionId, member.id)
+    if (owed !== undefined) throw owed
+    member = this.k.store.get('members', member.id) ?? member
+    const mission = this.k.mission(task.missionId)
+    this.recordWriterBusyRecovery(mission)
+    const started = performance.now()
+    const { candidate, decision } = this.admissionDecision(mission, member, task)
+    const latencyMs = Math.max(0, Math.round((performance.now() - started) * 1000) / 1000)
+    if (!decision.admitted) {
+      this.recordRefusal(candidate, decision, latencyMs)
+      throw new AdmissionRefusedError(decision)
+    }
+    return { candidate, decision, latencyMs }
   }
 
   admissionRecord(candidate: AdmissionCandidate, decision: AdmissionDecision, latencyMs: number): AdmissionRecord {

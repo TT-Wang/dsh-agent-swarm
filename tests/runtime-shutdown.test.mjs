@@ -176,7 +176,7 @@ async function budgetFixture(t) {
   }
   const preserve = attemptId => {
     const taskRecord = runtime.store.get('tasks', task.id)
-    taskRecord.budgetResume = { pauseId: 'pause-1', attemptId, epoch: taskRecord.epoch }
+    taskRecord.budgetResume = { pauseId: 'pause-1', attemptId }
     runtime.store.put('tasks', taskRecord)
   }
   return { directory, config, runtime, owner, mission, member, task, claimed, pause, preserve }
@@ -192,17 +192,6 @@ test('budget resume keeps the preserved attempt and spends no recovery credit', 
   assert.equal(resumed.attempt.id, f.claimed.attempt.id, 'the preserved attempt survives the pause')
   assert.equal(resumed.recoveryCount, undefined, 'a budget pause spends no recovery credit')
   assert.equal(f.runtime.store.get('missions', f.mission.id).status, 'active')
-})
-
-test('a stale budget resume marker re-pends without charging a recovery attempt', { timeout: 10000 }, async t => {
-  const f = await budgetFixture(t)
-  f.pause(); f.preserve('stale-attempt')
-  f.runtime.control(f.owner, f.mission.id, 'resume', 'Budget raised')
-  await eventually(() => f.runtime.store.events(f.mission.id, 100).some(event => event.type === 'task/budget-resume-skipped'), 'the stale marker must be reported', 2500)
-  const current = f.runtime.store.get('tasks', f.task.id)
-  assert.equal(current.recoveryCount, undefined, 'a stale marker is not a recovery failure')
-  assert.notEqual(current.attempt?.id, 'stale-attempt')
-  assert.notEqual(current.status, 'blocked')
 })
 
 test('a host restart during a budget pause spends no recovery credit', { timeout: 10000 }, async t => {

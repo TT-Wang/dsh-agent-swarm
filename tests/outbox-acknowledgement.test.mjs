@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 import { join } from 'node:path'
 import { FakeWorkers, makeRuntime } from './faults/harness.mjs'
 import { openAsks } from '../lib/arena.js'
+import { interpret } from '../lib/board.js'
 
 /** Records a clone of every delivery the outbox sends and lets a test intercept the transport. */
 class OutboxWorkers extends FakeWorkers {
@@ -97,18 +98,20 @@ for (const differentDelivery of [false, true]) {
 test('outbox acknowledgement preserves consumption and reply counters written during transport', async t => {
   const f = await fixture(t)
   const notice = f.emit('consumption')
+  let consumedAt
   f.workers.intercept = async (_member, delivery) => {
     if (delivery.id !== notice.id) return
-    assert.equal(f.runtime.notices.recordConsumption(notice.id, { at: 123456, source: 'agent/inbox/claimed' }), true)
+    assert.equal(f.runtime.notices.recordConsumption(f.owner.sessionId, notice.id), true)
     const current = f.runtime.store.get('deliveries', notice.id)
+    consumedAt = current.consumedAt
     current.replyNudges = 2
     f.runtime.store.put('deliveries', current)
   }
   await f.runtime.notices.flushOutbox(f.mission.id)
   const current = f.runtime.store.get('deliveries', notice.id)
   assert.ok(current.deliveredAt)
-  assert.equal(current.notice.consumedAt, 123456)
-  assert.equal(current.notice.consumptionSource, 'agent/inbox/claimed')
+  assert.ok(Number.isSafeInteger(consumedAt))
+  assert.equal(current.consumedAt, consumedAt)
   assert.equal(current.replyNudges, 2)
 })
 
@@ -268,7 +271,7 @@ for (const summary of [false, true]) test(`cancelled task preservation failure r
   const notice = f.rows().find(item => summary ? item.notice?.aggregatedFacts?.some(fact => fact.dedupKey.includes(':stop:')) : item.notice?.dedupKey.includes(':stop:'))
   assert.ok(notice)
   assert.equal(f.runtime.notices.ownerDeliveryRelevant(f.runtime.mission(f.mission.id), notice), true)
-  assert.deepEqual(f.runtime.notices.unresolvedSubjects(f.runtime.notices.interpretation(f.mission.id), notice), [`${row.id}@${row.epoch}`], 'cancelled execution still owes its saved workspace')
+  assert.deepEqual(f.runtime.notices.unresolvedSubjects(interpret(f.runtime.boardOf(f.mission.id)), notice), [`${row.id}@${row.epoch}`], 'cancelled execution still owes its saved workspace')
   const cleaned = f.runtime.task(f.mission.id, row.id); delete cleaned.resumeAfterStop
   f.runtime.commit(f.mission.id, () => f.runtime.store.put('tasks', cleaned))
   assert.equal(f.runtime.notices.ownerDeliveryRelevant(f.runtime.mission(f.mission.id), notice), false)

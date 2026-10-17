@@ -25,9 +25,9 @@ test('a failed tick guard and one failed mission do not suppress other guards or
   const second = f.runtime.create(f.owner, { title: 'Other', objective: 'Continue', workspace: f.mission.workspace, scope: ['src/'], acceptance: ['works'], budget: f.budget }, { grantRoot: f.mission.workspace, source: 'session' })
   f.runtime.notices.pumpOutbox = () => { calls.push('outbox'); throw new Error('injected write contention') }
   f.runtime.sweepStarts = () => calls.push('starts')
-  f.runtime.checkSchedulingPasses = () => calls.push('passes')
+  f.runtime.scheduling.checkSchedulingPasses = () => calls.push('passes')
   f.runtime.sweepDecisions = () => calls.push('decisions')
-  f.runtime.warnBudget = mission => { calls.push(mission.id); if (mission.id === f.mission.id) throw new Error('injected mission failure') }
+  f.runtime.gates.warnBudget = mission => { calls.push(mission.id); if (mission.id === f.mission.id) throw new Error('injected mission failure') }
   f.runtime.startTicker()
   await delay(25)
   // The tick reaches its pump through the member patched above, so the injected failure is the first thing it does.

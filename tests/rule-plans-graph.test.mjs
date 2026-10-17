@@ -182,6 +182,9 @@ test('replay closes only the precise attempt fenced by a structural amendment', 
   const event = (seq, type, data) => ({ seq, missionId: 'm', actor: 'owner', createdAt: seq, type, data })
   const log = [event(1, 'task/proposed', task('a', 'research', 'running')), event(2, 'task/claimed', { taskId: 'a', attempt: { id: 'attempt-a', ownerId: 'member' } })]
   assert.throws(() => orchestratorCommands([...log, event(3, 'task/amended', { taskId: 'a', changes: { maxSteps: 200 } })]), ReplayTruncationError)
+  // This build: the amendment's fence writes attempt/fenced, then task/amended.
+  assert.doesNotThrow(() => orchestratorCommands([...log, event(3, 'attempt/fenced', { taskId: 'a', attemptId: 'attempt-a', cause: 'owner-amend' }), event(4, 'task/amended', { taskId: 'a', changes: { dependencies: [] } })]))
+  // Logs older builds wrote: the fenced attempt is named only on task/amended.
   assert.doesNotThrow(() => orchestratorCommands([...log, event(3, 'task/amended', { taskId: 'a', changes: { dependencies: [] }, fencedAttemptId: 'attempt-a' })]))
   assert.throws(() => orchestratorCommands([...log, event(3, 'task/amended', { taskId: 'a', changes: {}, fencedAttemptId: 'other-attempt' })]), ReplayTruncationError)
 })

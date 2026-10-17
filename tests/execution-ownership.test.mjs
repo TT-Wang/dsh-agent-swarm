@@ -14,7 +14,7 @@ async function fixture(options = {}) {
   await f.runtime.exclusive(f.mission.id, async () => {})
   await new Promise(resolve => setImmediate(resolve))
   const priorPass = f.runtime.scheduling.passes.get(f.mission.id)
-  if (priorPass !== undefined) f.runtime.closePass(f.mission.id, priorPass)
+  if (priorPass !== undefined) f.runtime.scheduling.closePass(f.mission.id, priorPass)
   const keepAlive = setInterval(() => {}, 1000)
   const cleanup = f.cleanup
   f.cleanup = async () => { clearInterval(keepAlive); await cleanup() }
@@ -141,24 +141,24 @@ test('a wedged pass body is the only pass body: no newer pass runs beside it, so
     f.workers.prepareTask = async () => {
       if (++count === 1) { enteredOld.resolve(); await failOld.promise; throw Object.assign(new Error('stale preparation failed'), { code: 'EBUSY' }) }
     }
-    oldPass = f.runtime.openPass(f.mission.id)
+    oldPass = f.runtime.scheduling.openPass(f.mission.id)
     assert.ok(oldPass)
     old = f.runtime.exclusive(f.mission.id, () => f.runtime.scheduling.dispatch(f.runtime.mission(f.mission.id), f.mission.id))
     await enteredOld.promise
     await sleep(70); f.runtime.scheduling.checkSchedulingPasses()
     assert.equal(events(f.runtime, f.mission.id, 'mission/stalled').filter(item => item.data.wedged === true && item.data.runId === oldPass.operationId).length, 1, 'the watchdog names the wedged body')
-    assert.equal(f.runtime.openPass(f.mission.id), undefined, 'no newer pass is opened while the wedged body is held')
+    assert.equal(f.runtime.scheduling.openPass(f.mission.id), undefined, 'no newer pass is opened while the wedged body is held')
     let ranBeside = false
     await assert.rejects(f.runtime.exclusive(f.mission.id, async () => { ranBeside = true }), /mission_operation_pending/)
     assert.equal(ranBeside, false, 'and the queue refuses any other body instead of running it beside the wedged one')
     assert.equal(count, 1)
     failOld.resolve(); await old
-    f.runtime.closePass(f.mission.id, oldPass)
+    f.runtime.scheduling.closePass(f.mission.id, oldPass)
     const failed = taskOf(f.runtime, task.id)
     assert.equal(failed.preparationFailure?.attempts, 1, 'the wedged body records its own transient failure: it was the only body')
     assert.equal(failed.status, 'pending', 'and leaves the task for bounded retry')
     assert.equal(events(f.runtime, f.mission.id, 'task/preparation-failed').length, 1)
-    assert.ok(f.runtime.openPass(f.mission.id), 'once it settled, the next pass opens')
+    assert.ok(f.runtime.scheduling.openPass(f.mission.id), 'once it settled, the next pass opens')
   } finally { failOld.resolve(); await Promise.allSettled([old]); await f.cleanup() }
 })
 
@@ -170,7 +170,7 @@ test('the wedge watchdog cannot discard the queue of a physical preparation stil
     f.propose()
     f.workers.isIdle = () => true
     f.workers.prepareTask = async () => { entered.resolve(); await finish.promise }
-    const pass = f.runtime.openPass(f.mission.id)
+    const pass = f.runtime.scheduling.openPass(f.mission.id)
     assert.ok(pass)
     operation = f.runtime.exclusive(f.mission.id, () => f.runtime.scheduling.dispatch(f.runtime.mission(f.mission.id), f.mission.id))
     await entered.promise

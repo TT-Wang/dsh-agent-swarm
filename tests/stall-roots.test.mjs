@@ -6,7 +6,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { factKey } from '../lib/notices.js'
-import { stallRoots, waitsLegitimately } from '../lib/board.js'
+import { interpret, stallRoots, waitsLegitimately } from '../lib/board.js'
 import { taskGraphIndex } from '../lib/task-graph.js'
 import { wakePrecision } from './instruments.mjs'
 import { FakeClock, FakeWorkers, eventually, makeRuntime } from './faults/harness.mjs'
@@ -129,7 +129,7 @@ test('a pending task whose only eligible member still owes a stop past its bound
     assert.deepEqual(f.stallRoots().map(delivery => delivery.notice.dedupKey), [`stall-root:${f.mission.id}:${stopping.id}@${epochOf(stopping)}`], `wedged=${wedged}: the stop past its bound is a stall root`)
     assert.deepEqual(f.fallthroughs().map(delivery => delivery.subjects), [[`${queued.id}@${epochOf(queued)}`]], `wedged=${wedged}: the task queued behind it is named`)
     assert.equal(f.runtime.store.get('tasks', queued.id).status, 'pending', `wedged=${wedged}: and it was never dispatched`)
-    assert.deepEqual([f.runtime.observe(f.owner, f.mission.id).pendingDispatchable, f.runtime.notices.interpretation(f.mission.id).dispatchable.length], [0, 0], `wedged=${wedged}: the owner instruments count no dispatchable work`)
+    assert.deepEqual([f.runtime.observe(f.owner, f.mission.id).pendingDispatchable, interpret(f.runtime.boardOf(f.mission.id)).dispatchable.length], [0, 0], `wedged=${wedged}: the owner instruments count no dispatchable work`)
     release()
   }
 })

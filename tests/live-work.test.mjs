@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import { projectLiveWork } from '../lib/types/client/live-work.js'
+import { PROVIDER_OUTAGE_WINDOW_MS } from '../lib/types/types.js'
 import { uiSnapshot } from './fixtures/ui-snapshot.mjs'
 
 function fixture() {
@@ -101,6 +102,25 @@ test('inactive missions and parked or stopped workers override leftover native a
   assert.equal(nova(project(snapshot, now)).state, 'waiting')
   snapshot.members[1].phase = 'stopped'
   assert.equal(nova(project(snapshot, now)).state, 'stopped')
+})
+
+test('a provider outage holds a member\'s row only while the runtime reads its route as quiescent at the live clock, though the outage stays recorded and the snapshot was last written at its report', () => {
+  const { snapshot } = fixture()
+  // The adapter reported a rate limit during Nova's running turn and its in-place retry succeeded: the outage stays
+  // recorded until a start opens the session, and the mission row was last written at the report.
+  const outage = { class: 'rate-limit', status: 429, message: 'Rate limit reached for requests', at: snapshot.mission.updatedAt }
+  snapshot.members[1].providerOutage = outage
+  snapshot.mission.updatedAt = outage.at
+  // The panel projects at the live clock it is given; Nova keeps running a tool on its preserved attempt.
+  const row = now => {
+    snapshot.members[1].activity = { ...snapshot.members[1].activity, startedAt: now - 60_000, updatedAt: now - 1000 }
+    snapshot.tasks[1].attempt.leaseUntil = now + 60_000
+    const view = project(snapshot, now)
+    return [nova(view).state, nova(view).label, nova(view).activity?.id, view.workingCount]
+  }
+  assert.deepEqual(row(outage.at + PROVIDER_OUTAGE_WINDOW_MS), ['waiting', 'Waiting for provider recovery', undefined, 0], 'through the last millisecond of the report\'s window the route is quiescent')
+  assert.deepEqual(row(outage.at + PROVIDER_OUTAGE_WINDOW_MS + 1), ['observed', 'Running a tool', 'tool-b', 1], 'one millisecond past it the route is live, as start pacing and re-routing read it')
+  assert.deepEqual(row(outage.at + 3_600_000), ['observed', 'Running a tool', 'tool-b', 1], 'an outage reported an hour ago does not hide the member\'s work')
 })
 
 test('retry is waiting and verification includes its preparation phase without claiming test execution', () => {

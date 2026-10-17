@@ -128,7 +128,7 @@ for (const continuation of ['prose', 'tool', 'mixed']) test(`stop filters queued
   assert.ok(f.requests.every(request => !JSON.stringify(request).includes('STALE_MISSION_DECISION')))
   if (continuation === 'tool') assert.equal(ran, 1)
   if (continuation === 'mixed') assert.match(JSON.stringify(f.requests[1]), /SECOND_INDEPENDENT_REQUEST/)
-  assert.equal(f.rt.store.get('deliveries', notice.id).notice.consumedAt, undefined, 'discarded input never claims model consumption')
+  assert.equal(f.rt.store.get('deliveries', notice.id).consumedAt, undefined, 'discarded input never claims model consumption')
   assert.equal(f.agent.session.snapshotEvents().filter(event => event.type === 'turn/end').at(-1).data.reason.kind, 'completed')
 })
 
@@ -147,7 +147,7 @@ test('consumer rechecks messages already claimed while another pre-step handler 
   f.rt.control(f.owner, f.mission.id, 'stop', 'stopped during step preparation')
   release.resolve(); await flushing; await f.agent.whenIdle()
   assert.equal(f.requests.length, 0)
-  assert.equal(f.rt.store.get('deliveries', notice.id).notice.consumedAt, undefined)
+  assert.equal(f.rt.store.get('deliveries', notice.id).consumedAt, undefined)
 })
 
 test('completed mission facts still reach the owner after automatic completion overtakes transport', async t => {
@@ -158,7 +158,7 @@ test('completed mission facts still reach the owner after automatic completion o
   await f.rt.notices.flushOutbox(mission.id); await f.agent.whenIdle()
   assert.equal(f.requests.length, 1)
   assert.match(JSON.stringify(f.requests[0]), /COMPLETION_FACT_MUST_SURVIVE/)
-  assert.ok(f.rt.store.get('deliveries', notice.id).notice.consumedAt)
+  assert.ok(f.rt.store.get('deliveries', notice.id).consumedAt)
 })
 
 test('a wedged pass\'s naming handed to a busy owner is read once the body has settled, and tells the later bodies that wedge on the same fact', async t => {
@@ -187,7 +187,7 @@ test('a wedged pass\'s naming handed to a busy owner is read once the body has s
   // The hung call returns at its own bound while that request is still streaming.
   scheduling.closePass(mid, first)
   release.resolve(); await f.agent.whenIdle()
-  assert.deepEqual([read(), namings()[0].notice.consumedAt !== undefined], [1, true], 'the owner reads it at its next step, though no body is wedged any more')
+  assert.deepEqual([read(), namings()[0].consumedAt !== undefined], [1, true], 'the owner reads it at its next step, though no body is wedged any more')
   // The same call hangs again for later bodies: the naming fact the owner holds.
   for (const operationId of ['operation_host_2', 'operation_host_3']) {
     const pass = wedge(operationId)

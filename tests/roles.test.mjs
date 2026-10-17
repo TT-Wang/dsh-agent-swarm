@@ -256,7 +256,7 @@ for (const ending of ['error', 'aborted']) test(`final owner notices retain thei
     f.runtime.store.put('deliveries', notice)
   })
   assert.equal(f.scoper.roleOf(owner.agent), 'owner', 'transport alone is not final handling')
-  f.runtime.notices.recordConsumption(notice.id)
+  f.runtime.notices.recordConsumption('owner-session', notice.id)
   assert.equal(f.scoper.roleOf(owner.agent), 'owner', 'claiming before prompt assembly does not remove the protocol')
   await f.workers.deliver({ id: 'owner', missionId: mission.id, name: 'owner', role: 'owner', sessionId: 'owner-session', workspace: f.source, status: 'idle', subscriptions: [] }, notice)
   await owner.agent.whenIdle()

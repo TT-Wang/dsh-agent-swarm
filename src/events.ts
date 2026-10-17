@@ -60,7 +60,7 @@ export const EVENTS = {
   'task/cancelled': { description: 'Owner withdrew admitted work; dependents named as stranded', panel: { en: 'Task cancelled', zh: '子任务已取消' }, progress: true },
   'task/cancelled-at-completion': { description: 'Unschedulable leftover cancelled at mission completion', panel: { en: 'Task cancelled at completion', zh: '子任务在完成时被取消' }, historical: true, progress: true },
   'task/lease-expired': { description: 'Attempt lease expired and the owner was released', panel: { en: 'Task execution expired', zh: '任务执行已到期' } },
-  'attempt/fenced': { description: 'A control decision fenced a running attempt: epoch bumped, outgoing owner recorded, stop obligation installed', panel: { en: 'Task work was stopped', zh: '子任务的工作已被停止' } },
+  'attempt/fenced': { description: 'An attempt a handle may still be running was fenced: epoch bumped, outgoing owner recorded, stop obligation installed', panel: { en: 'Task work was stopped', zh: '子任务的工作已被停止' } },
   'task/ceiling-exhausted': { description: 'Task exhausted its step allocation and preserved work for owner-directed continuation', panel: { en: 'Task ceiling reached', zh: '子任务超出执行上限' } },
   'task/checkpointed': { description: 'Workspace checkpoint captured before reassignment', panel: { en: 'Task workspace checkpointed', zh: '已保存子任务工作区检查点' } },
   'task/checkpoint-failed': { description: 'Checkpoint capture failed; workspace preserved, recovery refuses a dirty tree', panel: { en: 'Task workspace checkpoint failed', zh: '子任务工作区检查点保存失败' } },
@@ -74,7 +74,7 @@ export const EVENTS = {
   'task/duplicate-carrier': { description: 'A task of an accepted replacement\'s lineage was still live, so it was not retired; names the accepted replacement that already carries its obligation (code lineage_duplicate_carrier)', panel: { en: 'Duplicate work flagged', zh: '发现重复承担的工作' } },
   'task/invalidated': { description: 'Dependent work invalidated by a challenged prerequisite', panel: { en: 'Dependent work needs another review', zh: '依赖此结果的工作需要重新审查' } },
   'task/git-write-denied': { description: 'Sandbox refused a worker git write; the supported exit is named', panel: { en: 'Worker git write denied', zh: '成员的 Git 写入被拒绝' } },
-  'task/budget-resume-skipped': { description: 'Budget-resume marker was stale and skipped', panel: { en: 'Task resume skipped', zh: '已跳过子任务恢复' } },
+  'task/budget-resume-skipped': { description: 'Budget-resume marker was stale and skipped', panel: { en: 'Task resume skipped', zh: '已跳过子任务恢复' }, historical: true },
   // S5c: emitted by `SwarmStore.putTask` through the exported constant
   // `STALE_TASK_REFUSAL_EVENT` (src/store.ts). `EventKind` checks a constant
   // emission exactly like a literal, so this row is required, not optional.

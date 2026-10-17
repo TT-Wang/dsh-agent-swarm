@@ -5,25 +5,16 @@ import { terminal } from './task-graph.ts'
 import { openAsks } from './arena.ts'
 import { noticeSubjectsFor } from './board.ts'
 
-/** One question booked at turn start, with everything the nudge must name. */
-interface Booking {
-  missionId: string
-  from: string
-  taskId?: string
-  content: string
-  deliveredAt?: number
-  consumedAt?: number
-}
-
 /** The nudge body: the question, the exact call, and the rule the owner must know. */
-function ownerReplyNudge(missionId: string, delivery: Delivery, booking: Booking, attempt: number, limit: number): string {
+function ownerReplyNudge(delivery: Delivery, attempt: number, limit: number): string {
+  const { missionId, from } = delivery
   return [
-    `[owner_reply_missing] ${booking.from} asked a question that this turn did not answer (nudge ${attempt} of ${limit}).`,
+    `[owner_reply_missing] ${from} asked a question that this turn did not answer (nudge ${attempt} of ${limit}).`,
     '',
-    `Question: ${booking.content.replace(/\s+/g, ' ').slice(0, 400)}`,
+    `Question: ${delivery.content.replace(/\s+/g, ' ').slice(0, 400)}`,
     '',
-    `Answer it with: swarm_message({ missionId: "${missionId}", to: "${booking.from}", kind: "question", content: "<your answer>", replyTo: "${delivery.id}" })`,
-    `Or close it deliberately: swarm_message({ missionId: "${missionId}", to: "${booking.from}", kind: "question", content: "<why not>", replyTo: "${delivery.id}", dismiss: true })`,
+    `Answer it with: swarm_message({ missionId: "${missionId}", to: "${from}", kind: "question", content: "<your answer>", replyTo: "${delivery.id}" })`,
+    `Or close it deliberately: swarm_message({ missionId: "${missionId}", to: "${from}", kind: "question", content: "<why not>", replyTo: "${delivery.id}", dismiss: true })`,
     'Your reply in the conversation is not delivered to the member: only that call writes the receipt.',
   ].join('\n')
 }
@@ -48,9 +39,13 @@ function ownerReplyNudge(missionId: string, delivery: Delivery, booking: Booking
  * The guard never edits the owner's answer and never sends on its behalf: it
  * makes the missing receipt visible and executable, which is the invariant the
  * board already keeps for task state.
+ *
+ * Its host subscription is also the one observer of an admitted swarm delivery
+ * (`observe`), so consumption has one listener, one order and one failure contract.
  */
 export class OwnerReplyGuard {
-  private readonly bookings = new Map<string, Map<string, Booking>>()
+  /** Per owner session, the ids of the open questions this turn is expected to settle; every fact the miss names is read from the row at turn end. */
+  private readonly bookings = new Map<string, Set<string>>()
   private readonly removal: () => void
   private closed = false
 
@@ -58,7 +53,7 @@ export class OwnerReplyGuard {
     this.removal = ctx.on('session/event', (session, event) => {
       if (this.closed) return
       try { this.observe(String(session.header.id), event.type, event.data) }
-      catch { /* An observer must never break a turn; the next turn re-derives the miss. */ }
+      catch { /* Best-effort observer: it must never break a turn, so a failed write is dropped. */ }
     })
   }
 
@@ -72,11 +67,20 @@ export class OwnerReplyGuard {
    * Drive the guard from one session event. Public on purpose: the cordis
    * listener above is the only production caller, and a test (or a host that
    * carries session events another way) can feed the same two events directly.
+   * An admitted message first books the turn, which writes nothing, and then
+   * records the swarm delivery it carries as consumed
+   * (`Notices.recordConsumption`, the one writer of `consumedAt`, which decides
+   * whether this session consumes it). A consumption write that fails is
+   * dropped and costs the turn nothing it booked.
    */
   observe(sessionId: string, type: string, data?: unknown): void {
     if (this.closed) return
-    if (type === 'user/message') this.startTurn(sessionId, data)
-    else if (type === 'turn/end') {
+    if (type === 'user/message') {
+      const source = (data as { source?: { kind?: unknown; deliveryId?: unknown } } | undefined)?.source
+      const admitted = source?.kind === 'swarm' && typeof source.deliveryId === 'string' ? source.deliveryId : undefined
+      this.startTurn(sessionId, admitted)
+      if (admitted !== undefined) this.rt.notices.recordConsumption(sessionId, admitted)
+    } else if (type === 'turn/end') {
       const reason = (data as { reason?: { kind?: string } } | undefined)?.reason?.kind
       if (reason === 'completed') this.endTurn(sessionId)
       else this.bookings.delete(sessionId)
@@ -93,34 +97,22 @@ export class OwnerReplyGuard {
    * started and still open. A turn with no such question books nothing, so an
    * ordinary owner turn is never nudged. The turn starts when its message is
    * observed, on the runtime clock that stamps `deliveredAt`, never on the
-   * host's message `createdAt`: two clocks cannot order one question.
+   * host's message `createdAt`: two clocks cannot order one question. A
+   * question is seen once the transport delivered it, an earlier admission
+   * consumed it, or this message admits it: the admission itself, not the
+   * consumption write it leads to.
    */
-  private startTurn(sessionId: string, data?: unknown): void {
+  private startTurn(sessionId: string, admitted?: string): void {
     const at = this.rt.now()
-    const source = (data as { source?: { kind?: string; deliveryId?: string } } | undefined)?.source
-    const consumedId = source?.kind === 'swarm' ? source.deliveryId : undefined
     // Several admitted messages (including the generated context snapshot) can
     // arrive in one step. Merge bookings until turn/end instead of replacing
     // the question booked by the preceding relay.
-    const booked = this.bookings.get(sessionId) ?? new Map<string, Booking>()
+    const booked = this.bookings.get(sessionId) ?? new Set<string>()
     for (const mission of this.ownerMissions(sessionId)) {
       for (const delivery of openAsks(this.rt.store.list('deliveries', mission.id), 'owner')) {
-        const consumedNow = delivery.id === consumedId
-        if (consumedNow && delivery.consumedAt === undefined) {
-          this.rt.commit(mission.id, () => {
-            const current = this.rt.store.get('deliveries', delivery.id)
-            if (current === undefined || current.consumedAt !== undefined) return
-            current.consumedAt = at
-            this.rt.store.put('deliveries', current)
-          })
-        }
-        const seenAt = consumedNow ? at : delivery.consumedAt ?? delivery.deliveredAt
+        const seenAt = delivery.id === admitted ? at : delivery.consumedAt ?? delivery.deliveredAt
         if (seenAt === undefined || seenAt > at) continue
-        booked.set(delivery.id, {
-          missionId: mission.id, from: delivery.from, content: delivery.content, deliveredAt: delivery.deliveredAt,
-          consumedAt: consumedNow ? at : delivery.consumedAt,
-          ...(delivery.taskId === undefined ? {} : { taskId: delivery.taskId }),
-        })
+        booked.add(delivery.id)
       }
     }
     if (booked.size === 0) this.bookings.delete(sessionId)
@@ -131,11 +123,11 @@ export class OwnerReplyGuard {
     const booked = this.bookings.get(sessionId)
     this.bookings.delete(sessionId)
     if (booked === undefined) return
-    for (const [deliveryId, booking] of booked) {
+    for (const deliveryId of booked) {
       const current = this.rt.store.get('deliveries', deliveryId)
       // Settled during the turn (answered or dismissed), or gone: nothing to report.
       if (current === undefined || current.answeredBy !== undefined) continue
-      this.missing(deliveryId, current, booking)
+      this.missing(current)
     }
   }
 
@@ -144,8 +136,9 @@ export class OwnerReplyGuard {
    * spent. Every step is durable, so a restart resumes at the same nudge count
    * instead of starting the count over.
    */
-  private missing(deliveryId: string, delivery: Delivery, booking: Booking): void {
-    const mission = this.rt.store.get('missions', booking.missionId)
+  private missing(delivery: Delivery): void {
+    const { id: deliveryId, missionId, from, taskId } = delivery
+    const mission = this.rt.store.get('missions', missionId)
     if (mission === undefined || terminal(mission) || mission.status === 'paused') return
     const spent = delivery.replyNudges ?? 0
     // The durable miss record is bounded with the nudges: after the bound the
@@ -154,26 +147,26 @@ export class OwnerReplyGuard {
     if (spent >= this.options.maxNudges) {
       // Idempotent by its own dedup key: the terminal is emitted once and later
       // turns re-derive the same decision without a second notice.
-      this.rt.notices.emitGuardTerminal(booking.missionId, 'owner_reply', {
-        detail: `question ${deliveryId} from ${booking.from} still has no answer after ${spent} nudge(s)`,
-        memberId: booking.from,
+      this.rt.notices.emitGuardTerminal(missionId, 'owner_reply', {
+        detail: `question ${deliveryId} from ${from} still has no answer after ${spent} nudge(s)`,
+        memberId: from,
         questionId: deliveryId,
-        ...(booking.taskId === undefined ? {} : { taskId: booking.taskId }),
+        ...(taskId === undefined ? {} : { taskId }),
       })
       return
     }
-    this.rt.commit(booking.missionId, () => {
-      this.rt.store.event(booking.missionId, 'owner/reply-missing', 'runtime', {
-        deliveryId, memberId: booking.from, taskId: booking.taskId ?? null,
-        deliveredAt: delivery.deliveredAt ?? booking.deliveredAt ?? null, consumedAt: delivery.consumedAt ?? booking.consumedAt ?? null,
-        nudges: spent, question: booking.content.replace(/\s+/g, ' ').slice(0, 200),
+    this.rt.commit(missionId, () => {
+      this.rt.store.event(missionId, 'owner/reply-missing', 'runtime', {
+        deliveryId, memberId: from, taskId: taskId ?? null,
+        deliveredAt: delivery.deliveredAt ?? null, consumedAt: delivery.consumedAt ?? null,
+        nudges: spent, question: delivery.content.replace(/\s+/g, ' ').slice(0, 200),
       })
       delivery.replyNudges = spent + 1
       this.rt.store.put('deliveries', delivery)
       // Each recovery turn needs its own wake. Persist its ordinal and outbox
       // row together so restart cannot spend a nudge without retaining it.
-      this.rt.notices.notify(booking.missionId, ownerReplyNudge(booking.missionId, delivery, booking, spent + 1, this.options.maxNudges),
-        noticeSubjectsFor(this.rt.boardOf(booking.missionId), { ...(booking.taskId === undefined ? {} : { taskId: booking.taskId }), memberId: booking.from }),
+      this.rt.notices.notify(missionId, ownerReplyNudge(delivery, spent + 1, this.options.maxNudges),
+        noticeSubjectsFor(this.rt.boardOf(missionId), { ...(taskId === undefined ? {} : { taskId }), memberId: from }),
         { dedupKey: `owner-reply-missing:${deliveryId}:${spent + 1}`, questionId: deliveryId })
     })
   }

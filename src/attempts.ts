@@ -6,8 +6,9 @@
  * (`SwarmRuntime.ownAttempt`), not lease accounting.
  */
 import { id } from './store.ts'
-import { TERMINAL_STATES, blockCauses, holdsAttempt, holdsOpenAttempt, openAttempt, stopPending, taskSubject, terminal, type BlockCause, type HeldTask } from './task-graph.ts'
+import { TERMINAL_STATES, blockCauses, dropForeignMarkers, holdsAttempt, holdsOpenAttempt, openAttempt, stopPending, taskSubject, terminal, type BlockCause, type HeldTask } from './task-graph.ts'
 import { stopFaultKey, type Notices } from './notices.ts'
+import { heldByParkedMember } from './board.ts'
 import { memberPhaseOf } from './projection.ts'
 import { PolicyError } from './policy-error.ts'
 import { awaited, formatSpan, type Kernel, type SchedulingPass } from './kernel.ts'
@@ -41,14 +42,30 @@ export function stopOutcome(causes: ReadonlySet<BlockCause>, reason: StopReason)
 }
 
 /**
- * X1 (P0): drop an attempt and remember its owner durably. Every path that
- * abandons an attempt without a verdict calls this, so the union below can
- * never forget a member who already touched the work.
+ * X1 (P0): take the attempt off the row with its markers (`dropForeignMarkers`:
+ * a row without an attempt carries none) and remember its owner durably, so the
+ * union below can never forget a member who already touched the work. Only the
+ * two operations that end an attempt, `endAttempt` and `Attempts.fenceRow`,
+ * call it.
  */
-export function dropAttempt(task: Task): void {
+function dropAttempt(task: Task): void {
   const owner = task.attempt?.ownerId
   if (owner !== undefined) task.priorOwnerIds = [...new Set([...(task.priorOwnerIds ?? []), owner])]
   delete task.attempt
+  dropForeignMarkers(task)
+}
+
+/**
+ * End the row's attempt when no handle owes a stop for it: the epoch bump
+ * fences its lease and every write it could still present. A host restart
+ * re-pending running work (the old process is gone), a rework re-opening a
+ * rejected task or its review (their handles finished with the submission and
+ * the verdict), and a worker start that failed end an attempt this way. An
+ * attempt a handle may still be running is fenced instead (`Attempts.fenceForStop`).
+ */
+export function endAttempt(task: Task): void {
+  task.epoch++
+  dropAttempt(task)
 }
 
 /** W6: bounded idle close-outs before the workspace is checkpointed and re-pended. */
@@ -75,9 +92,9 @@ interface SilentOperation {
 export class Attempts {
   /**
    * S5 cache-only: the durable `Task.idleSignal` row carries the same value and
-   * the scheduling pass re-reads it; losing this map changes no durable outcome.
+   * `turnEnded` re-reads it; losing this map changes no durable outcome.
    */
-  readonly idleSignals = new Map<string, { attemptId: string; at: number }>()
+  private readonly idleSignals = new Map<string, { attemptId: string; at: number }>()
   /** Retry timing is disposable; the fenced task row owns the recovery obligation. */
   private readonly stopRetries = new Map<string, { epoch: number; memberId?: string; retries: number; retryAt: number; inFlight: boolean }>()
 
@@ -115,8 +132,7 @@ export class Attempts {
         if (peers.length > 0 || prior?.cause !== 'stop-owner-unresolved' || prior.epoch !== task.epoch) this.k.commit(missionId, () => {
           for (const peer of peers) {
             const oldOwner = peer.attempt.ownerId
-            peer.status = 'blocked'; peer.epoch++; dropAttempt(peer); delete peer.budgetResume
-            peer.resumeAfterStop = { epoch: peer.epoch, memberId: oldOwner, reason: 'handoff', at: this.k.now() }
+            this.fenceForStop(peer, { status: 'blocked', reason: 'handoff', cause: 'stop-owner-unresolved' })
             this.k.store.put('tasks', peer)
             this.k.store.event(missionId, 'task/handoff-started', 'runtime', { taskId: peer.id, oldOwner, reason: 'legacy stop owner recovery' })
           }
@@ -234,21 +250,25 @@ export class Attempts {
     this.k.commit(mission.id, () => this.k.store.put('tasks', task))
   }
   /**
-   * The one write that fences a running attempt, whatever decided to stop it.
+   * The one write that fences an attempt a handle may still be running,
+   * whatever decided to stop it, with the handle that owes the stop named by
+   * the caller (`memberId`). Every site fences through `fenceForStop`, which
+   * reads that handle from the row; only the owner's task control names it
+   * itself (`SwarmRuntime.controlTask`).
    *
-   * Stopping work in flight is five things that only mean anything together:
-   * the epoch bump that invalidates the outstanding lease, the `dropAttempt`
-   * that records the outgoing owner in `priorOwnerIds` (the basis of reviewer
-   * independence), the attempt-scoped markers that describe an attempt which no
-   * longer exists, the stop marker a live handle still owes, and one durable
-   * closer event. Each control path used to assemble them by hand and they
-   * disagreed: `fenceWorkspace` blocked a running task while leaving its attempt
-   * and its handle alive, and mission pause/stop and challenge closed attempts
-   * with no closer event at all, so the replay decoder refused logs this runtime
-   * had just written.
+   * Stopping work in flight is four things that only mean anything together:
+   * the end of the attempt (`endAttempt`: the epoch bump that invalidates the
+   * outstanding lease, the outgoing owner in `priorOwnerIds`, which is the basis
+   * of reviewer independence, and the attempt's markers gone with it), the
+   * stop marker that handle owes, the row's new `status`, and the
+   * `attempt/fenced` closer. Each site used to assemble them by hand, each
+   * clearing a different subset of the markers, and only the control paths
+   * wrote the closer, so a budget-resume marker could outlive the attempt it
+   * named.
    *
-   * The caller keeps what is its own: its authorization check, its domain event,
-   * its member updates and its asynchronous `resumeStoppedAttempt` poke.
+   * The caller keeps what is its own: its authorization check, its closer
+   * event, its extra fields (a checkpoint, a recovery count, an assignee, an
+   * output), its member updates and its `resumeStoppedAttempt` poke.
    *
    * A marker already at the task's epoch means an earlier fence is still in
    * flight. That barrier keeps its epoch and its owner instead of being
@@ -260,23 +280,31 @@ export class Attempts {
    * Call inside a mission transaction: the closer event and the caller's task
    * write are one durable transition.
    */
-  fenceForStop(task: Task, options: { status: Task['status']; reason?: StopReason; cause: string }): { previousStatus: Task['status']; attempt: Task['attempt']; stopOwner: string | undefined } {
+  fenceRow(task: Task, options: { status: Task['status']; reason: StopReason; memberId: string | undefined; cause: string }): { previousStatus: Task['status']; attempt: Task['attempt']; stopOwner: string | undefined } {
     const previousStatus = task.status
     const attempt = task.attempt
     const priorStop = stopPending(task) ? task.resumeAfterStop : undefined
-    const reason = options.reason ?? 'handoff'
-    // Submitted work may retain an author who now owns another task. Only an
-    // active attempt or an existing stop marker can identify a handle to stop.
-    const stopOwner = priorStop?.memberId ?? (previousStatus === 'running' ? attempt?.ownerId : undefined)
     task.status = options.status
-    if (priorStop === undefined) task.epoch++
-    dropAttempt(task)
-    delete task.budgetResume; delete task.closeout; delete task.idleSignal; delete task.gitWriteDenied; delete task.leaseWarned
     if (priorStop === undefined) {
-      if (stopOwner !== undefined) task.resumeAfterStop = { epoch: task.epoch, memberId: stopOwner, reason, at: this.k.now() }
-    } else if (reason === 'invalidated' && priorStop.reason !== 'invalidated') task.resumeAfterStop = { ...priorStop, reason }
+      endAttempt(task)
+      if (options.memberId !== undefined) task.resumeAfterStop = { epoch: task.epoch, memberId: options.memberId, reason: options.reason, at: this.k.now() }
+    } else {
+      dropAttempt(task)
+      if (options.reason === 'invalidated' && priorStop.reason !== 'invalidated') task.resumeAfterStop = { ...priorStop, reason: options.reason }
+    }
     this.k.store.event(task.missionId, 'attempt/fenced', 'runtime', { taskId: task.id, attemptId: attempt?.id ?? null, cause: options.cause })
-    return { previousStatus, attempt, stopOwner }
+    return { previousStatus, attempt, stopOwner: priorStop?.memberId ?? options.memberId }
+  }
+  /**
+   * The fence every site uses: lease expiry, an idle close-out, a handoff, a
+   * task ceiling, the legacy stop-owner recovery and each control decision (an
+   * owner cancel, a mission pause or stop, a challenged prerequisite, a retired
+   * review, a revoked workspace). Submitted work may retain an author who now
+   * owns another task, so the handle that owes the stop is the one holding the
+   * row's open attempt, if any; a stop already owed keeps its own.
+   */
+  fenceForStop(task: Task, options: { status: Task['status']; reason?: StopReason; cause: string }): ReturnType<Attempts['fenceRow']> {
+    return this.fenceRow(task, { status: options.status, reason: options.reason ?? 'handoff', memberId: holdsOpenAttempt(task) ? task.attempt.ownerId : undefined, cause: options.cause })
   }
   /**
    * The live operation an attempt currently holds, or undefined when none is
@@ -289,7 +317,7 @@ export class Attempts {
     if (ownerId === undefined) return undefined
     const activity = this.k.store.get('members', ownerId)?.activity
     if (activity === undefined) return undefined
-    const observed = this.k.workers.currentActivity(ownerId)
+    const observed = this.k.view.activity(ownerId)
     return observed !== undefined && observed.id === activity.id ? activity : undefined
   }
   /**
@@ -419,6 +447,18 @@ export class Attempts {
     this.k.commit(mission.id, () => this.k.store.put('tasks', task))
     return task
   }
+  /**
+   * W6: whether the owner of an open attempt ended its turn on it (`onIdle`),
+   * the one question of the idle close-out: the dispatch sweep closes out such
+   * an attempt (it nudges, then checkpoints and re-pends with a coded
+   * terminal), and the attempt reporting bound leaves it to the close-out. A
+   * turn end is a fact of the attempt, so it leaves the row only with the
+   * attempt. The durable signal on the row is the record; the in-memory one
+   * stands in for its row write when that did not land.
+   */
+  turnEnded(open: HeldTask): boolean {
+    return open.idleSignal?.attemptId === open.attempt.id || this.idleSignals.get(open.attempt.ownerId)?.attemptId === open.attempt.id
+  }
   onIdle(memberId: string): void {
     if (this.k.closed || this.k.shuttingDown) return
     const member = this.k.store.get('members', memberId)
@@ -471,10 +511,9 @@ export class Attempts {
     catch (error) {
       const failed = this.k.task(mission.id, task.id)
       if (!holdsAttempt(failed, mission.id, attemptId)) return
-      failed.status = 'blocked'; failed.epoch++; dropAttempt(failed); delete failed.closeout; delete failed.idleSignal
-      failed.resumeAfterStop = { epoch: failed.epoch, reason: 'invalidated', memberId: member.id, at: this.k.now() }
       failed.output = `Worker ended its turn without submitting (${task.id}) and its workspace could not be checkpointed: ${error instanceof Error ? error.message : String(error)}. Inspect the member workspace before proposing a replacement.`
       this.k.commit(mission.id, () => {
+        this.fenceForStop(failed, { status: 'blocked', reason: 'invalidated', cause: 'closeout-failed' })
         this.k.store.put('tasks', failed)
         this.k.store.event(mission.id, 'task/closeout-failed', 'runtime', { taskId: failed.id, ownerId: member.id, reason: failed.output })
       })
@@ -490,15 +529,13 @@ export class Attempts {
     // The attempt may have finished while the checkpoint committed; never mutate terminal work.
     if (!holdsAttempt(current, mission.id, attemptId)) return
     current.checkpoint = { commit: checkpoint.commit, at: this.k.now() }
-    current.status = 'blocked'; current.epoch++
     current.recoveryCount = (current.recoveryCount ?? 0) + 1
-    dropAttempt(current); delete current.closeout; delete current.idleSignal
     // Prefer the same member: its next attempt resumes the checkpointed workspace
     // instead of a different member starting from the mission baseline.
     current.assigneeId = member.id
     current.plannedAssigneeId ??= member.id
-    current.resumeAfterStop = { epoch: current.epoch, reason: 'worker-closeout', memberId: member.id, at: this.k.now() }
     this.k.commit(mission.id, () => {
+      this.fenceForStop(current, { status: 'blocked', reason: 'worker-closeout', cause: 'closeout-abandoned' })
       this.k.store.put('tasks', current)
       this.k.store.event(mission.id, 'task/closeout-abandoned', 'runtime', { taskId: current.id, ownerId: member.id, commit: checkpoint.commit, recoveryCount: current.recoveryCount })
     })
@@ -541,8 +578,7 @@ export class Attempts {
           const attemptId = task.attempt.id
           // R10-15: a parked member holding a live attempt is a stall signal, not a
           // silent board. Record it durably and wake the owner once per attempt.
-          const ownerMember = this.k.store.get('members', oldOwner)
-          const parked = ownerMember?.status === 'waiting'
+          const parked = heldByParkedMember(this.k.store.list('members', missionId), task)
           if (parked) this.notices.notifyParkedHolder(mission, task)
           // F1: an in-flight operation that has recorded nothing past its
           // declared bound is named to the owner once, and stops renewing the
@@ -555,7 +591,7 @@ export class Attempts {
           // W6: capture a durable checkpoint before any reassignment when the old
           // owner is quiescent, so the next attempt resumes committed work instead
           // of falling back to the mission baseline.
-          if (this.k.workers.isIdle(oldOwner)) {
+          if (this.k.view.startable(oldOwner)) {
             const owner = this.k.store.get('members', oldOwner)
             if (owner !== undefined && owner.status !== 'stopped') {
               try {
@@ -591,19 +627,21 @@ export class Attempts {
           const expiring = this.k.task(missionId, task.id)
           if (!holdsAttempt(expiring, missionId, attemptId)) continue
           // A lease that expired while the task was budget-paused is host policy, not
-          // a recovery failure, and the plan's intended owner must survive it. A
-          // lease that expired while its owner was parked is the same class of
-          // host-induced stop (R10-15): the park, not the worker, caused the stall,
-          // so it must not spend a recovery credit.
-          const pauseInduced = expiring.budgetResume !== undefined || parked
-          expiring.status = 'blocked'; expiring.epoch++
+          // a recovery failure, and the plan's intended owner must survive it. The
+          // pause is the mission's, read after the checkpoint await above, which
+          // it can land during. A lease that expired while its owner was parked is
+          // the same class of host-induced stop (R10-15): the park, not the
+          // worker, caused the stall, so it must not spend a recovery credit.
+          const pauseInduced = this.k.mission(missionId).budgetPause !== undefined || parked
           if (!pauseInduced) expiring.recoveryCount = (expiring.recoveryCount ?? 0) + 1
-          dropAttempt(expiring)
           const planned = expiring.plannedAssigneeId === undefined ? undefined : this.k.store.get('members', expiring.plannedAssigneeId)
           if (planned !== undefined && planned.status !== 'stopped') expiring.assigneeId = planned.id
           else delete expiring.assigneeId
-          expiring.resumeAfterStop = { epoch: expiring.epoch, reason: 'lease-expired', memberId: oldOwner, at: this.k.now() }
-          this.k.commit(missionId, () => { this.k.store.put('tasks', expiring); this.k.store.event(missionId, 'task/lease-expired', 'runtime', { taskId: expiring.id, oldOwner }) })
+          this.k.commit(missionId, () => {
+            this.fenceForStop(expiring, { status: 'blocked', reason: 'lease-expired', cause: 'lease-expired' })
+            this.k.store.put('tasks', expiring)
+            this.k.store.event(missionId, 'task/lease-expired', 'runtime', { taskId: expiring.id, oldOwner })
+          })
           this.resumeStoppedAttempt(missionId, expiring)
         }
     return true

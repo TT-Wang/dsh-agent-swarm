@@ -400,8 +400,8 @@ test('R14 runtime (workspace chain): a revoked workspace escalates with the code
     f.workers.autoIdle = true
     // The re-validation fences where it detects the revocation, then throws the typed error.
     const { WorkspaceRevokedError } = await import('../lib/authorization.js')
-    f.runtime.assertWorkspaceAuthorized = async mission => {
-      f.runtime.fenceWorkspace(mission.id, 'workspace_revoked: the authorized grant root was removed')
+    f.runtime.workspaceAdmission.assertWorkspaceAuthorized = async mission => {
+      f.runtime.workspaceAdmission.fenceWorkspace(mission.id, 'workspace_revoked: the authorized grant root was removed')
       throw new WorkspaceRevokedError('workspace_revoked: the authorized grant root was removed')
     }
     f.propose({ title: 'Work under a revoked grant' })
@@ -738,7 +738,7 @@ test('S4b (workspace fence): fenceWorkspace itself emits the coded terminal for 
   const f = await setup()
   try {
     const task = f.propose({ title: 'Fenced work' })
-    f.runtime.fenceWorkspace(f.mission.id, 'workspace_revoked: the authorized grant root was removed')
+    f.runtime.workspaceAdmission.fenceWorkspace(f.mission.id, 'workspace_revoked: the authorized grant root was removed')
     const event = await eventually(() => events(f.runtime, f.mission.id, 'mission/stalled')
       .filter(item => item.data.cause === 'guard-terminal' && item.data.chain === 'workspace').at(-1),
       'the fence emits the workspace terminal for its own callers', 8_000)

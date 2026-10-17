@@ -232,7 +232,7 @@ test('R16-D4: an attempt with no durable progress past its bound escalates with 
   const claimedAt = f.staleEvents('task/claimed').find(event => event.data?.attempt?.id === attemptId)?.createdAt
   assert.ok(claimedAt, 'the dispatch is durable')
   // Inside the bound nothing escalates: the dispatch itself is the clock's floor.
-  assert.equal(f.runtime.silentAttempt(f.runtime.store.get('tasks', task.id), f.runtime.store.get('missions', f.mission.id)), undefined,
+  assert.equal(f.runtime.scheduling.silentAttempt(f.runtime.store.get('tasks', task.id), f.runtime.store.get('missions', f.mission.id)), undefined,
     'a freshly claimed attempt is inside its bound')
   const escalation = await eventually(() => f.escalations('attempt-silent:')[0], 'the silence must escalate inside the declared bound plus one tick', 3000)
   assert.equal(escalation.notice.class, 'stall', 'the escalation is a liveness notice')
@@ -251,14 +251,14 @@ test('R16-D4: an attempt with no durable progress past its bound escalates with 
   // One silence escalates once.
   await sleep(250)
   assert.equal(f.escalations('attempt-silent:').length, 1, 'an unchanged silence never repeats')
-  assert.ok(f.runtime.silentAttempt(f.runtime.store.get('tasks', task.id), f.runtime.store.get('missions', f.mission.id)) !== undefined,
+  assert.ok(f.runtime.scheduling.silentAttempt(f.runtime.store.get('tasks', task.id), f.runtime.store.get('missions', f.mission.id)) !== undefined,
     'the attempt is still silent: the escalation names it, it does not stop the clock')
   // Pair with the lease renewal that legitimately keeps a producing attempt
   // alive: a recorded tool run is durable progress and re-arms the clock.
   const recorded = await f.workers.callbacks.toolRun(builder.id, { tool: 'bash', arguments: {}, result: { ok: true }, isError: false })
   assert.equal(typeof recorded, 'string', 'the tool run is recorded durably')
   const rearmed = f.runtime.store.get('tasks', task.id)
-  assert.equal(f.runtime.silentAttempt(rearmed, f.runtime.store.get('missions', f.mission.id)), undefined,
+  assert.equal(f.runtime.scheduling.silentAttempt(rearmed, f.runtime.store.get('missions', f.mission.id)), undefined,
     'the recording re-arms the attempt clock even though the lease renewal alone would not')
   const runAt = f.runtime.store.toolRuns(f.mission.id, { attemptId }).at(-1).createdAt
   const eventAt = f.staleEvents('tool/recorded').at(-1).createdAt
