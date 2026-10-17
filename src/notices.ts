@@ -709,16 +709,15 @@ export class Notices {
         || ['progress', 'completion'].includes(fact.class)
         || FOLLOWUP_EXCLUDED_FAMILIES.has(noticeFamily(delivery))
         || now - (fact.followupAt ?? delivery.deliveredAt) < this.obligationFollowupMs) return []
-      // A summary has reminders left while one of its constituents has.
-      const left = fact.aggregatedFacts === undefined ? (fact.followupCount ?? 0) < limit : fact.aggregatedFacts.some(part => (part.followupCount ?? 0) < limit)
-      return left ? [{ delivery, fact }] : []
+      // A summary has reminders left while one of its constituents has (`open`), and reminds only those.
+      const open = fact.aggregatedFacts?.filter(part => (part.followupCount ?? 0) < limit)
+      return (open === undefined ? (fact.followupCount ?? 0) < limit : open.length > 0) ? [{ delivery, fact, open }] : []
     })
     if (due.length === 0) return
     const view = interpret(board)
-    for (const { delivery, fact } of due) {
+    for (const { delivery, fact, open } of due) {
       const spent = fact.followupCount ?? 0
-      const parts = fact.aggregatedFacts?.filter(part => (part.followupCount ?? 0) < limit
-        && this.unresolvedSubjects(view, this.summaryFactDelivery(mission.id, delivery.id, part)).length > 0)
+      const parts = open?.filter(part => this.unresolvedSubjects(view, this.summaryFactDelivery(mission.id, delivery.id, part)).length > 0)
       if (parts?.length === 0) continue
       const unresolved = parts === undefined ? this.unresolvedSubjects(view, delivery)
         : [...new Set(parts.flatMap(part => this.unresolvedSubjects(view, this.summaryFactDelivery(mission.id, delivery.id, part))))]
