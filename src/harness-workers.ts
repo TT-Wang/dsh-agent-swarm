@@ -1009,22 +1009,31 @@ export class HarnessWorkers implements WorkerAdapter {
     }
   }
 
+  /**
+   * R15-A5: wake the input an idle handle holds that no driver will claim. A
+   * revoked assignment is discarded first (`removeRevokedPending`). Then the
+   * pending tail is removed and sent again with its original identity and
+   * `wakeup: true`, through public APIs only (never the internal claim API).
+   * That one wake starts the native driver, which claims the inbox in the order
+   * it was queued and runs until nothing is pending, so FIFO and model-visible
+   * exactly-once delivery both hold. Re-sending every pending item would not:
+   * the first wake's driver claims the inbox before the rest are re-queued,
+   * the head now behind them. Whether it woke anything.
+   */
+  private rewake(resident: Resident, agent: Agent): boolean {
+    this.removeRevokedPending(resident, agent)
+    const target = agent.inbox.nextTurn.length > 0 ? 'next-turn' : 'next-step'
+    const message = (target === 'next-turn' ? agent.inbox.nextTurn : agent.inbox.nextStep).at(-1)
+    if (message === undefined || !agent.inbox.remove(message.id)) return false
+    agent.send(message, target, true)
+    return true
+  }
+
+  /** Harness ends its driver after a rejected pre-step, and input accepted while that driver was live has no latched wake: the handle's next idle wakes it. */
   private continueAfterRejectedStep(resident: Resident, agent: Agent): boolean {
     if (!resident.rejectedPendingStep) return false
     resident.rejectedPendingStep = false
-    if (this.fenced(resident)) return false
-    this.removeRevokedPending(resident, agent)
-    // Harness ends its driver after a rejected pre-step. Input accepted while
-    // that driver was live has no latched wake. Re-enqueue a pending tail with
-    // its original identity through public APIs; this preserves both FIFO and
-    // model-visible exactly-once delivery without using the internal claim API.
-    const target = agent.inbox.nextTurn.length > 0 ? 'next-turn' : 'next-step'
-    const pending = target === 'next-turn' ? agent.inbox.nextTurn : agent.inbox.nextStep
-    const message = pending.at(-1)
-    if (message === undefined) return false
-    if (!agent.inbox.remove(message.id)) return false
-    agent.send(message, target, true)
-    return true
+    return !this.fenced(resident) && this.rewake(resident, agent)
   }
 
   async stop(memberId: string): Promise<void> {
@@ -1088,24 +1097,12 @@ export class HarnessWorkers implements WorkerAdapter {
    * R15-A5: the drain step. An idle handle holding pending input cannot
    * consume it: the native driver that would claim the item has ended (a
    * rejected pre-step, a revoked assignment, input restored at activation) and
-   * nothing re-wakes it. This re-wakes the stranded tail through the same public
-   * `send` API `continueAfterRejectedStep` uses (original identity, `wakeup:
-   * true`). Removal first keeps FIFO and exactly-once delivery: a message a live
-   * driver already claimed fails `remove` and is left alone, and a revoked
-   * assignment is discarded first (`removeRevokedPending`).
+   * nothing re-wakes it. A stranded handle is woken by `rewake`, the one wake
+   * the rejected-step continuation shares.
    */
   drainStrandedInbox(memberId: string): void {
     const handle = this.handleDecision(memberId)
-    if (handle?.state !== 'stranded') return
-    const { resident, agent } = handle
-    this.removeRevokedPending(resident, agent)
-    for (const target of ['next-step', 'next-turn'] as const) {
-      const pending = target === 'next-step' ? agent.inbox.nextStep : agent.inbox.nextTurn
-      for (const message of [...pending]) {
-        if (!agent.inbox.remove(message.id)) continue
-        agent.send(message, target, true)
-      }
-    }
+    if (handle?.state === 'stranded') this.rewake(handle.resident, handle.agent)
   }
   captureArtifact(member: Member, task: Task, deliverables?: string[], options?: { requireOutputs?: boolean }): Promise<Artifact> { return this.workspaces.captureArtifact(member, task, deliverables, options) }
   inspectArtifact(member: Member, artifact: Artifact, signal?: AbortSignal): Promise<Artifact> { return this.workspaces.inspectArtifact(member, artifact, signal) }
