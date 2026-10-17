@@ -334,27 +334,30 @@ export class ScopedEnvironment {
 }
 
 /** The plugin fiber owns every worker; user/coordinator session disposal does not own them. */
+/** R15-A5: the state of an owned handle. `isIdle` answers whether it is not `busy`; the drain step acts on `stranded`. */
+export type HandleState = 'busy' | 'idle' | 'stranded'
+
 /**
  * R15-A5: the adapter's decision for one owned handle, exported so it is
  * testable without a running Harness host (the adapter itself needs the native
- * agent services). `isIdle` answers `startable`, and `drainStrandedInbox` acts
- * on `drain`. The rules, in order:
+ * agent services). It reads the native agent only as far as the rules need it.
+ * The rules, in order:
  *
- * 1. a stopping handle or one with in-flight observations is not startable;
- * 2. a handle that is not `idle` is working, not startable;
- * 3. an idle handle with pending inbox input has no driver left to claim it
- *    (`drain: true`): it is startable, and the drain step re-wakes the pending
- *    tail so the item is consumed instead of stranding the member.
+ * 1. a fenced handle (the adapter closing, the resident stopping or aborted) or
+ *    one with in-flight observations is busy;
+ * 2. a handle that is not `idle` is working: busy;
+ * 3. an idle handle with pending inbox input has no driver left to claim it:
+ *    `stranded`. It is startable, and the drain step re-wakes its input so the
+ *    input is consumed instead of stranding the member.
  *
  * Co-firing guards, named: the parked-member hatch (the runtime never asks
  * about a parked member's handle, nor drains it), the W6 open-attempt close-out
  * (`dispatch` handles a member with a running attempt before it dispatches) and
  * `removeRevokedPending` (discards a revoked assignment before the drain).
  */
-export function strandedInboxDecision(input: { stopping: boolean; observations: number; status: string; hasPending: boolean }): { startable: boolean; drain: boolean } {
-  if (input.stopping || input.observations > 0) return { startable: false, drain: false }
-  if (input.status !== 'idle') return { startable: false, drain: false }
-  return { startable: true, drain: input.hasPending }
+export function strandedInboxDecision(handle: { fenced: boolean; observations: number; agent: { readonly status: string; readonly inbox: { readonly nextStep: readonly unknown[]; readonly nextTurn: readonly unknown[] } } }): HandleState {
+  if (handle.fenced || handle.observations > 0 || handle.agent.status !== 'idle') return 'busy'
+  return handle.agent.inbox.nextStep.length > 0 || handle.agent.inbox.nextTurn.length > 0 ? 'stranded' : 'idle'
 }
 
 export class HarnessWorkers implements WorkerAdapter {
@@ -1009,7 +1012,7 @@ export class HarnessWorkers implements WorkerAdapter {
   private continueAfterRejectedStep(resident: Resident, agent: Agent): boolean {
     if (!resident.rejectedPendingStep) return false
     resident.rejectedPendingStep = false
-    if (this.closing || resident.stopping !== undefined || resident.abort.signal.aborted) return false
+    if (this.fenced(resident)) return false
     this.removeRevokedPending(resident, agent)
     // Harness ends its driver after a rejected pre-step. Input accepted while
     // that driver was live has no latched wake. Re-enqueue a pending tail with
@@ -1059,15 +1062,14 @@ export class HarnessWorkers implements WorkerAdapter {
     })()
   }
 
-  /** R15-A5: the decision for one member's live handle (`strandedInboxDecision`), or undefined while it has none: never opened, stopping, aborted, or the adapter closing. */
-  private handleDecision(memberId: string): { resident: Resident; agent: Agent; startable: boolean; drain: boolean } | undefined {
-    const resident = this.residents.get(memberId)
-    if (resident?.handle === undefined || this.closing || resident.stopping !== undefined || resident.abort.signal.aborted) return undefined
-    const agent = resident.handle.agent
-    return { resident, agent, ...strandedInboxDecision({
-      stopping: resident.stopping !== undefined, observations: resident.observations.size,
-      status: agent.status, hasPending: agent.inbox.nextStep.length > 0 || agent.inbox.nextTurn.length > 0,
-    }) }
+  /** Whether a resident is fenced: the adapter is closing, or the resident is stopping or aborted. */
+  private fenced(resident: Resident): boolean { return this.closing || resident.stopping !== undefined || resident.abort.signal.aborted }
+
+  /** R15-A5: one member's handle and its state (`strandedInboxDecision`), or undefined while the member has no handle. */
+  private handleDecision(memberId: string): { resident: Resident; agent: Agent; state: HandleState } | undefined {
+    const resident = this.residents.get(memberId), agent = resident?.handle?.agent
+    if (resident === undefined || agent === undefined) return undefined
+    return { resident, agent, state: strandedInboxDecision({ fenced: this.fenced(resident), observations: resident.observations.size, agent }) }
   }
 
   /**
@@ -1077,7 +1079,10 @@ export class HarnessWorkers implements WorkerAdapter {
    * skipped it, so the assignment whose waking delivery would carry that input
    * was never delivered.
    */
-  isIdle(memberId: string): boolean { return this.handleDecision(memberId)?.startable === true }
+  isIdle(memberId: string): boolean {
+    const handle = this.handleDecision(memberId)
+    return handle !== undefined && handle.state !== 'busy'
+  }
 
   /**
    * R15-A5: the drain step. An idle handle holding pending input cannot
@@ -1091,7 +1096,7 @@ export class HarnessWorkers implements WorkerAdapter {
    */
   drainStrandedInbox(memberId: string): void {
     const handle = this.handleDecision(memberId)
-    if (handle?.drain !== true) return
+    if (handle?.state !== 'stranded') return
     const { resident, agent } = handle
     this.removeRevokedPending(resident, agent)
     for (const target of ['next-step', 'next-turn'] as const) {

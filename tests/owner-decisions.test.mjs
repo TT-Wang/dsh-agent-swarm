@@ -252,12 +252,16 @@ test('R15-A4 pair: an open attempt stays silent — the close-out path already n
 })
 
 test('R15-A5: a stranded member stays dispatchable and the sweep\'s drain step wakes its input, and the naive predicate strands it', async t => {
-  // Unit: the decision function the adapter now uses (`isIdle` answers `startable`, the drain step acts on `drain`).
-  assert.deepEqual(strandedInboxDecision({ stopping: false, observations: 0, status: 'idle', hasPending: false }), { startable: true, drain: false })
-  assert.deepEqual(strandedInboxDecision({ stopping: false, observations: 0, status: 'idle', hasPending: true }), { startable: true, drain: true }, 'an idle handle holding queued input is startable and is drained')
-  assert.deepEqual(strandedInboxDecision({ stopping: true, observations: 0, status: 'idle', hasPending: true }), { startable: false, drain: false }, 'a stopping handle is never startable')
-  assert.deepEqual(strandedInboxDecision({ stopping: false, observations: 1, status: 'idle', hasPending: true }), { startable: false, drain: false }, 'in-flight observations are work, not a stranded queue')
-  assert.deepEqual(strandedInboxDecision({ stopping: false, observations: 0, status: 'running', hasPending: true }), { startable: false, drain: false }, 'a running handle is working')
+  // Unit: the decision function the adapter now uses (`isIdle` answers whether the handle is not `busy`, the drain step acts on `stranded`).
+  const handle = ({ fenced = false, observations = 0, status = 'idle', nextStep = [], nextTurn = [] } = {}) => ({ fenced, observations, agent: { status, inbox: { nextStep, nextTurn } } })
+  assert.equal(strandedInboxDecision(handle()), 'idle')
+  assert.equal(strandedInboxDecision(handle({ nextStep: ['queued'] })), 'stranded', 'an idle handle holding queued input is startable and is drained')
+  assert.equal(strandedInboxDecision(handle({ nextTurn: ['queued'] })), 'stranded', 'whichever list holds it')
+  assert.equal(strandedInboxDecision(handle({ fenced: true, nextStep: ['queued'] })), 'busy', 'a fenced handle (closing, stopping or aborted) is never startable')
+  assert.equal(strandedInboxDecision(handle({ observations: 1, nextStep: ['queued'] })), 'busy', 'in-flight observations are work, not a stranded queue')
+  assert.equal(strandedInboxDecision(handle({ status: 'running', nextStep: ['queued'] })), 'busy', 'a running handle is working')
+  const retired = { status: 'idle', get inbox() { throw new Error('the retired inbox was read') } }
+  assert.equal(strandedInboxDecision({ fenced: true, observations: 0, agent: retired }), 'busy', 'the decision reads a fenced handle\'s inbox never')
 
   const state = { pending: new Set(), drained: [] }
   const naive = memberId => !state.pending.has(memberId)
@@ -277,10 +281,10 @@ test('R15-A5: a stranded member stays dispatchable and the sweep\'s drain step w
   // The adapter's contract: `isIdle` is a question, and only the drain step,
   // which the dispatch sweep runs before it decides, wakes stranded input.
   const fixedState = { pending: new Set(), drained: [] }
-  const decide = memberId => strandedInboxDecision({ stopping: false, observations: 0, status: 'idle', hasPending: fixedState.pending.has(memberId) })
+  const decide = memberId => strandedInboxDecision(handle({ nextStep: fixedState.pending.has(memberId) ? ['queued'] : [] }))
   const fixed = await scenario(t, { workers: new Workers({
-    idle: memberId => decide(memberId).startable,
-    drain: memberId => { if (decide(memberId).drain) { fixedState.drained.push(memberId); fixedState.pending.delete(memberId) } },
+    idle: memberId => decide(memberId) !== 'busy',
+    drain: memberId => { if (decide(memberId) === 'stranded') { fixedState.drained.push(memberId); fixedState.pending.delete(memberId) } },
   }) })
   const drained = await fixed.addMember('Drained')
   fixedState.pending.add(drained.id)
