@@ -190,8 +190,9 @@ export class Scheduling {
             if (violation !== undefined) { this.workspaceAdmission.recordIsolation(prepared, violation); continue }
             this.k.assign(fresh, member)
           } catch (error) {
-            // Admission control already wrote the durable refusal; the task stays
-            // pending and a later tick re-evaluates it when a slot frees up.
+            // An admission refusal is transient (a full slot, a busy writer, a
+            // stop the member is still owed): the task stays pending and a later
+            // sweep re-evaluates it.
             if (error instanceof AdmissionRefusedError) continue
             if (this.halted(missionId)) return false
             // A withdrawn authorization was fenced where it was detected, which
