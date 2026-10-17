@@ -3178,13 +3178,18 @@ export class SwarmRuntime implements Kernel {
     // close-out restarts from the first nudge; the turn end that armed it stays.
     if (resumes) { delete next.preparationFailure; delete next.verificationRecovery; delete next.closeout }
     if (rework !== undefined) this.reopenForRework(next, rework)
-    // The decision ends the attempt the row holds when it changes running work
-    // structurally, or resumes a blocked row whose attempt ended in its
-    // submission or its verdict (a rework ended its own above). `fenceForStop`
-    // reads from the row who owes a stop, so only running work's handle does,
-    // and a resumed row re-pends at once unless a stop is still owed.
-    const fenced = holdsOpenAttempt(next) ? structural : resumes && next.status === 'blocked' && next.attempt !== undefined
-    if (structural && !fenced && !stopPending(next)) next.epoch++ // Fence a preparation already awaiting I/O.
+    // A structural change of running work fences it: the handle holding its
+    // open attempt owes the stop (`fenceForStop`). While a stop is owed, a
+    // resume is its cleanup retry, and the barrier re-pends the row. Otherwise
+    // the attempt a blocked row holds ended in its submission or its verdict,
+    // so its handle owes no stop: a resume ends it as a rework does
+    // (`endAttempt`) and re-pends the row.
+    const fenced = structural && holdsOpenAttempt(next)
+    if (!fenced && !stopPending(next)) {
+      if (resumes && next.status === 'blocked' && next.attempt !== undefined) endAttempt(next)
+      else if (structural) next.epoch++ // Fence a preparation already awaiting I/O.
+      if (resumes && next.status === 'blocked') next.status = 'pending'
+    }
     this.assertEffectiveTaskGraph({ ...next, status: 'pending' }, this.store.list('tasks', missionId).filter(row => row.id !== taskId))
     next.handoff = `${next.handoff ?? ''}\nOwner ${action}: ${reason}`.trim()
     // R20: raising a ceiling no longer has a host park to consume. The exhausted
@@ -3193,7 +3198,6 @@ export class SwarmRuntime implements Kernel {
     // one task has no business clearing.
     this.commit(missionId, () => {
       if (fenced) this.attempts.fenceForStop(next, { status: 'blocked', cause: `owner-${action}` })
-      if (resumes && !stopPending(next) && next.status === 'blocked') next.status = 'pending'
       this.store.put('tasks', next)
       this.store.event(missionId, 'task/amended', 'owner', { taskId, action, reason, changes, epoch: next.epoch, status: next.status, previous: Object.fromEntries(Object.keys(changes).map(key => [key, task[key as keyof Task] ?? null])),
         ...(rework === undefined ? {} : { rework: next.rejections!.at(-1), reworkCount: next.reworkCount }) })

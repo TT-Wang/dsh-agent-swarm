@@ -10,13 +10,14 @@
  * workspace from it, and only then re-pended the review. An owner cancel of the
  * same review already laid no stop.
  *
- * Now the fence reads the stop owner from the row (`Attempts.fenceForStop`, as
- * the cancel does): the finished attempt ends with its `attempt/fenced` closer
- * and the row re-pends in the same transition. No stop is owed, the
- * reviewer's handle and its other work are left alone, and the review is
- * dispatchable at once. Each test here fails on the pre-F2 head, except the
- * last, which pins what stays: a structural amendment of running work fences
- * it, and the stop is owed by the handle holding its open attempt.
+ * Now only a structural change of running work is fenced (`Attempts.fenceForStop`),
+ * with the stop owed by the handle holding its open attempt. The finished
+ * attempt of a blocked review ends as a rework ends one (`endAttempt`), with
+ * no `attempt/fenced` closer: its verdict already closed it in the log. The
+ * row re-pends in the owner's own transition, no stop is owed, the reviewer's
+ * handle and its other work are left alone, and the review is dispatchable at
+ * once. Each test here fails on the pre-F2 head, except the one that pins
+ * what stays: a structural amendment of running work fences it.
  */
 import test from 'node:test'
 import assert from 'node:assert/strict'
@@ -48,21 +49,21 @@ async function fixture(t) {
 }
 
 /**
- * The finished attempt was fenced with no stop owed and the row re-pended in
- * the owner's own transition: one `attempt/fenced` naming the owner's decision
- * immediately before `task/amended`, which records the row pending.
+ * The finished attempt ended with no stop owed and the row re-pended in the
+ * owner's own transition, whose one event is `task/amended` recording the row
+ * pending. No closer is written for an attempt its verdict already closed.
  */
-function assertEndedAndRepended(f, review, before, cause, label) {
+function assertEndedAndRepended(f, review, before, label) {
   const row = taskOf(f.runtime, review.id)
   assert.deepEqual([row.status, row.attempt, row.resumeAfterStop], ['pending', undefined, undefined], `${label}: the review re-pends at once, owing no stop`)
   assert.equal(row.epoch, before.epoch + 1, `${label}: the epoch bump that ends the finished attempt is the only one`)
   assert.ok(row.priorOwnerIds.includes(f.reviewer.id), `${label}: the reviewer is recorded as a prior owner`)
   assert.equal(row.verificationRecovery, undefined, `${label}: the deferral is cleared`)
-  const all = f.runtime.store.events(f.mission.id, 5_000)
-  const fenced = all.filter(event => event.type === 'attempt/fenced' && event.data.taskId === review.id)
-  assert.deepEqual(fenced.map(event => [event.data.attemptId, event.data.cause]), [[before.attempt.id, cause]], `${label}: one closer names the finished attempt and the owner's decision`)
-  const amended = all.find(event => event.type === 'task/amended' && event.data.taskId === review.id)
-  assert.deepEqual([amended?.seq, amended?.data.status, amended?.data.epoch], [fenced[0].seq + 1, 'pending', row.epoch], `${label}: the amendment records the re-pended row in the same transition`)
+  const mine = f.runtime.store.events(f.mission.id, 5_000).filter(event => event.data?.taskId === review.id)
+  assert.deepEqual(mine.filter(event => event.type === 'attempt/fenced'), [], `${label}: no closer: the verdict closed the attempt`)
+  const last = mine.at(-1)
+  assert.deepEqual([last?.type, last?.data.status, last?.data.epoch], ['task/amended', 'pending', row.epoch], `${label}: the amendment records the re-pended row`)
+  assert.equal(mine.filter(event => event.type === 'task/amended').length, 1, `${label}: one transition`)
 }
 
 test('an owner resume of a deferred review ends its finished attempt and re-pends it, and the reviewer, running other work, is not stopped', async t => {
@@ -73,7 +74,7 @@ test('an owner resume of a deferred review ends its finished attempt and re-pend
   const before = taskOf(f.runtime, review.id)
 
   f.runtime.controlTask(f.owner, f.mission.id, review.id, 'resume', {}, 'The host check deadline was repaired')
-  assertEndedAndRepended(f, review, before, 'owner-resume', 'resume')
+  assertEndedAndRepended(f, review, before, 'resume')
   await f.runtime.settle(f.mission.id)
   assert.deepEqual(f.workers.stopped, [], 'no handle was stopped')
   const still = taskOf(f.runtime, other.id)
@@ -99,7 +100,7 @@ test('an owner\'s structural amendment of a deferred review ends its finished at
   const before = taskOf(f.runtime, review.id)
 
   f.runtime.controlTask(f.owner, f.mission.id, review.id, 'amend', { assigneeId: next.id }, 'The first reviewer is busy')
-  assertEndedAndRepended(f, review, before, 'owner-amend', 'amend')
+  assertEndedAndRepended(f, review, before, 'amend')
   assert.equal(taskOf(f.runtime, review.id).assigneeId, next.id)
   await f.runtime.settle(f.mission.id)
   assert.deepEqual(f.workers.stopped, [], 'the old reviewer\'s handle was not stopped')
@@ -117,7 +118,7 @@ test('an owner resume of a rejecting review ends the attempt that ended in its v
   assert.deepEqual([before.status, before.attempt?.ownerId], ['blocked', f.reviewer.id], 'the rejecting review holds the attempt that ended in its verdict')
 
   f.runtime.controlTask(f.owner, f.mission.id, review.id, 'resume', {}, 'Review it again')
-  assertEndedAndRepended(f, review, before, 'owner-resume', 'rejecting resume')
+  assertEndedAndRepended(f, review, before, 'rejecting resume')
   await f.runtime.settle(f.mission.id)
   assert.deepEqual(f.workers.stopped, [], 'no handle was stopped')
 })

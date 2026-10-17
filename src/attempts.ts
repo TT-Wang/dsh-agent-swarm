@@ -59,8 +59,9 @@ function dropAttempt(task: Task): void {
  * End the row's attempt when no handle owes a stop for it: the epoch bump
  * fences its lease and every write it could still present. A host restart
  * re-pending running work (the old process is gone), a rework re-opening a
- * rejected task or its review (their handles finished with the submission and
- * the verdict), and a worker start that failed end an attempt this way. An
+ * rejected task or its review, an owner's resume of a blocked review holding
+ * its deferred or rejecting verdict (each handle finished with its submission
+ * or its verdict), and a worker start that failed end an attempt this way. An
  * attempt a handle may still be running is fenced instead (`Attempts.fenceForStop`).
  */
 export function endAttempt(task: Task): void {
@@ -252,10 +253,9 @@ export class Attempts {
   /**
    * The one write that fences the attempt a row holds, whatever decided to
    * end it: lease expiry, an idle close-out, a handoff, a task ceiling, the
-   * legacy stop-owner recovery, the owner's task control (a structural
-   * amendment of running work, a resume of a blocked row) and each control
-   * decision (an owner cancel, a mission pause or stop, a challenged
-   * prerequisite, a retired review, a revoked workspace).
+   * legacy stop-owner recovery, an owner's structural amendment of running
+   * work and each control decision (an owner cancel, a mission pause or stop,
+   * a challenged prerequisite, a retired review, a revoked workspace).
    *
    * The handle that owes the stop is the one holding the row's open attempt,
    * if any. An attempt that ended in a submission or a verdict owes none:
