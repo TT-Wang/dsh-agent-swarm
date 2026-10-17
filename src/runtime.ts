@@ -596,7 +596,7 @@ export class SwarmRuntime implements Kernel {
         const running = clocked.status === 'active' && !clocked.budgetPause && this.store.list('tasks', missionId).some(task => {
           if (!holdsOpenAttempt(task)) return false
           const member = this.store.get('members', task.attempt.ownerId)
-          return member?.activity !== undefined || this.workers.isIdle?.(task.attempt.ownerId) !== true
+          return member?.activity !== undefined || !this.view.startable(task.attempt.ownerId)
         })
         if (running !== (clocked.executionTime.since !== undefined)) { executionClock(clocked, running, this.now()); this.store.put('missions', clocked) }
       }
