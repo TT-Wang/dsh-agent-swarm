@@ -9,7 +9,7 @@
  */
 import { id } from './store.ts'
 import { TERMINAL_STATES, holdsOpenAttempt, openAttempt, pendingStopOwner, quiescencePending, subjectsOfTasks, taskSubject, terminal } from './task-graph.ts'
-import { eligible, isolationViolation, noticeSubjectsFor, overdueStop, ready, startBlocker, unschedulable } from './board.ts'
+import { asksHandle, eligible, isolationViolation, noticeSubjectsFor, overdueStop, ready, startBlocker, takesWork, unschedulable } from './board.ts'
 import { factKey, type Notices } from './notices.ts'
 import { AdmissionRefusedError } from './scheduler.ts'
 import { awaited, formatSpan, progressed, type Kernel, type PassState, type SchedulingPass } from './kernel.ts'
@@ -97,11 +97,10 @@ export class Scheduling {
         const order = end > 0 ? rotation.slice(0, end) : rotation
         // R15-A5: before it decides anything, the sweep has the adapter wake the
         // input each handle it asks about holds that no driver will claim
-        // (`WorkerAdapter.drainStrandedInbox`): a live member's that owes no
-        // stop and is not parked (the parked-member hatch never asks about its
-        // handle). Every ask below then reads the handles that step left, and
-        // asking drains nothing.
-        for (const member of order) if (memberPhaseOf(member) === 'active' && !pendingStopOwner(tasks, member.id)) this.k.workers.drainStrandedInbox(member.id)
+        // (`WorkerAdapter.drainStrandedInbox`): the handle of a member that takes
+        // work (`takesWork`) and that a decision asks about (`asksHandle`). Every
+        // ask below then reads the handles that step left, and asking drains nothing.
+        for (const member of order) if (takesWork(tasks, member) && asksHandle(member)) this.k.workers.drainStrandedInbox(member.id)
         let memberSince = this.k.now()
         for (const [index, member] of order.entries()) {
           if (this.k.shuttingDown || this.k.mission(missionId).status !== 'active') return false
@@ -113,8 +112,7 @@ export class Scheduling {
           }
           memberSince = this.k.now()
           progressed(pass, this.k.now())
-          if (memberPhaseOf(member) === 'stopped') continue
-          if (pendingStopOwner(this.k.store.list('tasks', missionId), member.id)) continue
+          if (!takesWork(this.k.store.list('tasks', missionId), member)) continue
           // Round 14: one member's guard chain must never abort the whole sweep.
           // Before this, a guard that threw here (the field evidence: "Member has
           // uncommitted commits" while an owner tried to preserve a cut-off

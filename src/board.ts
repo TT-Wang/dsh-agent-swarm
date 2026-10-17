@@ -170,9 +170,9 @@ export function readBoard(store: Pick<SwarmStore, 'get' | 'list' | 'latestTaskEv
  * both answer with the same predicate.
  *
  * Guards it can co-fire with:
- * - the parked-member hatch (`memberPhaseOf(member) === 'parked'`, R10-09/S3): a
- *   parked member is startable even when the adapter reports its handle busy,
- *   so the hatch wins here exactly as it does in `Scheduling.dispatch`;
+ * - the parked-member hatch (`asksHandle`, R10-09/S3): a parked member is
+ *   startable even when the adapter reports its handle busy, so the hatch wins
+ *   here exactly as it does in `Scheduling.dispatch`;
  * - the adapter's `isIdle` precondition (`HarnessWorkers.isIdle`), which answers
  *   an idle handle holding stranded input startable instead of stranding the
  *   member; the dispatch sweep has the adapter wake that input before it asks
@@ -182,9 +182,20 @@ export function readBoard(store: Pick<SwarmStore, 'get' | 'list' | 'latestTaskEv
  *   the dispatch question refuses to answer for a task with an open attempt.
  */
 export function startBlocker(view: AdapterView, member: Member): 'handle-busy' | undefined {
-  if (memberPhaseOf(member) === 'parked') return undefined
+  if (!asksHandle(member)) return undefined
   return view.startable(member.id) ? undefined : 'handle-busy'
 }
+
+/**
+ * R10-09/S3, the parked-member hatch: whether a decision asks the adapter about
+ * this member's handle. It never asks about a parked member's: an assignment is
+ * exactly the fresh input that unparks it, so its handle's answer cannot leave
+ * the board silent. A row alone.
+ */
+export function asksHandle(member: Member): boolean { return memberPhaseOf(member) !== 'parked' }
+
+/** Whether a decision can hand this member work: it is not stopped and owes no stop. Rows alone. */
+export function takesWork(tasks: readonly Task[], member: Member): boolean { return memberPhaseOf(member) !== 'stopped' && !pendingStopOwner(tasks, member.id) }
 
 /**
  * The tokens `members` are spending in model requests that have reported no
@@ -216,8 +227,8 @@ export function ready(board: Board, task: Task, member: Member): boolean {
   return readinessBlocker(board, task, member) === undefined
 }
 
-/** The dispatcher's eligibility, which every reader of a dispatchable task asks: a live member that owes no stop, for which the task is ready. */
-export function eligible(board: Board, task: Task, member: Member): boolean { return memberPhaseOf(member) !== 'stopped' && !pendingStopOwner(board.tasks, member.id) && ready(board, task, member) }
+/** The dispatcher's eligibility, which every reader of a dispatchable task asks: a member that takes work (`takesWork`), for which the task is ready. */
+export function eligible(board: Board, task: Task, member: Member): boolean { return takesWork(board.tasks, member) && ready(board, task, member) }
 
 /** Spec §2: the dispatchable work, each pending task an idle or waiting member is eligible for; a working member is already busy. */
 export function dispatchable(board: Board): Task[] {
