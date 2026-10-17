@@ -8,6 +8,9 @@
  *    made outside the mission queue during the preparation (here a challenge of
  *    the prerequisite's claim) changes a row other than the task's own, and the
  *    fresh-row check reads it (the kept interleaving of scheduler-snapshot S1);
+ *  - both ask one fresh-row rule (`stillChosen`): a change of the chosen row's
+ *    epoch or of any field of its assignment during the preparation drops the
+ *    sweep's choice and refuses the claim, though the row is still ready;
  *  - dispatch alone also decides the isolation invariant again on the board
  *    the preparation left: a worktree shared during the await is refused and
  *    recorded there (S7's decide, record, skip), never assigned into;
@@ -153,6 +156,48 @@ test('claim reads the board again after preparing: a prerequisite challenged dur
   await assert.rejects(claim, error => error.code === 'task_changed_during_preparation', 'the claim is refused by the board read after the await')
   const row = taskOf(f.runtime, f.dependent.id)
   assert.deepEqual([row.status, row.attempt, row.epoch], ['pending', undefined, f.dependent.epoch])
+})
+
+test('dispatch and claim ask one fresh-row rule after preparing: a changed epoch or assignment field drops the sweep\'s choice and refuses the claim, though the row is still ready', async t => {
+  // Each change is committed outside the mission queue during the preparation
+  // and leaves the dependent pending and ready for the author, its assignee,
+  // so only the fresh-row rule (`stillChosen`) can see it.
+  const changes = {
+    epoch: row => ({ epoch: row.epoch + 1 }),
+    assigneeId: () => ({ assigneeId: undefined }),
+    plannedAssigneeId: (_row, f) => ({ plannedAssigneeId: f.reviewer.id }),
+    assignmentMode: row => ({ assignmentMode: row.assignmentMode === 'preferred' ? 'pinned' : 'preferred' }),
+  }
+  for (const [field, change] of Object.entries(changes)) {
+    const changeDuringPreparation = f => {
+      f.runtime.commit(f.mission.id, () => { const row = taskOf(f.runtime, f.dependent.id); f.runtime.store.put('tasks', { ...row, ...change(row, f) }) })
+      const changed = taskOf(f.runtime, f.dependent.id)
+      assert.notEqual(changed[field], f.dependent[field], `the commit changed ${field}`)
+      assert.ok(ready(f.runtime.boardOf(f.mission.id), changed, f.author), `the changed ${field} leaves the dependent ready for the author`)
+      return changed
+    }
+    const swept = await fixture(t)
+    swept.workers.idle.add(swept.author.id)
+    swept.runtime.kick(swept.mission.id)
+    await swept.entered.promise
+    const changed = changeDuringPreparation(swept)
+    swept.gate.resolve()
+    await swept.runtime.settle(swept.mission.id)
+    const claimed = () => events(swept.runtime, swept.mission.id, 'task/claimed').filter(event => event.data.taskId === swept.dependent.id).length
+    const row = taskOf(swept.runtime, swept.dependent.id)
+    assert.deepEqual([row.status, row.attempt, claimed()], ['pending', undefined, 0], `a changed ${field} drops the sweep's choice: nothing is assigned on the preparation of the row it chose`)
+    swept.runtime.kick(swept.mission.id)
+    await swept.runtime.settle(swept.mission.id)
+    const dispatched = taskOf(swept.runtime, swept.dependent.id)
+    assert.deepEqual([dispatched.status, dispatched.epoch, claimed(), swept.workers.prepared.filter(prepared => prepared.taskId === swept.dependent.id).map(prepared => prepared.epoch)],
+      ['running', changed.epoch + 1, 1, [swept.dependent.epoch + 1, changed.epoch + 1]], `the next sweep prepares the row with the changed ${field} and assigns it`)
+    const asked = await fixture(t)
+    const claim = asked.runtime.claim(asked.actor(asked.author), asked.mission.id, asked.dependent.id)
+    await asked.entered.promise
+    changeDuringPreparation(asked)
+    asked.gate.resolve()
+    await assert.rejects(claim, error => error.code === 'task_changed_during_preparation', `a changed ${field} refuses the claim`)
+  }
 })
 
 test('dispatch asserts admission before preparing: a refused admission is recorded and no workspace is prepared for it', async t => {
