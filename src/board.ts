@@ -230,6 +230,33 @@ export function ready(board: Board, task: Task, member: Member): boolean {
 /** The dispatcher's eligibility, which every reader of a dispatchable task asks: a member that takes work (`takesWork`), for which the task is ready. */
 export function eligible(board: Board, task: Task, member: Member): boolean { return takesWork(board.tasks, member) && ready(board, task, member) }
 
+/**
+ * The fresh-row rule a choice made before an await asks after it, because
+ * other mutators commit outside the mission queue during the await: the row
+ * chosen, as this board holds it, while its epoch and its assignment are
+ * unchanged; otherwise undefined, and the choice no longer stands. Readiness
+ * is each caller's own: the dispatch sweep asks `eligible`, the predicate that
+ * chose (`stillDispatchable`), and a claim asks `ready`, leaving a stop owed to
+ * the admission.
+ */
+export function stillChosen(board: Board, chosen: Task): Task | undefined {
+  const fresh = board.tasks.find(task => task.id === chosen.id)
+  return fresh !== undefined && fresh.epoch === chosen.epoch && fresh.assigneeId === chosen.assigneeId
+    && fresh.plannedAssigneeId === chosen.plannedAssigneeId && fresh.assignmentMode === chosen.assignmentMode ? fresh : undefined
+}
+
+/**
+ * The dispatch sweep's choice after its preparation await: the chosen row
+ * (`stillChosen`) while the member is still `eligible` for it; otherwise
+ * undefined, and the work waits for a later sweep. The sweep asks it before
+ * the assignment and before it records a preparation failure, so a stop the
+ * member came to owe during the await drops the choice on either outcome.
+ */
+export function stillDispatchable(board: Board, chosen: Task, member: Member): Task | undefined {
+  const fresh = stillChosen(board, chosen)
+  return fresh !== undefined && eligible(board, fresh, member) ? fresh : undefined
+}
+
 /** Spec §2: the dispatchable work, each pending task an idle or waiting member is eligible for; a working member is already busy. */
 export function dispatchable(board: Board): Task[] {
   const runnable = board.members.filter(member => member.status === 'idle' || member.status === 'waiting')

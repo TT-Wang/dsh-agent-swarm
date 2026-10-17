@@ -11,7 +11,7 @@ import { Notices, NOTICE_TEMPLATES, REJECTION_DECISION_TRIGGER, assignmentCurren
 import { RefusalRegistry, requireStrings, requireText, sameChecks, unsupportedEffort, validatedBudget } from './refusals.ts'
 import { Scheduling } from './scheduling.ts'
 import { progressed, type Kernel, type SchedulingPass } from './kernel.ts'
-import { ADMISSION_REFUSED, AUTOMATIC_REVIEW_PREFIX, bounds, capable, completionError, fingerprintBoard, inFlightEstimate, missionFingerprint, noticeSubjectsFor, readBoard, readinessBlocker, readMission, ready, rerouteTarget, reviewable, reviewNeed, reviewPathBlocker, reviewPathStalled, unreviewedSources, unschedulable, type AdapterView, type Board, type Bounds, type ReviewNeed } from './board.ts'
+import { ADMISSION_REFUSED, AUTOMATIC_REVIEW_PREFIX, bounds, capable, completionError, fingerprintBoard, inFlightEstimate, missionFingerprint, noticeSubjectsFor, readBoard, readinessBlocker, readMission, ready, rerouteTarget, reviewable, reviewNeed, reviewPathBlocker, reviewPathStalled, stillChosen, unreviewedSources, unschedulable, type AdapterView, type Board, type Bounds, type ReviewNeed } from './board.ts'
 // R17-G6/G7: the one derivation of mission derived state and its host projection.
 import { deriveMemberStatus, memberPhaseOf, memberDeliveryHealth, type MissionBoardMember } from './projection.ts'
 export { emptyUsage, addUsage } from './gates.ts'
@@ -1190,10 +1190,8 @@ export class SwarmRuntime implements Kernel {
       const { graph } = this.boardOf(missionId)
       await this.workers.prepareTask(member, { ...task, epoch: task.epoch + 1 }, graph.effectiveDependencies(task), graph.reviewSource(task))
       this.active(actor, missionId)
-      const fresh = this.task(missionId, taskId)
-      if (fresh.epoch !== task.epoch || fresh.assigneeId !== task.assigneeId
-        || fresh.plannedAssigneeId !== task.plannedAssigneeId || fresh.assignmentMode !== task.assignmentMode
-        || !ready(this.boardOf(missionId), fresh, member)) throw new PolicyError('task_changed_during_preparation', 'conflict_error', 'Task changed while preparing its workspace')
+      const board = this.boardOf(missionId), fresh = stillChosen(board, task)
+      if (fresh === undefined || !ready(board, fresh, member)) throw new PolicyError('task_changed_during_preparation', 'conflict_error', 'Task changed while preparing its workspace')
       const result = this.assign(fresh, member)
       this.kick(missionId)
       return result
