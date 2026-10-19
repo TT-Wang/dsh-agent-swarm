@@ -446,9 +446,11 @@ export class Attempts {
    * recorded on that attempt (`turnEnded`), in the one commit that also clears
    * the member's activity, so the dispatch sweep can nudge it and, when the
    * bounded retry is exhausted, checkpoint the workspace before any
-   * reassignment. A commit the writer refuses records nothing, so that turn end
-   * gets no nudge: the attempt reporting bound names the attempt and its lease
-   * expiry frees it.
+   * reassignment. A commit the writer refuses records nothing: that turn end
+   * gets no nudge, and the attempt's lease expiry frees it. The attempt
+   * reporting bound names it before that only when its own bound passes first
+   * (at the default bounds the lease runs out first) and the member row records
+   * no operation (an activity end the same writer refused leaves one recorded).
    */
   onIdle(memberId: string): void {
     if (this.k.closed || this.k.shuttingDown) return
