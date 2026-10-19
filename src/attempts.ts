@@ -7,11 +7,11 @@
  */
 import { id } from './store.ts'
 import { TERMINAL_STATES, blockCauses, holdsAttempt, holdsOpenAttempt, openAttempt, stopPending, taskSubject, terminal, type BlockCause, type HeldTask } from './task-graph.ts'
-import { parkedHolder, stopFaultKey, type Notices } from './notices.ts'
+import { parkedHolder, silenceNotice, stopFaultKey, type Notices, type SilentOperation } from './notices.ts'
 import { heldByParkedMember } from './board.ts'
 import { memberPhaseOf } from './projection.ts'
 import { PolicyError } from './policy-error.ts'
-import { awaited, formatSpan, type Kernel, type SchedulingPass } from './kernel.ts'
+import { awaited, type Kernel, type SchedulingPass } from './kernel.ts'
 import type { Artifact, Member, Mission, Task, WorkerActivity } from './types.ts'
 
 /**
@@ -71,22 +71,6 @@ export function endAttempt(task: Task): void {
 const DEFAULT_IDLE_CLOSEOUTS = 2
 /** Renewal allowance per model output token, so a long model call keeps its lease. */
 const LEASE_MS_PER_OUTPUT_TOKEN = 20
-/** F1: one in-flight operation that has produced nothing beyond the declared bound. */
-interface SilentOperation {
-  attemptId: string
-  ownerId: string
-  activityId: string
-  kind: WorkerActivity['kind']
-  tool?: string
-  /** When the operation itself started. */
-  startedAt: number
-  /** Newest durable recording on this attempt, 0 when the attempt never recorded. */
-  lastRecordedAt: number
-  /** `max(startedAt, lastRecordedAt)`: the instant this silence began. */
-  silentSince: number
-  elapsedMs: number
-  boundMs: number
-}
 
 export class Attempts {
   /** Retry timing is disposable; the fenced task row owns the recovery obligation. */
@@ -301,18 +285,19 @@ export class Attempts {
     return this.fenceRow(task, { status: options.status, reason: options.reason ?? 'handoff', memberId: holdsOpenAttempt(task) ? task.attempt.ownerId : undefined, cause: options.cause })
   }
   /**
-   * The live operation an attempt currently holds, or undefined when none is
-   * live. This is the liveness rule renewal has always used: the durable member
-   * activity is the record, and the adapter's current activity must confirm
-   * that exact operation is still the live one.
+   * The live operation an attempt currently holds, with the member row that
+   * records it, or undefined when none is live. This is the liveness rule
+   * renewal has always used: the durable member activity is the record, and the
+   * adapter's current activity must confirm that exact operation is still the
+   * live one.
    */
-  private liveOperation(task: Task): WorkerActivity | undefined {
+  private liveOperation(task: Task): { holder: Member; activity: WorkerActivity } | undefined {
     const ownerId = task.attempt?.ownerId
     if (ownerId === undefined) return undefined
-    const activity = this.k.store.get('members', ownerId)?.activity
-    if (activity === undefined) return undefined
+    const holder = this.k.store.get('members', ownerId)
+    if (holder?.activity === undefined) return undefined
     const observed = this.k.view.activity(ownerId)
-    return observed !== undefined && observed.id === activity.id ? activity : undefined
+    return observed !== undefined && observed.id === holder.activity.id ? { holder, activity: holder.activity } : undefined
   }
   /**
    * F1: the bound that applies to one operation, i.e. the operations that
@@ -349,13 +334,21 @@ export class Attempts {
    * since `silentSince`: the `tool_runs` rows are the recording, `0` when the
    * attempt never recorded. A recording mid-operation (a sibling tool
    * returning, a retry recorded) moves that instant forward, so an operation
-   * that is still producing something cannot trip the bound.
+   * that is still producing something cannot trip the bound. The owner is told
+   * once per silence (`silenceNotice`). This guard can co-fire with the
+   * lease-expiry path (the operation stops being liveness, so the existing
+   * recovery frees the attempt), the scheduling stall detector (an in-flight
+   * operation is progress, so the board-level stall notice must stay silent
+   * while this one names the stuck call) and the task-ceiling path (which
+   * blocks the task and drops the attempt, after which no operation remains to
+   * watch).
    */
   silentOperation(task: Task, mission: Mission): SilentOperation | undefined {
     const attempt = task.attempt
     if (attempt === undefined) return undefined
-    const activity = this.liveOperation(task)
-    if (activity === undefined) return undefined
+    const live = this.liveOperation(task)
+    if (live === undefined) return undefined
+    const { holder, activity } = live
     // One operation belongs to the attempt it started under; an operation
     // recorded under a different attempt is not this task's stuck call.
     if (activity.attemptId !== undefined && activity.attemptId !== attempt.id) return undefined
@@ -366,38 +359,10 @@ export class Attempts {
     const elapsedMs = this.k.now() - silentSince
     if (elapsedMs < boundMs) return undefined
     return {
-      attemptId: attempt.id, ownerId: attempt.ownerId, activityId: activity.id, kind: activity.kind,
+      family: 'operation-silent', holder, attemptId: attempt.id, activityId: activity.id, kind: activity.kind,
       ...(activity.tool === undefined ? {} : { tool: activity.tool }),
       startedAt: activity.startedAt, lastRecordedAt, silentSince, elapsedMs, boundMs,
     }
-  }
-  /**
-   * F1: one durable witness plus one owner escalation per silent operation. The
-   * dedup key is the operation identity and the instant its silence began, so an
-   * unchanged stuck call never repeats, a recording that resumes progress
-   * re-arms the clock, and a genuinely new silence warns again. This guard can
-   * co-fire with the lease-expiry path (the operation stops being liveness, so
-   * the existing recovery frees the attempt), the scheduling stall detector (an
-   * in-flight operation is progress, so the board-level stall notice must stay
-   * silent while this one names the stuck call) and the task-ceiling path (which
-   * blocks the task and drops the attempt, after which no operation remains to
-   * watch).
-   */
-  private escalateSilentOperation(mission: Mission, task: Task, silent: SilentOperation): void {
-    const member = this.k.store.get('members', silent.ownerId)
-    const name = member === undefined ? silent.ownerId : `${member.name} (${member.id})`
-    const what = silent.tool === undefined ? `a ${silent.kind} operation` : `a ${silent.kind} operation \`${silent.tool}\``
-    const message = `${name} has held ${what} for ${formatSpan(silent.elapsedMs)} (${silent.elapsedMs}ms) without recording anything, past its declared bound of ${formatSpan(silent.boundMs)}: task ${task.id} "${task.title}", attempt ${silent.attemptId}. The operation no longer counts as liveness, so the lease is not renewed and the attempt expires into the existing recovery, which stops the worker and re-pends the task. Owner actions: inspect the stuck call with swarm_observe (taskId ${task.id}), raise operationBoundMs if the operation is genuinely long, or withdraw the work with swarm_cancel. [witness: activity ${silent.activityId}, kind ${silent.kind}${silent.tool === undefined ? '' : `, tool ${silent.tool}`}, attempt ${silent.attemptId}, startedAt ${silent.startedAt}, lastRecordedAt ${silent.lastRecordedAt}, elapsedMs ${silent.elapsedMs}, boundMs ${silent.boundMs}]`
-    // The durable witness is the owner delivery row itself, on the
-    // deliveries ledger. A dedicated
-    // `task/operation-silent` event type would need its own registry row in
-    // src/events.ts, outside this task's write scope; that exact change is
-    // named as a hand-off in the submission.
-    // R15-A1: the silent operation names its own task. Guard pair: F1 operation
-    // silence x lease expiry x the board-level stall — the subject is this task's
-    // identity, so a healthy sibling's notices never consume the clock of this
-    // one (they carry different subjects and different dedup keys).
-    this.notices.record(mission.id, { content: message, subjects: [taskSubject(task)], options: { noticeClass: 'stall', dedupKey: `operation-silent:${silent.attemptId}:${silent.activityId}:${silent.silentSince}` } })
   }
   /**
    * Renew only a still-owned native operation, bounded by the owner's actual
@@ -421,8 +386,8 @@ export class Attempts {
     // A live operation is liveness for its full duration: match by member and
     // activity id, never by the attempt the operation happens to be stored under.
     // The adapter must confirm the operation is live; a durable activity alone never renews.
-    const activity = this.liveOperation(task)
-    if (activity === undefined) {
+    const live = this.liveOperation(task)
+    if (live === undefined) {
       if (task.attempt.leaseWarned !== task.attempt.leaseUntil) {
         task.attempt.leaseWarned = task.attempt.leaseUntil
         this.k.commit(mission.id, () => {
@@ -433,8 +398,7 @@ export class Attempts {
       return task
     }
     if (silent) return task
-    const member = this.k.store.get('members', task.attempt.ownerId)
-    const modelAllowance = activity.kind === 'model' ? (member?.maxOutputTokens ?? 0) : 0
+    const modelAllowance = live.activity.kind === 'model' ? (live.holder.maxOutputTokens ?? 0) : 0
     task.attempt.leaseUntil = Math.min(mission.deadline, this.k.now() + this.k.config.leaseMs + Math.ceil(modelAllowance * LEASE_MS_PER_OUTPUT_TOKEN))
     delete task.attempt.leaseWarned
     // A lease extension is liveness bookkeeping, not a new progress timestamp or milestone.
@@ -567,7 +531,7 @@ export class Attempts {
           // declared bound is named to the owner once, and stops renewing the
           // lease so the existing expiry path can free the attempt.
           const silent = this.silentOperation(task, mission)
-          if (silent !== undefined) this.escalateSilentOperation(mission, task, silent)
+          if (silent !== undefined) this.notices.record(missionId, silenceNotice(task, silent))
           const renewed = this.renewActiveOperation(task.id, attemptId, mission, silent !== undefined)
           if (renewed === undefined || renewed.attempt.leaseUntil >= this.k.now()) continue
           task = renewed

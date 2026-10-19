@@ -12,9 +12,9 @@ import { guardTerminal, guardTerminalKey, type GuardChainId, type GuardTerminal,
 import { TERMINAL_STATES, holdsAttempt, missionSubject, stopPending, subjectsOfTasks, taskSubject, terminal } from './task-graph.ts'
 import { WriterBusyError, id, type SwarmStore } from './store.ts'
 import type { EventKind } from './events.ts'
-import { awaited, type Kernel, type PassState, type SchedulingPass } from './kernel.ts'
+import { awaited, formatSpan, type Kernel, type PassState, type SchedulingPass } from './kernel.ts'
 import { completionError, dependentsOf, eligible, fingerprintBoard, heldByParkedMember, interpret, isolationIssues, missionFingerprint, newestReviewBlock, noticeSubjectsFor, overdueStop, reviewNeed, reviewPathBlocker, reviewPathStalled, stallRoots, startBlocker, unreviewedSources, waitsLegitimately, type Board, type Interpretation } from './board.ts'
-import type { Delivery, Escalation, Member, Mission, NoticeClass, Task } from './types.ts'
+import type { Delivery, Escalation, Member, Mission, NoticeClass, Task, WorkerActivity } from './types.ts'
 
 /**
  * R15-A1: a notice without a subject is unattributable, so it is refused rather
@@ -571,6 +571,70 @@ export function reviewBlocked(board: Pick<Board, 'missionId' | 'tasks' | 'record
   return { content, subjects: subjectsOfTasks([row], { id: board.missionId }),
     options: { dedupKey: reviewBlockedKey(board.missionId, row.id, need, reason), trigger: NOTICE_TEMPLATES['review-blocked'].trigger, reason, statement },
     event: { type: 'task/review-blocked', data: { taskId: source.id, kind: source.kind, reason }, whenHeld: newestReviewBlock(board.records, board.missionId, source.id)?.reason !== reason } }
+}
+
+/**
+ * F1: one in-flight operation that has recorded nothing past its declared
+ * bound (`Attempts.silentOperation`), with the member row that records it.
+ */
+export interface SilentOperation {
+  family: 'operation-silent'
+  holder: Member
+  attemptId: string
+  activityId: string
+  kind: WorkerActivity['kind']
+  tool?: string
+  /** When the operation itself started. */
+  startedAt: number
+  /** Newest durable recording on this attempt, 0 when the attempt never recorded. */
+  lastRecordedAt: number
+  /** `max(startedAt, lastRecordedAt)`: the instant this silence began. */
+  silentSince: number
+  elapsedMs: number
+  boundMs: number
+}
+/**
+ * R16-D: one live attempt whose durable progress is past its declared bound
+ * (`Scheduling.silentAttempt`), with the member row that holds it and, while
+ * the mission's scheduling pass is wedged, that pass: the path that would
+ * otherwise have named the attempt.
+ */
+export interface SilentAttempt {
+  family: 'attempt-silent'
+  holder: Member
+  /** The notice subject (`taskId@epoch`). */
+  subject: string
+  attemptId: string
+  /** Newest durable row attributable to the attempt; 0 when only the dispatch exists. */
+  lastDurableAt: number
+  /** `now - lastDurableAt`. */
+  silentMs: number
+  boundMs: number
+  wedgedPass?: { operationId: string; boundMs: number }
+}
+
+/**
+ * What one silence owes the owner, once per silence. The operation silence
+ * (F1) and the attempt silence (R16-D) each keep their own verdict, dedup
+ * family and text; their notice is one shape. It names the silent task at its
+ * epoch (R15-A1), so a healthy sibling's notices, which carry other subjects
+ * and keys, never consume its clock, and it is a stall-class notice keyed by
+ * the silence's identity and the instant it began: an unchanged silence is
+ * told once, and a recording that resumes progress re-arms it. Its delivery
+ * row is the durable witness; neither silence has an event type of its own.
+ */
+export function silenceNotice(task: Task, silence: SilentOperation | SilentAttempt): Notice {
+  const holder = `${silence.holder.name} (${silence.holder.id})`
+  const told = (content: string, dedupKey: string): Notice => ({ content, subjects: [taskSubject(task)], options: { noticeClass: 'stall', dedupKey } })
+  if (silence.family === 'operation-silent') {
+    const what = silence.tool === undefined ? `a ${silence.kind} operation` : `a ${silence.kind} operation \`${silence.tool}\``
+    return told(`${holder} has held ${what} for ${formatSpan(silence.elapsedMs)} (${silence.elapsedMs}ms) without recording anything, past its declared bound of ${formatSpan(silence.boundMs)}: task ${task.id} "${task.title}", attempt ${silence.attemptId}. The operation no longer counts as liveness, so the lease is not renewed and the attempt expires into the existing recovery, which stops the worker and re-pends the task. Owner actions: inspect the stuck call with swarm_observe (taskId ${task.id}), raise operationBoundMs if the operation is genuinely long, or withdraw the work with swarm_cancel. [witness: activity ${silence.activityId}, kind ${silence.kind}${silence.tool === undefined ? '' : `, tool ${silence.tool}`}, attempt ${silence.attemptId}, startedAt ${silence.startedAt}, lastRecordedAt ${silence.lastRecordedAt}, elapsedMs ${silence.elapsedMs}, boundMs ${silence.boundMs}]`,
+      `operation-silent:${silence.attemptId}:${silence.activityId}:${silence.silentSince}`)
+  }
+  const since = silence.lastDurableAt === 0 ? 'it was dispatched' : `durable row at ${silence.lastDurableAt}`
+  const wedged = silence.wedgedPass === undefined ? '' : ` The mission's scheduling pass ${silence.wedgedPass.operationId} is wedged past its ${silence.wedgedPass.boundMs}ms bound, so the in-pass recovery sweep cannot run either.`
+  return told(`${holder} has held task ${task.id} "${task.title}" at epoch ${task.epoch} (attempt ${silence.attemptId}) for ${formatSpan(silence.silentMs)} (${silence.silentMs}ms) with no durable report past its declared bound of ${formatSpan(silence.boundMs)} (${silence.boundMs}ms): no durable event, no task state transition and no recorded tool run names this attempt since ${since}; no operation is in flight and the idle close-out is not handling it.${wedged} Nothing was stopped or re-pended by this notice: the attempt may still be working. Owner actions: inspect it with swarm_observe (taskId ${task.id}), send it input or finish it with swarm_handoff, raise attemptSilenceBoundMs if this silence is healthy, or withdraw the work with swarm_cancel. [witness: attempt-silent, subject ${silence.subject}, attempt ${silence.attemptId}, member ${silence.holder.id}, lastDurableAt ${silence.lastDurableAt}, silentMs ${silence.silentMs}, boundMs ${silence.boundMs}]`,
+    `attempt-silent:${silence.attemptId}:${silence.lastDurableAt}`)
 }
 
 /**

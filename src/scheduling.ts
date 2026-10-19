@@ -10,9 +10,9 @@
 import { id } from './store.ts'
 import { TERMINAL_STATES, holdsOpenAttempt, openAttempt, pendingStopOwner, quiescencePending, subjectsOfTasks, taskSubject, terminal, turnEnded } from './task-graph.ts'
 import { asksHandle, eligible, isolationViolation, noticeSubjectsFor, overdueStop, startBlocker, stillDispatchable, takesWork, unschedulable } from './board.ts'
-import { factKey, type Notices } from './notices.ts'
+import { factKey, silenceNotice, type Notices, type SilentAttempt } from './notices.ts'
 import { AdmissionRefusedError } from './scheduler.ts'
-import { awaited, formatSpan, progressed, type Kernel, type PassState, type SchedulingPass } from './kernel.ts'
+import { awaited, progressed, type Kernel, type PassState, type SchedulingPass } from './kernel.ts'
 // R17-G6/G7: the one derivation of the derived member status.
 import { memberPhaseOf } from './projection.ts'
 import type { Attempts } from './attempts.ts'
@@ -29,25 +29,6 @@ export type DispatchKernel = Kernel & {
   startWorker(mission: Mission, member: Member, options: { pass?: SchedulingPass }): Promise<void>
   assign(task: Task, member: Member): Task
 }
-
-/** R16-D: the dedup-key family of the attempt reporting-bound escalation. */
-const ATTEMPT_SILENCE_PREFIX = 'attempt-silent:'
-
-/** R16-D: one live attempt whose durable progress is past its declared bound. */
-interface SilentAttempt {
-  taskId: string
-  epoch: number
-  /** The notice subject (`taskId@epoch`). */
-  subject: string
-  attemptId: string
-  ownerId: string
-  /** Newest durable row attributable to the attempt; 0 when only the dispatch exists. */
-  lastDurableAt: number
-  /** `now - lastDurableAt`. */
-  silentMs: number
-  boundMs: number
-}
-
 
 export class Scheduling {
   /**
@@ -588,7 +569,11 @@ export class Scheduling {
    * ----------------------------------------------------------------------- */
 
   /**
-   * R16-D: one live attempt whose durable progress is past its declared bound.
+   * R16-D: one live attempt whose durable progress is past its declared bound,
+   * with the member row that holds it and, while this mission's scheduling pass
+   * is past its bound (`pastBound`), that pass. The pass state is part of the honesty
+   * of the claim: the same guard fires whether or not the pass is running, and
+   * the reader must know which path would otherwise have named the attempt.
    * `subject` is the attempt's task@epoch, the identity the escalation carries.
    */
   silentAttempt(task: Task, mission: Mission, now = this.k.now()): SilentAttempt | undefined {
@@ -609,7 +594,9 @@ export class Scheduling {
     const lastDurableAt = this.lastDurableAt(mission.id, task, attempt)
     const silentMs = now - lastDurableAt
     if (silentMs < boundMs) return undefined
-    return { taskId: task.id, epoch: task.epoch, subject: taskSubject(task), attemptId: attempt.id, ownerId: attempt.ownerId, lastDurableAt, silentMs, boundMs }
+    const pass = this.passes.get(mission.id)
+    return { family: 'attempt-silent', holder: member, subject: taskSubject(task), attemptId: attempt.id, lastDurableAt, silentMs, boundMs,
+      ...(pass !== undefined && this.pastBound(pass) ? { wedgedPass: { operationId: pass.operationId, boundMs: this.k.bounds.stallPassTimeoutMs } } : {}) }
   }
 
   /**
@@ -629,25 +616,9 @@ export class Scheduling {
     for (const task of this.k.store.list('tasks', missionId)) {
       const silent = this.silentAttempt(task, mission)
       if (silent === undefined) continue
-      if (this.escalateSilentAttempt(mission, task, silent)) fired += 1
+      if (this.notices.record(missionId, silenceNotice(task, silent))) fired += 1
     }
     return fired
-  }
-
-  /** One durable owner escalation per silence; returns false when it was already named. */
-  private escalateSilentAttempt(mission: Mission, task: Task, silent: SilentAttempt): boolean {
-    const member = this.k.store.get('members', silent.ownerId)
-    const name = member === undefined ? silent.ownerId : `${member.name} (${member.id})`
-    const since = silent.lastDurableAt === 0 ? 'it was dispatched' : `durable row at ${silent.lastDurableAt}`
-    // The pass state is part of the honesty of the claim: the same guard fires
-    // whether or not the pass is running, and the reader must know which path
-    // would otherwise have named the attempt.
-    const pass = this.passes.get(mission.id)
-    const passState = pass !== undefined && this.passWedged(mission.id)
-      ? ` The mission's scheduling pass ${pass.operationId} is wedged past its ${this.k.bounds.stallPassTimeoutMs}ms bound, so the in-pass recovery sweep cannot run either.`
-      : ''
-    const message = `${name} has held task ${task.id} "${task.title}" at epoch ${task.epoch} (attempt ${silent.attemptId}) for ${formatSpan(silent.silentMs)} (${silent.silentMs}ms) with no durable report past its declared bound of ${formatSpan(silent.boundMs)} (${silent.boundMs}ms): no durable event, no task state transition and no recorded tool run names this attempt since ${since}; no operation is in flight and the idle close-out is not handling it.${passState} Nothing was stopped or re-pended by this notice: the attempt may still be working. Owner actions: inspect it with swarm_observe (taskId ${task.id}), send it input or finish it with swarm_handoff, raise attemptSilenceBoundMs if this silence is healthy, or withdraw the work with swarm_cancel. [witness: attempt-silent, subject ${silent.subject}, attempt ${silent.attemptId}, member ${silent.ownerId}, lastDurableAt ${silent.lastDurableAt}, silentMs ${silent.silentMs}, boundMs ${silent.boundMs}]`
-    return this.notices.record(mission.id, { content: message, subjects: [taskSubject(task)], options: { noticeClass: 'stall', dedupKey: `${ATTEMPT_SILENCE_PREFIX}${silent.attemptId}:${silent.lastDurableAt}` } })
   }
 
   /**
