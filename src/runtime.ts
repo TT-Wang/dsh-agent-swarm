@@ -11,7 +11,7 @@ import { Notices, NOTICE_TEMPLATES, REJECTION_DECISION_TRIGGER, assignmentCurren
 import { RefusalRegistry, requireStrings, requireText, sameChecks, unsupportedEffort, validatedBudget } from './refusals.ts'
 import { Scheduling } from './scheduling.ts'
 import { progressed, type Kernel, type SchedulingPass } from './kernel.ts'
-import { ADMISSION_REFUSED, AUTOMATIC_REVIEW_PREFIX, bounds, capable, completionError, fingerprintBoard, inFlightEstimate, missionFingerprint, noticeSubjectsFor, readBoard, readinessBlocker, readMission, ready, rerouteTarget, reviewable, reviewNeed, reviewPathBlocker, reviewPathStalled, unreviewedSources, unschedulable, type AdapterView, type Board, type Bounds, type ReviewNeed } from './board.ts'
+import { ADMISSION_REFUSED, AUTOMATIC_REVIEW_PREFIX, bounds, capable, completionError, fingerprintBoard, inFlightEstimate, missionFingerprint, noticeSubjectsFor, readBoard, readinessBlocker, readMission, ready, rerouteTarget, reviewable, reviewNeed, reviewPathBlocker, reviewPathStalled, stillChosen, unreviewedSources, unschedulable, type AdapterView, type Board, type Bounds, type ReviewNeed } from './board.ts'
 // R17-G6/G7: the one derivation of mission derived state and its host projection.
 import { deriveMemberStatus, memberPhaseOf, memberDeliveryHealth, type MissionBoardMember } from './projection.ts'
 export { emptyUsage, addUsage } from './gates.ts'
@@ -596,7 +596,7 @@ export class SwarmRuntime implements Kernel {
         const running = clocked.status === 'active' && !clocked.budgetPause && this.store.list('tasks', missionId).some(task => {
           if (!holdsOpenAttempt(task)) return false
           const member = this.store.get('members', task.attempt.ownerId)
-          return member?.activity !== undefined || this.workers.isIdle?.(task.attempt.ownerId) !== true
+          return member?.activity !== undefined || !this.view.startable(task.attempt.ownerId)
         })
         if (running !== (clocked.executionTime.since !== undefined)) { executionClock(clocked, running, this.now()); this.store.put('missions', clocked) }
       }
@@ -640,8 +640,8 @@ export class SwarmRuntime implements Kernel {
   mission(missionId: string): Mission { return readMission(this.store, missionId, this.now) }
   /**
    * The adapter's answers a decision asks, called through to the adapter on
-   * every ask and never memoized: asking whether a handle is idle can drain a
-   * stranded inbox item.
+   * every ask and never memoized: a handle's answer changes as its turns start
+   * and end.
    */
   readonly view: AdapterView = { startable: memberId => this.workers.isIdle(memberId), activity: memberId => this.workers.currentActivity(memberId) }
   /** One mission's board as the store holds it now: a decision reads it where it decides. */
@@ -1190,10 +1190,8 @@ export class SwarmRuntime implements Kernel {
       const { graph } = this.boardOf(missionId)
       await this.workers.prepareTask(member, { ...task, epoch: task.epoch + 1 }, graph.effectiveDependencies(task), graph.reviewSource(task))
       this.active(actor, missionId)
-      const fresh = this.task(missionId, taskId)
-      if (fresh.epoch !== task.epoch || fresh.assigneeId !== task.assigneeId
-        || fresh.plannedAssigneeId !== task.plannedAssigneeId || fresh.assignmentMode !== task.assignmentMode
-        || !ready(this.boardOf(missionId), fresh, member)) throw new PolicyError('task_changed_during_preparation', 'conflict_error', 'Task changed while preparing its workspace')
+      const board = this.boardOf(missionId), fresh = stillChosen(board, task)
+      if (fresh === undefined || !ready(board, fresh, member)) throw new PolicyError('task_changed_during_preparation', 'conflict_error', 'Task changed while preparing its workspace')
       const result = this.assign(fresh, member)
       this.kick(missionId)
       return result
@@ -1331,7 +1329,7 @@ export class SwarmRuntime implements Kernel {
     })
     // M1a seam 5/7: the declared-check execution path is src/declared-checks.ts.
     const checks = await this.declaredChecks.run(prepared.member, prepared.source, prepared.artifact, actor.signal)
-    const reported = this.declaredChecks.recordEnvelope(missionId, input.taskId, prepared.source.id, prepared.member.id)
+    this.declaredChecks.recordEnvelope(missionId, input.taskId, prepared.source.id, prepared.member.id)
     return this.exclusive(missionId, async () => {
       const { task, member } = this.ownAttempt(actor, missionId, input.taskId, input.attemptId)
       const source = this.task(missionId, prepared.source.id)
@@ -1352,7 +1350,7 @@ export class SwarmRuntime implements Kernel {
       // before it is reported. A failed check still blocks the source with its
       // real failure. An acceptance, though, is refused rather than validating
       // an artifact under an environment the host check cannot reproduce.
-      const comparison = this.declaredChecks.reproduce({ missionId, taskId: task.id, sourceTaskId: source.id, attemptId: input.attemptId, memberId: member.id, verdict: input.verdict }, checks, reported)
+      const comparison = this.declaredChecks.reproduce({ missionId, taskId: task.id, sourceTaskId: source.id, attemptId: input.attemptId, memberId: member.id, verdict: input.verdict }, checks)
       if (passed && comparison !== undefined && comparison.blocking.length > 0) {
         this.commit(missionId, () => { this.declaredChecks.recordRuns(missionId, { memberId: member.id, taskId: task.id, attemptId: input.attemptId, commit: artifact.commit }, checks) })
         throw new CheckEnvironmentMismatchError(comparison)
@@ -3178,7 +3176,7 @@ export class SwarmRuntime implements Kernel {
     if (taskCeilingBlock(next, this.now()) === undefined) delete next.ceiling
     // A resume is not a fence: a running attempt keeps running, and its idle
     // close-out restarts from the first nudge; the turn end that armed it stays.
-    if (resumes) { delete next.preparationFailure; delete next.verificationRecovery; delete next.closeout }
+    if (resumes) { delete next.preparationFailure; delete next.verificationRecovery; delete next.attempt?.closeout }
     if (rework !== undefined) this.reopenForRework(next, rework)
     // A rejected submission holds no live attempt: its author is not stopped.
     // Any other attempt the row holds owes its owner's stop, a blocked row's
@@ -3446,8 +3444,8 @@ export class SwarmRuntime implements Kernel {
     // never outlive the mission deadline (the same clamp every other renewal uses).
     task.attempt.leaseUntil = Math.min(this.mission(member.missionId).deadline, this.now() + this.config.leaseMs)
     const denied = deniedGitWrite(input)
-    const firstDenial = denied !== undefined && task.gitWriteDenied === undefined
-    if (firstDenial) task.gitWriteDenied = { command: denied, runId: run.id, at: this.now() }
+    const firstDenial = denied !== undefined && task.attempt.gitWriteDenied === undefined
+    if (firstDenial) task.attempt.gitWriteDenied = { command: denied, runId: run.id, at: this.now() }
     // R11-15: a shared-temp rendezvous is decided before the transaction and
     // recorded atomically with the run.
     const rendezvous = this.workspaceAdmission.tempRendezvous(memberId, task.id, input)

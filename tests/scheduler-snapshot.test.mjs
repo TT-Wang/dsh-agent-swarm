@@ -84,7 +84,7 @@ test('S1: a cancel committed during a lease-expiry await is not reverted by a st
   // Injection 1: a host tool run during the await latches the git-write denial on T1.
   const runId = await workers.callbacks.toolRun(author.id, { tool: 'bash', arguments: { command: 'git commit -m "work"' }, result: { exitCode: 128, output: 'index.lock: Operation not permitted' }, isError: true })
   assert.ok(runId, 'the tool run is recorded')
-  assert.match(taskOf(first.id).gitWriteDenied.command, /git commit/, 'the denial is latched on the running row')
+  assert.match(taskOf(first.id).attempt.gitWriteDenied.command, /git commit/, 'the denial is latched on the running attempt')
   // T1's row as every later commit leaves it.
   const committed = []
   runtime.subscribe(missionId => { if (missionId === mission.id) committed.push(structuredClone(taskOf(first.id))) })
@@ -108,14 +108,13 @@ test('S1: a cancel committed during a lease-expiry await is not reverted by a st
   assert.equal(after.attempt, undefined, 'the cancelled attempt must not be resurrected')
   assert.equal(after.assigneeId, other.id, 'the cancelled row is otherwise unchanged')
   assert.equal(events('task/lease-expired').filter(event => event.data.taskId === second.id).length, 0, 'a cancelled task never expires its lease')
-  // F1: the denial is latched on the attempt. It stays on the row in every
-  // commit while the attempt does, and the expiry fence, written over the
-  // newest row rather than the pre-await snapshot, takes it off with the attempt.
+  // F1: the denial is a field of the attempt. It stays in every commit while
+  // the attempt does, and the expiry fence, written over the newest row rather
+  // than the pre-await snapshot, takes it off the row with the attempt.
   const fencedAt = committed.findIndex(row => row.attempt === undefined)
   assert.ok(fencedAt > 0, 'the expiry fence committed after the rows that held the attempt')
-  assert.ok(committed.slice(0, fencedAt).every(row => row.attempt.id === firstClaim.attempt.id && row.gitWriteDenied?.runId === runId), 'the denial stays while the attempt does')
+  assert.ok(committed.slice(0, fencedAt).every(row => row.attempt.id === firstClaim.attempt.id && row.attempt.gitWriteDenied?.runId === runId), 'the denial stays while the attempt does')
   assert.equal(committed[fencedAt].revision, committed[fencedAt - 1].revision + 1, 'the fence wrote over the newest row')
-  assert.equal(committed[fencedAt].gitWriteDenied, undefined, 'the denial left the row with the expired attempt it was latched on')
   assert.ok(events('task/git-write-denied').some(event => event.data.taskId === first.id), 'the denial is durable')
   assert.equal(taskOf(first.id).checkpoint?.commit, 'c'.repeat(40), 'the checkpoint was captured and committed')
 })

@@ -446,7 +446,7 @@ test('budget resume waits for quiescence then promptly wakes the same long-lived
     assert.equal(current.epoch, claimed.epoch)
     assert.equal(current.attempt.id, claimed.attempt.id)
     assert.ok(current.attempt.leaseUntil > Date.now() + 500000, 'wake is immediate; it does not wait for the ten-minute lease to expire')
-    assert.equal(current.budgetResume, undefined)
+    assert.equal(current.attempt.pausedBy, undefined, 'the resume takes the pause off the attempt it continues')
     assert.equal(f.runtime.snapshot(f.owner, snapshot.mission.id).members.find(member => member.id === builder.id).status, 'working')
     const published = f.runtime.publish(actor, snapshot.mission.id, { taskId: claimed.id, attemptId: claimed.attempt.id, claim: 'Earlier host evidence is still from this attempt', outcome: 'supported', toolRunIds: [run.id] })
     assert.deepEqual(published.toolRunIds, [run.id])
@@ -489,8 +489,7 @@ test('a restarted budget pause promptly assigns a recovered epoch instead of wai
     await recovered.start()
     const task = recovered.snapshot(f.owner, snapshot.mission.id).tasks.find(task => task.id === source.id)
     assert.equal(task.status, 'pending')
-    assert.equal(task.attempt, undefined, 'a host restart retains the existing epoch-fencing policy')
-    assert.equal(task.budgetResume, undefined)
+    assert.equal(task.attempt, undefined, 'a host restart retains the existing epoch-fencing policy, and the pause leaves with the attempt')
     recovered.updateBudget(f.owner, snapshot.mission.id, { ...budget, maxTokens: budget.maxTokens * 2 })
     workers.isIdle = () => true
     recovered.control(f.owner, snapshot.mission.id, 'resume', 'Continue after host restart')

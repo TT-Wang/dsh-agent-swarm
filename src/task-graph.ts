@@ -336,9 +336,9 @@ export function holdsOpenAttempt(task: Task): task is HeldTask {
  * replaces the attempt or touches a row that is not running. So a fencing
  * transition committed since the caller read the attempt fails this check,
  * and a caller that passes it writes over no such transition. The attempt
- * seam's re-reads, the budget resume, a worker tool's authority over its
- * attempt and an assignment delivery's currency all ask it; the last two put
- * their owner check on top.
+ * seam's re-reads, a worker tool's authority over its attempt and an
+ * assignment delivery's currency all ask it; the last two put their owner
+ * check on top.
  */
 export function holdsAttempt(row: Task | undefined, missionId: string, attemptId: string): row is HeldTask {
   return row !== undefined && row.missionId === missionId && holdsOpenAttempt(row) && row.attempt.id === attemptId
@@ -355,27 +355,15 @@ export function openAttempt(tasks: readonly Task[], memberId: string): HeldTask 
 }
 
 /**
- * The markers one attempt writes while it runs: the budget pause that preserved
- * it, its idle close-out (`closeout`, `idleSignal`), its denied git write and
- * its lease warning. A submission or a verdict keeps the attempt on the row as
- * its record, and these markers with it.
+ * W6: the owner of an open attempt ended its turn on it (`Attempts.onIdle`),
+ * the one question of the idle close-out: the dispatch sweep closes out such
+ * an attempt (it nudges, then checkpoints and re-pends with a coded terminal),
+ * and the attempt reporting bound leaves it to the close-out. A turn end is a
+ * fact of the attempt, one of its fields, so it leaves the row only with the
+ * attempt.
  */
-const ATTEMPT_MARKERS = ['budgetResume', 'closeout', 'idleSignal', 'gitWriteDenied', 'leaseWarned'] as const satisfies readonly (keyof Task)[]
-
-/**
- * A row carries only the markers of the attempt it holds: none when it holds no
- * attempt, and no budget pause or idle signal naming another attempt. This
- * drops the rest and says whether it dropped any. The attempt seam settles a
- * row through it when an attempt leaves the row, so a new attempt starts
- * without them; opening a store an older build wrote settles every row once
- * (its schema 6 upgrade).
- */
-export function dropForeignMarkers(task: Task): boolean {
-  const held = task.attempt?.id
-  const foreign = held === undefined ? ATTEMPT_MARKERS.filter(marker => task[marker] !== undefined)
-    : (['budgetResume', 'idleSignal'] as const).filter(marker => task[marker] !== undefined && task[marker].attemptId !== held)
-  for (const marker of foreign) delete task[marker]
-  return foreign.length > 0
+export function turnEnded(open: HeldTask): boolean {
+  return open.attempt.idleSignal !== undefined
 }
 
 /** A fenced handle must finish stopping before that member can own new work. */

@@ -290,63 +290,94 @@ test('a failed lease-expiry checkpoint is audited and wakes the owner', async t 
 })
 
 /**
- * The author ended its turn on an open attempt, on the fake clock, but the
- * writer refused the row write that records it (`Task.idleSignal`): only the
- * attempt seam's in-memory signal holds the ended turn, the cache that stands
- * in for a row write which did not land.
+ * The author ended its turn on an open attempt, on the fake clock, while the
+ * writer refused every write: `onIdle`'s commit, the one write that records the
+ * turn end (`Attempt.idleSignal`), lands nothing, so nothing records it. With
+ * `operation`, the author first recorded an operation whose end the same
+ * episode refused too (the Harness adapter publishes an activity end just
+ * before its idle callback), so the member row still records that operation.
  */
-async function turnEndedUnrecorded(t, config = {}) {
+async function turnEndRefused(t, { config = {}, operation = false } = {}) {
   const f = await setup({ clock: new FakeClock(), config })
   t.after(() => f.cleanup())
   const task = f.propose({ title: 'Turn ended' })
   const claimed = await f.runtime.claim(f.actor(f.author), f.mission.id, task.id)
   await f.runtime.settle(f.mission.id)
-  const put = f.runtime.store.put
-  f.runtime.store.put = function (table, value) {
-    if (table === 'tasks' && value.idleSignal !== undefined) throw new WriterBusyError('SQLite writer stayed busy after 1 attempt(s): database is locked', 1)
-    return put.call(this, table, value)
-  }
-  assert.throws(() => f.workers.callbacks.idle(f.author.id), WriterBusyError, 'the writer refused the row write that records the ended turn')
+  if (operation) f.workers.reportActivity(f.author.id, { id: 'op-1', kind: 'model', startedAt: f.clock.now(), updatedAt: f.clock.now() })
+  f.runtime.store.put = () => { throw new WriterBusyError('SQLite writer stayed busy after 1 attempt(s): database is locked', 1) }
+  if (operation) assert.throws(() => f.workers.reportActivity(f.author.id, undefined), WriterBusyError, 'the writer refused the commit that ends the operation')
+  assert.throws(() => f.workers.callbacks.idle(f.author.id), WriterBusyError, 'the writer refused the commit that records the ended turn')
   delete f.runtime.store.put
-  assert.equal(taskOf(f.runtime, task.id).idleSignal, undefined, 'the row does not record the ended turn')
+  assert.equal(taskOf(f.runtime, task.id).attempt.idleSignal, undefined, 'the row does not record the ended turn')
+  assert.equal(f.runtime.store.get('members', f.author.id).activity?.id, operation ? 'op-1' : undefined)
   return { ...f, task, attemptId: claimed.attempt.id }
 }
 
-/** The author's handle is idle and a pass runs, so the idle close-out acts on the ended turn. */
+/** The author's handle is idle and a pass runs, so the idle close-out acts on any recorded turn end. */
 async function closeOutPass(f) {
   f.workers.idle.add(f.author.id)
   f.runtime.kick(f.mission.id)
   await f.runtime.settle(f.mission.id)
 }
 
-test('an ended turn the writer could not record on the row is still closed out: the next pass nudges on the attempt seam\'s own signal', async t => {
-  const f = await turnEndedUnrecorded(t)
+const nudges = f => f.workers.deliveries.filter(delivery => delivery.memberId === f.author.id && /still open but your turn ended/.test(delivery.content))
+/** The distinct attempts the attempt reporting bound named, by its dedup key (a durable row re-arms its clock, so one attempt can be named again). */
+const named = f => [...new Set(f.runtime.store.list('deliveries', f.mission.id).filter(delivery => delivery.notice?.dedupKey?.startsWith('attempt-silent:'))
+  .map(delivery => delivery.notice.dedupKey.split(':')[1]))]
+
+/**
+ * The author's handle is idle, and the clock moves in 10 s ticks (the reporting
+ * bound and a pass on each) until the lease expiry frees the attempt; returns
+ * the attempts the reporting bound had named by then.
+ */
+async function untilLeaseExpiry(f) {
+  f.workers.idle.add(f.author.id)
+  const expired = () => events(f.runtime, f.mission.id, 'task/lease-expired').length > 0
+  for (let ticks = 0; !expired(); ticks += 1) {
+    assert.ok(ticks < 100, 'the lease expiry frees the attempt within its bound')
+    f.clock.advance(10_000)
+    await f.runtime.tick()
+  }
+  return named(f)
+}
+
+/** The outcome every busy-writer case shares: the lease expiry freed the attempt, and no idle close-out acted on it. */
+function freedByLease(f) {
+  assert.deepEqual(events(f.runtime, f.mission.id, 'task/lease-expiring').map(event => event.data.taskId), [f.task.id], 'the lease expiry was announced')
+  assert.deepEqual(events(f.runtime, f.mission.id, 'task/lease-expired').map(event => [event.data.taskId, event.data.oldOwner]), [[f.task.id, f.author.id]],
+    'the lease expiry frees the attempt')
+  assert.notEqual(taskOf(f.runtime, f.task.id).attempt?.id, f.attemptId, 'the row no longer holds it')
+  assert.deepEqual(events(f.runtime, f.mission.id, 'task/closeout-nudged'), [])
+  assert.deepEqual(nudges(f), [], 'and no idle close-out ever acted on it')
+}
+
+test('a turn end the writer refused to commit is not recorded anywhere, so the idle close-out does not nudge that turn', async t => {
+  const f = await turnEndRefused(t)
   await closeOutPass(f)
   const row = taskOf(f.runtime, f.task.id)
-  assert.deepEqual([row.status, row.attempt?.id, row.idleSignal, row.closeout?.nudges], ['running', f.attemptId, undefined, 1],
-    'the pass nudged the open attempt that its row alone does not name')
-  assert.deepEqual(events(f.runtime, f.mission.id, 'task/closeout-nudged').map(event => event.data.taskId), [f.task.id])
-  assert.ok(f.workers.deliveries.some(delivery => delivery.memberId === f.author.id && /still open but your turn ended/.test(delivery.content)),
-    'and the member is told to finish it')
+  assert.deepEqual([row.status, row.attempt?.id, row.attempt?.idleSignal, row.attempt?.closeout], ['running', f.attemptId, undefined, undefined],
+    'the pass leaves the open attempt as it was: no turn end, no nudge count')
+  assert.deepEqual(events(f.runtime, f.mission.id, 'task/closeout-nudged'), [])
+  assert.deepEqual(nudges(f), [], 'and the member is not told to finish a turn the runtime never recorded')
 })
 
-test('the attempt reporting bound never names an attempt whose turn ended, though only the attempt seam records it, before the close-out\'s first nudge or after it', async t => {
-  const f = await turnEndedUnrecorded(t, { attemptSilenceBoundMs: 1_000 })
-  // The reviewer holds an attempt too, and never ends a turn on it.
-  const other = f.propose({ title: 'Never idle', assigneeId: f.reviewer.id })
-  const { attempt } = await f.runtime.claim(f.actor(f.reviewer), f.mission.id, other.id)
-  await f.runtime.settle(f.mission.id)
-  const named = () => f.runtime.store.list('deliveries', f.mission.id).filter(delivery => delivery.notice?.dedupKey?.startsWith('attempt-silent:'))
-    .map(delivery => delivery.notice.dedupKey.split(':')[1])
-  f.clock.advance(2_000)
-  assert.equal(f.runtime.scheduling.sweepSilentAttempts(f.mission.id), 1, 'past the bound, before any nudge, one attempt is named')
-  assert.deepEqual(named(), [attempt.id], 'the attempt whose owner never ended a turn, never the one the close-out is about to nudge')
-  await closeOutPass(f)
-  const nudged = taskOf(f.runtime, f.task.id)
-  assert.deepEqual([nudged.idleSignal, nudged.closeout?.nudges], [undefined, 1], 'the close-out nudged the attempt its row does not name')
-  f.clock.advance(2_000)
-  assert.equal(f.runtime.scheduling.silentAttempt(nudged, f.runtime.store.get('missions', f.mission.id)), undefined,
-    'after the nudge, the reporting bound still leaves the attempt to the close-out')
-  f.runtime.scheduling.sweepSilentAttempts(f.mission.id)
-  assert.deepEqual(named(), [attempt.id], 'and no owner notice ever names it')
+test('at the default lease and reporting bound, the lease expiry frees an attempt whose turn end the writer refused before the reporting bound could name it', async t => {
+  const f = await turnEndRefused(t, { config: { leaseMs: 120_000 } })
+  assert.equal(f.runtime.bounds.attemptSilenceBoundMs, 600_000, 'the reporting bound is its default')
+  assert.deepEqual(await untilLeaseExpiry(f), [], 'no owner notice named the attempt')
+  freedByLease(f)
+})
+
+test('a reporting bound shorter than the lease names an attempt whose turn end the writer refused, and the lease expiry then frees it', async t => {
+  const f = await turnEndRefused(t, { config: { attemptSilenceBoundMs: 1_000 } })
+  assert.deepEqual(await untilLeaseExpiry(f), [f.attemptId], 'the owner is told about the attempt no close-out will handle')
+  freedByLease(f)
+})
+
+test('when the writer also refused the end of the member\'s operation, the operation silence guard owns the attempt, so even a short reporting bound leaves it to the lease expiry', async t => {
+  const f = await turnEndRefused(t, { config: { attemptSilenceBoundMs: 1_000 }, operation: true })
+  assert.deepEqual(await untilLeaseExpiry(f), [], 'the reporting bound defers to the operation the member row still records')
+  assert.deepEqual(f.runtime.store.list('deliveries', f.mission.id).filter(delivery => delivery.notice?.dedupKey?.startsWith('operation-silent:')), [],
+    'and the operation silence guard names only an operation the adapter confirms')
+  freedByLease(f)
 })

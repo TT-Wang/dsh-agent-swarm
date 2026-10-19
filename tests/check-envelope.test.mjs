@@ -495,19 +495,20 @@ test('ENV: the environment report is best-effort at a verdict too: a report that
   assert.deepEqual(events(f.runtime, f.mission.id, 'task/check-envelope'), [], 'and the verdict records no envelope')
 })
 
-test('ENV: a verdict reads the adapter\'s report once, so an attempt delivered no envelope is compared with the envelope the verdict recorded', async t => {
+test('ENV: an attempt delivered no envelope has nothing to compare: its verdict never compares the envelope the adapter reports when it verifies', async t => {
   const f = await setup({ clock: new FakeClock() })
   t.after(() => f.cleanup())
   const { verify } = await claimedReview(f)
-  // The adapter reports one envelope on its first ask and another on any later one.
-  const recorded = environmentAt('/recorded'), later = environmentAt('/later')
+  // The adapter reports an envelope only from the verdict on, and the host
+  // checks ran under an environment that does not reproduce that report.
+  const reported = environmentAt('/reported')
   let asks = 0
-  f.workers.checkEnvelope = () => { const environment = asks++ === 0 ? recorded : later; return { environment, selfRunEnvironment: environment } }
-  f.workers.checks = [{ command: 'test -d .', exitCode: 0, output: 'ok', environment: recorded }]
-  assert.equal((await verify()).status, 'accepted', 'host checks under the envelope the verdict recorded reproduce it')
-  assert.equal(asks, 1, 'the verdict asked the adapter once')
-  assert.deepEqual(events(f.runtime, f.mission.id, 'task/check-envelope').map(event => event.data.environment.home), ['/recorded'],
-    'and its one record is the envelope it compared with')
+  f.workers.checkEnvelope = () => { asks++; return { environment: reported, selfRunEnvironment: reported } }
+  f.workers.checks = [{ command: 'test -d .', exitCode: 0, output: 'ok', environment: environmentAt('/checked') }]
+  assert.equal((await verify()).status, 'accepted', 'the host checks decide a verdict whose attempt was given no envelope')
+  assert.equal(asks, 1, 'the verdict asked the adapter once, to record its report')
+  assert.deepEqual(events(f.runtime, f.mission.id, 'task/check-envelope').map(event => [event.data.environment.home, event.data.reproduction]), [['/reported', undefined]],
+    'its one record is the report it measured, and no reproduction was compared')
 })
 
 test('ENV: a cold user cache is recorded as advisory and never refuses an acceptance', async t => {
@@ -666,7 +667,7 @@ test('ENV-R2: the budget-resume assignment carries the check envelope too', asyn
   const fixture = await missionFixture(t, { checkEnv: checkEnvFor(home) })
   const reviewer = fixture.reviews[0]
   const review = fixture.runtime.store.get('tasks', reviewer.review.id)
-  review.budgetResume = { pauseId: 'pause-1', attemptId: review.attempt.id }
+  review.attempt.pausedBy = 'pause-1'
   fixture.runtime.store.put('tasks', review)
   const mission = fixture.runtime.store.get('missions', fixture.mission.id)
   mission.status = 'blocked'

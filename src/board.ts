@@ -107,8 +107,8 @@ function declaredBound(value: number | undefined, fallback: number): number {
 
 /**
  * The adapter's answers a decision asks. Each call goes straight through to the
- * adapter at the instant the decision asks it, never memoized: asking whether a
- * handle is idle can drain a stranded inbox item (`WorkerAdapter.isIdle`, R15-A5).
+ * adapter at the instant the decision asks it, never memoized: a handle's answer
+ * changes as its turns start and end. Asking changes nothing (`WorkerAdapter.isIdle`).
  */
 export interface AdapterView {
   /** Whether the member's worker handle can take an assignment now (`WorkerAdapter.isIdle`). */
@@ -170,19 +170,32 @@ export function readBoard(store: Pick<SwarmStore, 'get' | 'list' | 'latestTaskEv
  * both answer with the same predicate.
  *
  * Guards it can co-fire with:
- * - the parked-member hatch (`memberPhaseOf(member) === 'parked'`, R10-09/S3): a
- *   parked member is startable even when the adapter reports a pending inbox item,
- *   so the hatch wins here exactly as it does in `Scheduling.dispatch`;
- * - the adapter's `isIdle` precondition (`HarnessWorkers.isIdle`), which drains a
- *   stranded `nextStep` item instead of stranding the member (R15-A5);
+ * - the parked-member hatch (`asksHandle`, R10-09/S3): a parked member is
+ *   startable even when the adapter reports its handle busy, so the hatch wins
+ *   here exactly as it does in `Scheduling.dispatch`;
+ * - the adapter's `isIdle` precondition (`HarnessWorkers.isIdle`), which answers
+ *   an idle handle holding stranded input startable instead of stranding the
+ *   member; the dispatch sweep has the adapter wake that input before it asks
+ *   (`WorkerAdapter.drainStrandedInbox`, R15-A5);
  * - the W6 open-attempt close-out, which owns a member that already has a
  *   running attempt: `dispatch` handles that member before it dispatches, and
  *   the dispatch question refuses to answer for a task with an open attempt.
  */
 export function startBlocker(view: AdapterView, member: Member): 'handle-busy' | undefined {
-  if (memberPhaseOf(member) === 'parked') return undefined
+  if (!asksHandle(member)) return undefined
   return view.startable(member.id) ? undefined : 'handle-busy'
 }
+
+/**
+ * R10-09/S3, the parked-member hatch: whether a decision asks the adapter about
+ * this member's handle. It never asks about a parked member's: an assignment is
+ * exactly the fresh input that unparks it, so its handle's answer cannot leave
+ * the board silent. A row alone.
+ */
+export function asksHandle(member: Member): boolean { return memberPhaseOf(member) !== 'parked' }
+
+/** Whether a decision can hand this member work: it is not stopped and owes no stop. Rows alone. */
+export function takesWork(tasks: readonly Task[], member: Member): boolean { return memberPhaseOf(member) !== 'stopped' && !pendingStopOwner(tasks, member.id) }
 
 /**
  * The tokens `members` are spending in model requests that have reported no
@@ -214,8 +227,35 @@ export function ready(board: Board, task: Task, member: Member): boolean {
   return readinessBlocker(board, task, member) === undefined
 }
 
-/** The dispatcher's eligibility, which every reader of a dispatchable task asks: a live member that owes no stop, for which the task is ready. */
-export function eligible(board: Board, task: Task, member: Member): boolean { return memberPhaseOf(member) !== 'stopped' && !pendingStopOwner(board.tasks, member.id) && ready(board, task, member) }
+/** The dispatcher's eligibility, which every reader of a dispatchable task asks: a member that takes work (`takesWork`), for which the task is ready. */
+export function eligible(board: Board, task: Task, member: Member): boolean { return takesWork(board.tasks, member) && ready(board, task, member) }
+
+/**
+ * The fresh-row rule a choice made before an await asks after it, because
+ * other mutators commit outside the mission queue during the await: the row
+ * chosen, as this board holds it, while its epoch and its assignment are
+ * unchanged; otherwise undefined, and the choice no longer stands. Readiness
+ * is each caller's own: the dispatch sweep asks `eligible`, the predicate that
+ * chose (`stillDispatchable`), and a claim asks `ready`, leaving a stop owed to
+ * the admission.
+ */
+export function stillChosen(board: Board, chosen: Task): Task | undefined {
+  const fresh = board.tasks.find(task => task.id === chosen.id)
+  return fresh !== undefined && fresh.epoch === chosen.epoch && fresh.assigneeId === chosen.assigneeId
+    && fresh.plannedAssigneeId === chosen.plannedAssigneeId && fresh.assignmentMode === chosen.assignmentMode ? fresh : undefined
+}
+
+/**
+ * The dispatch sweep's choice after its preparation await: the chosen row
+ * (`stillChosen`) while the member is still `eligible` for it; otherwise
+ * undefined, and the work waits for a later sweep. The sweep asks it before
+ * the assignment and before it records a preparation failure, so a stop the
+ * member came to owe during the await drops the choice on either outcome.
+ */
+export function stillDispatchable(board: Board, chosen: Task, member: Member): Task | undefined {
+  const fresh = stillChosen(board, chosen)
+  return fresh !== undefined && eligible(board, fresh, member) ? fresh : undefined
+}
 
 /** Spec §2: the dispatchable work, each pending task an idle or waiting member is eligible for; a working member is already busy. */
 export function dispatchable(board: Board): Task[] {
@@ -840,8 +880,7 @@ export function fingerprintBoard(board: Board): MissionFingerprintBoard {
 
 /* ----------------------------------------------------------------------- *
  * R17-G1: the interpretation, the one judgement of a board the board
- * classifiers read. A reader of rows alone reads the board; until A1 the one
- * other builder is the dispatch sweep's member step (`interpret`).
+ * classifiers read. A reader of rows alone reads the board.
  * ----------------------------------------------------------------------- */
 
 /** Whether a durably parked member holds this task's open attempt (the R10-15 holder family): rows alone, so asking asks the adapter nothing. */
@@ -865,21 +904,17 @@ export interface Interpretation extends Board {
 
 /**
  * R17-G1: the ONE shared interpretation of a board. Every board classifier
- * (`Notices.ensureWitness`, the absence net, the obligation follow-ups and the
- * relevance of a board fact) reads it instead of re-reading raw rows and
- * re-deriving its own answer: it is the board, so the dispatcher's own
- * predicates (`eligible`, `reviewable`, `completionError`) are asked of it
- * directly, and beside it what they answer over it once (`dispatchable`,
- * `unschedulable`, `stalled`), so a notice can never describe a board the
- * dispatcher would act on differently. A value of the board alone: it writes
- * nothing, holds no cache, and asks the adapter exactly where its predicates
- * ask it. A reader of rows alone (the sweep's member order, a notice naming the
- * tasks it is about with `subjectsOfTasks`) reads the board, and asks the
- * adapter nothing. One caller outside the classifiers builds it: each member
- * step of the dispatch sweep, which reads none of its judged fields, so that
- * its asks come before that member's eligibility asks (an ask can drain a
- * stranded inbox, R15-A5). A1 separates isIdle's question from its drain and
- * deletes that call with this sentence.
+ * (`Notices.ensureWitness`, the obligation follow-ups and the relevance of a
+ * board fact) reads it instead of re-reading raw rows and re-deriving its own
+ * answer: it is the board, so the dispatcher's own predicates (`eligible`,
+ * `reviewable`, `completionError`) are asked of it directly, and beside it what
+ * they answer over it once (`dispatchable`, `unschedulable`, `stalled`), so a
+ * notice can never describe a board the dispatcher would act on differently. A
+ * value of the board alone: it writes nothing, holds no cache, and asks the
+ * adapter exactly where its predicates ask it. A reader that needs no judged
+ * field reads the board instead: the dispatch sweep, which asks its predicates
+ * where it decides; the absence net, until a follow-up is due; and a notice
+ * naming the tasks it is about (`subjectsOfTasks`), which asks the adapter nothing.
  */
 export function interpret(board: Board): Interpretation {
   return {

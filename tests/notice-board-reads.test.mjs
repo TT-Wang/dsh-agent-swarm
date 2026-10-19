@@ -1,8 +1,7 @@
 /**
  * S11: a notice that names only board rows (the tasks it is about, its
  * subjects) reads the board, never the interpretation, so writing it asks the
- * adapter nothing, and no stranded inbox drains inside a commit (the Harness
- * adapter's `isIdle` can drain one, R15-A5).
+ * adapter nothing.
  *
  * Every case runs on a board an interpretation must ask the adapter about: work
  * preferred to a third member, Busy, whose handle cannot start, which an idle

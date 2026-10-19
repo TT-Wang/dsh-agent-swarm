@@ -853,19 +853,19 @@ test('S1/R17-G5: the body stamps each delivery of its own pass-end outbox flush,
 })
 
 test('S1/R17-G5: a worker turn the body woke inside an adapter call keeps committing, but only the body\'s own progress keeps it live, so the wedge publishes and the owner is asked about new work', async () => {
-  // The real adapter's isIdle drains a stranded inbox item by waking a Harness
-  // turn, which runs in the caller's async context. Called from the body's
-  // startBlocker, that turn's heartbeats committed inside the body's context,
-  // and every one of them stamped the body's progress: the body sat in H's hung
-  // start for the whole start bound, published as a live pass, and the owner
-  // was never asked about task Z proposed for idle member I until the start
-  // settled. Only the body's own awaits and member boundaries count as its
-  // progress now.
+  // The real adapter's drain step wakes a stranded inbox item as a Harness
+  // turn, which runs in the caller's async context: the body's, since the
+  // dispatch sweep runs the step. That turn's heartbeats commit inside the
+  // body's context, and when every one of them stamped the body's progress the
+  // body sat in H's hung start for the whole start bound, published as a live
+  // pass, and the owner was never asked about task Z proposed for idle member I
+  // until the start settled. Only the body's own awaits and member boundaries
+  // count as its progress now.
   //
   // The clock and the ticks are driven by hand, and H's start hangs until the
   // test ends it at its declared start bound (1500ms of clock). The woken turn
-  // is the Harness turn's shape: it runs in the async context of the isIdle
-  // call that woke it, inside the body, and its tool republishes the member's
+  // is the Harness turn's shape: it runs in the async context of the drain
+  // step that woke it, inside the body, and its tool republishes the member's
   // activity at each beat, one every 40ms of clock (`beat`).
   const startBoundMs = 1_500
   const clock = new FakeClock()
@@ -890,10 +890,8 @@ test('S1/R17-G5: a worker turn the body woke inside an adapter call keeps commit
       hang.entered.resolve()
       try { await hang.release.promise } finally { hang.to = clock.now() }
     }
-    isIdle(id) {
-      if (this.stranded.delete(id)) { this.wake(id); return true }
-      return !this.busy.has(id)
-    }
+    isIdle(id) { return !this.busy.has(id) }
+    drainStrandedInbox(id) { if (this.isIdle(id) && this.stranded.delete(id)) this.wake(id) }
     /** The woken turn: its running tool republishes the member's activity at every beat. */
     wake(id) {
       const startedAt = clock.now()
@@ -922,8 +920,8 @@ test('S1/R17-G5: a worker turn the body woke inside an adapter call keeps commit
     const running = f.propose({ title: 'Author work' })
     await ticksUntil(f, () => taskOf(f.runtime, running.id).status === 'running', 'the Author task dispatches', 400)
     await ticks(f, 5)
-    // Armed in one synchronous step: the next body's startBlocker(Author) drains
-    // the stranded item and wakes the turn, then the body waits in H's start.
+    // Armed in one synchronous step: the next body's sweep drains the Author's
+    // stranded item and wakes the turn, then the body waits in H's start.
     workers.stranded.add(f.author.id)
     const hang = workers.armed = hold()
     await ticksUntilHeld(f, hang, 'the body waits in H\'s hung start')
@@ -1235,7 +1233,6 @@ test('S5: clearing every in-memory scheduling cache leaves the durable outcome u
     // The cache-only entries enumerated on the scheduling path, cleared while
     // the bodies the setup kicked may still be queued.
     f.runtime.queues.clear()
-    f.runtime.attempts.idleSignals.clear()
     f.runtime.startFailures.clear()
     f.runtime.fingerprintCache.clear()
     const task = f.propose()

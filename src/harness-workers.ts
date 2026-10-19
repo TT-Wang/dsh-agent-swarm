@@ -333,27 +333,31 @@ export class ScopedEnvironment {
   }
 }
 
+/** R15-A5: the state of an owned handle. `isIdle` answers whether it is not `busy`; the drain step acts on `stranded`. */
+export type HandleState = 'busy' | 'idle' | 'stranded'
+
 /** The plugin fiber owns every worker; user/coordinator session disposal does not own them. */
 /**
- * R15-A5: the adapter's startability decision for one owned handle, exported so
- * the hatch is testable without a running Harness host (the adapter itself needs
- * the native agent services). The rules, in order:
+ * R15-A5: the adapter's decision for one owned handle, exported so it is
+ * testable without a running Harness host (the adapter itself needs the native
+ * agent services). It reads the native agent only as far as the rules need it.
+ * The rules, in order:
  *
- * 1. a stopping handle or one with in-flight observations is not startable;
- * 2. a handle that is not `idle` is working, not startable;
- * 3. an idle handle with pending inbox input has no driver left to claim it
- *    (`drain: true`): it is startable, and the caller re-wakes the pending tail so
- *    the item is consumed instead of stranding the member.
+ * 1. a fenced handle (the adapter closing, the resident stopping or aborted) or
+ *    one with in-flight observations is busy;
+ * 2. a handle that is not `idle` is working: busy;
+ * 3. an idle handle with pending inbox input has no driver left to claim it:
+ *    `stranded`. It is startable, and the drain step re-wakes its input so the
+ *    input is consumed instead of stranding the member.
  *
- * Co-firing guards, named: the parked-member hatch (`member.status === 'waiting'`
- * makes the runtime skip this call entirely), the W6 open-attempt close-out
- * (`dispatch` owns a member with a running attempt before it dispatches) and
+ * Co-firing guards, named: the parked-member hatch (the runtime never asks
+ * about a parked member's handle, nor drains it), the W6 open-attempt close-out
+ * (`dispatch` handles a member with a running attempt before it dispatches) and
  * `removeRevokedPending` (discards a revoked assignment before the drain).
  */
-export function strandedInboxDecision(input: { stopping: boolean; observations: number; status: string; hasPending: boolean }): { startable: boolean; drain: boolean } {
-  if (input.stopping || input.observations > 0) return { startable: false, drain: false }
-  if (input.status !== 'idle') return { startable: false, drain: false }
-  return { startable: true, drain: input.hasPending }
+export function strandedInboxDecision(handle: { fenced: boolean; observations: number; agent: { readonly status: string; readonly inbox: { readonly nextStep: readonly unknown[]; readonly nextTurn: readonly unknown[] } } }): HandleState {
+  if (handle.fenced || handle.observations > 0 || handle.agent.status !== 'idle') return 'busy'
+  return handle.agent.inbox.nextStep.length > 0 || handle.agent.inbox.nextTurn.length > 0 ? 'stranded' : 'idle'
 }
 
 export class HarnessWorkers implements WorkerAdapter {
@@ -426,7 +430,7 @@ export class HarnessWorkers implements WorkerAdapter {
   /** Read liveness from owned native operations, never from a persisted UI record. */
   currentActivity(memberId: string): WorkerActivity | undefined {
     const resident = this.residents.get(memberId)
-    if (!resident || this.closing || resident.stopping || resident.abort.signal.aborted) return undefined
+    if (resident === undefined || this.fenced(resident)) return undefined
     const active = [...resident.activities.values()].filter(item => !item.signal?.aborted && (item.value.retryAt === undefined || Date.now() <= item.value.retryAt))
     const value = active.at(-1)?.value
     return value === undefined ? undefined : { ...value }
@@ -727,12 +731,12 @@ export class HarnessWorkers implements WorkerAdapter {
       const visible = new Set(agentCtx.tools.schemas(agent).map(schema => schema.name))
       const hidden = hiddenToolsFor('worker').filter(name => visible.has(name))
       if (hidden.length) agentCtx.tools.restrict({ deny: hidden })
-      agentCtx.tools.guard(exec => resident.stopping !== undefined || this.closing || abort.signal.aborted ? 'Swarm worker is stopping' : this.observer().guard(spec.member.id, exec.name))
+      agentCtx.tools.guard(exec => this.fenced(resident) ? 'Swarm worker is stopping' : this.observer().guard(spec.member.id, exec.name))
       agentCtx.on('agent/pre-step', async ({ signal, messages }, next) => {
-        if (this.closing || resident.stopping !== undefined || abort.signal.aborted) return { kind: 'reject' }
+        if (this.fenced(resident)) return { kind: 'reject' }
         await this.drainObservations(resident)
         signal.throwIfAborted()
-        if (this.closing || resident.stopping !== undefined || abort.signal.aborted) return { kind: 'reject' }
+        if (this.fenced(resident)) return { kind: 'reject' }
         this.removeRevokedPending(resident, agent)
         // Claims are already removed from Inbox before this hook. Reject a
         // wholly stale batch and filter mixed batches through the admitted view.
@@ -828,7 +832,7 @@ export class HarnessWorkers implements WorkerAdapter {
         this.compactIfRequested(resident)
         if (this.continueAfterRejectedStep(resident, agent)) return
         void this.drainObservations(resident).then(() => {
-          if (resident.stopping === undefined && !this.closing && !abort.signal.aborted && agent.status === 'idle') this.observer().idle(spec.member.id)
+          if (!this.fenced(resident) && agent.status === 'idle') this.observer().idle(spec.member.id)
         }).catch(error => { this.failure(spec.member.id, error) })
       })
     }
@@ -870,7 +874,7 @@ export class HarnessWorkers implements WorkerAdapter {
    */
   compactAtBoundary(memberId: string): void {
     const resident = this.residents.get(memberId)
-    if (resident === undefined || this.closing || resident.stopping !== undefined || resident.abort.signal.aborted) return
+    if (resident === undefined || this.fenced(resident)) return
     resident.compactionRequested = true
     this.compactIfRequested(resident)
   }
@@ -903,7 +907,7 @@ export class HarnessWorkers implements WorkerAdapter {
   private compactIfRequested(resident: Resident): void {
     const threshold = this.options.boundaryCompactionTokens ?? 250000
     const agent = resident.handle?.agent
-    if (!resident.compactionRequested || threshold <= 0 || agent === undefined || agent.status !== 'idle' || this.closing || resident.stopping !== undefined || resident.abort.signal.aborted) return
+    if (!resident.compactionRequested || threshold <= 0 || agent === undefined || agent.status !== 'idle' || this.fenced(resident)) return
     if (resident.lastPromptTokens < threshold) { resident.compactionRequested = false; return }
     resident.compactionRequested = false
     const compact = this.compactionFor(agent)
@@ -1005,22 +1009,31 @@ export class HarnessWorkers implements WorkerAdapter {
     }
   }
 
+  /**
+   * R15-A5: wake the input an idle handle holds that no driver will claim. A
+   * revoked assignment is discarded first (`removeRevokedPending`). Then the
+   * pending tail is removed and sent again with its original identity and
+   * `wakeup: true`, through public APIs only (never the internal claim API).
+   * That one wake starts the native driver, which claims the inbox in the order
+   * it was queued and runs until nothing is pending, so FIFO and model-visible
+   * exactly-once delivery both hold. Re-sending every pending item would not:
+   * the first wake's driver claims the inbox before the rest are re-queued,
+   * the head now behind them. Whether it woke anything.
+   */
+  private rewake(resident: Resident, agent: Agent): boolean {
+    this.removeRevokedPending(resident, agent)
+    const target = agent.inbox.nextTurn.length > 0 ? 'next-turn' : 'next-step'
+    const message = (target === 'next-turn' ? agent.inbox.nextTurn : agent.inbox.nextStep).at(-1)
+    if (message === undefined || !agent.inbox.remove(message.id)) return false
+    agent.send(message, target, true)
+    return true
+  }
+
+  /** Harness ends its driver after a rejected pre-step, and input accepted while that driver was live has no latched wake: the handle's next idle wakes it. */
   private continueAfterRejectedStep(resident: Resident, agent: Agent): boolean {
     if (!resident.rejectedPendingStep) return false
     resident.rejectedPendingStep = false
-    if (this.closing || resident.stopping !== undefined || resident.abort.signal.aborted) return false
-    this.removeRevokedPending(resident, agent)
-    // Harness ends its driver after a rejected pre-step. Input accepted while
-    // that driver was live has no latched wake. Re-enqueue a pending tail with
-    // its original identity through public APIs; this preserves both FIFO and
-    // model-visible exactly-once delivery without using the internal claim API.
-    const target = agent.inbox.nextTurn.length > 0 ? 'next-turn' : 'next-step'
-    const pending = target === 'next-turn' ? agent.inbox.nextTurn : agent.inbox.nextStep
-    const message = pending.at(-1)
-    if (message === undefined) return false
-    if (!agent.inbox.remove(message.id)) return false
-    agent.send(message, target, true)
-    return true
+    return !this.fenced(resident) && this.rewake(resident, agent)
   }
 
   async stop(memberId: string): Promise<void> {
@@ -1058,55 +1071,38 @@ export class HarnessWorkers implements WorkerAdapter {
     })()
   }
 
-  /**
-   * R15-A5: whether the adapter could start this member right now.
-   *
-   * An idle handle holding pending inbox input cannot consume it: the native
-   * driver that would claim the item has ended (a rejected pre-step, a revoked
-   * assignment) and nothing re-wakes it, so `hasPending` used to strand the
-   * member — every dispatch sweep skipped it and the assignment that would have
-   * drained it was never delivered. The round-14 workaround (one owner message
-   * per stalled member) is not a mechanism.
-   *
-   * The hatch drains the stranded tail through the same public `send` API
-   * `continueAfterRejectedStep` uses (original identity, `wakeup: true`) and then
-   * reports the member startable, so the drained input and any fresh assignment
-   * are both delivered by the native inbox.
-   *
-   * Co-firing guards, named: the parked-member hatch (`member.status ===
-   * 'waiting'`, which makes the runtime treat this member as startable without
-   * asking), the W6 open-attempt close-out (`dispatch` handles a member with a
-   * running attempt before it dispatches, so this hatch cannot hand one member
-   * two assignments) and `removeRevokedPending` (a revoked assignment is
-   * discarded before the tail is re-woken).
-   */
-  isIdle(memberId: string): boolean {
-    const resident = this.residents.get(memberId)
-    if (resident?.handle === undefined || this.closing || resident.stopping !== undefined || resident.abort.signal.aborted) return false
-    const agent = resident.handle.agent
-    const decision = strandedInboxDecision({
-      stopping: resident.stopping !== undefined, observations: resident.observations.size,
-      status: agent.status, hasPending: agent.inbox.nextStep.length > 0 || agent.inbox.nextTurn.length > 0,
-    })
-    if (decision.drain) this.drainStrandedInbox(resident, agent)
-    return decision.startable
+  /** Whether a resident is fenced: the adapter is closing, or the resident is stopping or aborted. */
+  private fenced(resident: Resident): boolean { return this.closing || resident.stopping !== undefined || resident.abort.signal.aborted }
+
+  /** R15-A5: one member's handle and its state (`strandedInboxDecision`), or undefined while the member has no handle. */
+  private handleDecision(memberId: string): { resident: Resident; agent: Agent; state: HandleState } | undefined {
+    const resident = this.residents.get(memberId), agent = resident?.handle?.agent
+    if (resident === undefined || agent === undefined) return undefined
+    return { resident, agent, state: strandedInboxDecision({ fenced: this.fenced(resident), observations: resident.observations.size, agent }) }
   }
 
   /**
-   * R15-A5: re-wake the pending tail of an idle handle so a queued item cannot
-   * strand the member. Removal first keeps FIFO and exactly-once delivery: a
-   * message a live driver already claimed fails `remove` and is left alone.
+   * R15-A5: whether the adapter could start this member right now. A question:
+   * an idle handle holding pending input is startable, and asking wakes nothing.
+   * Reporting it busy stranded the member (round 14): every dispatch sweep
+   * skipped it, so the assignment whose waking delivery would carry that input
+   * was never delivered.
    */
-  private drainStrandedInbox(resident: Resident, agent: Agent): void {
-    if (this.closing || resident.stopping !== undefined || resident.abort.signal.aborted) return
-    this.removeRevokedPending(resident, agent)
-    for (const target of ['next-step', 'next-turn'] as const) {
-      const pending = target === 'next-step' ? agent.inbox.nextStep : agent.inbox.nextTurn
-      for (const message of [...pending]) {
-        if (!agent.inbox.remove(message.id)) continue
-        agent.send(message, target, true)
-      }
-    }
+  isIdle(memberId: string): boolean {
+    const handle = this.handleDecision(memberId)
+    return handle !== undefined && handle.state !== 'busy'
+  }
+
+  /**
+   * R15-A5: the drain step. An idle handle holding pending input cannot
+   * consume it: the native driver that would claim the item has ended (a
+   * rejected pre-step, a revoked assignment, input restored at activation) and
+   * nothing re-wakes it. A stranded handle is woken by `rewake`, the one wake
+   * the rejected-step continuation shares.
+   */
+  drainStrandedInbox(memberId: string): void {
+    const handle = this.handleDecision(memberId)
+    if (handle?.state === 'stranded') this.rewake(handle.resident, handle.agent)
   }
   captureArtifact(member: Member, task: Task, deliverables?: string[], options?: { requireOutputs?: boolean }): Promise<Artifact> { return this.workspaces.captureArtifact(member, task, deliverables, options) }
   inspectArtifact(member: Member, artifact: Artifact, signal?: AbortSignal): Promise<Artifact> { return this.workspaces.inspectArtifact(member, artifact, signal) }

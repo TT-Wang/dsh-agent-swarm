@@ -49,7 +49,7 @@ async function fixture(t) {
     const runs = runtime.observe(actor, mission.id, { taskId: task.id }).toolRuns
     return runtime.publish(actor, mission.id, { taskId: task.id, attemptId: task.attempt.id, claim: `Read ${file}`, outcome: 'supported', toolRunIds: [runs.at(-1).id] })
   }
-  return { root, source, runtime, workers, workspaces, owner, mission, author, reviewer, a, b, propose, readEvidence }
+  return { root, source, runtime, workers, workspaces, owner, mission, author, reviewer, a, b, propose, readEvidence, command }
 }
 
 test('research label cannot submit real JS changes without checks; captured work and evidence survive', async t => {
@@ -233,6 +233,12 @@ test('captured review report survives deferred checks and reassignment without l
   assert.equal(blocked.status, 'blocked'); assert.ok(blocked.verificationRecovery)
   assert.ok(blocked.reviewArtifact); assert.equal(blocked.artifact, undefined)
   assert.equal(f.runtime.task(f.mission.id, task.id).artifact.commit, source.artifact.commit)
+  // The deferral's capture publishes its epoch's artifact ref, and the first
+  // reviewer keeps writing after its verdict: recovering the review for the next
+  // reviewer must not move that ref off the commit the verdict recorded.
+  const deferralRef = () => f.command(path.join(f.root, 'worktrees', f.mission.id, 'artifacts.git'), ['git', 'rev-parse', `refs/artifacts/${review.id}/${review.epoch}`])
+  assert.equal(await deferralRef(), blocked.reviewArtifact.commit, 'the deferral publishes its epoch\'s artifact ref')
+  await writeFile(path.join(f.reviewer.workspace, 'after-verdict.md'), 'Written after the deferred verdict\n')
   f.workers.verifyArtifact = verify
   f.runtime.updateBudget(f.owner, f.mission.id, { ...f.runtime.mission(f.mission.id).budget, maxWorkers: 3 }, 'Replacement reviewer availability')
   const nextReviewer = await f.runtime.addMember(f.owner, f.mission.id, { role: 'independent replacement reviewer' })
@@ -245,6 +251,7 @@ test('captured review report survives deferred checks and reassignment without l
   assert.equal(f.runtime.task(f.mission.id, review.id).status, 'pending', 'saved review record is not a rejected deliverable exhaustion gate')
   const nextActor = { sessionId: nextReviewer.sessionId }
   const resumed = await f.runtime.claim(nextActor, f.mission.id, review.id)
+  assert.equal(await deferralRef(), blocked.reviewArtifact.commit, 'recovering the review leaves the deferral epoch\'s artifact ref at the commit its verdict recorded')
   assert.equal(await readFile(path.join(nextReviewer.workspace, 'reviews/verdict.md'), 'utf8'), 'Preserved first reviewer record')
   await writeFile(path.join(nextReviewer.workspace, 'reviews/verdict.md'), 'Replacement reviewer verified the exact original source')
   const accepted = await f.runtime.verify(nextActor, f.mission.id, { taskId: resumed.id, attemptId: resumed.attempt.id, verdict: 'accept', reason: 'Host checks now pass', deliverables: ['reviews/verdict.md'] })

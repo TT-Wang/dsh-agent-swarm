@@ -6,7 +6,7 @@
  * (`SwarmRuntime.ownAttempt`), not lease accounting.
  */
 import { id } from './store.ts'
-import { TERMINAL_STATES, blockCauses, dropForeignMarkers, holdsAttempt, holdsOpenAttempt, openAttempt, stopPending, taskSubject, terminal, type BlockCause, type HeldTask } from './task-graph.ts'
+import { TERMINAL_STATES, blockCauses, holdsAttempt, holdsOpenAttempt, openAttempt, stopPending, taskSubject, terminal, type BlockCause, type HeldTask } from './task-graph.ts'
 import { stopFaultKey, type Notices } from './notices.ts'
 import { heldByParkedMember } from './board.ts'
 import { memberPhaseOf } from './projection.ts'
@@ -42,17 +42,16 @@ export function stopOutcome(causes: ReadonlySet<BlockCause>, reason: StopReason)
 }
 
 /**
- * X1 (P0): take the attempt off the row with its markers (`dropForeignMarkers`:
- * a row without an attempt carries none) and remember its owner durably, so the
- * union below can never forget a member who already touched the work. Only the
- * two operations that end an attempt, `endAttempt` and `Attempts.fenceRow`,
- * call it.
+ * X1 (P0): take the attempt off the row, and with it every fact it recorded
+ * while it ran (they are its fields, `Attempt`), and remember its owner
+ * durably, so the union below can never forget a member who already touched
+ * the work. Only the two operations that end an attempt, `endAttempt` and
+ * `Attempts.fenceRow`, call it.
  */
 function dropAttempt(task: Task): void {
   const owner = task.attempt?.ownerId
   if (owner !== undefined) task.priorOwnerIds = [...new Set([...(task.priorOwnerIds ?? []), owner])]
   delete task.attempt
-  dropForeignMarkers(task)
 }
 
 /**
@@ -90,11 +89,6 @@ interface SilentOperation {
 }
 
 export class Attempts {
-  /**
-   * S5 cache-only: the durable `Task.idleSignal` row carries the same value and
-   * `turnEnded` re-reads it; losing this map changes no durable outcome.
-   */
-  private readonly idleSignals = new Map<string, { attemptId: string; at: number }>()
   /** Retry timing is disposable; the fenced task row owns the recovery obligation. */
   private readonly stopRetries = new Map<string, { epoch: number; memberId?: string; retries: number; retryAt: number; inFlight: boolean }>()
 
@@ -429,8 +423,8 @@ export class Attempts {
     // The adapter must confirm the operation is live; a durable activity alone never renews.
     const activity = this.liveOperation(task)
     if (activity === undefined) {
-      if (task.leaseWarned !== task.attempt.leaseUntil) {
-        task.leaseWarned = task.attempt.leaseUntil
+      if (task.attempt.leaseWarned !== task.attempt.leaseUntil) {
+        task.attempt.leaseWarned = task.attempt.leaseUntil
         this.k.commit(mission.id, () => {
           this.k.store.put('tasks', task)
           this.k.store.event(mission.id, 'task/lease-expiring', 'runtime', { taskId: task.id, ownerId: task.attempt.ownerId, leaseUntil: task.attempt.leaseUntil })
@@ -442,38 +436,28 @@ export class Attempts {
     const member = this.k.store.get('members', task.attempt.ownerId)
     const modelAllowance = activity.kind === 'model' ? (member?.maxOutputTokens ?? 0) : 0
     task.attempt.leaseUntil = Math.min(mission.deadline, this.k.now() + this.k.config.leaseMs + Math.ceil(modelAllowance * LEASE_MS_PER_OUTPUT_TOKEN))
-    delete task.leaseWarned
+    delete task.attempt.leaseWarned
     // A lease extension is liveness bookkeeping, not a new progress timestamp or milestone.
     this.k.commit(mission.id, () => this.k.store.put('tasks', task))
     return task
   }
   /**
-   * W6: whether the owner of an open attempt ended its turn on it (`onIdle`),
-   * the one question of the idle close-out: the dispatch sweep closes out such
-   * an attempt (it nudges, then checkpoints and re-pends with a coded
-   * terminal), and the attempt reporting bound leaves it to the close-out. A
-   * turn end is a fact of the attempt, so it leaves the row only with the
-   * attempt. The durable signal on the row is the record; the in-memory one
-   * stands in for its row write when that did not land.
+   * W6: the member ended a turn. When it still owns an attempt, the turn end is
+   * recorded on that attempt (`turnEnded`), in the one commit that also clears
+   * the member's activity, so the dispatch sweep can nudge it and, when the
+   * bounded retry is exhausted, checkpoint the workspace before any
+   * reassignment. A commit the writer refuses records nothing: that turn end
+   * gets no nudge, and the attempt's lease expiry frees it. The attempt
+   * reporting bound names it before that only when its own bound passes first
+   * (at the default bounds the lease runs out first) and the member row records
+   * no operation (an activity end the same writer refused leaves one recorded).
    */
-  turnEnded(open: HeldTask): boolean {
-    return open.idleSignal?.attemptId === open.attempt.id || this.idleSignals.get(open.attempt.ownerId)?.attemptId === open.attempt.id
-  }
   onIdle(memberId: string): void {
     if (this.k.closed || this.k.shuttingDown) return
     const member = this.k.store.get('members', memberId)
     if (!member || member.status === 'stopped') return
-    // W6: remember that this member ended a turn while still owning an attempt,
-    // so scheduling can nudge it and, when the bounded retry is exhausted,
-    // checkpoint the workspace before any reassignment.
     const open = openAttempt(this.k.store.list('tasks', member.missionId), memberId)
-    if (open !== undefined) {
-      this.idleSignals.set(memberId, { attemptId: open.attempt.id, at: this.k.now() })
-      // S5: the signal is durable on the task row the scheduling pass re-reads;
-      // the map above is only a cache for a row write still in flight.
-      open.idleSignal = { attemptId: open.attempt.id, at: this.k.now() }
-      this.k.store.put('tasks', open)
-    } else this.idleSignals.delete(memberId)
+    if (open !== undefined) open.attempt.idleSignal = { at: this.k.now() }
     // No member status is written: it is derived from the phase and the live
     // attempts on every read (src/projection.ts) and the store strips it.
     delete member.activity
@@ -493,11 +477,11 @@ export class Attempts {
   async closeOutIdleAttempt(mission: Mission, member: Member, task: HeldTask, pass?: SchedulingPass): Promise<void> {
     const attemptId = task.attempt.id
     const bound = this.k.config.maxIdleCloseouts ?? DEFAULT_IDLE_CLOSEOUTS
-    const nudges = task.closeout?.nudges ?? 0
+    const nudges = task.attempt.closeout?.nudges ?? 0
     if (nudges < bound) {
       const nudge = nudges + 1
       const remaining = bound - nudge
-      task.closeout = { nudges: nudge, at: this.k.now() }
+      task.attempt.closeout = { nudges: nudge, at: this.k.now() }
       this.k.commit(mission.id, () => {
         this.k.store.put('tasks', task)
         this.k.store.put('deliveries', { id: id('msg'), missionId: mission.id, from: 'runtime', to: member.id, kind: 'control', createdAt: this.k.now(),
@@ -547,7 +531,6 @@ export class Attempts {
     // with the dispatch sweep that re-pends the task, and (when the recovery
     // limit is already spent) with the close-out exhaustion terminal below.
     this.notices.emitGuardTerminal(mission.id, 'attempt_lease', { taskId: current.id, memberId: member.id, localKey: `closeout-abandoned:${attemptId}`, detail: `idle close-out abandoned attempt ${attemptId}: the workspace was checkpointed at ${checkpoint.commit} and the task was re-pended (recovery ${current.recoveryCount ?? 0})` })
-    this.idleSignals.delete(member.id)
     this.resumeStoppedAttempt(mission.id, current)
   }
 

@@ -7,6 +7,122 @@ Current **0.7.0** working-tree checks and the historical **0.6.0** baseline are 
 | `0.1.5-rc.3` (npm `latest`, default host) | `a4c74a91e06b00fe0b0937bde982170c526cc842` |
 | `0.1.7-rc.1` (npm `next`) | `46a7f68b0922371ce7144b668b90e377d8e799f4` |
 
+## Batch 16: decide-then-act A1, R1, F2 (reverted), F3, V1, I1 (2026-10-19)
+
+**Head**: `c7fed65` and this record (documentation only), branch `batch16/kernel` on `6d5da9d`, not merged; this entry
+is written in the batch's first integrator repair round. `src` against `6d5da9d`: +351 −279, net +72. By slice: A1
++61 (`53cb1d3` to `f1a0530`), `089f45b` 0, R1 +23, F2 0 (reverted), F3 −7, V1 −1, I1 −4, and this round 0.
+
+**The full-log oracle at the head against `6d5da9d`** (`npm run test:oracle`; each slice that changed a log
+re-recorded it with `--write` after three identical runs). Measured by diffing each log at `6d5da9d` with the head's,
+trace indices ignored. Every event is identical in all 11 scenarios. Rows, deliveries and the adapter trace differ by
+exactly these deltas:
+
+- A1 (`53cb1d3`, `91e08b4`): 1263 `drainStrandedInbox` adapter calls, one per board member that takes work and
+  whose handle a decision may ask about, at the start of each dispatch sweep: replay 22, F2 9, F5 6, F12 6, F13 12,
+  F18 150, F19 852, F21 8, paths 162, dangling 8, outage 28. `91e08b4` added F21's and paths' last one, the member a
+  chained body's order leaves out. paths also loses 30 `isIdle` calls (292 to 262; 16 for `member#3`, 14 for
+  `member#4`): 23 came from the member steps' interpretation and 7 from the absence net's. With the drain calls
+  removed, every runtime's trace is its old trace minus those asks, in order.
+- F3 (`e71289f`): F19's task#1 row has `attempt.pausedBy: budget-pause#1` in place of the row's `budgetResume`
+  `{attemptId: attempt#1, pauseId: budget-pause#1}`.
+- I1 (`e1c2767`): F13's task row and `attempt#2`'s assignment content hold `revision` 10, not 13 (lines 21 and 27),
+  because each `onIdle` writes the row once.
+
+R1, F2, V1 and this round's commits change no log. No oracle scenario makes a member owe a stop during a
+preparation, resumes or amends a deferred review, or reports a check envelope.
+
+**What each slice leaves at the head.**
+
+- **A1, one point where a stranded inbox is woken.** `isIdle` is a question: the adapter answers that an idle handle
+  holding input no driver will claim is startable, and wakes nothing. Draining is the adapter's own step,
+  `WorkerAdapter.drainStrandedInbox`. The dispatch sweep runs it at one point: after the sweep's guard
+  (`Scheduling.halted`), for each board member with `takesWork && asksHandle`, whatever order the body sweeps. A
+  drain that throws ends that member's chain (`chainFailed`, the `attempt_lease` guard terminal), and that member is
+  not stepped in that sweep (`135d183`). In the adapter, `strandedInboxDecision` decides one handle state (`busy`,
+  `idle` or `stranded`) from `fenced(resident)`, the in-flight observations and the native agent. One `rewake` wakes
+  the tail, so a multi-item stranded inbox reaches the model in the order it was queued (`db52e30`; the reorder is
+  R15-A5's, older than A1). Every site that asks whether a handle is fenced now asks `fenced(resident)` (`9478e8e`,
+  this round). Each member step decides on the board. The absence net builds the interpretation only when a
+  follow-up is due, and finds a summary's open constituents once. `commit()`'s execution clock asks
+  `view.startable`. Batch 15's two placeholders that waited for A1 (the member step building the interpretation,
+  and `interpret`'s second builder) are deleted. Regressions: `tests/board-read-points.test.mjs`, with a draining
+  fake. It covers the stranded member drained once and the parked one not, the preferred member drained before its
+  borrower asks, a member whose turn ends stranded during the sweep, a paused mission woken nowhere (`4702f90`), a
+  drain that throws (`832ba8d`, `135d183`) and a chained body (`91e08b4`). `tests/harness-workers.test.mjs` (the
+  real adapter: two asks wake nothing, the drain step wakes, FIFO) and `tests/owner-decisions.test.mjs` (the
+  handle-state rules, and a revoked assignment discarded before the re-wake). `tests/notice-ledger.test.mjs`
+  performs each exit of the drain-throw terminal through the owner's tools (`ec50037`) and checks that a wake
+  summary reminds only its open constituents (`f1a0530`).
+- **R1, a choice decided again after the preparation.** After the preparation await, the dispatch sweep decides its
+  choice again with the predicate that made it. `stillDispatchable(board, chosen, member)` is
+  `stillChosen(board, chosen)` (the row's epoch, `assigneeId`, `plannedAssigneeId` and `assignmentMode` are
+  unchanged) while the member is still `eligible`. The sweep asks it before the assignment and before it records a
+  preparation failure. Claim asks `stillChosen` and then `ready` on one board. `stopOwed` stays an untyped `Error`.
+  The typed `stop_owed` admission refusal of `04a3f7c` was reverted by `d8144e4`, since it put into the ledgered
+  admission vocabulary a reason no admission decision makes. The owner-approved delta, against `6d5da9d`: when the
+  member came to owe a stop during the preparation, the sweep records no `task/preparation-failed`, `task/blocked`
+  or `mission/stalled`, sends no preparation-failed or stall-root notice, does not move the epoch and records no
+  `preparationFailure`. The task stays pending and dispatches after the stop. Regressions, all in
+  `tests/board-read-points.test.mjs`. The stop barrier held open: the work stays pending and the owner is told
+  nothing while the stop is owed (`ced9aff`). A preparation that throws after the stop became owed records no
+  failure (`c4b22be`). Each of the four fresh-row clauses is pinned through dispatch and claim (`66febb2`, a gap
+  older than `6d5da9d`). Not changed: the barrier's release publishes a dispatch question before the pass it kicks is
+  open. That ordering also gives the replay, F2, F13 and F19 logs their question, so changing it is an owner-facing
+  change of its own.
+- **F2, reverted** (`89e294c` to `6a09912`, reverted by `4f54cf1`; `src`, tests and docs are as at `66febb2`). The
+  rule F2 wanted is that the handle holding a row's open attempt owes the stop, and an attempt that ended in a
+  submission or a verdict owes none. That rule needs a recovery F2's brief did not name. Without the stop and the
+  checkpoint, the next member's preparation captured the first reviewer's live worktree and re-published the
+  deferral epoch's artifact ref at a new commit. `d934886` pins that this ref keeps the commit the verdict recorded.
+  It fails on the F2 build and passes at `6d5da9d` and here. The follow-up, W1, recovers a finished attempt from the
+  capture its verdict or submission recorded, so the runtime names the recovery source to `prepareTask`. That is a
+  `WorkerAdapter` change, and the owner decides it. F2 then lands as one fence. Until then `Attempts.fenceRow` and
+  `controlTask`'s own stop owner stay as they are.
+- **F3, an attempt's markers are fields of the attempt.** `pausedBy`, `idleSignal`, `closeout`, `leaseWarned` and
+  `gitWriteDenied` live on `Attempt`. Whatever ends the attempt takes them, and a submission or a verdict keeps them
+  with the attempt it keeps as its record. The budget resume continues the open attempts whose `pausedBy` names its
+  pause. Opening a store before schema 7 rewrites each row that carries a marker once, inside the opening
+  transaction, and writes no row that carries none (owner-approved durable change). Regressions:
+  `tests/attempt-fence.test.mjs`, where each fence takes every marker and the schema 7 upgrade runs over a v6 and a v5
+  store, its restored snapshot and a reopen. This round adds the budget resume's two clauses (`349ac77`): a
+  submission's or a deferred verdict's kept attempt carrying the pause's id is not resumed, and a running attempt with
+  no `pausedBy` or another pause's is neither redelivered nor recorded. It also adds a store whose rows carry no
+  marker, which the upgrade does not write (`c7fed65`). Built-lib mutants that drop either clause, or the upgrade's
+  skip of an unmarked row, each fail exactly the test written for it.
+- **V1, one comparison basis** (`9aa4a59`, owner-approved). A verdict compares only the envelope delivered with its
+  attempt; an attempt delivered none has nothing to compare, whatever the adapter reports at verify time.
+  Regression: `tests/check-envelope.test.mjs`. A review delivered no envelope, verified while the adapter reports
+  one, is accepted and records only that report; it fails on `6d5da9d` with `check_environment_mismatch`. R22
+  (`tests/rule-workspace-recovery.test.mjs`) installs its envelope before the review is claimed.
+- **I1, one record of a turn end** (`e1c2767`, `30754b4`, `1ce5025`; owner decision (b)). `onIdle` records the turn
+  end once, as `attempt.idleSignal`, in the commit that clears the member's activity. `turnEnded` is a predicate over
+  the row. A turn end whose commit the writer refused records nothing, so it is not nudged and its lease expiry frees
+  the attempt. The attempt reporting bound names it first only when that bound passes before the lease and the member
+  row records no operation. Regressions: `tests/worker-closeout.test.mjs` covers the default bounds (nothing names
+  it before the lease expiry), a reporting bound shorter than the lease (it names it), and the operation end refused
+  too (nothing names it). Each fails on `6d5da9d`, whose in-memory signal nudged the attempt.
+
+**Integrator repair round 1** (`9478e8e` to `c7fed65`, and this record).
+
+- `9478e8e` (refactor): seven sites in `HarnessWorkers` spelled the fence's three clauses inline. They are
+  `currentActivity`, the tool guard, the pre-step's two rejects, the idle callback, `compactAtBoundary` and
+  `compactIfRequested`, and each now asks `fenced(resident)`. The sites that first throw the abort's own reason and
+  then refuse a closing adapter or a stopping resident keep their two clauses. The oracle is unchanged, the 17 test
+  files that name the adapter pass 296/296, and `npm run test:harness` (which runs the real boundary compaction)
+  passes.
+- `349ac77`, `c7fed65` (tests): F3's two findings, described above. No `src` change.
+- This record answers R1's finding and the missing batch-16 record.
+
+Gate at `c7fed65` (`src` as at `9478e8e`). On 0.1.5-rc.3 these passed: `npm run typecheck`, `npm run build`,
+`npm run test:oracle` (11 scenarios identical over three runs), `npm run test:harness` (with
+`UPDATE_SMOKE_SNAPSHOT=1` the model-visible fixture does not drift), `npm run test:replay` (digest
+`sha256:61a921e64088b78b957cd6aeaa563d5436d4a6eae4b0130725d1f3c74c6f971e`, unchanged),
+`node scripts/faults/run.mjs` (24/24) and both web smokes (`passed: true`). On 0.1.7-rc.1, in a detached worktree on
+that host's link farm, these passed: typecheck, build, `test:harness`, and harness-workers, owner-decisions,
+activity, operation-bound, r12-native-start-fixes and attempt-fence (107/107). `tests/attempt-fence.test.mjs` passed
+17/17 in three rounds of two concurrent copies.
+
 ## Batch 15: decide-then-act X1, X2, X3, F1, S7, S8, S9, S11, the full-log oracle record (2026-10-17)
 
 **Head**: `9234211` and this record (documentation only), branch `batch15/kernel` on `b462a61`, not merged; this

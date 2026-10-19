@@ -13,7 +13,7 @@
 import { createHash } from 'node:crypto'
 import { id } from './store.ts'
 import { arenaView as projectArenaView, hasNotice, openAsks } from './arena.ts'
-import { TERMINAL_STATES, currentEvidenceIds, holdsAttempt, holdsOpenAttempt, subjectsOfTasks, terminal } from './task-graph.ts'
+import { TERMINAL_STATES, currentEvidenceIds, holdsOpenAttempt, subjectsOfTasks, terminal } from './task-graph.ts'
 import { excerpt } from './check-results.ts'
 import type { DeclaredChecks } from './declared-checks.ts'
 import { executionElapsed, exhaustedDimensions } from './resource-time.ts'
@@ -288,7 +288,7 @@ export class RuntimeGates {
     this.k.commit(mission.id, () => {
       this.k.store.put('missions', mission)
       for (const task of this.k.store.list('tasks', mission.id)) if (holdsOpenAttempt(task)) {
-        task.budgetResume = { pauseId: mission.budgetPause!.id, attemptId: task.attempt.id }
+        task.attempt.pausedBy = mission.budgetPause!.id
         // S5: every task write is a compare-and-swap on the task's own revision.
         // These records were read inside this transaction, so the presented
         // revision is the durable one and the write is accepted; a record that
@@ -356,11 +356,10 @@ export class RuntimeGates {
     if (mission.status !== 'active' || !pause?.quiesced) return
     this.k.commit(mission.id, () => {
       for (const task of this.k.store.list('tasks', mission.id)) {
-        // A marker leaves the row with the attempt it names, so the rows that
-        // still hold the attempt their marker names are what this pause preserved.
-        const resume = task.budgetResume
-        if (resume?.pauseId !== pause.id || !holdsAttempt(task, mission.id, resume.attemptId)) continue
-        delete task.budgetResume
+        // The pause is a field of the attempt it preserved and leaves the row
+        // with it, so the open attempts this pause names are what it preserved.
+        if (!holdsOpenAttempt(task) || task.attempt.pausedBy !== pause.id) continue
+        delete task.attempt.pausedBy
         task.attempt.leaseUntil = Math.min(mission.deadline, this.k.now() + this.k.config.leaseMs)
         this.k.store.putTask(task)
         // The resumed attempt is what makes its owner `working`; the status is

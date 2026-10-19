@@ -50,11 +50,13 @@ async function runtimeFixture(t) {
 }
 
 
-async function reviewFixture(t) {
+/** A submitted source and its claimed review; `checkEnvelope`, when given, is the adapter's report from the review's claim on, so that attempt is delivered its envelope. */
+async function reviewFixture(t, { checkEnvelope } = {}) {
   const f = await runtimeFixture(t)
   const source = await f.runtime.claim(f.actor(f.author), f.mission.id, f.propose().id)
   await f.runtime.submit(f.actor(f.author), f.mission.id, { taskId: source.id, attemptId: source.attempt.id, output: 'ready' })
   const review = f.propose({ title: 'Review', kind: 'verification', reviewOf: source.id, assigneeId: f.reviewer.id })
+  if (checkEnvelope !== undefined) f.workers.checkEnvelope = checkEnvelope
   const claim = await f.runtime.claim(f.actor(f.reviewer), f.mission.id, review.id)
   return { ...f, source, review, claim, verify: () => f.runtime.verify(f.actor(f.reviewer), f.mission.id, { taskId: review.id, attemptId: claim.attempt.id, verdict: 'accept', reason: 'independent check' }) }
 }
@@ -203,12 +205,13 @@ test('R14: integration gets recorded conflict files, resolves without Git writes
 })
 
 test('R22: a divergent actual supporting host-check environment still refuses acceptance and retains its execution', async t => {
-  const f = await reviewFixture(t)
   const environment = { home: '/stable', userCacheDir: '/stable/.cache', huggingfaceCacheDir: '/stable/.cache/huggingface',
     userCacheDirExists: false, huggingfaceCacheDirExists: false, xdgCacheHome: '/check/.cache',
     sandboxPolicy: { mode: 'workspace-write', enforcement: 'full', workspaceRoot: '/check' },
     dependencyLinks: { mode: 'copy', dirs: [] }, checkCacheRoot: '/check/.cache', checkCacheRoots: {} }
-  f.workers.checkEnvelope = () => ({ environment, selfRunEnvironment: environment })
+  // The envelope is the adapter's report before the review is claimed, so the
+  // attempt is delivered it: a verdict compares only the envelope its attempt was given.
+  const f = await reviewFixture(t, { checkEnvelope: () => ({ environment, selfRunEnvironment: environment }) })
   f.workers.checks = [{ command: 'test', exitCode: 0, output: 'ok', environment },
     { command: 'second-check', exitCode: 0, output: 'ok', environment: { ...environment, home: '/different' } }]
   await assert.rejects(f.verify(), error => error.code === 'check_environment_mismatch')

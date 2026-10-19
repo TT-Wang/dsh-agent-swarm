@@ -674,7 +674,7 @@ export class Notices {
    */
   absenceNet(missionId: string, options: { boundMs?: number } = {}): void {
     const board = this.k.boardOf(missionId), mission = board.mission
-    this.followupObligations(interpret(board))
+    this.followupObligations(board)
     if (mission.status !== 'active' || mission.budgetPause !== undefined) return
     // The latest task, evidence or owner-decision progress; telemetry does not reset this clock.
     const lastAt = board.records.progressAt(mission)
@@ -694,23 +694,31 @@ export class Notices {
    * summary reminds only the constituents that are unresolved and have
    * reminders left, and spends only theirs, so an unrelated constituent that
    * stays open cannot spend the reminders of one that is resolved for a while
-   * and then reopens.
+   * and then reopens. Which facts are due a reminder now is a question of their
+   * rows alone; only those are judged against the board, so a board with none
+   * due builds no interpretation.
    */
-  private followupObligations(view: Interpretation): void {
-    const mission = view.mission
+  private followupObligations(board: Board): void {
+    const mission = board.mission
     if (!['active', 'blocked'].includes(mission.status)) return
-    const now = this.k.now()
-    for (const delivery of this.k.store.list('deliveries', mission.id)) {
+    const now = this.k.now(), limit = this.maxObligationFollowups
+    const due = this.k.store.list('deliveries', mission.id).flatMap(delivery => {
       const fact = noticeRow(delivery)
       // Only a sent fact is reminded: a covered one never is, and its covering delivery's reminders carry its root.
       if (delivery.to !== 'owner' || delivery.deliveredAt === undefined || fact === undefined
         || ['progress', 'completion'].includes(fact.class)
-        || FOLLOWUP_EXCLUDED_FAMILIES.has(noticeFamily(delivery))) continue
+        || FOLLOWUP_EXCLUDED_FAMILIES.has(noticeFamily(delivery))
+        || now - (fact.followupAt ?? delivery.deliveredAt) < this.obligationFollowupMs) return []
+      // A summary has reminders left while one of its constituents has (`open`), and reminds only those.
+      const open = fact.aggregatedFacts?.filter(part => (part.followupCount ?? 0) < limit)
+      return (open === undefined ? (fact.followupCount ?? 0) < limit : open.length > 0) ? [{ delivery, fact, open }] : []
+    })
+    if (due.length === 0) return
+    const view = interpret(board)
+    for (const { delivery, fact, open } of due) {
       const spent = fact.followupCount ?? 0
-      if (now - (fact.followupAt ?? delivery.deliveredAt) < this.obligationFollowupMs) continue
-      const parts = fact.aggregatedFacts?.filter(part => (part.followupCount ?? 0) < this.maxObligationFollowups
-        && this.unresolvedSubjects(view, this.summaryFactDelivery(mission.id, delivery.id, part)).length > 0)
-      if (parts === undefined ? spent >= this.maxObligationFollowups : parts.length === 0) continue
+      const parts = open?.filter(part => this.unresolvedSubjects(view, this.summaryFactDelivery(mission.id, delivery.id, part)).length > 0)
+      if (parts?.length === 0) continue
       const unresolved = parts === undefined ? this.unresolvedSubjects(view, delivery)
         : [...new Set(parts.flatMap(part => this.unresolvedSubjects(view, this.summaryFactDelivery(mission.id, delivery.id, part))))]
       if (unresolved.length === 0) continue
