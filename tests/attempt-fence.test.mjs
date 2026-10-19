@@ -18,9 +18,11 @@
  * of them (`pausedBy`): a fence during a budget pause takes it, and the resume
  * finds no stale marker to skip. A store an older build wrote, which kept them
  * on the row beside the attempt, is rewritten once when it is opened (schema
- * 7). Each fence test here fails on the hand-assembled fences (b462a61); the
- * last pins what the fence is not: an owner resume keeps a running attempt and
- * restarts its idle close-out.
+ * 7). A budget resume continues exactly the open attempts whose `pausedBy`
+ * names its pause: neither a finished attempt a row keeps as its record nor a
+ * running attempt the pause did not name. Each fence test here fails on the
+ * hand-assembled fences (b462a61); the last pins what the fence is not: an
+ * owner resume keeps a running attempt and restarts its idle close-out.
  */
 import test from 'node:test'
 import assert from 'node:assert/strict'
@@ -56,7 +58,34 @@ async function fixture(t) {
     f.runtime.commit(f.mission.id, () => f.runtime.store.put('tasks', row))
   }
   const member = () => f.runtime.store.get('members', f.author.id)
-  return { ...f, claim, mark, member }
+  /** The token budget runs out while the author works: the pause preserves each running attempt, and its stop quiesces. Returns the pause's id. */
+  const pause = async () => {
+    await f.workers.callbacks.usage(f.author.id, budget.maxTokens + 1)
+    await f.runtime.settle(f.mission.id)
+    const { id, quiesced } = f.runtime.mission(f.mission.id).budgetPause
+    assert.equal(quiesced, true, 'the pause\'s stop quiesced')
+    return id
+  }
+  /** The owner raises the budget and resumes: the pass that resume kicks continues what the pause preserved. */
+  const resume = async () => {
+    f.runtime.updateBudget(f.owner, f.mission.id, { ...f.runtime.mission(f.mission.id).budget, maxTokens: budget.maxTokens * 4 })
+    f.runtime.control(f.owner, f.mission.id, 'resume', 'Budget raised')
+    await f.runtime.settle(f.mission.id)
+    assert.equal(f.runtime.mission(f.mission.id).budgetPause, undefined, 'the resume cleared the pause')
+  }
+  /** The attempts the budget resume continued, as [taskId, attemptId]. */
+  const resumed = () => events(f.runtime, f.mission.id, 'task/budget-resumed').map(event => [event.data.taskId, event.data.attemptId])
+  /** How many assignments a task was delivered. */
+  const assignments = taskId => f.runtime.store.list('deliveries', f.mission.id).filter(delivery => delivery.kind === 'assignment' && delivery.taskId === taskId).length
+  /** The author's work is submitted and the reviewer claims its review: returns both rows' ids and the review's attempt. */
+  const underReview = async () => {
+    const { task: source, attemptId } = await claim({ title: 'Submitted source' })
+    await f.runtime.submit(f.actor(f.author), f.mission.id, { taskId: source.id, attemptId, output: 'candidate for review' })
+    const review = f.propose({ title: 'Review the source', objective: 'Independent review', kind: 'verification', reviewOf: source.id, checks: undefined, covers: undefined, assigneeId: f.reviewer.id })
+    const taken = await f.runtime.claim(f.actor(f.reviewer), f.mission.id, review.id)
+    return { source: source.id, review: review.id, reviewAttemptId: taken.attempt.id }
+  }
+  return { ...f, claim, mark, member, pause, resume, resumed, assignments, underReview }
 }
 
 /**
@@ -182,13 +211,56 @@ test('a fence during a budget pause takes the pause marker with the attempt, so 
   f.runtime.controlTask(f.owner, f.mission.id, task.id, 'amend', { checks: ['test -e .'] }, 'Amend the paused task')
   assert.deepEqual(markersOf(taskOf(f.runtime, task.id)), [], 'the pause left the row with the fenced attempt')
   assertFenced(f, task.id, attemptId, 'owner-amend', 'task/amended')
-  f.runtime.updateBudget(f.owner, f.mission.id, { ...f.runtime.mission(f.mission.id).budget, maxTokens: budget.maxTokens * 4 })
-  f.runtime.control(f.owner, f.mission.id, 'resume', 'Budget raised')
-  for (let tick = 0; tick < 20 && f.runtime.mission(f.mission.id).budgetPause !== undefined; tick++) { f.clock.advance(10); await f.runtime.tick() }
-  assert.equal(f.runtime.mission(f.mission.id).budgetPause, undefined, 'the resume cleared the pause')
+  await f.resume()
   assert.deepEqual(events(f.runtime, f.mission.id, 'task/budget-resume-skipped'), [], 'no marker outlived its attempt, so none is skipped')
-  assert.deepEqual(events(f.runtime, f.mission.id, 'task/budget-resumed'), [], 'the fenced attempt is not resumed')
+  assert.deepEqual(f.resumed(), [], 'the fenced attempt is not resumed')
   assert.equal(taskOf(f.runtime, task.id).recoveryCount, undefined, 'the fence spent no recovery credit')
+})
+
+test('a budget resume continues no finished attempt: a submission or a deferred verdict kept as the row\'s record is not resumed, though its pausedBy names the pause', async t => {
+  const f = await fixture(t)
+  // A submission keeps its attempt as the row's record, and so does a review that defers its verdict.
+  const { source, review, reviewAttemptId } = await f.underReview()
+  f.workers.checks = [{ command: '(verification preparation)', exitCode: 125, failureKind: 'infrastructure', output: 'Host verification could not execute: Error: EMFILE' }]
+  const deferred = await f.runtime.verify(f.actor(f.reviewer), f.mission.id, { taskId: review, attemptId: reviewAttemptId, verdict: 'accept', reason: 'Review against acceptance' })
+  assert.deepEqual([taskOf(f.runtime, source).status, deferred.status], ['submitted', 'blocked'], 'the source is submitted and its review deferred its verdict')
+  const { task: running, attemptId } = await f.claim({ title: 'Running work' })
+  const pauseId = await f.pause()
+  assert.equal(taskOf(f.runtime, running.id).attempt.pausedBy, pauseId, 'the pause preserved the running attempt')
+  // Each kept record carries this pause's id, so only whether the attempt is open tells it from the attempt the pause preserved.
+  for (const id of [source, review]) {
+    const row = taskOf(f.runtime, id)
+    row.attempt.pausedBy = pauseId
+    f.runtime.commit(f.mission.id, () => f.runtime.store.put('tasks', row))
+  }
+  const kept = [source, review].map(id => taskOf(f.runtime, id))
+  const delivered = kept.map(row => f.assignments(row.id))
+  await f.resume()
+  assert.deepEqual(f.resumed(), [[running.id, attemptId]], 'the resume continues the running attempt alone')
+  assert.deepEqual(kept.map(row => [taskOf(f.runtime, row.id).status, taskOf(f.runtime, row.id).attempt]), kept.map(row => [row.status, row.attempt]),
+    'each kept record keeps its status and its attempt as it was: its lease and its pausedBy')
+  assert.deepEqual(kept.map(row => f.assignments(row.id)), delivered, 'no kept record is delivered its assignment again')
+})
+
+test('a budget resume continues only the attempts its pause names: a running attempt with no pausedBy, or with another pause\'s, is neither redelivered nor recorded', async t => {
+  for (const other of [undefined, 'budget-pause-earlier']) {
+    const f = await fixture(t)
+    const { review } = await f.underReview()
+    const { task: preserved, attemptId } = await f.claim({ title: 'Preserved work' })
+    const pauseId = await f.pause()
+    assert.deepEqual([preserved.id, review].map(id => taskOf(f.runtime, id).attempt.pausedBy), [pauseId, pauseId], 'the pause preserved both running attempts')
+    // The review's running attempt is one this pause did not name.
+    const row = taskOf(f.runtime, review)
+    if (other === undefined) delete row.attempt.pausedBy
+    else row.attempt.pausedBy = other
+    f.runtime.commit(f.mission.id, () => f.runtime.store.put('tasks', row))
+    const unnamed = taskOf(f.runtime, review)
+    const delivered = f.assignments(review)
+    await f.resume()
+    assert.deepEqual(f.resumed(), [[preserved.id, attemptId]], `pausedBy ${other ?? 'absent'}: the resume continues the attempt its pause named alone`)
+    assert.deepEqual([taskOf(f.runtime, review).status, taskOf(f.runtime, review).attempt], ['running', unnamed.attempt], `pausedBy ${other ?? 'absent'}: the unnamed attempt keeps its lease and its pausedBy`)
+    assert.equal(f.assignments(review), delivered, `pausedBy ${other ?? 'absent'}: the unnamed attempt is not delivered its assignment again`)
+  }
 })
 
 test('a lease the sweep fences after a budget pause landed during its checkpoint capture spends no recovery credit', async t => {
