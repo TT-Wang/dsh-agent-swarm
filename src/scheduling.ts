@@ -8,7 +8,7 @@
  * sweep reads the board where it decides, after each of its awaits.
  */
 import { id } from './store.ts'
-import { TERMINAL_STATES, holdsOpenAttempt, openAttempt, pendingStopOwner, quiescencePending, subjectsOfTasks, taskSubject, terminal } from './task-graph.ts'
+import { TERMINAL_STATES, holdsOpenAttempt, openAttempt, pendingStopOwner, quiescencePending, subjectsOfTasks, taskSubject, terminal, turnEnded } from './task-graph.ts'
 import { asksHandle, eligible, isolationViolation, noticeSubjectsFor, overdueStop, startBlocker, stillDispatchable, takesWork, unschedulable } from './board.ts'
 import { factKey, type Notices } from './notices.ts'
 import { AdmissionRefusedError } from './scheduler.ts'
@@ -156,7 +156,7 @@ export class Scheduling {
             // bounded retry, then checkpoint the workspace and re-pend the task
             // instead of leaving it a zombie until lease expiry. A parked owner is
             // not an abandoned turn: the lease path re-pends it without a credit.
-            if (!parkedMember && this.attempts.turnEnded(open)) await this.attempts.closeOutIdleAttempt(mission, member, open, pass)
+            if (!parkedMember && turnEnded(open)) await this.attempts.closeOutIdleAttempt(mission, member, open, pass)
             continue
           }
           const choices = board.tasks.filter(t => eligible(board, t, member)).sort((a, b) => b.priority - a.priority || a.createdAt - b.createdAt)
@@ -575,7 +575,7 @@ export class Scheduling {
    *    stays quiet rather than double-reporting the same attempt. (It is also
    *    the conservative half of the F1v D1/D2 pair: this guard never judges a
    *    live declared check or retry, where a wall-clock bound false-positived.)
-   *  - the W6 idle close-out (`Attempts.turnEnded`): an attempt whose turn
+   *  - the W6 idle close-out (`turnEnded`): an attempt whose turn
    *    ended is the close-out's, which nudges it and then checkpoints it with a
    *    coded terminal, so this guard stays quiet for exactly that attempt.
    *  - the parked member (`waiting`): `notifyParkedHolder` names the holder;
@@ -600,7 +600,7 @@ export class Scheduling {
     if (!Number.isSafeInteger(attempt.leaseUntil)) return undefined
     // Naming an attempt the W6 idle close-out acts on would double-report it
     // (the pair is pinned by R16-D5).
-    if (this.attempts.turnEnded(task)) return undefined
+    if (turnEnded(task)) return undefined
     const member = this.k.store.get('members', attempt.ownerId)
     if (member === undefined || memberPhaseOf(member) === 'stopped' || memberPhaseOf(member) === 'parked') return undefined
     // F1's subject: any recorded in-flight operation means that guard owns this

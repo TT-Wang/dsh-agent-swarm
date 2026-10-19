@@ -364,7 +364,7 @@ export interface Attempt {
   sourceCommit?: string
   /** The budget pause (`Mission.budgetPause.id`) that preserved this attempt; that pause's resume continues it. */
   pausedBy?: string
-  /** Its owner ended a turn while this attempt was open (`onIdle`): the idle close-out acts on it, asking `Attempts.turnEnded`, its one reader. */
+  /** Its owner ended a turn while this attempt was open (`onIdle`): the idle close-out acts on it, asking `turnEnded`, its one reader. */
   idleSignal?: { at: number }
   /** Idle close-out nudges already delivered; an owner resume restarts them. */
   closeout?: { nudges: number; at: number }

@@ -1233,7 +1233,6 @@ test('S5: clearing every in-memory scheduling cache leaves the durable outcome u
     // The cache-only entries enumerated on the scheduling path, cleared while
     // the bodies the setup kicked may still be queued.
     f.runtime.queues.clear()
-    f.runtime.attempts.idleSignals.clear()
     f.runtime.startFailures.clear()
     f.runtime.fingerprintCache.clear()
     const task = f.propose()

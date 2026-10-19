@@ -124,7 +124,6 @@ const CENSUS = [
   ["src/admission.ts",14,"Set","const resolved = resolveHostOnlyScript(command, scripts, new Set(), 0)","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
   ["src/admission.ts",15,"Set","const SHELL_WORD_OPERATORS = new Set([';', '&', '|', '(', ')', '<', '>', '\\n'])","constant","","module-level immutable lookup table, never mutated after construction: data, not a gate"],
   ["src/admission.ts",16,"Set","const seen = new Set<string>()","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
-  ["src/attempts.ts",1,"Map","readonly idleSignals = new Map<string, { attemptId: string; at: number }>()","gate","cache-only","the durable Attempt.idleSignal carries the same value and the scheduling pass re-reads it"],
   ["src/attempts.ts",2,"Set","if (owner !== undefined) task.priorOwnerIds = [...new Set([...(task.priorOwnerIds ?? []), owner])]","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
   ["src/declared-checks.ts",1,"Map","private readonly checkRuns = new Map<string, CheckResult[][]>()","outside","","outside the runtime decision path: the declared-check runner (DeclaredChecks) below the runtime, reached through the verification adapter; the in-memory hold carries the FIRST failed pass until recordRuns() writes the pair, so losing it under-records that pair without changing the verdict (enumerated, no label claimed)"],
   ["src/delivery.ts",1,"Set","const activeSources = new Set<string>()","outside","","outside the runtime decision path: the delivery engine module (applyDelivery); the runtime serializes applies per workspace through exclusive(\"delivery:<workspace>\"), so the runtime path does not depend on this process-global mutex (enumerated, no label claimed)"],
@@ -525,30 +524,6 @@ const GATE_TESTS = {
       const after = f.runtime.fingerprint(f.mission.id)
       assert.notEqual(after, before, 'a changed board changes the digest')
       assert.equal(inside, after, 'inside a transaction the cache is bypassed (commitDepth), so it can never gate on a stale board')
-    } finally { await f.cleanup() }
-  },
-  'src/attempts.ts:1': async t => {
-    const f = await setup({ config: { tickMs: 10 } })
-    try {
-      const task = f.propose({ title: 'Idle close-out' })
-      await f.runtime.claim(f.actor(f.author), f.mission.id, task.id)
-      await f.workers.callbacks.idle(f.author.id)
-      const { attempt } = taskOf(f.runtime, task.id)
-      assert.ok(attempt.idleSignal, 'the durable `Attempt.idleSignal` carries the same value the map held')
-      assert.equal(f.runtime.attempts.idleSignals.get(f.author.id)?.attemptId, attempt.id)
-      assert.ok(f.runtime.attempts.idleSignals.size > 0, 'the loss must be exercised on a non-empty collection')
-      f.runtime.attempts.idleSignals.clear()   // the loss
-      // Dispatch must be able to reach the open attempt for the durable signal
-      // to be consulted at all.
-      f.workers.autoIdle = true
-      const closed = await eventually(() => {
-        const current = taskOf(f.runtime, task.id)
-        const closedOut = events(f.runtime, f.mission.id, 'task/checkpointed').length > 0
-          || events(f.runtime, f.mission.id, 'task/closeout-failed').length > 0
-          || events(f.runtime, f.mission.id, 'task/closeout-abandoned').length > 0
-        return closedOut ? current : undefined
-      }, 'the scheduling pass re-reads the durable signal and closes the idle attempt out')
-      assert.ok(closed)
     } finally { await f.cleanup() }
   },
   'src/notices.ts:9': async t => {

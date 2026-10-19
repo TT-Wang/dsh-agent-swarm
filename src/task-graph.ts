@@ -354,6 +354,18 @@ export function openAttempt(tasks: readonly Task[], memberId: string): HeldTask 
   return tasks.find((task): task is HeldTask => holdsOpenAttempt(task) && task.attempt.ownerId === memberId)
 }
 
+/**
+ * W6: the owner of an open attempt ended its turn on it (`Attempts.onIdle`),
+ * the one question of the idle close-out: the dispatch sweep closes out such
+ * an attempt (it nudges, then checkpoints and re-pends with a coded terminal),
+ * and the attempt reporting bound leaves it to the close-out. A turn end is a
+ * fact of the attempt, one of its fields, so it leaves the row only with the
+ * attempt.
+ */
+export function turnEnded(open: HeldTask): boolean {
+  return open.attempt.idleSignal !== undefined
+}
+
 /** A fenced handle must finish stopping before that member can own new work. */
 export function pendingStopOwner(tasks: readonly Task[], memberId: string): boolean {
   return tasks.some(task => {
