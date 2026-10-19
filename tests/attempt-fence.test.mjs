@@ -18,11 +18,12 @@
  * of them (`pausedBy`): a fence during a budget pause takes it, and the resume
  * finds no stale marker to skip. A store an older build wrote, which kept them
  * on the row beside the attempt, is rewritten once when it is opened (schema
- * 7). A budget resume continues exactly the open attempts whose `pausedBy`
- * names its pause: neither a finished attempt a row keeps as its record nor a
- * running attempt the pause did not name. Each fence test here fails on the
- * hand-assembled fences (b462a61); the last pins what the fence is not: an
- * owner resume keeps a running attempt and restarts its idle close-out.
+ * 7), and a store whose rows carry no marker is not written at all. A budget
+ * resume continues exactly the open attempts whose `pausedBy` names its pause:
+ * neither a finished attempt a row keeps as its record nor a running attempt
+ * the pause did not name. Each fence test here fails on the hand-assembled
+ * fences (b462a61); the last pins what the fence is not: an owner resume keeps
+ * a running attempt and restarts its idle close-out.
  */
 import test from 'node:test'
 import assert from 'node:assert/strict'
@@ -38,6 +39,8 @@ const MARKERS = ['pausedBy', 'closeout', 'idleSignal', 'gitWriteDenied', 'leaseW
 const ROW_MARKERS = ['budgetResume', 'closeout', 'idleSignal', 'gitWriteDenied', 'leaseWarned']
 /** Every marker a row carries, on its attempt or, in the shape before schema 7, beside it. */
 const markersOf = row => [...ROW_MARKERS.filter(key => row[key] !== undefined).map(key => `row.${key}`), ...MARKERS.filter(key => row.attempt?.[key] !== undefined)]
+/** One value a closed store holds, read past the runtime. */
+const readValue = (statePath, sql) => { const db = new DatabaseSync(statePath, { readOnly: true }); try { return Object.values(db.prepare(sql).get())[0] } finally { db.close() } }
 
 async function fixture(t) {
   const f = await setup({ clock: new FakeClock() })
@@ -315,7 +318,7 @@ test('a store an older build wrote is rewritten once, at open: each marker moves
       const db = new DatabaseSync(statePath)
       try { for (const row of rows) db.prepare('UPDATE tasks SET value=? WHERE id=?').run(JSON.stringify(row), row.id); db.exec(`PRAGMA user_version=${schema}`) } finally { db.close() }
     }
-    const read = sql => { const db = new DatabaseSync(statePath, { readOnly: true }); try { return Object.values(db.prepare(sql).get())[0] } finally { db.close() } }
+    const read = sql => readValue(statePath, sql)
     write(older, version)
     const snapshot = `${statePath}.v${version}.sqlite`
     copyFileSync(statePath, snapshot)
@@ -328,7 +331,7 @@ test('a store an older build wrote is rewritten once, at open: each marker moves
     assert.deepEqual(taskOf(opened, fenced.id), strip(older[1]), `v${version}: a row that holds no attempt keeps none of its markers`)
     assert.deepEqual(taskOf(opened, submitted.id), { ...strip(older[2]), attempt: { ...older[2].attempt, gitWriteDenied } },
       `v${version}: a pause and an idle signal naming another attempt leave; the held attempt keeps its own`)
-    assert.deepEqual(taskOf(opened, plain.id), plainRow, `v${version}: a row without markers is not rewritten`)
+    assert.deepEqual(taskOf(opened, plain.id), plainRow, `v${version}: a row without markers keeps its value`)
     assert.deepEqual(opened.store.changesSince(before).map(change => change.scopes), [[f.mission.id]], `v${version}: the upgrade is one recorded change`)
     assert.equal(read('PRAGMA user_version'), 7)
     await opened.dispose()
@@ -345,6 +348,28 @@ test('a store an older build wrote is rewritten once, at open: each marker moves
     t.after(() => restored.dispose())
     assert.deepEqual(taskOf(restored, held.id), upgraded, `v${version}: the restored snapshot is upgraded at open`)
     await restored.dispose()
+  }
+})
+
+test('opening an older store whose rows carry no marker writes nothing: the schema 7 upgrade records no change and moves no state revision', async t => {
+  // A schema 6 store (the previous version), and a schema 5 one, whose rows a v7 build wrote: no marker beside an attempt.
+  for (const version of [6, 5]) {
+    const f = await fixture(t)
+    const { task: held } = await f.claim({ title: 'Held attempt' })
+    const pending = f.propose({ title: 'No attempt' })
+    const rows = [taskOf(f.runtime, held.id), taskOf(f.runtime, pending.id)]
+    assert.deepEqual(rows.map(markersOf), [[], []], 'no row carries a marker')
+    await f.runtime.dispose()
+    const { statePath } = f.runtime.config
+    const db = new DatabaseSync(statePath)
+    try { db.exec(`PRAGMA user_version=${version}`) } finally { db.close() }
+    const before = readValue(statePath, 'SELECT revision FROM state_revision WHERE id=1')
+    const opened = new SwarmRuntime(f.runtime.config, new FakeWorkers())
+    t.after(() => opened.dispose())
+    assert.deepEqual([opened.store.revision(), opened.store.changesSince(before)], [before, []], `v${version}: the upgrade rewrote no row, so it records no change`)
+    assert.deepEqual(rows.map(row => taskOf(opened, row.id)), rows, `v${version}: every row keeps its value`)
+    await opened.dispose()
+    assert.equal(readValue(statePath, 'PRAGMA user_version'), 7, `v${version}: the store is at schema 7`)
   }
 })
 
