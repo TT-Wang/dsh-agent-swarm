@@ -1,7 +1,8 @@
 /**
  * S12: what a board owes the owner is a function of the board (`judge`), and
  * one executor writes a notice (`Notices.record`). S13: the notice a guard
- * chain ends with is a function of the board too (`guardTerminalNotice`).
+ * chain ends with is a function of the board too (`guardTerminalNotice`), and
+ * the two silences share one notice of their verdicts (`silenceNotice`).
  *
  * - `judge` decides and writes nothing: its notices are exactly the rows (and
  *   events) its executor, `Notices.ensureWitness`, then writes, in order, and a
@@ -14,7 +15,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { interpret } from '../lib/board.js'
-import { Notices, guardTerminalNotice, judge, noticeIdentity, reviewBlocked } from '../lib/notices.js'
+import { Notices, guardTerminalNotice, judge, noticeIdentity, reviewBlocked, silenceNotice } from '../lib/notices.js'
 import { RefusalRegistry } from '../lib/refusals.js'
 import { WriterBusyError } from '../lib/store.js'
 import { FakeClock, events, makeRuntimeStub, setup, taskOf } from './faults/harness.mjs'
@@ -168,4 +169,23 @@ test('S13: a guard chain\'s notice is recorded in one commit, its request\'s row
   assert.equal(notice.event.data.noticeKey, row.notice.dedupKey)
   assert.equal(f.runtime.notices.record(f.mission.id, guardTerminalNotice(f.runtime.boardOf(f.mission.id), 'attempt_lease', context)), false, 'the same request again is held')
   assert.deepEqual([commits.length, pumped], [1, 1], 'and commits and pumps nothing')
+})
+
+test('S13: an operation silence and an attempt silence are told by one notice of their verdict: the silent task at its epoch, the stall class, a key of the silence\'s family, identity and onset, and the holder row its predicate read', () => {
+  const task = { id: 'task_1', epoch: 2, title: 'Stuck work' }
+  const holder = { id: 'member_1', name: 'Author' }
+  const operation = silenceNotice(task, { family: 'operation-silent', holder, attemptId: 'attempt_1', activityId: 'activity_1', kind: 'tool', tool: 'bash',
+    startedAt: 1_000, lastRecordedAt: 0, silentSince: 1_000, elapsedMs: 61_000, boundMs: 60_000 })
+  const silent = { family: 'attempt-silent', holder, subject: 'task_1@2', attemptId: 'attempt_1', lastDurableAt: 0, silentMs: 130_000, boundMs: 120_000 }
+  const attempt = silenceNotice(task, silent)
+  for (const [notice, dedupKey] of [[operation, 'operation-silent:attempt_1:activity_1:1000'], [attempt, 'attempt-silent:attempt_1:0']]) {
+    assert.deepEqual([notice.subjects, notice.options, notice.event], [['task_1@2'], { noticeClass: 'stall', dedupKey }, undefined], 'its delivery row is its only witness')
+    assert.match(notice.content, /^Author \(member_1\) has held /)
+  }
+  assert.match(operation.content, /a tool operation `bash` for 1m 1s \(61000ms\)/)
+  assert.match(attempt.content, /since it was dispatched;/)
+  assert.doesNotMatch(attempt.content, /scheduling pass/)
+  const wedged = silenceNotice(task, { ...silent, wedgedPass: { operationId: 'operation_9', boundMs: 120 } })
+  assert.match(wedged.content, /The mission's scheduling pass operation_9 is wedged past its 120ms bound, so the in-pass recovery sweep cannot run either\./)
+  assert.equal(wedged.options.dedupKey, attempt.options.dedupKey, 'the pass is no part of the silence\'s identity')
 })
