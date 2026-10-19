@@ -4,8 +4,10 @@
  * follow-ups) both read: a fact is reminded exactly while it would still be
  * delivered, and of exactly what it still asserts. Before, a parked holder, a
  * dispatch question, a wedged pass's naming and a fall-through were delivered
- * by their own claim and reminded by another (`waitsLegitimately`, or any
- * subject where delivery asked every one).
+ * by their own claim and reminded by another (`waitsLegitimately`, its
+ * mission-level counterpart for a naming of the mission root, which reminded
+ * only a blocked, paused, stalled or all-terminal board, or any subject where
+ * delivery asked every one).
  *
  * Each case delivers its fact, lets one reminder interval pass, and asks the
  * relevance and the reminder of one board.
@@ -88,6 +90,31 @@ test('a wedged pass\'s naming is reminded of the work it named while that work i
     preparationFailure: { reason: 'Workspace or worker preparation failed: EBUSY', transient: true, attempts: 1, retryAt: f.clock.now() + 3_600_000 } }))
   assert.equal(relevant(f, naming), true, 'the naming is still deliverable: the work it named is unfinished at that epoch')
   assert.deepEqual(await remind(f, naming), [naming.subjects], 'so it is reminded, naming that work')
+})
+
+test('a wedged pass\'s naming of a board with no unfinished work names the mission root, and is reminded while the mission it named is unfinished, on a later board whose work runs under a live lease too', async t => {
+  const f = await fixture(t)
+  await f.runtime.settle(f.mission.id)
+  const scheduling = f.runtime.scheduling
+  const pass = { id: scheduling.passKey(f.mission.id), operationId: 'operation_wedge', missionId: f.mission.id, startedAt: f.clock.now() - 60_000,
+    revisionBefore: f.runtime.store.revision(), fingerprintBefore: f.runtime.fingerprint(f.mission.id) }
+  scheduling.passes.set(f.mission.id, pass)
+  scheduling.checkSchedulingPasses()
+  const [naming] = family(f, 'scheduling-pass:')
+  assert.deepEqual(naming.subjects, [`mission:${f.mission.id}`], 'with no unfinished work, the naming names the mission root')
+  // The owner plans work while the body is still wedged: a body is named once, so this row stays its only naming.
+  const work = f.propose({ title: 'Planned after the wedge' })
+  scheduling.checkSchedulingPasses()
+  assert.deepEqual(family(f, 'scheduling-pass:').map(row => row.id), [naming.id], 'the body is not named again for the work planned while it is wedged')
+  // The body settles; the planned work runs under a live lease, so nothing on the board waits illegitimately.
+  scheduling.closePass(f.mission.id, pass)
+  await f.runtime.settle(f.mission.id)
+  await f.runtime.claim(f.actor(f.author), f.mission.id, work.id)
+  assert.equal(taskOf(f.runtime, work.id).status, 'running')
+  assert.equal(relevant(f, naming), true, 'the naming is deliverable while the mission it named is unfinished, as before: the board does not say whether its body is still wedged')
+  assert.deepEqual(await remind(f, naming), [naming.subjects], 'so it is reminded by that rule, even while the work waits on its lease')
+  assert.deepEqual(await remind(f, naming), [naming.subjects], 'and again: the reminder limit, not the board, ends its reminders')
+  assert.deepEqual(await remind(f, naming), [], 'no reminder past the limit')
 })
 
 test('a fall-through is reminded while no live path advances any work it names, and not once one of them ended', async t => {
