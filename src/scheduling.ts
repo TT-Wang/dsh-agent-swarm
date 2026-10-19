@@ -446,13 +446,13 @@ export class Scheduling {
     // the stop unbounded.
     const stopFacts = unreached.flatMap(task => { const fact = overdueStop(board, task); return fact === undefined ? [] : [`${task.id} is blocked and ${fact}`] })
     const stopText = stopFacts.length ? ` Stop state: ${stopFacts.join('; ')}.` : ''
-    this.notices.tell(missionId, `Scheduling pass ${pass.id} (run ${pass.operationId}) for mission ${missionId} did not return within ${bound}ms and produced no durable state change (fingerprint ${fingerprint.slice(0, 12)}). This pass keeps the mission's scheduling until the call it awaits returns at its own bound; the next pass then resumes from lease recovery. Unschedulable: ${stuck.join(', ') || 'none'}.${heldText} Work the pass never reached: ${unreachedText}.${stopText} Decide: inspect the named tasks, admit a repair with swarm_propose, or withdraw the blocking work with swarm_cancel.`, subjects,
-      { dedupKey: noticeKey, reason }, () => {
+    this.notices.record(missionId, { content: `Scheduling pass ${pass.id} (run ${pass.operationId}) for mission ${missionId} did not return within ${bound}ms and produced no durable state change (fingerprint ${fingerprint.slice(0, 12)}). This pass keeps the mission's scheduling until the call it awaits returns at its own bound; the next pass then resumes from lease recovery. Unschedulable: ${stuck.join(', ') || 'none'}.${heldText} Work the pass never reached: ${unreachedText}.${stopText} Decide: inspect the named tasks, admit a repair with swarm_propose, or withdraw the blocking work with swarm_cancel.`, subjects,
+      options: { dedupKey: noticeKey, reason },
       // Reuse the registered board-stall event rather than inventing a new type:
       // `cause: 'scheduling-pass'` and `wedged` make the pass-level escalation
       // distinguishable in the durable log and in every existing read path. It
       // exists only with the row its `noticeKey` names.
-      this.k.store.event(missionId, 'mission/stalled', 'runtime', {
+      event: { type: 'mission/stalled', data: {
         cause: 'scheduling-pass',
         passId: pass.id, runId: pass.operationId,
         reason: `scheduling pass did not return within its ${bound}ms bound and advanced no durable state`,
@@ -474,8 +474,7 @@ export class Scheduling {
         releaseGapMs: Math.max(0, now - pass.startedAt),
         releasedWhileLive: heldByLiveWork,
         liveSubjects: holders.map(holder => holder.subject),
-      })
-    })
+      } } })
   }
 
   /**
@@ -578,7 +577,7 @@ export class Scheduling {
    *  - the W6 idle close-out (`turnEnded`): an attempt whose turn
    *    ended is the close-out's, which nudges it and then checkpoints it with a
    *    coded terminal, so this guard stays quiet for exactly that attempt.
-   *  - the parked member (`waiting`): `notifyParkedHolder` names the holder;
+   *  - the parked member (`waiting`): `parkedHolder` names the holder;
    *    the park is the owner's intent, not silence.
    *  - the budget pause: a deliberate host pause is not a stalled worker.
    *  - the wedge watchdog (`checkSchedulingPasses`): the tick this guard runs on
@@ -648,7 +647,7 @@ export class Scheduling {
       ? ` The mission's scheduling pass ${pass.operationId} is wedged past its ${this.k.bounds.stallPassTimeoutMs}ms bound, so the in-pass recovery sweep cannot run either.`
       : ''
     const message = `${name} has held task ${task.id} "${task.title}" at epoch ${task.epoch} (attempt ${silent.attemptId}) for ${formatSpan(silent.silentMs)} (${silent.silentMs}ms) with no durable report past its declared bound of ${formatSpan(silent.boundMs)} (${silent.boundMs}ms): no durable event, no task state transition and no recorded tool run names this attempt since ${since}; no operation is in flight and the idle close-out is not handling it.${passState} Nothing was stopped or re-pended by this notice: the attempt may still be working. Owner actions: inspect it with swarm_observe (taskId ${task.id}), send it input or finish it with swarm_handoff, raise attemptSilenceBoundMs if this silence is healthy, or withdraw the work with swarm_cancel. [witness: attempt-silent, subject ${silent.subject}, attempt ${silent.attemptId}, member ${silent.ownerId}, lastDurableAt ${silent.lastDurableAt}, silentMs ${silent.silentMs}, boundMs ${silent.boundMs}]`
-    return this.notices.tell(mission.id, message, [taskSubject(task)], { noticeClass: 'stall', dedupKey: `${ATTEMPT_SILENCE_PREFIX}${silent.attemptId}:${silent.lastDurableAt}` })
+    return this.notices.record(mission.id, { content: message, subjects: [taskSubject(task)], options: { noticeClass: 'stall', dedupKey: `${ATTEMPT_SILENCE_PREFIX}${silent.attemptId}:${silent.lastDurableAt}` } })
   }
 
   /**

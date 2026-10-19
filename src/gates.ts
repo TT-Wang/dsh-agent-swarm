@@ -12,13 +12,13 @@
  */
 import { createHash } from 'node:crypto'
 import { id } from './store.ts'
-import { arenaView as projectArenaView, hasNotice, openAsks } from './arena.ts'
+import { arenaView as projectArenaView, openAsks } from './arena.ts'
 import { TERMINAL_STATES, currentEvidenceIds, holdsOpenAttempt, subjectsOfTasks, terminal } from './task-graph.ts'
 import { excerpt } from './check-results.ts'
 import type { DeclaredChecks } from './declared-checks.ts'
 import { executionElapsed, exhaustedDimensions } from './resource-time.ts'
 import { dispatchable, inFlightEstimate, stepsInFlight } from './board.ts'
-import { noticeFamily, noticeIdentity, type Notices } from './notices.ts'
+import { held, noticeFamily, noticeIdentity, type Notices } from './notices.ts'
 import type { RefusalRegistry } from './refusals.ts'
 import type { Kernel } from './kernel.ts'
 import type { Delivery, Mission, Post, Task, UsageBuckets, UsageSnapshotSource } from './types.ts'
@@ -247,7 +247,7 @@ export class RuntimeGates {
       const crossed = thresholds.filter(threshold => projected / item.limit >= threshold).at(-1)
       const review = `budget-review:${mission.id}:${item.task?.id ?? 'mission'}:${item.dimension}:${item.limit}`, subjects = subjectsOfTasks(item.task === undefined ? [] : [item.task], mission)
       if (crossed === undefined || thresholds.some(threshold => threshold >= crossed
-        && hasNotice(ledger ??= this.k.store.list('deliveries', mission.id), noticeIdentity(mission.id, subjects, { noticeClass: 'budget', dedupKey: `${review}:${threshold}` }).identity))) continue
+        && held(ledger ??= this.k.store.list('deliveries', mission.id), mission.id, { subjects, options: { noticeClass: 'budget', dedupKey: `${review}:${threshold}` } }))) continue
       // This is only the numeric floor that restores threshold headroom, never
       // an estimate of the resources needed to finish the mission.
       const recommendation = Math.max(item.limit + 1, Math.ceil(Number((projected / thresholds[0]!).toFixed(6))))

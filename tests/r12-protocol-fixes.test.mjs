@@ -14,8 +14,8 @@ import { FakeClock, FakeWorkers, MISSION_ACCEPTANCE, makeRuntime, makeRuntimeStu
 import { openAsks } from '../lib/arena.js'
 import { dispatchable as dispatchableOf } from '../lib/board.js'
 
-/** A stub `Notices.tell`: the record that exists only with the fact, in the stubs' pass-through transaction (the ledger is not modelled). */
-function tell(_missionId, _content, _subjects, _options, then) { then?.(); return true }
+/** A stub `Notices.record`: the notice is recorded (the ledger is not modelled). */
+function record() { return true }
 
 function guardFixture() {
   const mission = { id: 'm', ownerSessionId: 'owner', status: 'active' }
@@ -226,7 +226,7 @@ function stopFixture(reason, stop) {
     defer: fn => { pending.push(Promise.resolve().then(fn)) }, exclusive: (_id, fn) => fn(), commit: (_id, fn) => fn(),
     kick() {}, fingerprint: () => 'stable',
   })
-  return { mission, rows, pending, events, stopped, attempts: new Attempts(rt, { emitGuardTerminal() {}, notify() {}, tell }) }
+  return { mission, rows, pending, events, stopped, attempts: new Attempts(rt, { emitGuardTerminal() {}, notify() {}, record }) }
 }
 
 for (const reason of ['lease-expired', 'worker-closeout', 'handoff']) test(`R12: ${reason} retries a rejected stop before re-pending without charging another recovery`, async () => {

@@ -9,8 +9,7 @@
 import { tmpdir } from 'node:os'
 import { stopPending, subjectsOfTasks, terminal } from './task-graph.ts'
 import { claimFor, isContained, reauthorizeWorkspace, WorkspaceRevokedError, WORKSPACE_AUTHORIZATION_CODE, type WorkspaceClaim } from './authorization.ts'
-import { hasNotice } from './arena.ts'
-import { isolationOpener, noticeIdentity, type Notices } from './notices.ts'
+import { held, isolationOpener, type Notices } from './notices.ts'
 import { noticeSubjectsFor, type Board, type IsolationIssue } from './board.ts'
 import { guardTerminalKey } from './refusals.ts'
 import type { Attempts } from './attempts.ts'
@@ -437,7 +436,7 @@ export class WorkspaceAdmission {
     const revocation = `workspace-revoked:${this.k.instanceId}`
     // Idempotent from mission state: nothing left to block, and the owner already
     // holds this revocation's request, under the identity it is told with, means the mission is fenced.
-    if (blocked.length === 0 && hasNotice(this.k.store.list('deliveries', missionId), noticeIdentity(missionId, subjectsOfTasks(blocked, mission), { dedupKey: guardTerminalKey('workspace', { localKey: revocation }) }).identity)) return
+    if (blocked.length === 0 && held(this.k.store.list('deliveries', missionId), missionId, { subjects: subjectsOfTasks(blocked, mission), options: { dedupKey: guardTerminalKey('workspace', { localKey: revocation }) } })) return
     this.k.commit(missionId, () => {
       for (const task of blocked) {
         // A running task here holds a live attempt and a live handle. Setting the

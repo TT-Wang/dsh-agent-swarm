@@ -7,7 +7,7 @@ import { PolicyError } from './policy-error.ts'
 export { WorkspaceRevokedError } from './authorization.ts'
 import { recordedClaim, type WorkspaceClaim } from './authorization.ts'
 import { WorkspaceAdmission, deniedGitWrite, gitWriteDeniedMessage, TEMP_RENDEZVOUS_WINDOW_MS } from './workspace-admission.ts'
-import { Notices, NOTICE_TEMPLATES, REJECTION_DECISION_TRIGGER, assignmentCurrent, renderNotice } from './notices.ts'
+import { Notices, NOTICE_TEMPLATES, REJECTION_DECISION_TRIGGER, assignmentCurrent, integrationGap, renderNotice, reviewBlocked } from './notices.ts'
 import { RefusalRegistry, requireStrings, requireText, sameChecks, unsupportedEffort, validatedBudget } from './refusals.ts'
 import { Scheduling } from './scheduling.ts'
 import { progressed, type Kernel, type SchedulingPass } from './kernel.ts'
@@ -1134,7 +1134,8 @@ export class SwarmRuntime implements Kernel {
       for (const change of checkChanges) this.store.event(missionId, 'task/check-changed', key, { taskId: task.id, reason: 'replacement', ...change })
     })
     this.gates.warnBudget(this.mission(missionId))
-    this.notices.warnIntegrationGap(mission, task)
+    const gap = integrationGap(this.boardOf(missionId), task)
+    if (gap !== undefined) this.notices.record(missionId, gap)
     this.kick(missionId)
     return owner ? task : memberTask(this.boardOf(missionId), task)
   }
@@ -2038,8 +2039,9 @@ export class SwarmRuntime implements Kernel {
       const need = reviewNeed(this.boardOf(mission.id), source)
       if (!need.ripe) continue
       if (!need.recorded) this.reportMissingReview(mission, source)
-      const blocked = reviewPathBlocker(this.boardOf(mission.id), source, need, stalled)
-      if (blocked !== undefined) this.notices.notifyReviewBlocked(mission, source, need.id, blocked)
+      const board = this.boardOf(mission.id)
+      const blocked = reviewPathBlocker(board, source, need, stalled)
+      if (blocked !== undefined) this.notices.record(mission.id, reviewBlocked(board, source, need.id, blocked))
       else this.admitAutomaticReview(mission, source, need)
     }
   }
@@ -2068,7 +2070,7 @@ export class SwarmRuntime implements Kernel {
       // what to admit instead. A busy writer or any other failure is not a
       // refusal: it leaves the pass, and the next pass proposes again.
       if (!(error instanceof PolicyError)) throw error
-      this.notices.notifyReviewBlocked(mission, source, need.id, `${ADMISSION_REFUSED}${error instanceof Error ? error.message : String(error)}`)
+      this.notices.record(mission.id, reviewBlocked(this.boardOf(mission.id), source, need.id, `${ADMISSION_REFUSED}${error instanceof Error ? error.message : String(error)}`))
       return
     }
     // The review already exists and its task/proposed event is durable; a busy
@@ -3020,7 +3022,7 @@ export class SwarmRuntime implements Kernel {
   /** Automatic completion consumes accepted obligations; it never withdraws unfinished work.
    * Owner-assembled missions retain explicit completion (R10-14: an owner-assembled
    * mission may still be extending its plan); the board classifier tells the owner
-   * of a stalled board or a coverage-complete owner-assembled mission (`Notices.judgeBoard`).
+   * of a stalled board or a coverage-complete owner-assembled mission (`judge`, src/notices.ts).
    */
   private completeAutomatic(missionId: string): boolean {
     const mission = this.mission(missionId)

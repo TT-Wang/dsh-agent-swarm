@@ -17,7 +17,7 @@ import { join } from 'node:path'
 import { FakeClock, FakeWorkers, MISSION_ACCEPTANCE, acceptThroughReview, blockThroughReview, eventually, events, setup, taskOf } from './faults/harness.mjs'
 import { BOARD_RUNNING, completionError, interpret, isolationIssues, reviewNeed } from '../lib/board.js'
 import { assertNamedCalls, ownerTools } from './refusal-inventory.mjs'
-import { NOTICE_TEMPLATES, factKey, noticeFamily, noticeTemplateKey } from '../lib/notices.js'
+import { NOTICE_TEMPLATES, factKey, noticeFamily, noticeTemplateKey, reviewBlocked } from '../lib/notices.js'
 
 const ownerRows = f => f.runtime.store.list('deliveries', f.mission.id).filter(delivery => delivery.to === 'owner' && delivery.notice !== undefined)
 const stallRow = f => ownerRows(f).find(delivery => delivery.notice.trigger === 'mission/stalled' && delivery.content.startsWith('Mission stalled'))
@@ -799,7 +799,7 @@ test('a review-blocked decision an older build wrote for a submission without an
     await f.runtime.settle(f.mission.id)
     // The decision 29a0268 wrote for this source past its grace, through the same emitter, with its event: the running board's cause.
     const row = taskOf(f.runtime, source.id)
-    f.runtime.notices.notifyReviewBlocked(f.runtime.mission(f.mission.id), row, reviewNeed(f.runtime.boardOf(f.mission.id), row).id, BOARD_RUNNING)
+    f.runtime.notices.record(f.mission.id, reviewBlocked(f.runtime.boardOf(f.mission.id), row, reviewNeed(f.runtime.boardOf(f.mission.id), row).id, BOARD_RUNNING))
     const [legacy] = ownerRows(f).filter(delivery => noticeFamily(delivery) === 'review-blocked')
     assert.equal(legacy.notice.dedupKey, `review-blocked:${f.mission.id}:${source.id}:${reviewNeed(f.runtime.boardOf(f.mission.id), row).id}:${BOARD_RUNNING}`, `running=${running}: the older build's key`)
     // After the upgrade the running work goes on, or the owner withdraws it and the board has nothing else to do.

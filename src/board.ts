@@ -22,7 +22,7 @@ import { memberPhaseOf } from './projection.ts'
 import { recoveryExit } from './check-results.ts'
 import { scopeKeysOverlap } from './scheduler.ts'
 import { TERMINAL_STATES, blockCauses, completionExempt, holdsOpenAttempt, missionSubject, openAttempt, pendingStopOwner, quiescencePending, selectAcceptedDelivery, stopPending, subjectsOfTasks, taskGraphIndex, taskSubject, terminal, uncoveredCriteria, type HeldTask, type TaskGraphIndex } from './task-graph.ts'
-import { providerQuiescent, type CheckResult, type Delivery, type Evidence, type Member, type Mission, type RuntimeConfig, type Task, type WorkerActivity } from './types.ts'
+import { providerQuiescent, type AutoStart, type CheckResult, type Delivery, type Evidence, type Member, type Mission, type RuntimeConfig, type Task, type WorkerActivity } from './types.ts'
 
 /**
  * S1: the bound on one scheduling pass before the runtime names it wedged, in
@@ -119,14 +119,15 @@ export interface AdapterView {
 
 /**
  * The durable log a board reads where a decision reads it: task events (and
- * the mission's progress clock over them), tool runs, the deliveries ledger and
- * evidence. It lists those two tables only: the board's own rows (its mission,
- * tasks and members) are its fields, so no predicate can read one again
- * through the log.
+ * the mission's progress clock over them), tool runs, the deliveries ledger,
+ * evidence and the start request that launched the mission, if one did. It
+ * lists those three tables only: the board's own rows (its mission, tasks and
+ * members) are its fields, so no predicate can read one again through the log.
  */
 export interface BoardRecords extends Pick<SwarmStore, 'latestTaskEvent' | 'progressAt' | 'toolRuns'> {
   list(table: 'deliveries', missionId: string): Delivery[]
   list(table: 'evidence', missionId: string): Evidence[]
+  list(table: 'starts', missionId: string): AutoStart[]
 }
 
 /** One mission's rows at one instant, with the clock, the bounds, the adapter view and the log every decision over them reads. */
@@ -904,7 +905,7 @@ export interface Interpretation extends Board {
 
 /**
  * R17-G1: the ONE shared interpretation of a board. Every board classifier
- * (`Notices.ensureWitness`, the obligation follow-ups and the relevance of a
+ * (`judge` in src/notices.ts, the obligation follow-ups and the relevance of a
  * board fact) reads it instead of re-reading raw rows and re-deriving its own
  * answer: it is the board, so the dispatcher's own predicates (`eligible`,
  * `reviewable`, `completionError`) are asked of it directly, and beside it what
