@@ -81,7 +81,7 @@ test('read-only git commands and unrelated failures never claim the typed denial
   await f.workers.callbacks.toolRun(f.author.id, { ...deniedCommit, arguments: { command: 'git commit -m "no denial here"' }, result: { isError: false, content: 'committed' }, isError: false })
   assert.equal(f.events('task/git-write-denied').length, 0)
   assert.equal(f.workers.callbacks.guard(f.author.id, 'bash'), undefined)
-  assert.equal(f.runtime.store.get('tasks', task.id).gitWriteDenied, undefined)
+  assert.equal(f.runtime.store.get('tasks', task.id).attempt.gitWriteDenied, undefined)
 })
 
 test('a new attempt starts without the previous attempt git-write denial', async t => {
@@ -95,7 +95,7 @@ test('a new attempt starts without the previous attempt git-write denial', async
     return current.status === 'pending' ? current : undefined
   }, 'the handoff re-pends the task', 2500)
   const claimed = await f.runtime.claim(f.actor(f.reviewer), f.mission.id, task.id)
-  assert.equal(claimed.gitWriteDenied, undefined, 'the marker is cleared when the new attempt is admitted')
+  assert.equal(claimed.attempt.gitWriteDenied, undefined, 'the new attempt starts without the previous attempt\'s denial')
   assert.equal(f.workers.callbacks.guard(f.reviewer.id, 'bash'), undefined, 'the new owner is not denied for the old attempt')
 })
 
@@ -132,7 +132,7 @@ test('F14: a non-shell tool quoting a git-write phrase with refusal text never d
     })
   }
   assert.equal(f.events('task/git-write-denied').length, 0, 'a quoted phrase was never executed')
-  assert.equal(f.runtime.store.get('tasks', task.id).gitWriteDenied, undefined)
+  assert.equal(f.runtime.store.get('tasks', task.id).attempt.gitWriteDenied, undefined)
   for (const tool of [SHELL, ...NON_SHELL]) assert.equal(f.workers.callbacks.guard(f.author.id, tool), undefined, `${tool} must not be latched`)
 })
 
@@ -217,7 +217,7 @@ test('R6-01: a failing command whose output quotes the refusal text never denies
     })
   }
   assert.equal(f.events('task/git-write-denied').length, 0, 'output text never claims the typed denial')
-  assert.equal(f.runtime.store.get('tasks', task.id).gitWriteDenied, undefined, 'the attempt is not latched')
+  assert.equal(f.runtime.store.get('tasks', task.id).attempt.gitWriteDenied, undefined, 'the attempt is not latched')
   assert.equal(f.workers.callbacks.guard(f.author.id, SHELL), undefined)
 })
 
@@ -234,7 +234,7 @@ test('R6-01: a real git add through bash is still denied once with the typed dur
   assert.equal(denied.length, 1, 'the real write is durably recorded exactly once')
   assert.equal(denied[0].data.taskId, task.id)
   assert.match(denied[0].data.command, /git add/)
-  assert.equal(f.runtime.store.get('tasks', task.id).gitWriteDenied.command, realAddCommand)
+  assert.equal(f.runtime.store.get('tasks', task.id).attempt.gitWriteDenied.command, realAddCommand)
   assert.equal(f.workers.callbacks.guard(f.author.id, SHELL), undefined)
 })
 
@@ -246,7 +246,7 @@ test('R15: a non-permission Git failure is not reported as a sandbox refusal', a
     result: { isError: true, content: [{ type: 'text', text: 'fatal: cannot lock ref, repository is busy' }] }, isError: true,
   })
   assert.equal(f.events('task/git-write-denied').length, 0)
-  assert.equal(f.runtime.store.get('tasks', task.id).gitWriteDenied, undefined)
+  assert.equal(f.runtime.store.get('tasks', task.id).attempt.gitWriteDenied, undefined)
   assert.equal(f.workers.callbacks.guard(f.author.id, SHELL), undefined)
 })
 
@@ -274,7 +274,7 @@ test('R6-02: a failing read-only command that merely mentions a write word never
     })
   }
   assert.equal(f.events('task/git-write-denied').length, 0, 'a mention in an argument is not an executed write')
-  assert.equal(f.runtime.store.get('tasks', task.id).gitWriteDenied, undefined, 'the attempt is not latched')
+  assert.equal(f.runtime.store.get('tasks', task.id).attempt.gitWriteDenied, undefined, 'the attempt is not latched')
   assert.equal(f.workers.callbacks.guard(f.author.id, SHELL), undefined)
 })
 
@@ -293,7 +293,7 @@ test('R6-02: a metadata write at subcommand position still denies once after glo
   assert.equal(denied.length, 1, 'a write at subcommand position is durably recorded exactly once')
   assert.equal(denied[0].data.taskId, task.id)
   assert.match(denied[0].data.command, /commit/)
-  assert.equal(f.runtime.store.get('tasks', task.id).gitWriteDenied.command, positionedWriteCommand)
+  assert.equal(f.runtime.store.get('tasks', task.id).attempt.gitWriteDenied.command, positionedWriteCommand)
   assert.equal(f.workers.callbacks.guard(f.author.id, SHELL), undefined)
 })
 
@@ -324,7 +324,7 @@ test('R6-I2c: a git token that is an argument, not the command, never denies or 
     })
   }
   assert.equal(f.events('task/git-write-denied').length, 0, 'an argument token is not an executed write')
-  assert.equal(f.runtime.store.get('tasks', task.id).gitWriteDenied, undefined, 'the attempt is not latched')
+  assert.equal(f.runtime.store.get('tasks', task.id).attempt.gitWriteDenied, undefined, 'the attempt is not latched')
   assert.equal(f.workers.callbacks.guard(f.author.id, SHELL), undefined)
 })
 
@@ -349,7 +349,7 @@ test('R6-I2c: wrapper forms still deny exactly once at command position', async 
     const denied = f.events('task/git-write-denied')
     assert.equal(denied.length, 1, `${command} denies exactly once`)
     assert.equal(denied[0].data.taskId, task.id)
-    assert.equal(f.runtime.store.get('tasks', task.id).gitWriteDenied.command, command)
+    assert.equal(f.runtime.store.get('tasks', task.id).attempt.gitWriteDenied.command, command)
   }
 })
 
@@ -379,7 +379,7 @@ test('R7-01: a heredoc body naming git writes never denies or latches, even when
     isError: true,
   })
   assert.equal(f.events('task/git-write-denied').length, 0, 'heredoc body text was never executed')
-  assert.equal(f.runtime.store.get('tasks', task.id).gitWriteDenied, undefined, 'the attempt is not latched')
+  assert.equal(f.runtime.store.get('tasks', task.id).attempt.gitWriteDenied, undefined, 'the attempt is not latched')
   for (const tool of [SHELL, 'edit', 'read', 'swarm_submit']) {
     assert.equal(f.workers.callbacks.guard(f.author.id, tool), undefined, `${tool} stays available`)
   }
@@ -395,7 +395,7 @@ test('R7-01: the same heredoc without a failing command stays allowed', async t 
     isError: false,
   })
   assert.equal(f.events('task/git-write-denied').length, 0, 'a successful heredoc write is allowed')
-  assert.equal(f.runtime.store.get('tasks', task.id).gitWriteDenied, undefined)
+  assert.equal(f.runtime.store.get('tasks', task.id).attempt.gitWriteDenied, undefined)
   assert.equal(f.workers.callbacks.guard(f.author.id, SHELL), undefined)
 })
 
@@ -412,7 +412,7 @@ test('R7-01: a real write after the heredoc terminator still denies exactly once
   const denied = f.events('task/git-write-denied')
   assert.equal(denied.length, 1, 'the executed write after the terminator is durably recorded exactly once')
   assert.equal(denied[0].data.taskId, task.id)
-  assert.equal(f.runtime.store.get('tasks', task.id).gitWriteDenied.command, command)
+  assert.equal(f.runtime.store.get('tasks', task.id).attempt.gitWriteDenied.command, command)
   assert.equal(f.workers.callbacks.guard(f.author.id, SHELL), undefined)
 })
 
@@ -428,7 +428,7 @@ test('R7-01: a real git write whose stdin is a heredoc still denies exactly once
   })
   const denied = f.events('task/git-write-denied')
   assert.equal(denied.length, 1, 'the command line itself is still an executed write')
-  assert.equal(f.runtime.store.get('tasks', task.id).gitWriteDenied.command, command)
+  assert.equal(f.runtime.store.get('tasks', task.id).attempt.gitWriteDenied.command, command)
 })
 
 test('R7-01: unquoted, tab-stripped and multiple heredoc bodies are all data', async t => {
@@ -451,7 +451,7 @@ test('R7-01: unquoted, tab-stripped and multiple heredoc bodies are all data', a
     isError: true,
   })
   assert.equal(f.events('task/git-write-denied').length, 0, 'quoted, unquoted and tab-stripped bodies are all data')
-  assert.equal(f.runtime.store.get('tasks', task.id).gitWriteDenied, undefined)
+  assert.equal(f.runtime.store.get('tasks', task.id).attempt.gitWriteDenied, undefined)
   assert.equal(f.workers.callbacks.guard(f.author.id, SHELL), undefined)
 })
 
@@ -476,7 +476,7 @@ test('R7-01: a here-string or arithmetic shift never hides a later real write', 
     })
     const denied = f.events('task/git-write-denied')
     assert.equal(denied.length, 1, `${command} denies exactly once`)
-    assert.equal(f.runtime.store.get('tasks', task.id).gitWriteDenied.command, command)
+    assert.equal(f.runtime.store.get('tasks', task.id).attempt.gitWriteDenied.command, command)
   }
 })
 
@@ -510,7 +510,7 @@ test('R7-01b: a here-string or arithmetic operator never swallows a later real w
     const denied = f.events('task/git-write-denied')
     assert.equal(denied.length, 1, `${command.split('\n')[0]} still denies the later write exactly once`)
     assert.equal(denied[0].data.taskId, task.id)
-    assert.equal(f.runtime.store.get('tasks', task.id).gitWriteDenied.command, command, 'the executed command is latched')
+    assert.equal(f.runtime.store.get('tasks', task.id).attempt.gitWriteDenied.command, command, 'the executed command is latched')
     assert.equal(f.workers.callbacks.guard(f.author.id, SHELL), undefined)
   }
 })
@@ -536,7 +536,7 @@ test('R7-01b: a heredoc operator followed by other text still makes its body dat
       isError: true,
     })
     assert.equal(f.events('task/git-write-denied').length, 0, `${command.split('\n')[0]} body is data`)
-    assert.equal(f.runtime.store.get('tasks', task.id).gitWriteDenied, undefined, 'the attempt is not latched')
+    assert.equal(f.runtime.store.get('tasks', task.id).attempt.gitWriteDenied, undefined, 'the attempt is not latched')
     assert.equal(f.workers.callbacks.guard(f.author.id, SHELL), undefined)
   }
 })
@@ -561,7 +561,7 @@ test('R7-01b: a real write after a legal heredoc terminator still denies exactly
     })
     const denied = f.events('task/git-write-denied')
     assert.equal(denied.length, 1, `${command.split('\n')[0]} still denies the write after the terminator`)
-    assert.equal(f.runtime.store.get('tasks', task.id).gitWriteDenied.command, command)
+    assert.equal(f.runtime.store.get('tasks', task.id).attempt.gitWriteDenied.command, command)
   }
 })
 
@@ -580,7 +580,7 @@ test('R7-01b: an unterminated heredoc never swallows a later real write', async 
   })
   const denied = f.events('task/git-write-denied')
   assert.equal(denied.length, 1, 'the later write is still seen when no terminator line exists')
-  assert.equal(f.runtime.store.get('tasks', task.id).gitWriteDenied.command, command)
+  assert.equal(f.runtime.store.get('tasks', task.id).attempt.gitWriteDenied.command, command)
 })
 
 // R7-01b: spaced, backslash-quoted and tab-stripped delimiters are real
@@ -602,7 +602,7 @@ test('R7-01b: spaced, backslash-quoted and tab-stripped delimiters make their bo
       isError: true,
     })
     assert.equal(f.events('task/git-write-denied').length, 0, `${command.split('\n')[0]} body is data`)
-    assert.equal(f.runtime.store.get('tasks', task.id).gitWriteDenied, undefined)
+    assert.equal(f.runtime.store.get('tasks', task.id).attempt.gitWriteDenied, undefined)
     assert.equal(f.workers.callbacks.guard(f.author.id, SHELL), undefined)
   }
 })
@@ -619,7 +619,7 @@ test('R7-01b: a here-string without a space never hides a later real write', asy
   })
   const denied = f.events('task/git-write-denied')
   assert.equal(denied.length, 1, 'a spaceless here-string still denies the later write exactly once')
-  assert.equal(f.runtime.store.get('tasks', task.id).gitWriteDenied.command, command)
+  assert.equal(f.runtime.store.get('tasks', task.id).attempt.gitWriteDenied.command, command)
 })
 
 // R7-01c: `$[...]` (deprecated arithmetic expansion) and unquoted `${...}` are
@@ -649,7 +649,7 @@ test('R7-01c: $[...] and unquoted ${...} are literal spans, not heredoc operator
     const denied = f.events('task/git-write-denied')
     assert.equal(denied.length, 1, `${command.split('\n')[0]} still denies the later write exactly once`)
     assert.equal(denied[0].data.taskId, task.id)
-    assert.equal(f.runtime.store.get('tasks', task.id).gitWriteDenied.command, command, 'the executed command is latched')
+    assert.equal(f.runtime.store.get('tasks', task.id).attempt.gitWriteDenied.command, command, 'the executed command is latched')
     assert.equal(f.workers.callbacks.guard(f.author.id, SHELL), undefined)
   }
 })
@@ -673,7 +673,7 @@ test('R7-01c: arithmetic $((...)) controls still deny exactly once', async t => 
     })
     const denied = f.events('task/git-write-denied')
     assert.equal(denied.length, 1, `${command.split('\n')[0]} control denies exactly once`)
-    assert.equal(f.runtime.store.get('tasks', task.id).gitWriteDenied.command, command)
+    assert.equal(f.runtime.store.get('tasks', task.id).attempt.gitWriteDenied.command, command)
   }
 })
 
@@ -695,7 +695,7 @@ test('R7-01c: a legal heredoc after a literal span still makes its body data', a
       isError: true,
     })
     assert.equal(f.events('task/git-write-denied').length, 0, `${command.split('\n')[0]} body is data`)
-    assert.equal(f.runtime.store.get('tasks', task.id).gitWriteDenied, undefined)
+    assert.equal(f.runtime.store.get('tasks', task.id).attempt.gitWriteDenied, undefined)
     assert.equal(f.workers.callbacks.guard(f.author.id, SHELL), undefined)
   }
 })
@@ -717,6 +717,6 @@ test('R7-01c: a real write after a literal span and a heredoc terminator still d
     })
     const denied = f.events('task/git-write-denied')
     assert.equal(denied.length, 1, `${command.split('\n')[0]} still denies the write after the terminator`)
-    assert.equal(f.runtime.store.get('tasks', task.id).gitWriteDenied.command, command)
+    assert.equal(f.runtime.store.get('tasks', task.id).attempt.gitWriteDenied.command, command)
   }
 })

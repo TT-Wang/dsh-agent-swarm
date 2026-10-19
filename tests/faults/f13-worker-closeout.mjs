@@ -25,7 +25,7 @@ await runScenario({
       const afterNudge = taskOf(f.runtime, task.id)
       assert.equal(afterNudge.status, 'running', 'the first nudge does not fence the attempt')
       assert.equal(afterNudge.attempt.id, claimed.attempt.id)
-      assert.equal(afterNudge.closeout.nudges, 1)
+      assert.equal(afterNudge.attempt.closeout.nudges, 1)
       assert.equal(f.workers.captured.length, 0, 'no checkpoint before the bound is exhausted')
       // The outbox is flushed after the nudge commits, so the wake is awaited, not read at once.
       const nudgeDelivery = await eventually(() => f.workers.deliveries.find(item => item.kind === 'control' && /still open but your turn ended/.test(item.content)),
@@ -38,7 +38,7 @@ await runScenario({
       await f.runtime.settle(f.mission.id)
       f.workers.callbacks.idle(f.author.id)
       await eventually(() => events(f.runtime, f.mission.id, 'task/closeout-nudged').length === 2, 'the second close-out nudge')
-      assert.equal(taskOf(f.runtime, task.id).closeout.nudges, 2, 'nudges are bounded by maxIdleCloseouts')
+      assert.equal(taskOf(f.runtime, task.id).attempt.closeout.nudges, 2, 'nudges are bounded by maxIdleCloseouts')
       // Injection 3: the bound is exhausted, so the workspace is checkpointed.
       await f.runtime.settle(f.mission.id)
       f.workers.callbacks.idle(f.author.id)

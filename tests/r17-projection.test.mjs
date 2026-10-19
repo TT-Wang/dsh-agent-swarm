@@ -201,7 +201,7 @@ test('pair: the W6 idle close-out owns the attempt and the derived status agrees
   // The adapter ended its turn; the attempt is still live until the close-out
   // fences it, so the member is still working — the derivation agrees with the
   // close-out instead of racing it.
-  assert.ok(f.taskRow(task).idleSignal, 'the durable idle signal is recorded')
+  assert.ok(f.taskRow(task).attempt.idleSignal, 'the durable idle signal is recorded')
   assert.equal(f.memberRow(member).status, 'working')
   assert.equal(f.storedMember(member).status ?? null, null, 'the close-out window writes no durable status either')
   // The close-out fences that attempt (nudge, then checkpoint + re-pend) with no

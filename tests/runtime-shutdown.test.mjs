@@ -174,9 +174,9 @@ async function budgetFixture(t) {
     missionRecord.status = 'blocked'; missionRecord.reason = 'Aggregate mission budget exhausted: maxTokens'; missionRecord.budgetPause = { id: 'pause-1', quiesced: true }
     runtime.store.put('missions', missionRecord)
   }
-  const preserve = attemptId => {
+  const preserve = () => {
     const taskRecord = runtime.store.get('tasks', task.id)
-    taskRecord.budgetResume = { pauseId: 'pause-1', attemptId }
+    taskRecord.attempt.pausedBy = 'pause-1'
     runtime.store.put('tasks', taskRecord)
   }
   return { directory, config, runtime, owner, mission, member, task, claimed, pause, preserve }
@@ -184,7 +184,7 @@ async function budgetFixture(t) {
 
 test('budget resume keeps the preserved attempt and spends no recovery credit', { timeout: 10000 }, async t => {
   const f = await budgetFixture(t)
-  f.pause(); f.preserve(f.claimed.attempt.id)
+  f.pause(); f.preserve()
   f.runtime.control(f.owner, f.mission.id, 'resume', 'Budget raised')
   await eventually(() => f.runtime.store.get('missions', f.mission.id).budgetPause === undefined, 'the pause must clear on resume', 2500)
   const resumed = f.runtime.store.get('tasks', f.task.id)
@@ -196,7 +196,7 @@ test('budget resume keeps the preserved attempt and spends no recovery credit', 
 
 test('a host restart during a budget pause spends no recovery credit', { timeout: 10000 }, async t => {
   const f = await budgetFixture(t)
-  f.pause(); f.preserve(f.claimed.attempt.id)
+  f.pause(); f.preserve()
   await f.runtime.dispose()
   const recovered = new SwarmRuntime(f.config, new ShutdownWorkers())
   try {

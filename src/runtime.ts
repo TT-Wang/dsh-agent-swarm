@@ -3176,7 +3176,7 @@ export class SwarmRuntime implements Kernel {
     if (taskCeilingBlock(next, this.now()) === undefined) delete next.ceiling
     // A resume is not a fence: a running attempt keeps running, and its idle
     // close-out restarts from the first nudge; the turn end that armed it stays.
-    if (resumes) { delete next.preparationFailure; delete next.verificationRecovery; delete next.closeout }
+    if (resumes) { delete next.preparationFailure; delete next.verificationRecovery; delete next.attempt?.closeout }
     if (rework !== undefined) this.reopenForRework(next, rework)
     // A rejected submission holds no live attempt: its author is not stopped.
     // Any other attempt the row holds owes its owner's stop, a blocked row's
@@ -3444,8 +3444,8 @@ export class SwarmRuntime implements Kernel {
     // never outlive the mission deadline (the same clamp every other renewal uses).
     task.attempt.leaseUntil = Math.min(this.mission(member.missionId).deadline, this.now() + this.config.leaseMs)
     const denied = deniedGitWrite(input)
-    const firstDenial = denied !== undefined && task.gitWriteDenied === undefined
-    if (firstDenial) task.gitWriteDenied = { command: denied, runId: run.id, at: this.now() }
+    const firstDenial = denied !== undefined && task.attempt.gitWriteDenied === undefined
+    if (firstDenial) task.attempt.gitWriteDenied = { command: denied, runId: run.id, at: this.now() }
     // R11-15: a shared-temp rendezvous is decided before the transaction and
     // recorded atomically with the run.
     const rendezvous = this.workspaceAdmission.tempRendezvous(memberId, task.id, input)

@@ -43,7 +43,7 @@ await runScenario({
         result: { exitCode: 128, output: "fatal: Unable to create '/repo/.git/worktrees/author/index.lock': Operation not permitted" }, isError: true,
       })
       assert.equal(inbox().length, 1, 'I14: a repeated denial is not delivered twice')
-      const denied = taskOf(f.runtime, task.id).gitWriteDenied
+      const denied = taskOf(f.runtime, task.id).attempt.gitWriteDenied
       assert(denied, 'the denial is durably recorded on the attempt')
       assert.match(denied.command, /git commit/, 'the recorded command is the denied git write')
       assert.equal(denied.runId, runId)
@@ -78,7 +78,7 @@ await runScenario({
         tool: 'bash', arguments: { command: 'git status --porcelain' },
         result: { exitCode: 1, output: 'Operation not permitted' }, isError: true,
       })
-      assert.equal(taskOf(g.runtime, other.id).gitWriteDenied, undefined, 'a read-only git failure is not a denied write')
+      assert.equal(taskOf(g.runtime, other.id).attempt.gitWriteDenied, undefined, 'a read-only git failure is not a denied write')
       assert.equal(events(g.runtime, g.mission.id, 'task/git-write-denied').length, 0)
       return { deniedCommand: denied.command, runId, artifact: submitted.artifact.commit }
     } finally { await f.cleanup(); await g.cleanup(); await workspaces.dispose(); await rm(root, { recursive: true, force: true }) }

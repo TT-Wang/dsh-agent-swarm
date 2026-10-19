@@ -349,6 +349,12 @@ export interface Workstream {
   objective: string
   coordinatorId?: string
 }
+/**
+ * One attempt on a task, and what happened to it while it ran. A submission or
+ * a verdict keeps it on the row as its record; whatever ends it takes it off
+ * the row, and these facts with it, so a row never carries one of another
+ * attempt.
+ */
 export interface Attempt {
   id: string
   epoch: number
@@ -356,6 +362,16 @@ export interface Attempt {
   leaseUntil: number
   /** Immutable source selected when a verification attempt was assigned. */
   sourceCommit?: string
+  /** The budget pause (`Mission.budgetPause.id`) that preserved this attempt; that pause's resume continues it. */
+  pausedBy?: string
+  /** Its owner ended a turn while this attempt was open (`onIdle`): the idle close-out acts on it, asking `Attempts.turnEnded`, its one reader. */
+  idleSignal?: { at: number }
+  /** Idle close-out nudges already delivered; an owner resume restarts them. */
+  closeout?: { nudges: number; at: number }
+  /** The lease value already warned about, so a lease-expiring event is emitted once per lease. */
+  leaseWarned?: number
+  /** The sandbox denied its worker a git write. */
+  gitWriteDenied?: { command: string; runId?: string; at: number }
 }
 export interface Artifact {
   commit: string
@@ -445,8 +461,6 @@ export interface Task {
   /** Initial plan owner; a preferred task fixes this to its first actual owner for recovery. */
   plannedAssigneeId?: string
   attempt?: Attempt
-  /** Lease value already warned about, so a lease-expiring event is emitted once per lease; it leaves the row with the attempt. */
-  leaseWarned?: number
   epoch: number
   output?: string
   recoveryCount?: number
@@ -471,21 +485,8 @@ export interface Task {
   verificationRecovery?: { sourceTaskId: string; commit: string; reason: string; at: number }
   /** Per-command host verification timeout chosen for this task. */
   checkTimeoutMs?: number
-  /** Same-owner resume preserves attempt provenance after budget quiescence; the marker leaves the row with the attempt it names. */
-  budgetResume?: { pauseId: string; attemptId: string }
   /** Durable quiescence transition; epoch matching prevents reopening invalidated work. */
   resumeAfterStop?: { epoch: number; memberId?: string; reason: 'handoff' | 'lease-expired' | 'worker-closeout' | 'resource' | 'invalidated'; /** R14-F2(d): when the stop began, so a waited-on stop has a durable bound. */ at?: number; /** Deterministic preservation failures retain the fence until an explicit resume retries them. */ failure?: { message: string; deterministic: boolean } }
-  /** Idle close-out nudges already delivered for this attempt; an owner resume restarts them, and they leave the row with the attempt. */
-  closeout?: { nudges: number; at: number }
-  /**
-   * S5: durable form of the adapter's "this member ended a turn while still
-   * owning this attempt" signal. The attempts seam, which writes it, is its one
-   * reader (`Attempts.turnEnded`): the scheduling path
-   * asks it rather than trusting the in-memory `idleSignals` map, which is now only a
-   * cache: a lost cache delays the bounded close-out until lease expiry, it
-   * cannot make the close-out wrong. It names its attempt and leaves the row with it.
-   */
-  idleSignal?: { attemptId: string; at: number }
   /** Durable workspace checkpoint captured before an abandoned attempt was reassigned. */
   checkpoint?: { commit: string; at: number }
   /**
@@ -498,8 +499,6 @@ export interface Task {
    * and the owner notice, and projected by `swarm_observe`.
    */
   recovery?: { epoch: number; previousOwnerId: string; commit: string; preserved: boolean; reason: string; at: number }
-  /** Sandbox denial of a worker-side git write on this attempt; it leaves the row with the attempt. */
-  gitWriteDenied?: { command: string; runId?: string; at: number }
   artifact?: Artifact
   /** Captured reviewer-authored record; never a dependency deliverable or independent verdict on its own contents. */
   reviewArtifact?: Artifact

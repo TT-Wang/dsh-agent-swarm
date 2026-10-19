@@ -13,10 +13,10 @@ import { mkdirSync, openSync, closeSync, readSync, fsyncSync, readFileSync, unli
 import { dirname, join, basename, resolve } from 'node:path'
 import { createHash, randomUUID } from 'node:crypto'
 import { execFileSync } from 'node:child_process'
-import { criterionId, type AutoStart, type Delivery, type DraftPlan, type Evidence, type Member, type Mission, type PlanTask, type Post, type PostKind, type SwarmEvent, type Task, type ToolRun, type Workstream } from './types.ts'
+import { criterionId, type Attempt, type AutoStart, type Delivery, type DraftPlan, type Evidence, type Member, type Mission, type PlanTask, type Post, type PostKind, type SwarmEvent, type Task, type ToolRun, type Workstream } from './types.ts'
 import type { AdmissionReason, AdmissionRecord, LimitRule } from './scheduler.ts'
 import { PROGRESS_KINDS, type EventKind } from './events.ts'
-import { dropForeignMarkers, taskGraphIndex } from './task-graph.ts'
+import { taskGraphIndex } from './task-graph.ts'
 // R17-G7: one derivation for the derived member status; the store never persists it.
 import { deriveMemberStatus, memberPhaseOf } from './projection.ts'
 
@@ -54,8 +54,8 @@ export interface PostFilter {
   newest?: boolean
   limit?: number
 }
-/** v3 adds the append-only `posts` board table; v4 cites mission criteria by id (`citeCriteria`); v5 records an owner notice's consumption on its delivery (`consumptionOnDelivery`); v6 keeps an attempt's markers only with that attempt (`markersWithTheirAttempt`). Older versions are upgraded at open. */
-const SCHEMA_VERSION = 6
+/** v3 adds the append-only `posts` board table; v4 cites mission criteria by id (`citeCriteria`); v5 records an owner notice's consumption on its delivery (`consumptionOnDelivery`); v6 kept an attempt's markers on the row only with that attempt; v7 makes them fields of the attempt (`markersOnTheirAttempt`, whose upgrade settles a store before v6 as v6's did). Older versions are upgraded at open. */
+const SCHEMA_VERSION = 7
 const CHANGE_HISTORY = 1024
 const DEFAULT_BUSY_TIMEOUT_MS = 5000
 const DEFAULT_WRITER_ATTEMPTS = 3
@@ -367,7 +367,7 @@ export class SwarmStore {
         // Each upgrade runs once: for a store older than the version that introduced it.
         if (version < 4) this.citeCriteria()
         if (version < 5) this.consumptionOnDelivery()
-        if (version < 6) this.markersWithTheirAttempt()
+        if (version < 7) this.markersOnTheirAttempt()
         this.db.exec(`PRAGMA user_version=${SCHEMA_VERSION}`)
       })
     } catch (error) {
@@ -480,9 +480,29 @@ export class SwarmStore {
       if (consumedAt !== undefined) this.upsert('deliveries', { ...delivery, notice, consumedAt })
     }
   }
-  /** The v6 upgrade, once, in the opening transaction like any other change. A build before v6 could leave an attempt's markers on the row after a fence took the attempt off it, and carry a budget-pause marker into the next attempt; this version takes them off with the attempt (`dropForeignMarkers`), and each row an older build wrote is settled the same way. */
-  private markersWithTheirAttempt(): void {
-    for (const task of this.list('tasks')) if (dropForeignMarkers(task)) this.upsert('tasks', task)
+  /**
+   * The v7 upgrade, once, in the opening transaction like any other change. A
+   * build before v7 kept the markers an attempt writes while it runs on the task
+   * row beside it, a budget pause and an idle signal naming the attempt by id;
+   * each moves onto the attempt it belongs to (the pause as its `pausedBy`), and
+   * one that belongs to no attempt the row holds is dropped: every marker of a
+   * row that holds none, and a pause or an idle signal naming another attempt.
+   * A build before v6 could leave such markers after a fence took their attempt
+   * and carry a pause into the next attempt, so this also settles its rows.
+   */
+  private markersOnTheirAttempt(): void {
+    type RowMarkers = { budgetResume?: { pauseId: string; attemptId: string }; idleSignal?: { attemptId: string; at: number }; closeout?: Attempt['closeout']; leaseWarned?: number; gitWriteDenied?: Attempt['gitWriteDenied'] }
+    for (const row of this.list('tasks') as Array<Task & RowMarkers>) {
+      const { budgetResume, idleSignal, closeout, leaseWarned, gitWriteDenied, ...task } = row
+      if ([budgetResume, idleSignal, closeout, leaseWarned, gitWriteDenied].every(marker => marker === undefined)) continue
+      const held = task.attempt
+      if (held !== undefined) Object.assign(held, {
+        pausedBy: budgetResume?.attemptId === held.id ? budgetResume.pauseId : undefined,
+        idleSignal: idleSignal?.attemptId === held.id ? { at: idleSignal.at } : undefined,
+        closeout, leaseWarned, gitWriteDenied,
+      })
+      this.upsert('tasks', task)
+    }
   }
   /** Read a mission's records, or all records for host recovery. */
   list<T extends Table>(table: T, missionId?: string): Tables[T][] {

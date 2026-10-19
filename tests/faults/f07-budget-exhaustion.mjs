@@ -23,7 +23,7 @@ await runScenario({
       const paused = taskOf(f.runtime, task.id)
       assert.equal(paused.status, 'running', 'I5: the in-flight attempt is preserved, not discarded')
       assert.equal(paused.attempt.id, claimed.attempt.id, 'I5: consumed work keeps its attempt')
-      assert.deepEqual(paused.budgetResume, { pauseId: exhausted.budgetPause.id, attemptId: claimed.attempt.id }, 'I5: the resume marker names the pause and the consumed attempt, and nothing else')
+      assert.equal(paused.attempt.pausedBy, exhausted.budgetPause.id, 'I5: the consumed attempt names the pause that preserved it')
       assert.equal(paused.recoveryCount ?? 0, 0, 'a budget pause is host policy, not a recovery failure')
       assert(f.workers.stopped.includes(f.author.id), 'the exhausted mission stopped worker activity')
       const usedBefore = f.runtime.snapshot(f.owner, f.mission.id).mission.usedTokens
