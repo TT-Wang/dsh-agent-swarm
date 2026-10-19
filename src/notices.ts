@@ -452,6 +452,9 @@ export function dispatchQuestion(board: Board, dispatchable: Task[]): DispatchQu
 const reviewBlockedKey =(missionId: string, sourceId: string, need: string, reason: string): string => `review-blocked:${missionId}:${sourceId}:${need}:${reason}`
 /** The families of the board's own fact: the W3 stall, or an owner-assembled mission's coverage-complete (R10-14). */
 const BOARD_FAMILIES: readonly string[] = ['board-stall', 'coverage-complete']
+/** The families whose decision is outstanding by the subjects it names, judged on the board (`Notices.outstanding`). */
+const SUBJECT_FAMILIES = ['stall-root', 'review-blocked', 'parked', 'dispatch-question', 'scheduling-pass', 'fallthrough'] as const
+const subjectFamily = (family: string): family is typeof SUBJECT_FAMILIES[number] => (SUBJECT_FAMILIES as readonly string[]).includes(family)
 /**
  * The board's one fact while its condition holds, with the body and the
  * identity it is told under. Completion refused: a stalled board's W3
@@ -1005,11 +1008,8 @@ export class Notices {
     }
     const terminal = this.openGuardTerminal(mission, delivery)
     if (terminal !== undefined) return terminal
-    // A stall-root decision is outstanding exactly while its root still is one;
-    // the dependents it lists (a rejecting review) never keep it open.
     const family = noticeFamily(delivery)
-    if (family === 'stall-root') return this.openStallRoot(view, delivery)
-    if (family === 'review-blocked') return this.openReviewBlock(view, delivery)
+    if (subjectFamily(family)) return this.outstanding(view, delivery, family)
     if (BOARD_FAMILIES.includes(family) && !this.boardFactOpen(view, delivery)) return []
     // Coverage-complete names its terminal deliverable: the completion it asks for is what stays outstanding.
     if (family === 'coverage-complete') return delivery.subjects ?? []
@@ -1064,28 +1064,46 @@ export class Notices {
       return this.unresolvedSubjects(interpret(this.k.boardOf(mission.id)), original ?? delivery).length > 0
     }
     if (BOARD_FAMILIES.includes(family)) return this.boardFactOpen(interpret(this.k.boardOf(mission.id)), delivery)
-    if (family === 'review-blocked' || family === 'fallthrough' || family === 'stall-root'
-      || family === 'dispatch-question' || family === 'parked' || family === 'scheduling-pass') {
-      const board = this.k.boardOf(mission.id), tasks = board.tasks
-      const subjects = delivery.subjects ?? fact.subjects ?? []
-      // Old unattributed rows cannot be judged from their text alone.
-      if (subjects.length === 0) return true
-      if (family === 'stall-root') return this.openStallRoot(board, delivery).length > 0
-      if (family === 'review-blocked') return this.openReviewBlock(board, delivery).length === subjects.length
-      // A wedged pass's naming holds for the work it named that is unfinished at that epoch: a body is named once (one on a held fact is left to this row), so no later fact speaks for the rest.
-      if (family === 'scheduling-pass') return subjects.some(subject => subject === missionSubject(mission) || unfinished(subject, tasks) !== undefined)
-      // A batch asserts the condition for every named subject. If one changes,
-      // the transition publisher emits the remaining subjects as a fresh fact.
-      return subjects.every(subject => {
-        if (subject === missionSubject(mission)) return true
-        const task = unfinished(subject, tasks)
-        if (task === undefined) return false
-        if (family === 'fallthrough') return !waitsLegitimately(board, task)
-        if (family === 'dispatch-question') return task.status === 'pending'
-        return heldByParkedMember(board.members, task)
-      })
+    if (!subjectFamily(family)) return true
+    // Old unattributed rows cannot be judged from their text alone.
+    return (delivery.subjects ?? fact.subjects ?? []).length === 0 || this.outstanding(this.k.boardOf(mission.id), delivery, family).length > 0
+  }
+
+  /**
+   * The subjects a decision of one of `SUBJECT_FAMILIES` still asserts its
+   * claim of, judged on the board it names: the one rule its delivery reads
+   * (deliverable while one remains, `ownerDeliveryRelevant`) and its reminders
+   * read (they name exactly these, `unresolvedSubjects`), so a fact is
+   * reminded exactly while it would still be delivered.
+   *  - stall-root: its root while it still is one; the dependents it lists (a
+   *    rejecting review) never keep it open (`openStallRoot`);
+   *  - review-blocked: its source while the admission names that blocker under
+   *    that need (`openReviewBlock`);
+   *  - parked: a task a parked member still holds at the epoch it names;
+   *  - dispatch-question: its task while still pending at that epoch;
+   *  - scheduling-pass: the work it named that is unfinished at that epoch: a
+   *    body is named once (one on a held fact is left to this row), so no later
+   *    fact speaks for the rest;
+   *  - fallthrough: every subject while no live path advances any of them: a
+   *    batch asserts its claim of every subject, and once one changes, the
+   *    transition publisher tells the rest as a fresh fact.
+   * A subject that is the mission root is outstanding while the claim names it.
+   */
+  private outstanding(board: Board, delivery: Delivery, family: typeof SUBJECT_FAMILIES[number]): string[] {
+    const subjects = delivery.subjects ?? noticeRow(delivery)?.subjects ?? []
+    const claimed = (claim: (task: Task) => boolean): string[] => subjects.filter(subject => {
+      if (subject === missionSubject(board.mission)) return true
+      const task = unfinished(subject, board.tasks)
+      return task !== undefined && claim(task)
+    })
+    switch (family) {
+      case 'stall-root': return this.openStallRoot(board, delivery)
+      case 'review-blocked': return this.openReviewBlock(board, delivery)
+      case 'parked': return claimed(task => heldByParkedMember(board.members, task))
+      case 'dispatch-question': return claimed(task => task.status === 'pending')
+      case 'scheduling-pass': return claimed(() => true)
+      case 'fallthrough': { const open = claimed(task => !waitsLegitimately(board, task)); return open.length === subjects.length ? open : [] }
     }
-    return true
   }
 
   /**
