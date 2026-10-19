@@ -1329,7 +1329,7 @@ export class SwarmRuntime implements Kernel {
     })
     // M1a seam 5/7: the declared-check execution path is src/declared-checks.ts.
     const checks = await this.declaredChecks.run(prepared.member, prepared.source, prepared.artifact, actor.signal)
-    const reported = this.declaredChecks.recordEnvelope(missionId, input.taskId, prepared.source.id, prepared.member.id)
+    this.declaredChecks.recordEnvelope(missionId, input.taskId, prepared.source.id, prepared.member.id)
     return this.exclusive(missionId, async () => {
       const { task, member } = this.ownAttempt(actor, missionId, input.taskId, input.attemptId)
       const source = this.task(missionId, prepared.source.id)
@@ -1350,7 +1350,7 @@ export class SwarmRuntime implements Kernel {
       // before it is reported. A failed check still blocks the source with its
       // real failure. An acceptance, though, is refused rather than validating
       // an artifact under an environment the host check cannot reproduce.
-      const comparison = this.declaredChecks.reproduce({ missionId, taskId: task.id, sourceTaskId: source.id, attemptId: input.attemptId, memberId: member.id, verdict: input.verdict }, checks, reported)
+      const comparison = this.declaredChecks.reproduce({ missionId, taskId: task.id, sourceTaskId: source.id, attemptId: input.attemptId, memberId: member.id, verdict: input.verdict }, checks)
       if (passed && comparison !== undefined && comparison.blocking.length > 0) {
         this.commit(missionId, () => { this.declaredChecks.recordRuns(missionId, { memberId: member.id, taskId: task.id, attemptId: input.attemptId, commit: artifact.commit }, checks) })
         throw new CheckEnvironmentMismatchError(comparison)
