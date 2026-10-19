@@ -1,8 +1,9 @@
 /**
  * Notices and witnesses: the owner-notice ledger, the one record that the
  * owner was told (dedup by class, key and sender, each key naming its fact),
- * the bounded outbox that delivers it outside the mission queue, and the board
- * classifier whose families each tell their own fact. M1a seam 3/7.
+ * its one executor (`Notices.record`, which writes a `Notice` value), the
+ * bounded outbox that delivers it outside the mission queue, and the board
+ * judgement (`judge`) whose families each owe their own fact. M1a seam 3/7.
  */
 import { createHash } from 'node:crypto'
 import { covered, hasNotice } from './arena.ts'
