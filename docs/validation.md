@@ -7,6 +7,89 @@ Current **0.7.0** working-tree checks and the historical **0.6.0** baseline are 
 | `0.1.5-rc.3` (npm `latest`, default host) | `a4c74a91e06b00fe0b0937bde982170c526cc842` |
 | `0.1.7-rc.1` (npm `next`) | `46a7f68b0922371ce7144b668b90e377d8e799f4` |
 
+## Kernel/Board W1 and F2: a finished attempt's recovery, one stop-owner rule (2026-10-19)
+
+**Head**: `4e8e7f7` and this record (documentation only), branch `claude/lucid-germain-771544` on `9aa4a59`
+(`batch16/kernel`), not merged. Two owner-approved slices in order: W1 (`d627c2f`), then F2 (`4e8e7f7`), which
+re-lands the slice reverted in `4f54cf1` on W1's recovery. `src` against `9aa4a59`: +122 −52, net +70 (W1 +79 −16;
+F2 +57 −50, part of it moving W1's `resumedFrom` write into F2's `endAttempt` branch).
+
+**W1: a finished attempt is recovered from the capture its submission or verdict recorded.** The runtime names the
+attempt (`finishedAttempt`, `src/task-graph.ts`): the round a rework archived last (a source's `rejections[].commit`,
+a rejecting review's `rejections[].reviewArtifact`), or the verdict an owner resume re-opened a review from
+(`Task.resumedFrom`, written by `controlTask` from the attempt it ends), whichever is at the later epoch. Both
+preparation sites pass it to `WorkerAdapter.prepareTask` as a fifth argument. In `Workspaces.recoverTask` a task
+record of that epoch is that attempt's: the replacement starts from the named capture, or from the record's base
+when the verdict captured none, never from that attempt's worktree or a snapshot of it taken after it finished,
+and that epoch's artifact ref is not published again. A record of a later epoch is an attempt that did not end in a
+capture (a restart, a failed start, a fenced attempt), recovered as before. A record older than the named attempt
+is refused as invalid recovery metadata. A member whose own worktree still holds the task continues in place.
+
+**F2: one stop-owner rule.** `controlTask` fences only a structural change of running work, through
+`fenceForStop`, into which `fenceRow` is inlined. A review blocked on its deferred or rejecting verdict holds a
+finished attempt: a resume, or a structural amendment that resumes it, records `resumedFrom`, ends that attempt with
+`endAttempt` and re-pends the review in the same transition. Every stop question `controlTask` asks is
+`stopPending`, so a marker of an earlier epoch obliges nothing. The closer rule has one owner, option (b):
+`fenceForStop` writes `attempt/fenced` exactly when it fenced an open attempt or carried a stop already owed. A
+finished attempt's own event (`task/submitted`, `task/verification-deferred`, `task/rejected`, `task/accepted`)
+closed it, and the replay decoder ignores a closer for an attempt that is not open. Option (a) would have put a
+closer on the owner resume while a rework's `endAttempt` still wrote none, so the site, not the row, would decide
+again.
+
+**User-facing change.** An owner's resume or structural amendment of a deferred or rejecting review no longer stops
+and checkpoints the reviewer's handle, which may by then be running other work, and re-pends the review at once. The
+next reviewer starts from the review artifact that verdict captured (the source commit when it captured none), and a
+reworked task given to another member starts from its rejected commit. Neither carries what the previous member
+wrote after its verdict or submission; those writes stay in that member's worktree, and the epoch's artifact ref
+keeps the commit the row records. An owner cancel, a review retirement or a challenge that ends a finished attempt,
+or a row holding none, writes no `attempt/fenced`.
+
+**The full-log oracle at the head against `9aa4a59`** (`npm run test:oracle`, each slice re-recorded with
+`--runs 3 --write`, three identical runs; the head reproduces the logs). Measured by diffing each slice's logs with
+the previous ones row by row, event indices stripped:
+
+- W1 (`d627c2f`): each of the 58 `prepareTask` trace entries gains its fifth argument, `null` in every scenario
+  (none reworks or resumes a review holding its verdict): F12 2, F13 2, F18 1, F19 31, F2 2, F21 1, F5 2, dangling 1,
+  outage 1, paths 11, replay 4. No event, row or other adapter call changes.
+- F2 (`4e8e7f7`): five `attempt/fenced` events go. F12 loses one (`owner-cancel` of a pending row, `attemptId` null)
+  and dangling two (`owner-cancel`, `attemptId` null). F19 loses two: an `owner-cancel` of a pending row (`attemptId`
+  null), and `prerequisite-challenged` of an accepted review's finished attempt (`attempt#2`). Each later event of
+  those runtimes moves up one index. F19's `evidence/challenged` owner notice records that event's seq one lower:
+  its delivery's `reason` reads `evidence#1 challenge 16`, not 17, and its `dedupKey` digest changes. paths keeps
+  its one closer: that owner cancel carried the owed stop of a missing stop owner. replay, F2, F5, F13, F18, F21 and
+  outage are identical.
+
+No other difference exists.
+
+**Regressions.** Each was run against a detached build of the commit before its slice.
+
+- W1, `tests/finished-attempt-recovery.test.mjs` (new). On the real engine, a named finished attempt recovers from
+  its capture: the previous worktree is not committed into, and its epoch's ref stays. A verdict that captured
+  nothing recovers from the base, and a record older than the named attempt is refused. Two real-engine runtime
+  cases cover a reworked source handed to another member and a rework-reopened review handed to another reviewer:
+  each leaves the previous member's HEAD, its uncommitted later write and the recorded epoch's ref alone. A further
+  case pins the unchanged branch: a record of a later epoch recovers by capturing its quiescent worktree. On
+  `9aa4a59` five fail and that pin passes.
+- W1, the d934886 test in `tests/artifact-policy.test.mjs`: the next reviewer of a reassigned deferred review now
+  starts at the deferral's review artifact, without the file the first reviewer wrote after its verdict. It fails on
+  `9aa4a59`, where the barrier's checkpoint carries that file. The artifact-ref invariant still holds.
+- F2, `tests/stop-owner.test.mjs` (restored from F2 as landed, on W1). It covers the resume while the reviewer runs
+  other work, the reassignment, the rejecting review, a marker of an earlier epoch on a resume and on a structural
+  amendment, and the closer rule (a cancelled finished attempt and a cancelled pending row write no closer;
+  cancelling running work fences it). Six fail on `d627c2f`; the pin that a structural amendment of running work
+  still fences it passes on both. The d934886 test now also asserts that the first reviewer is not stopped and that
+  the resume owes no stop; it fails on `d627c2f`. R1's two regressions in `tests/board-read-points.test.mjs` record
+  the owed stop by a commit outside the mission queue, because no owner control lays one on a member holding no open
+  attempt now. Their old fixture fails both cases on the head.
+
+Gate at `4e8e7f7` on 0.1.5-rc.3 (`DSH_HARNESS_ROOT` at the 0.1.5-rc.3 checkout): `npm run typecheck`, `npm run build`,
+the full `node --test tests/*.test.mjs` (1927/1927; 1920/1920 at `d627c2f`), `npm run test:harness`, `npm run
+test:replay` (digest `sha256:61a921e64088b78b957cd6aeaa563d5436d4a6eae4b0130725d1f3c74c6f971e`, unchanged),
+`npm run test:oracle` (11 scenarios identical to the logs recorded above), `node scripts/faults/run.mjs` (24/24),
+`npm run test:web` (13 checks) and `npm run test:command-web` (11 checks) passed. `test:harness` logs a varying
+number of `mission_operation_pending` lines from its composition run, 5 to 20 a run on both `9aa4a59` and the head.
+Not run: 0.1.7-rc.1.
+
 ## Batch 15: decide-then-act X1, X2, X3, F1, S7, S8, S9, S11, the full-log oracle record (2026-10-17)
 
 **Head**: `9234211` and this record (documentation only), branch `batch15/kernel` on `b462a61`, not merged; this
