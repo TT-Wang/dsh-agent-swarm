@@ -49,7 +49,7 @@ async function submitForReview(f, source, write = async () => {}, reviewId = und
   return { review, verify: (reason = 'Review against acceptance') => f.runtime.verify(f.actor(f.reviewer), f.mission.id, { taskId: review.id, attemptId: taken.attempt.id, verdict: 'accept', reason }) }
 }
 
-/** Resume a deferred review through swarm_control, let its stop barrier settle, and accept it on passing checks. */
+/** Resume a deferred review through swarm_control (it re-pends at once: its reviewer owes no stop), let the pass it kicks settle, and accept it on passing checks. */
 async function resumeAndAccept(f, tool, review) {
   await tool('swarm_control', { action: 'resume', taskId: review.id, reason: 'condition repaired' })
   await f.runtime.settle(f.mission.id)

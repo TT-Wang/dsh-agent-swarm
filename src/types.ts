@@ -803,7 +803,7 @@ export const OWNER_ONLY_TOOLS: readonly string[] = [
  */
 export const ATTEMPT_FENCING_EVENTS: readonly EventKind[] = [
   // `attempt/fenced` is the uniform closer every fence writes through
-  // `Attempts.fenceRow`. Mission pause/stop and challenge closed attempts
+  // `Attempts.fenceForStop`. Mission pause/stop and challenge closed attempts
   // with only their own domain event, so a log this runtime wrote was refused as
   // truncated by its own replay; `task/start-failed` drops the attempt too and
   // had the same gap.
@@ -1145,13 +1145,15 @@ export interface WorkerAdapter {
   /** R11-19: the host's measured declared-check envelope, when the adapter runs checks. */
   checkEnvelope?(): CheckEnvelope
   /**
-   * Materialize accepted dependencies or a prior task checkpoint. Stop/fence
-   * the old owner before preparing a later epoch. `finished` names the newest
-   * attempt on the task that ended in a submission or a verdict (`finishedAttempt`):
-   * a task record of that epoch is that attempt's, and the work is recovered from
-   * the capture it recorded, never from its worktree, which its handle may still
-   * be writing, and never by capturing that epoch again. A record of a later
-   * epoch is an attempt that did not end in a capture, and recovers as before.
+   * Materialize accepted dependencies or a prior task checkpoint. The runtime
+   * stops and fences an attempt a handle may still be running before it
+   * prepares a later epoch. An attempt that ended in a submission or a verdict
+   * owes no stop: `finished` names the newest such attempt on the task
+   * (`finishedAttempt`). A task record of that epoch is that attempt's, and the
+   * work is recovered from the capture it recorded, never from its worktree,
+   * which its handle may still be writing, and never by capturing that epoch
+   * again. A record of a later epoch is an attempt that did not end in a
+   * capture, and recovers as before.
    */
   prepareTask(member: Member, task: Task, dependencies: Task[], reviewSource?: Task, finished?: FinishedAttempt): Promise<void>
   dispose(): Promise<void>
