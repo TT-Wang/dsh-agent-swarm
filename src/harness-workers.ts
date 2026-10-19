@@ -430,7 +430,7 @@ export class HarnessWorkers implements WorkerAdapter {
   /** Read liveness from owned native operations, never from a persisted UI record. */
   currentActivity(memberId: string): WorkerActivity | undefined {
     const resident = this.residents.get(memberId)
-    if (!resident || this.closing || resident.stopping || resident.abort.signal.aborted) return undefined
+    if (resident === undefined || this.fenced(resident)) return undefined
     const active = [...resident.activities.values()].filter(item => !item.signal?.aborted && (item.value.retryAt === undefined || Date.now() <= item.value.retryAt))
     const value = active.at(-1)?.value
     return value === undefined ? undefined : { ...value }
@@ -731,12 +731,12 @@ export class HarnessWorkers implements WorkerAdapter {
       const visible = new Set(agentCtx.tools.schemas(agent).map(schema => schema.name))
       const hidden = hiddenToolsFor('worker').filter(name => visible.has(name))
       if (hidden.length) agentCtx.tools.restrict({ deny: hidden })
-      agentCtx.tools.guard(exec => resident.stopping !== undefined || this.closing || abort.signal.aborted ? 'Swarm worker is stopping' : this.observer().guard(spec.member.id, exec.name))
+      agentCtx.tools.guard(exec => this.fenced(resident) ? 'Swarm worker is stopping' : this.observer().guard(spec.member.id, exec.name))
       agentCtx.on('agent/pre-step', async ({ signal, messages }, next) => {
-        if (this.closing || resident.stopping !== undefined || abort.signal.aborted) return { kind: 'reject' }
+        if (this.fenced(resident)) return { kind: 'reject' }
         await this.drainObservations(resident)
         signal.throwIfAborted()
-        if (this.closing || resident.stopping !== undefined || abort.signal.aborted) return { kind: 'reject' }
+        if (this.fenced(resident)) return { kind: 'reject' }
         this.removeRevokedPending(resident, agent)
         // Claims are already removed from Inbox before this hook. Reject a
         // wholly stale batch and filter mixed batches through the admitted view.
@@ -832,7 +832,7 @@ export class HarnessWorkers implements WorkerAdapter {
         this.compactIfRequested(resident)
         if (this.continueAfterRejectedStep(resident, agent)) return
         void this.drainObservations(resident).then(() => {
-          if (resident.stopping === undefined && !this.closing && !abort.signal.aborted && agent.status === 'idle') this.observer().idle(spec.member.id)
+          if (!this.fenced(resident) && agent.status === 'idle') this.observer().idle(spec.member.id)
         }).catch(error => { this.failure(spec.member.id, error) })
       })
     }
@@ -874,7 +874,7 @@ export class HarnessWorkers implements WorkerAdapter {
    */
   compactAtBoundary(memberId: string): void {
     const resident = this.residents.get(memberId)
-    if (resident === undefined || this.closing || resident.stopping !== undefined || resident.abort.signal.aborted) return
+    if (resident === undefined || this.fenced(resident)) return
     resident.compactionRequested = true
     this.compactIfRequested(resident)
   }
@@ -907,7 +907,7 @@ export class HarnessWorkers implements WorkerAdapter {
   private compactIfRequested(resident: Resident): void {
     const threshold = this.options.boundaryCompactionTokens ?? 250000
     const agent = resident.handle?.agent
-    if (!resident.compactionRequested || threshold <= 0 || agent === undefined || agent.status !== 'idle' || this.closing || resident.stopping !== undefined || resident.abort.signal.aborted) return
+    if (!resident.compactionRequested || threshold <= 0 || agent === undefined || agent.status !== 'idle' || this.fenced(resident)) return
     if (resident.lastPromptTokens < threshold) { resident.compactionRequested = false; return }
     resident.compactionRequested = false
     const compact = this.compactionFor(agent)
