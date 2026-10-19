@@ -17,7 +17,7 @@ import { join } from 'node:path'
 import { FakeClock, FakeWorkers, MISSION_ACCEPTANCE, acceptThroughReview, blockThroughReview, eventually, events, setup, taskOf } from './faults/harness.mjs'
 import { BOARD_RUNNING, completionError, interpret, isolationIssues, reviewNeed } from '../lib/board.js'
 import { assertNamedCalls, ownerTools } from './refusal-inventory.mjs'
-import { NOTICE_TEMPLATES, factKey, noticeFamily, noticeTemplateKey, reviewBlocked } from '../lib/notices.js'
+import { NOTICE_TEMPLATES, factKey, guardTerminalNotice, noticeFamily, noticeTemplateKey, reviewBlocked } from '../lib/notices.js'
 
 const ownerRows = f => f.runtime.store.list('deliveries', f.mission.id).filter(delivery => delivery.to === 'owner' && delivery.notice !== undefined)
 const stallRow = f => ownerRows(f).find(delivery => delivery.notice.trigger === 'mission/stalled' && delivery.content.startsWith('Mission stalled'))
@@ -1908,7 +1908,7 @@ test('the fall-through names stuck work at its epoch, once, beside an open reque
       // Work only the reviewer may take, dead once the reviewer is gone, with a request raised for it.
       const stuck = f.propose({ title: 'Reviewer-only work', kind: 'research', checks: [], assigneeId: f.reviewer.id })
       f.runtime.commit(f.mission.id, () => f.runtime.store.put('members', { ...f.runtime.store.get('members', f.reviewer.id), phase: 'stopped' }))
-      f.runtime.notices.emitGuardTerminal(f.mission.id, 'attempt_lease', { taskId: stuck.id, localKey: 'closeout-abandoned:attempt_abandoned', detail: 'idle close-out abandoned attempt attempt_abandoned and re-pended the task' })
+      f.runtime.notices.record(f.mission.id, guardTerminalNotice(f.runtime.boardOf(f.mission.id), 'attempt_lease', { taskId: stuck.id, localKey: 'closeout-abandoned:attempt_abandoned', detail: 'idle close-out abandoned attempt attempt_abandoned and re-pended the task' }))
       await quiet(f)
       // The board digest moves: work queued behind the author's live lease.
       f.propose({ title: 'Queued work', kind: 'research', checks: [] })

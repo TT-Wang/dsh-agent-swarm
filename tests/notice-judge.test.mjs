@@ -1,6 +1,7 @@
 /**
  * S12: what a board owes the owner is a function of the board (`judge`), and
- * one executor writes a notice (`Notices.record`).
+ * one executor writes a notice (`Notices.record`). S13: the notice a guard
+ * chain ends with is a function of the board too (`guardTerminalNotice`).
  *
  * - `judge` decides and writes nothing: its notices are exactly the rows (and
  *   events) its executor, `Notices.ensureWitness`, then writes, in order, and a
@@ -13,7 +14,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { interpret } from '../lib/board.js'
-import { Notices, judge, noticeIdentity, reviewBlocked } from '../lib/notices.js'
+import { Notices, guardTerminalNotice, judge, noticeIdentity, reviewBlocked } from '../lib/notices.js'
 import { RefusalRegistry } from '../lib/refusals.js'
 import { WriterBusyError } from '../lib/store.js'
 import { FakeClock, events, makeRuntimeStub, setup, taskOf } from './faults/harness.mjs'
@@ -110,7 +111,7 @@ test('a busy writer\'s refusal is queued only for a guard terminal\'s notice; an
   const kernel = makeRuntimeStub({
     commit: () => { throw new WriterBusyError('database is locked', 3) },
     store: { get: (table, id) => table === 'missions' ? { id, status: 'active' } : undefined, list: () => [], event() {} },
-    boardOf: missionId => ({ missionId, tasks: [] }),
+    boardOf: missionId => ({ missionId, mission: { id: missionId, status: 'active' }, tasks: [] }),
   })
   const refusals = new RefusalRegistry(kernel)
   refusals.queueWriterBusy = recovery => queued.push(recovery)
@@ -121,7 +122,50 @@ test('a busy writer\'s refusal is queued only for a guard terminal\'s notice; an
   const context = { detail: 'probe', localKey: 'probe' }
   assert.equal(notices.record('m', { ...notice, terminal: { chain: 'attempt_lease', context } }), false, 'a guard terminal\'s notice is not written')
   assert.deepEqual(queued.map(recovery => [recovery.missionId, recovery.chain, recovery.context, recovery.attempts]), [['m', 'attempt_lease', context, 3]], 'and its refusal is queued for the writer\'s recovery')
-  const request = notices.emitGuardTerminal('m', 'attempt_lease', context)
-  assert.equal(request.code, 'attempt_terminal', 'the guard terminal still returns its request')
-  assert.equal(queued.length, 2, 'and queues the refusal through the same record')
+  const terminal = guardTerminalNotice(kernel.boardOf('m'), 'attempt_lease', context)
+  assert.deepEqual([terminal.terminal, terminal.event.data.code], [{ chain: 'attempt_lease', context }, 'attempt_terminal'], 'a guard chain\'s notice opts in')
+  assert.equal(notices.record('m', terminal), false, 'so recording it')
+  assert.equal(queued.length, 2, 'queues the refusal through the same record')
+})
+
+test('S13: a guard chain\'s notice is a function of the board: it names its caller\'s subjects, else the task, else the member\'s unfinished work, else the mission root; only a terminal mission owes none, and deciding writes nothing', async t => {
+  const f = await setup({ clock: new FakeClock() })
+  t.after(f.cleanup)
+  const assigned = f.propose({ title: 'The author\'s work', kind: 'research', checks: [] })
+  const other = f.propose({ title: 'The reviewer\'s work', kind: 'research', checks: [], assigneeId: f.reviewer.id })
+  await f.runtime.settle(f.mission.id)
+  const revision = f.runtime.store.revision(), rows = ownerRows(f).length
+  const board = f.runtime.boardOf(f.mission.id)
+  const subject = task => `${task.id}@${taskOf(f.runtime, task.id).epoch}`
+  const subjects = context => guardTerminalNotice(board, 'attempt_lease', { localKey: 'probe', ...context }).subjects
+  assert.deepEqual(subjects({ subjects: ['a', 'b', 'a'], taskId: other.id }), ['a', 'b'], 'its caller\'s subjects, once each')
+  assert.deepEqual(subjects({ taskId: other.id, memberId: f.author.id }), [subject(other)], 'else the task it was asked about')
+  assert.deepEqual(subjects({ memberId: f.author.id }), [subject(assigned)], 'else the member\'s unfinished work')
+  assert.deepEqual(subjects({}), [`mission:${f.mission.id}`], 'else the mission root')
+  const at = status => ({ ...board, mission: { ...board.mission, status } })
+  assert.deepEqual(['active', 'paused', 'blocked', 'completed', 'stopped'].map(status => guardTerminalNotice(at(status), 'budget', { localKey: 'probe' }) !== undefined),
+    [true, true, true, false, false], 'only a completed or stopped mission ends the chain\'s duty to speak')
+  assert.equal(f.runtime.notices.record(f.mission.id, guardTerminalNotice(at('stopped'), 'budget', { localKey: 'probe' })), false, 'and what it owes there, nothing, records nothing')
+  assert.deepEqual([f.runtime.store.revision(), ownerRows(f).length], [revision, rows], 'deciding wrote nothing')
+})
+
+test('S13: a guard chain\'s notice is recorded in one commit, its request\'s row then the stall event that names it, pumped outside the mission queue, and held by the ledger after', async t => {
+  const f = await setup({ clock: new FakeClock() })
+  t.after(f.cleanup)
+  const task = f.propose({ title: 'Held work', kind: 'research', checks: [] })
+  await f.runtime.settle(f.mission.id)
+  let pumped = 0
+  const pump = f.runtime.notices.pumpOutbox.bind(f.runtime.notices)
+  f.runtime.notices.pumpOutbox = () => { pumped += 1; return pump() }
+  const context = { taskId: task.id, memberId: f.author.id, detail: 'the close-out could not checkpoint', localKey: `closeout-failed:${task.id}@0` }
+  const notice = guardTerminalNotice(f.runtime.boardOf(f.mission.id), 'attempt_lease', context)
+  const commits = commitWrites(f)
+  assert.equal(f.runtime.notices.record(f.mission.id, notice), true)
+  assert.deepEqual([commits, pumped], [[['put deliveries', 'event mission/stalled']], 1], 'one commit, row then event, and the outbox is pumped')
+  const row = ownerRows(f).find(delivery => delivery.notice.dedupKey === notice.options.dedupKey)
+  assert.deepEqual([row.content, row.subjects], [notice.content, notice.subjects], 'the row is the notice')
+  assert.deepEqual(events(f.runtime, f.mission.id, 'mission/stalled').at(-1).data, notice.event.data, 'and its event names that row')
+  assert.equal(notice.event.data.noticeKey, row.notice.dedupKey)
+  assert.equal(f.runtime.notices.record(f.mission.id, guardTerminalNotice(f.runtime.boardOf(f.mission.id), 'attempt_lease', context)), false, 'the same request again is held')
+  assert.deepEqual([commits.length, pumped], [1, 1], 'and commits and pumps nothing')
 })

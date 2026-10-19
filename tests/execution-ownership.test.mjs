@@ -47,6 +47,20 @@ test('queue wait timeout refuses all successors until the actual operation retur
   } finally { gate.resolve(); nextGate.resolve(); await Promise.allSettled([first, next]); await f.cleanup() }
 })
 
+test('a queue keyed by no mission (a start request\'s, a draft\'s, a delivery\'s) refuses its waiter alone: the refusal is the waiter\'s, and no mission is told', async () => {
+  const f = await fixture()
+  const gate = deferred()
+  let first
+  try {
+    const key = 'start_request_without_mission'
+    const told = () => [f.runtime.store.list('deliveries', f.mission.id).length, events(f.runtime, f.mission.id, 'mission/stalled').length]
+    const before = told()
+    first = f.runtime.exclusive(key, async () => { await gate.promise })
+    await assert.rejects(f.runtime.exclusive(key, async () => {}), /^Error: \[mission_operation_pending\]/, 'the waiter gets the queue\'s own refusal')
+    assert.deepEqual(told(), before, 'and no mission\'s workspace chain is ended for it')
+  } finally { gate.resolve(); await first; await f.cleanup() }
+})
+
 test('a rejected second claim leaves real Git workspace ownership and working content untouched', async () => {
   const repo = await makeRepo('swarm-claim-ownership')
   const ws = makeWorkspaces(repo.root, { maxCheckOutputBytes: 100_000 })

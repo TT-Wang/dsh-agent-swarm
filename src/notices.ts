@@ -8,7 +8,7 @@
 import { createHash } from 'node:crypto'
 import { covered, hasNotice } from './arena.ts'
 import { formatDiagnostic, missingReviewDiagnostic } from './admission.ts'
-import { guardTerminal, guardTerminalKey, type GuardChainId, type GuardTerminal, type GuardTerminalContext, type RefusalRegistry } from './refusals.ts'
+import { guardTerminal, guardTerminalKey, type GuardChainId, type GuardTerminalContext, type RefusalRegistry } from './refusals.ts'
 import { TERMINAL_STATES, holdsAttempt, missionSubject, stopPending, subjectsOfTasks, taskSubject, terminal } from './task-graph.ts'
 import { WriterBusyError, id, type SwarmStore } from './store.ts'
 import type { EventKind } from './events.ts'
@@ -94,7 +94,7 @@ export interface Notice {
   /** The event its record writes after its row, in the same commit, so it exists only with that row (or alone, `NoticeEvent.whenHeld`). */
   event?: NoticeEvent
   /**
-   * The guard chain this notice ends (`Notices.emitGuardTerminal`): once
+   * The guard chain this notice ends (`guardTerminalNotice`): once
    * recorded it is pumped outside the mission queue, and a busy writer's
    * refusal of it is queued for the writer's recovery, never thrown. No other
    * notice opts in.
@@ -574,6 +574,35 @@ export function reviewBlocked(board: Pick<Board, 'missionId' | 'tasks' | 'record
 }
 
 /**
+ * The notice that ends a guard chain on `board`: its terminal decision request
+ * (`guardTerminal`) with the stall event that names its row. A caller names the
+ * chain and passes the scope it already has with the fact that opened it
+ * (`GuardTerminalContext.localKey`, or the unanswered question), which is the
+ * request's identity (`guardTerminalKey`).
+ *
+ * S4r-D5: only a terminal mission (completed or stopped) ends the chain's duty
+ * to speak, so there alone the chain owes nothing. A mission that left `active`
+ * without reaching a terminal status, `blocked` after a budget stop above all,
+ * which is when the owner needs the executable exit most, still owes it.
+ * Nothing else suppresses it: the ledger holding the same request does
+ * (`Notices.record`), a failure of the chain under another opener is another
+ * request whatever the board looks like, and a busy writer's refusal of it is
+ * queued, never silent (`Notice.terminal`). It names its caller's subjects,
+ * else the task it was asked about, else the member's unfinished work, else
+ * the mission root (`noticeSubjectsFor`). The board-stall event type is reused
+ * with `cause: 'guard-terminal'`, so the durable log names the chain and the
+ * code without inventing an unregistered event type.
+ */
+export function guardTerminalNotice(board: Pick<Board, 'missionId' | 'mission' | 'tasks'>, chain: GuardChainId, context: GuardTerminalContext): Notice | undefined {
+  if (terminal(board.mission)) return undefined
+  const request = guardTerminal(chain, context), key = guardTerminalKey(chain, context)
+  const subjects = context.subjects ?? noticeSubjectsFor(board, { taskId: context.taskId, memberId: context.memberId })
+  return { content: request.message, subjects: [...new Set(subjects)], options: { dedupKey: key, reason: context.detail, questionId: context.questionId },
+    event: { type: 'mission/stalled', data: { cause: 'guard-terminal', chain, code: request.code, taskId: context.taskId ?? null, memberId: context.memberId ?? null, detail: context.detail ?? null, noticeKey: key } },
+    terminal: { chain, context } }
+}
+
+/**
  * F1: one in-flight operation that has recorded nothing past its declared
  * bound (`Attempts.silentOperation`), with the member row that records it.
  */
@@ -773,7 +802,7 @@ export class Notices {
   /**
    * The notices stand on the kernel and the refusal registry below them:
    * `refusals` holds the writes a busy writer refused, and a guard terminal it
-   * could not tell is queued there (`emitGuardTerminal`). `passState` is their
+   * could not write is queued there (`record`). `passState` is their
    * one reach above the kernel, the scheduling pass state a publication reads
    * when it runs (`publishTransition`).
    */
@@ -805,17 +834,20 @@ export class Notices {
 
   /**
    * Record one notice in a transaction of its own, the one writer of a
-   * `Notice`. A notice the ledger already holds (`held`) commits nothing, except
-   * an event that records a change of its own (`NoticeEvent.whenHeld`), which is
-   * committed alone. Otherwise one commit writes its row (`notify`), then its
-   * event. A guard terminal's notice (`Notice.terminal`) is pumped once
-   * recorded; the best-effort contract of a busy writer is its alone: the
-   * refusal is queued and recorded once the writer is free
-   * (`RefusalRegistry.recordWriterBusyRecovery`), never an unhandled rejection,
-   * and the chain re-derives its state on the next pass. Any other notice's busy
-   * writer throws to its caller. Returns whether the notice's row was written.
+   * `Notice`: what a decision owes the owner, and undefined, a decision that
+   * owes nothing, records nothing. A notice the ledger already holds (`held`)
+   * commits nothing, except an event that records a change of its own
+   * (`NoticeEvent.whenHeld`), which is committed alone. Otherwise one commit
+   * writes its row (`notify`), then its event. A guard terminal's notice
+   * (`Notice.terminal`) is pumped once recorded; the best-effort contract of a
+   * busy writer is its alone: the refusal is queued and recorded once the
+   * writer is free (`RefusalRegistry.recordWriterBusyRecovery`), never an
+   * unhandled rejection, and the chain re-derives its state on the next pass.
+   * Any other notice's busy writer throws to its caller. Returns whether the
+   * notice's row was written.
    */
-  record(missionId: string, notice: Notice): boolean {
+  record(missionId: string, notice: Notice | undefined): boolean {
+    if (notice === undefined) return false
     const { content, subjects, options, event, terminal } = notice
     const write = () => { if (event !== undefined) this.k.store.event(missionId, event.type, 'runtime', event.data) }
     try {
@@ -832,39 +864,6 @@ export class Notices {
     // The notice path must not share the fate of the pass that could not report it: the queue-external pump delivers it.
     if (terminal !== undefined) this.pumpOutbox()
     return true
-  }
-
-  /**
-   * End a guard chain: record its terminal decision request (`guardTerminal`)
-   * with the stall event that names its row. A caller names the chain and
-   * passes the scope it already has with the fact that opened it
-   * (`GuardTerminalContext.localKey`, or the unanswered question).
-   *
-   * The terminal is always built, and its request is told unless the same
-   * request is already on the deliveries ledger. Nothing else suppresses it: a
-   * failure of the chain under another opener is another request whatever the
-   * board looks like, and a busy writer is recorded (`Notice.terminal`), never
-   * silent. It names its caller's subjects, else the task it was asked about,
-   * else the member's unfinished work, else the mission root
-   * (`noticeSubjectsFor`).
-   */
-  emitGuardTerminal(missionId: string, chain: GuardChainId, context: GuardTerminalContext): GuardTerminal | undefined {
-    const mission = this.k.store.get('missions', missionId)
-    // S4r-D5: only a terminal mission (completed/stopped) ends the chain's duty to
-    // speak. A mission that left `active` without reaching a terminal status —
-    // most importantly `blocked` after a budget stop, which is when the owner needs
-    // the executable exit most — still emits the terminal.
-    if (mission === undefined || terminal(mission)) return undefined
-    const request = guardTerminal(chain, context)
-    const key = guardTerminalKey(chain, context)
-    const subjects = context.subjects ?? noticeSubjectsFor(this.k.boardOf(missionId), { taskId: context.taskId, memberId: context.memberId })
-    // The board-stall event type is reused with `cause: 'guard-terminal'`, so the
-    // durable log names the chain and the code without inventing an unregistered
-    // event type (the vocabulary is a separate owner surface).
-    this.record(missionId, { content: request.message, subjects: [...new Set(subjects)], options: { dedupKey: key, reason: context.detail, questionId: context.questionId },
-      event: { type: 'mission/stalled', data: { cause: 'guard-terminal', chain, code: request.code, taskId: context.taskId ?? null, memberId: context.memberId ?? null, detail: context.detail ?? null, noticeKey: key } },
-      terminal: { chain, context } })
-    return request
   }
 
   /**

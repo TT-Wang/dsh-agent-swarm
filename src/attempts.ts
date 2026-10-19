@@ -7,7 +7,7 @@
  */
 import { id } from './store.ts'
 import { TERMINAL_STATES, blockCauses, holdsAttempt, holdsOpenAttempt, openAttempt, stopPending, taskSubject, terminal, type BlockCause, type HeldTask } from './task-graph.ts'
-import { parkedHolder, silenceNotice, stopFaultKey, type Notices, type SilentOperation } from './notices.ts'
+import { guardTerminalNotice, parkedHolder, silenceNotice, stopFaultKey, type Notices, type SilentOperation } from './notices.ts'
 import { heldByParkedMember } from './board.ts'
 import { memberPhaseOf } from './projection.ts'
 import { PolicyError } from './policy-error.ts'
@@ -172,7 +172,7 @@ export class Attempts {
               taskId: fresh.id, ...(state.memberId === undefined ? { memberIds: ownerIds } : { memberId: state.memberId }), reason, retries: state.retries,
             })
           })
-          if (recoveryExhausted && mission.status === 'active' && fresh.status !== 'cancelled') this.notices.emitGuardTerminal(missionId, 'attempt_lease', { taskId: fresh.id, memberId: state.memberId, localKey: `recovery-exhausted:${taskSubject(fresh)}`, detail: `${reason === 'lease-expired' ? 'lease expiry exhausted' : 'idle close-out reached'} the recovery limit (${fresh.recoveryCount ?? 0}/${fresh.maxRecoveryAttempts ?? this.k.config.maxTasksPerMember}) and left the task blocked` })
+          if (recoveryExhausted && mission.status === 'active' && fresh.status !== 'cancelled') this.notices.record(missionId, guardTerminalNotice(this.k.boardOf(missionId), 'attempt_lease', { taskId: fresh.id, memberId: state.memberId, localKey: `recovery-exhausted:${taskSubject(fresh)}`, detail: `${reason === 'lease-expired' ? 'lease expiry exhausted' : 'idle close-out reached'} the recovery limit (${fresh.recoveryCount ?? 0}/${fresh.maxRecoveryAttempts ?? this.k.config.maxTasksPerMember}) and left the task blocked` }))
         })
         if (this.stopRetries.get(task.id) === state) this.stopRetries.delete(task.id)
         if (state.memberId === undefined) for (const peer of this.k.store.list('tasks', missionId)) if (peer.id !== task.id && stopPending(peer)) this.resumeStoppedAttempt(missionId, peer)
@@ -211,9 +211,9 @@ export class Attempts {
       : /recorded stop owner is missing/.test(message)
         ? `A resume only repeats this refusal. Withdraw the task with swarm_cancel (taskId "${task.id}"); if its work is still needed, propose its repair with swarm_propose naming replaces: ["${task.id}"].`
         : `The member remains fenced. Repair the recorded workspace condition, then retry cleanup with swarm_control(action: "resume", taskId: "${task.id}"); its cancelled or blocked outcome is preserved.`
-    this.notices.emitGuardTerminal(missionId, 'attempt_lease', { taskId: task.id, memberId: marker.memberId,
+    this.notices.record(missionId, guardTerminalNotice(this.k.boardOf(missionId), 'attempt_lease', { taskId: task.id, memberId: marker.memberId,
       localKey: stopFaultKey(task.id, marker, message),
-      detail: `Stopping or preserving this attempt failed: ${message}. ${exit}` })
+      detail: `Stopping or preserving this attempt failed: ${message}. ${exit}` }))
   }
 
   /**
@@ -469,7 +469,7 @@ export class Attempts {
       // checkpoint guard (a dirty or unprovisioned worktree) and the close-out
       // guard co-fire here, so the owner gets the shared coded decision request
       // naming the task and the exits instead of a prose-only reason.
-      this.notices.emitGuardTerminal(mission.id, 'attempt_lease', { taskId: failed.id, memberId: member.id, localKey: `closeout-failed:${taskSubject(failed)}`, detail: terminalDetail(failed.output!) })
+      this.notices.record(mission.id, guardTerminalNotice(this.k.boardOf(mission.id), 'attempt_lease', { taskId: failed.id, memberId: member.id, localKey: `closeout-failed:${taskSubject(failed)}`, detail: terminalDetail(failed.output!) }))
       this.resumeStoppedAttempt(mission.id, failed)
       return
     }
@@ -494,7 +494,7 @@ export class Attempts {
     // chain fires with the workspace capture guard that produced the checkpoint,
     // with the dispatch sweep that re-pends the task, and (when the recovery
     // limit is already spent) with the close-out exhaustion terminal below.
-    this.notices.emitGuardTerminal(mission.id, 'attempt_lease', { taskId: current.id, memberId: member.id, localKey: `closeout-abandoned:${attemptId}`, detail: `idle close-out abandoned attempt ${attemptId}: the workspace was checkpointed at ${checkpoint.commit} and the task was re-pended (recovery ${current.recoveryCount ?? 0})` })
+    this.notices.record(mission.id, guardTerminalNotice(this.k.boardOf(mission.id), 'attempt_lease', { taskId: current.id, memberId: member.id, localKey: `closeout-abandoned:${attemptId}`, detail: `idle close-out abandoned attempt ${attemptId}: the workspace was checkpointed at ${checkpoint.commit} and the task was re-pended (recovery ${current.recoveryCount ?? 0})` }))
     this.resumeStoppedAttempt(mission.id, current)
   }
 
@@ -563,7 +563,7 @@ export class Attempts {
                   // the attempt/lease chain for this attempt: the workspace guard
                   // refused the capture, so recovery will refuse a dirty
                   // workspace too. The coded decision request replaces the prose.
-                  this.notices.emitGuardTerminal(missionId, 'attempt_lease', { taskId: task.id, memberId: oldOwner, localKey: `checkpoint-failed:${attemptId}`, detail: terminalDetail(reason) })
+                  this.notices.record(missionId, guardTerminalNotice(this.k.boardOf(missionId), 'attempt_lease', { taskId: task.id, memberId: oldOwner, localKey: `checkpoint-failed:${attemptId}`, detail: terminalDetail(reason) }))
                 }
               }
             }

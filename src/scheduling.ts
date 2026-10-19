@@ -10,7 +10,7 @@
 import { id } from './store.ts'
 import { TERMINAL_STATES, holdsOpenAttempt, openAttempt, pendingStopOwner, quiescencePending, subjectsOfTasks, taskSubject, terminal, turnEnded } from './task-graph.ts'
 import { asksHandle, eligible, isolationViolation, noticeSubjectsFor, overdueStop, startBlocker, stillDispatchable, takesWork, unschedulable } from './board.ts'
-import { factKey, silenceNotice, type Notices, type SilentAttempt } from './notices.ts'
+import { factKey, guardTerminalNotice, silenceNotice, type Notices, type SilentAttempt } from './notices.ts'
 import { AdmissionRefusedError } from './scheduler.ts'
 import { awaited, progressed, type Kernel, type PassState, type SchedulingPass } from './kernel.ts'
 // R17-G6/G7: the one derivation of the derived member status.
@@ -227,8 +227,8 @@ export class Scheduling {
     // The terminal of this member's chain, opened by this failure of the work
     // its request names: the same throw over that work on a later pass is the
     // request the owner already holds; other work or another failure is another.
-    const detail = String(error), subjects = noticeSubjectsFor(this.k.boardOf(missionId), { memberId: member.id })
-    this.notices.emitGuardTerminal(missionId, 'attempt_lease', { memberId: member.id, detail, subjects, localKey: factKey(missionId, { trigger: `dispatch-failed:${member.id}`, reason: detail, subjects }) })
+    const board = this.k.boardOf(missionId), detail = String(error), subjects = noticeSubjectsFor(board, { memberId: member.id })
+    this.notices.record(missionId, guardTerminalNotice(board, 'attempt_lease', { memberId: member.id, detail, subjects, localKey: factKey(missionId, { trigger: `dispatch-failed:${member.id}`, reason: detail, subjects }) }))
     return true
   }
 

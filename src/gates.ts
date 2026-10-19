@@ -18,7 +18,7 @@ import { excerpt } from './check-results.ts'
 import type { DeclaredChecks } from './declared-checks.ts'
 import { executionElapsed, exhaustedDimensions } from './resource-time.ts'
 import { dispatchable, inFlightEstimate, stepsInFlight } from './board.ts'
-import { held, noticeFamily, noticeIdentity, type Notices } from './notices.ts'
+import { guardTerminalNotice, held, noticeFamily, noticeIdentity, type Notices } from './notices.ts'
 import type { RefusalRegistry } from './refusals.ts'
 import type { Kernel } from './kernel.ts'
 import type { Delivery, Mission, Post, Task, UsageBuckets, UsageSnapshotSource } from './types.ts'
@@ -302,12 +302,12 @@ export class RuntimeGates {
     // S4b: the budget chain's terminal. The mission is durably blocked and the
     // in-flight attempts are preserved; the owner gets the shared coded decision
     // request (chain budget, exits swarm_budget/swarm_cancel/swarm_control)
-    // instead of a prose-only reason. `emitGuardTerminal` proceeds for the
+    // instead of a prose-only reason. `guardTerminalNotice` owes it for the
     // non-terminal `blocked` status (S4r-D5), which is exactly this state.
     // Co-firing guards: the budget guard fires with the attempt/lease chain (the
     // preserved attempts) and with the dispatch sweep (nothing new is admitted
     // while the pause holds).
-    this.notices.emitGuardTerminal(mission.id, 'budget', { detail: mission.reason!, localKey: `budget-pause:${mission.budgetPause.id}` })
+    this.notices.record(mission.id, guardTerminalNotice(this.k.boardOf(mission.id), 'budget', { detail: mission.reason!, localKey: `budget-pause:${mission.budgetPause.id}` }))
     this.beginBudgetStop(mission.id, mission.budgetPause.id)
   }
 

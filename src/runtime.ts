@@ -7,7 +7,7 @@ import { PolicyError } from './policy-error.ts'
 export { WorkspaceRevokedError } from './authorization.ts'
 import { recordedClaim, type WorkspaceClaim } from './authorization.ts'
 import { WorkspaceAdmission, deniedGitWrite, gitWriteDeniedMessage, TEMP_RENDEZVOUS_WINDOW_MS } from './workspace-admission.ts'
-import { Notices, NOTICE_TEMPLATES, REJECTION_DECISION_TRIGGER, assignmentCurrent, integrationGap, renderNotice, reviewBlocked } from './notices.ts'
+import { Notices, NOTICE_TEMPLATES, REJECTION_DECISION_TRIGGER, assignmentCurrent, guardTerminalNotice, integrationGap, renderNotice, reviewBlocked } from './notices.ts'
 import { RefusalRegistry, requireStrings, requireText, sameChecks, unsupportedEffort, validatedBudget } from './refusals.ts'
 import { Scheduling } from './scheduling.ts'
 import { progressed, type Kernel, type SchedulingPass } from './kernel.ts'
@@ -560,8 +560,11 @@ export class SwarmRuntime implements Kernel {
       operation.id = id('operation')
       return await fn()
     } catch (error) {
-      if (error instanceof Error && error.message.startsWith('[mission_operation_pending]')) {
-        this.notices.emitGuardTerminal(missionId, 'workspace', { localKey: `mission-operation-pending:${operation.id}`, detail: error.message })
+      // A mission's queue that refused a wait ends that mission's workspace
+      // chain. A start request's, a draft's or a delivery's queue has no
+      // mission to tell: its caller alone is refused.
+      if (error instanceof Error && error.message.startsWith('[mission_operation_pending]') && this.store.get('missions', missionId) !== undefined) {
+        this.notices.record(missionId, guardTerminalNotice(this.boardOf(missionId), 'workspace', { localKey: `mission-operation-pending:${operation.id}`, detail: error.message }))
       }
       throw error
     } finally {
@@ -1036,7 +1039,7 @@ export class SwarmRuntime implements Kernel {
     // so its tool result carries it; the owner's own is thrown below.
     const refuse = (budget: 'task' | 'experiment', admitted: number, limit: number): void => {
       const reason = `mission ${budget} budget exhausted (${admitted}/${limit} ${budget}s admitted)`
-      this.notices.emitGuardTerminal(mission.id, 'task_ceiling', { detail: reason, localKey: `${budget}-budget:${limit}` })
+      this.notices.record(mission.id, guardTerminalNotice(this.boardOf(mission.id), 'task_ceiling', { detail: reason, localKey: `${budget}-budget:${limit}` }))
       if (owner) return
       this.commit(mission.id, () => this.store.event(mission.id, 'task/proposal-refused', key, { memberId: key, title: input.title, reason, limit }))
       throw new Error(`Worker ${key} cannot propose ${JSON.stringify(input.title)}: ${reason} (limit ${limit}). The owner can raise the mission ceiling with swarm_budget or admit the work with swarm_propose.`)
@@ -1134,8 +1137,7 @@ export class SwarmRuntime implements Kernel {
       for (const change of checkChanges) this.store.event(missionId, 'task/check-changed', key, { taskId: task.id, reason: 'replacement', ...change })
     })
     this.gates.warnBudget(this.mission(missionId))
-    const gap = integrationGap(this.boardOf(missionId), task)
-    if (gap !== undefined) this.notices.record(missionId, gap)
+    this.notices.record(missionId, integrationGap(this.boardOf(missionId), task))
     this.kick(missionId)
     return owner ? task : memberTask(this.boardOf(missionId), task)
   }
@@ -3404,8 +3406,8 @@ export class SwarmRuntime implements Kernel {
     })
     // S4b: the durable event carried the code, the owner notice did not. The
     // shared coded terminal names the task, the dimension and the exits.
-    this.notices.emitGuardTerminal(mission.id, 'task_ceiling', { taskId: task.id, ...(ownerId === undefined ? {} : { memberId: ownerId }), localKey: `ceiling:${taskSubject(task)}:${ceiling.dimension}`,
-      detail: `${task.title} (${task.id}) exhausted its own ${ceiling.dimension} ceiling (${ceiling.used}/${ceiling.limit}) and blocked` })
+    this.notices.record(mission.id, guardTerminalNotice(this.boardOf(mission.id), 'task_ceiling', { taskId: task.id, ...(ownerId === undefined ? {} : { memberId: ownerId }), localKey: `ceiling:${taskSubject(task)}:${ceiling.dimension}`,
+      detail: `${task.title} (${task.id}) exhausted its own ${ceiling.dimension} ceiling (${ceiling.used}/${ceiling.limit}) and blocked` }))
     this.attempts.resumeStoppedAttempt(mission.id, task)
     this.kick(mission.id)
   }
