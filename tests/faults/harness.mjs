@@ -271,7 +271,7 @@ export class WorkspaceWorkers extends FakeWorkers {
     this.verified.push({ memberId: member.id, sourceId: source.id, commit: artifact.commit })
     return await this.workspaces.verifyArtifact(member, source, artifact, signal)
   }
-  async prepareTask(member, task, dependencies, reviewSource) { this.prepared.push({ memberId: member.id, taskId: task.id, epoch: task.epoch }); await this.workspaces.prepareTask(member, task, dependencies, reviewSource) }
+  async prepareTask(member, task, dependencies, reviewSource, finished) { this.prepared.push({ memberId: member.id, taskId: task.id, epoch: task.epoch }); await this.workspaces.prepareTask(member, task, dependencies, reviewSource, finished) }
 }
 
 /**

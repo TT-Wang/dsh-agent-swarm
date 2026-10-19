@@ -27,7 +27,7 @@ import { validScope, scopeSubset } from './scope.ts'
 import { AdmissionError, assertDeclaredOutputs, assertScopeSelectors, citedCovers, dependencyAssumptions, formatDiagnostic, isNoopCheck, loadPackageScripts, normalizeReviewDependencies, normalizeScopeSelectors, normalizeTaskCeilings, reconcileTaskAdmission, requireHostChecks, taskCeilingBlock, taskGraphDefects, TaskGraphAdmissionError, type TaskGraphNode } from './admission.ts'
 import { canBorrowTask, canOwnReview, strandedReview } from './assignment.ts'
 import { executionClock, executionElapsed, exhaustedDimensions } from './resource-time.ts'
-import { TERMINAL_STATES, blockCauses, currentEvidenceIds, holdsAttempt, holdsOpenAttempt, memberTask, missionSubject, openAttempt, pendingStopOwner, quiescencePending, selectAcceptedDelivery, stopPending, subjectsOfTasks, taskEdges, taskGraphIndex, taskSubject, terminal, uncoveredCriteria, type BlockCause, type HeldTask } from './task-graph.ts'
+import { TERMINAL_STATES, blockCauses, currentEvidenceIds, finishedAttempt, holdsAttempt, holdsOpenAttempt, memberTask, missionSubject, openAttempt, pendingStopOwner, quiescencePending, selectAcceptedDelivery, stopPending, subjectsOfTasks, taskEdges, taskGraphIndex, taskSubject, terminal, uncoveredCriteria, type BlockCause, type HeldTask } from './task-graph.ts'
 import { checkSyntaxDetail, declaredPlanChecks, orderedTasks, pairReviews, planAdvisories, validatePlan } from './plans.ts'
 import { OWNER_ONLY_TOOLS, type Actor, type AutoStart, BoardQuery, Budget, CheckAttribution, CreateMissionInput, CriticalPath, criterionId, Delivery, DraftPlan, Escalation, Evidence, EvidenceStatus, Member, Mission, nextWorkerName, ObserveQuery, MessageInput, PlanInput, Post, PostInput, PostKind, PROVIDER_OUTAGE_WINDOW_MS, ProposeTaskInput, ProviderOutage, providerQuiescent, PublishInput, RecoveryFallback, RequestStartInput, RuntimeConfig, Snapshot, Task, TaskAmendment, TaskRejection, TaskCeiling, ToolRun, VerificationCleanupFailure, WorkerAdapter, WorkerActivity, Workstream } from './types.ts'
 import { requireArtifactChecks } from './artifact-policy.ts'
@@ -1188,7 +1188,7 @@ export class SwarmRuntime implements Kernel {
       this.refusals.assertAdmission(task, member)
       await this.workspaceAdmission.assertWorkspaceAuthorized(this.mission(missionId))
       const { graph } = this.boardOf(missionId)
-      await this.workers.prepareTask(member, { ...task, epoch: task.epoch + 1 }, graph.effectiveDependencies(task), graph.reviewSource(task))
+      await this.workers.prepareTask(member, { ...task, epoch: task.epoch + 1 }, graph.effectiveDependencies(task), graph.reviewSource(task), finishedAttempt(task))
       this.active(actor, missionId)
       const board = this.boardOf(missionId), fresh = stillChosen(board, task)
       if (fresh === undefined || !ready(board, fresh, member)) throw new PolicyError('task_changed_during_preparation', 'conflict_error', 'Task changed while preparing its workspace')
@@ -3178,6 +3178,15 @@ export class SwarmRuntime implements Kernel {
     // close-out restarts from the first nudge; the turn end that armed it stays.
     if (resumes) { delete next.preparationFailure; delete next.verificationRecovery; delete next.attempt?.closeout }
     if (rework !== undefined) this.reopenForRework(next, rework)
+    // W1: a blocked row that still holds its attempt is a review whose attempt
+    // ended in its deferred or rejecting verdict (a rejected source is reworked
+    // above, and every other blocked source with an attempt carries an artifact
+    // a resume refuses). The resume re-opens it from that verdict: its next
+    // attempt is recovered from the review artifact the verdict captured
+    // (`finishedAttempt`), as a rework's is from the round it archives.
+    if (resumes && rework === undefined && !stopPending(task) && task.status === 'blocked' && task.attempt !== undefined) {
+      next.resumedFrom = { epoch: task.attempt.epoch, ...(task.reviewArtifact === undefined ? {} : { capture: task.reviewArtifact.commit }) }
+    }
     // A rejected submission holds no live attempt: its author is not stopped.
     // Any other attempt the row holds owes its owner's stop, a blocked row's
     // too (a verification-deferred review), so the fence below names that

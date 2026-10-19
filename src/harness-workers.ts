@@ -20,7 +20,7 @@ import { ownerModelSelection, workerModelSelection } from './model-selection.js'
 import { persistedSessionHeader } from './session-metadata.js'
 import { hiddenToolsFor, WORKER_PROMPT } from './tools.js'
 import { classifyProviderOutage } from './scheduler.js'
-import type { Artifact, CheckEnvelope, CheckSyntaxIssue, Delivery, Member, Mission, Task, UsageBuckets, WorkerAdapter, WorkerCallbacks, WorkerSpec, WorkerActivity } from './types.js'
+import type { Artifact, CheckEnvelope, CheckSyntaxIssue, Delivery, FinishedAttempt, Member, Mission, Task, UsageBuckets, WorkerAdapter, WorkerCallbacks, WorkerSpec, WorkerActivity } from './types.js'
 
 declare module '@deepseek-ai/dsh-llm' {
   interface MessageSourceMap {
@@ -1121,7 +1121,7 @@ export class HarnessWorkers implements WorkerAdapter {
     }
     finally { activity?.end() }
   }
-  prepareTask(member: Member, task: Task, dependencies: Task[], reviewSource?: Task): Promise<void> { return this.workspaces.prepareTask(member, task, dependencies, reviewSource) }
+  prepareTask(member: Member, task: Task, dependencies: Task[], reviewSource?: Task, finished?: FinishedAttempt): Promise<void> { return this.workspaces.prepareTask(member, task, dependencies, reviewSource, finished) }
   checkpointTask(member: Member, task: Task, options?: { ifOwned?: boolean }): Promise<void> { return this.workspaces.checkpointTask(member, task, options) }
   dispose(): Promise<void> {
     return this.disposal ??= (async () => {

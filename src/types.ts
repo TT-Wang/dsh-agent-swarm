@@ -373,6 +373,17 @@ export interface Attempt {
   /** The sandbox denied its worker a git write. */
   gitWriteDenied?: { command: string; runId?: string; at: number }
 }
+/**
+ * W1: an attempt that ended in a submission or a verdict and was then ended (a
+ * rework, an owner resume), as the next attempt on its task is recovered from
+ * it: that attempt's epoch, and the commit its submission or verdict captured
+ * (absent when the verdict captured none). The runtime names it to
+ * `WorkerAdapter.prepareTask` because the workspace engine cannot tell it from
+ * its own record: a submission refused after its capture (`[rework_unchanged]`,
+ * a missing host check) records a captured commit at an epoch whose attempt
+ * runs on.
+ */
+export interface FinishedAttempt { epoch: number; capture?: string }
 export interface Artifact {
   commit: string
   baseCommit: string
@@ -471,6 +482,12 @@ export interface Task {
   maxRework?: number
   /** Rejections this task was re-opened from, oldest first; on a review, the verdicts a rework of its source archived. */
   rejections?: TaskRejection[]
+  /**
+   * W1: the attempt an owner resume last re-opened this review from, which had
+   * ended in its deferred or rejecting verdict: its epoch, and the review
+   * artifact that verdict captured. A rework records the same in `rejections`.
+   */
+  resumedFrom?: FinishedAttempt
   /** Per-task model-step ceiling admitted with the task; the runtime blocks the task at this limit. */
   maxSteps?: number
   /** Per-task finding (published evidence) ceiling admitted with the task. */
@@ -1127,8 +1144,16 @@ export interface WorkerAdapter {
   verifyArtifact(member: Member, task: Task, artifact: Artifact, signal?: AbortSignal): Promise<CheckResult[]>
   /** R11-19: the host's measured declared-check envelope, when the adapter runs checks. */
   checkEnvelope?(): CheckEnvelope
-  /** Materialize accepted dependencies or a prior task checkpoint. Stop/fence the old owner before preparing a later epoch. */
-  prepareTask(member: Member, task: Task, dependencies: Task[], reviewSource?: Task): Promise<void>
+  /**
+   * Materialize accepted dependencies or a prior task checkpoint. Stop/fence
+   * the old owner before preparing a later epoch. `finished` names the newest
+   * attempt on the task that ended in a submission or a verdict (`finishedAttempt`):
+   * a task record of that epoch is that attempt's, and the work is recovered from
+   * the capture it recorded, never from its worktree, which its handle may still
+   * be writing, and never by capturing that epoch again. A record of a later
+   * epoch is an attempt that did not end in a capture, and recovers as before.
+   */
+  prepareTask(member: Member, task: Task, dependencies: Task[], reviewSource?: Task, finished?: FinishedAttempt): Promise<void>
   dispose(): Promise<void>
 }
 export interface RuntimeConfig {

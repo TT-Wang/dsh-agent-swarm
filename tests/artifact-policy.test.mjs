@@ -253,6 +253,10 @@ test('captured review report survives deferred checks and reassignment without l
   const resumed = await f.runtime.claim(nextActor, f.mission.id, review.id)
   assert.equal(await deferralRef(), blocked.reviewArtifact.commit, 'recovering the review leaves the deferral epoch\'s artifact ref at the commit its verdict recorded')
   assert.equal(await readFile(path.join(nextReviewer.workspace, 'reviews/verdict.md'), 'utf8'), 'Preserved first reviewer record')
+  // W1: the review is recovered from the capture its deferral recorded, not
+  // from the first reviewer's worktree as it stood after the verdict.
+  await assert.rejects(readFile(path.join(nextReviewer.workspace, 'after-verdict.md')), { code: 'ENOENT' }, 'what the first reviewer wrote after its verdict is not carried')
+  assert.equal(await f.command(nextReviewer.workspace, ['git', 'rev-parse', 'HEAD']), blocked.reviewArtifact.commit, 'the next reviewer starts from the deferral\'s review artifact')
   await writeFile(path.join(nextReviewer.workspace, 'reviews/verdict.md'), 'Replacement reviewer verified the exact original source')
   const accepted = await f.runtime.verify(nextActor, f.mission.id, { taskId: resumed.id, attemptId: resumed.attempt.id, verdict: 'accept', reason: 'Host checks now pass', deliverables: ['reviews/verdict.md'] })
   assert.equal(accepted.status, 'accepted'); assert.equal(accepted.reviewedCommit, source.artifact.commit)

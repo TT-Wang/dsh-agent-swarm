@@ -64,7 +64,7 @@ class ProdShapeWorkers extends FakeWorkers {
   async prepareBaseline(mission, signal) { return await this.workspaces.prepareBaseline(mission, signal) }
   async prepareWorkspace(mission, memberId) { return await this.workspaces.prepareWorkspace(mission, memberId) }
   async start(spec) { const error = this.failStart.get(spec.member.id); if (error) throw error }
-  async prepareTask(member, task, dependencies, reviewSource) { await this.workspaces.prepareTask(member, task, dependencies, reviewSource) }
+  async prepareTask(member, task, dependencies, reviewSource, finished) { await this.workspaces.prepareTask(member, task, dependencies, reviewSource, finished) }
   checkpointTask(member, task, options) { return this.workspaces.checkpointTask(member, task, options) }
   async captureArtifact(member, task, deliverables) { return await this.workspaces.captureArtifact(member, task, deliverables) }
   async verifyArtifact(member, task, artifact, signal) { return await this.workspaces.verifyArtifact(member, task, artifact, signal) }

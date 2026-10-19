@@ -9,7 +9,7 @@ import { withinScope } from './scope.js'
 import { PolicyError } from './policy-error.js'
 import { captureGitSnapshot } from './git-snapshot.js'
 import { unexecutedCheck } from './check-results.js'
-import type { Artifact, CheckAttribution, CheckEnvelope, CheckEnvironment, CheckResult, CheckSyntaxIssue, Member, Mission, RecoveryFallback, Task, VerificationCleanupFailure, WorkspaceBaseline } from './types.js'
+import type { Artifact, CheckAttribution, CheckEnvelope, CheckEnvironment, CheckResult, CheckSyntaxIssue, FinishedAttempt, Member, Mission, RecoveryFallback, Task, VerificationCleanupFailure, WorkspaceBaseline } from './types.js'
 
 /** Full-repository path inventories are metadata, not user-visible check output. */
 const INVENTORY_BYTES = 16 * 1024 * 1024
@@ -1093,7 +1093,7 @@ export class Workspaces {
   /** In-flight preparation gates; stop/dispose abort queued operations before workspace I/O. */
   private readonly preparations = new Map<string, Promise<void>>()
 
-  async prepareTask(member: Member, task: Task, dependencies: Task[], reviewSource?: Task): Promise<void> {
+  async prepareTask(member: Member, task: Task, dependencies: Task[], reviewSource?: Task, finished?: FinishedAttempt): Promise<void> {
     await this.operation(member.id, async signal => {
       const previousPreparation = this.preparations.get(member.id)
       let release!: () => void
@@ -1150,7 +1150,7 @@ export class Workspaces {
         // Captured task commits have durable Git refs; a rejected experiment cannot leak in.
         const mission = await this.missionRecord(member.missionId)
         const reviewCommit = reviewSource?.artifact?.commit
-        const recovered = await this.recoverTask(member, task)
+        const recovered = await this.recoverTask(member, task, finished)
         // Review notes are task WIP too. Carry them across reviewers only while
         // their immutable source is unchanged; old-source notes stay preserved
         // in their own refs and must not be replayed onto another artifact.
@@ -1490,15 +1490,28 @@ export class Workspaces {
     })
   }
 
-  /** Carry a previous owner's quiescent partial work into a replacement attempt. */
-  private async recoverTask(member: Member, task: Task): Promise<(Pick<Artifact, 'commit' | 'baseCommit'> & Pick<TaskBase, 'recovery' | 'dependencyCommits' | 'integrationConflicts'>) | undefined> {
+  /**
+   * Carry the previous attempt's work into a replacement attempt. The task
+   * record is the worktree last prepared for the task. When it is the attempt
+   * `finished` names (the same epoch), that attempt ended in a submission or a
+   * verdict, and the replacement starts from the capture it recorded, or from
+   * its base when its verdict captured none: never from its worktree, which its
+   * handle may still be writing, nor from a snapshot of it taken after it
+   * finished, and that epoch's artifact ref is not published again. A record of
+   * a later epoch is an attempt that did not end in a capture (a restart, a
+   * failed start, a fenced attempt whose stop preserved its work), whose
+   * quiescent partial work it carries.
+   */
+  private async recoverTask(member: Member, task: Task, finished?: FinishedAttempt): Promise<(Pick<Artifact, 'commit' | 'baseCommit'> & Pick<TaskBase, 'recovery' | 'dependencyCommits' | 'integrationConflicts'>) | undefined> {
     const value = await readJson(this.taskPath(member.missionId, task.id))
     if (value === undefined) return undefined
-    if (!isRecord(value) || value.version !== 1 || value.missionId !== member.missionId || typeof value.memberId !== 'string' || typeof value.workspace !== 'string' || !isRecord(value.task) || value.task.taskId !== task.id || !Number.isSafeInteger(value.task.epoch) || !commitId(value.task.baseCommit)) throw new Error('Invalid task recovery metadata')
+    if (!isRecord(value) || value.version !== 1 || value.missionId !== member.missionId || typeof value.memberId !== 'string' || typeof value.workspace !== 'string' || !isRecord(value.task) || value.task.taskId !== task.id || !Number.isSafeInteger(value.task.epoch) || !commitId(value.task.baseCommit)
+      || (finished !== undefined && Number(value.task.epoch) < finished.epoch)) throw new Error('Invalid task recovery metadata')
     if (Number(value.task.epoch) >= task.epoch) throw new Error('Task workspace is already owned by this or a newer attempt')
-    const prior = await this.memberRecord({ id: value.memberId, missionId: member.missionId, workspace: value.workspace })
     const composition = { ...(Array.isArray(value.task.dependencyCommits) ? { dependencyCommits: value.task.dependencyCommits as string[] } : {}),
       ...(Array.isArray(value.task.integrationConflicts) ? { integrationConflicts: value.task.integrationConflicts as unknown as IntegrationConflict[] } : {}) }
+    if (Number(value.task.epoch) === finished?.epoch) return { commit: finished.capture ?? value.task.baseCommit, baseCommit: value.task.baseCommit, ...composition }
+    const prior = await this.memberRecord({ id: value.memberId, missionId: member.missionId, workspace: value.workspace })
     if (commitId(value.task.preservedCommit)) return { commit: value.task.preservedCommit, baseCommit: value.task.baseCommit, ...composition }
     if (prior.task?.taskId === task.id) {
       // Task scoping is checked before committing partial work. The old worktree

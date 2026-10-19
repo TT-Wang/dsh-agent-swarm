@@ -8,7 +8,7 @@
  * sweep reads the board where it decides, after each of its awaits.
  */
 import { id } from './store.ts'
-import { TERMINAL_STATES, holdsOpenAttempt, openAttempt, pendingStopOwner, quiescencePending, subjectsOfTasks, taskSubject, terminal } from './task-graph.ts'
+import { TERMINAL_STATES, finishedAttempt, holdsOpenAttempt, openAttempt, pendingStopOwner, quiescencePending, subjectsOfTasks, taskSubject, terminal } from './task-graph.ts'
 import { asksHandle, eligible, isolationViolation, noticeSubjectsFor, overdueStop, startBlocker, stillDispatchable, takesWork, unschedulable } from './board.ts'
 import { factKey, type Notices } from './notices.ts'
 import { AdmissionRefusedError } from './scheduler.ts'
@@ -176,7 +176,7 @@ export class Scheduling {
             // member it prepares before the report commits.
             if (pass !== undefined) pass.preparing = member.id
             const { graph } = this.k.boardOf(missionId)
-            try { await awaited(pass, this.k.workers.prepareTask(member, { ...task, epoch: task.epoch + 1 }, graph.effectiveDependencies(task), graph.reviewSource(task)), this.k.now) }
+            try { await awaited(pass, this.k.workers.prepareTask(member, { ...task, epoch: task.epoch + 1 }, graph.effectiveDependencies(task), graph.reviewSource(task), finishedAttempt(task)), this.k.now) }
             finally { if (pass !== undefined) delete pass.preparing }
             if (this.halted(missionId)) return false
             const prepared = this.k.boardOf(missionId), fresh = stillDispatchable(prepared, task, member)
