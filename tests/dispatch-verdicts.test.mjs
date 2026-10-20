@@ -9,13 +9,20 @@
  *  - `afterStart(board, member)` once the member's worker start settled: skip
  *    a busy handle (a parked member is the hatch) or a member that owes a stop,
  *    close out an open attempt whose turn ended (not a parked owner's), else
- *    dispatch the first task the member is eligible for, by priority then age.
+ *    dispatch the first task the member is eligible for, by priority then age;
+ *  - `preparationFailure(fresh, error, clock, config)` over the error a
+ *    preparation threw: an identified transient failure under the row's limit
+ *    re-pends it with its backoff and tells nobody; any other failure, and the
+ *    one at the limit, blocks it and owes the owner the notice that names the
+ *    resume. The chosen row is not written: the verdict returns the new one.
  *
- * The sweep's executor sequence over them is pinned by the full-log oracle.
+ * The sweep's executor sequence over them is pinned by the full-log oracle,
+ * whose `prep` scenario (scripts/replay/prep-clocked.mjs) is the one whose
+ * preparations throw.
  */
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { afterStart, memberStep } from '../lib/scheduling.js'
+import { afterStart, memberStep, preparationFailure } from '../lib/scheduling.js'
 import { FakeClock, setup, taskOf } from './faults/harness.mjs'
 
 /** A runtime on the fake clock whose author's handle is busy until a test frees it, and a pending task assigned to the author. */
@@ -81,4 +88,29 @@ test('afterStart closes out an open attempt whose turn ended, and skips one whos
   const ended = afterStart(f.board(), f.reached())
   assert.deepEqual([ended.kind, ended.open?.attempt.id], ['close-out', 'attempt-open'])
   assert.deepEqual(afterStart(f.board(), f.reached({ phase: 'parked' })), { kind: 'skip' }, 'a parked owner is not an abandoned turn')
+})
+
+test('preparationFailure re-pends a transient failure under its limit with its backoff and tells nobody; the failure at the limit, and a deterministic one, block the row and owe the notice that names the resume', async t => {
+  const f = await fixture(t)
+  const config = f.runtime.config, clock = f.clock.now, row = taskOf(f.runtime, f.work.id)
+  const chosen = { ...row, maxRecoveryAttempts: 5 }, before = structuredClone(chosen)
+  const busy = Object.assign(new Error('workspace busy'), { code: 'EBUSY' })
+  const first = preparationFailure(chosen, busy, clock, config)
+  assert.deepEqual(chosen, before, 'the chosen row is not written')
+  assert.equal(first.notice, undefined, 'a re-pend owes the owner nothing')
+  assert.deepEqual([first.task.status, first.task.epoch, first.task.preparationFailure], ['pending', row.epoch + 1,
+    { reason: 'Workspace or worker preparation failed: Error: workspace busy', transient: true, attempts: 1, retryAt: f.clock.now() + 1000 }])
+  assert.match(first.task.output, /\nThe host will retry after bounded backoff\.$/)
+  const timedOut = Object.assign(new Error('git timed out'), { name: 'ProcessTimeoutError' })
+  const second = preparationFailure(first.task, timedOut, clock, config)
+  assert.deepEqual([second.task.status, second.task.preparationFailure.transient, second.task.preparationFailure.retryAt], ['pending', true, f.clock.now() + 2000], 'a process past its bound is transient; the backoff doubles')
+  const third = preparationFailure(second.task, busy, clock, config)
+  assert.deepEqual([third.task.status, third.task.preparationFailure.attempts, third.task.preparationFailure.retryAt], ['blocked', 3, undefined], 'the third failure is at the limit of three, whatever a larger allowance')
+  assert.deepEqual(third.notice, { content: third.task.output, subjects: [`${row.id}@${row.epoch + 3}`],
+    options: { trigger: 'task/preparation-failed', reason: 'Workspace or worker preparation failed: Error: workspace busy' } })
+  assert.match(third.notice.content, new RegExp(`swarm_control\\(action: "resume", taskId: "${row.id}", reason: "condition repaired"\\)\\.$`))
+  assert.equal(preparationFailure({ ...row, maxRecoveryAttempts: 1 }, busy, clock, config).task.status, 'blocked', 'a recovery allowance below three is the limit')
+  assert.equal(preparationFailure({ ...row, maxRecoveryAttempts: undefined }, busy, clock, { ...config, maxTasksPerMember: 1 }).task.status, 'blocked', 'without one, the member task limit is')
+  const deterministic = preparationFailure({ ...row, maxRecoveryAttempts: 3 }, new Error('dependency artifact is missing'), clock, config)
+  assert.deepEqual([deterministic.task.status, deterministic.task.preparationFailure.transient, deterministic.notice?.options.trigger], ['blocked', false, 'task/preparation-failed'])
 })

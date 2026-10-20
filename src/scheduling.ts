@@ -6,9 +6,9 @@
  * the notices, the attempts, the workspace admission and the refusals. A
  * body's standing is a verdict of the board (`wedgeVerdict`, `passState`),
  * and so is each step of the sweep (`memberStep`, `afterStart`,
- * `stillDispatchable`), over the readiness, review and stall predicates of
- * src/board.ts; the sweep reads the board where it decides, after each of its
- * awaits, and acts on the verdict.
+ * `stillDispatchable`, `preparationFailure`), over the readiness, review and
+ * stall predicates of src/board.ts; the sweep reads the board where it
+ * decides, after each of its awaits, and acts on the verdict.
  */
 import { id } from './store.ts'
 import { TERMINAL_STATES, holdsOpenAttempt, openAttempt, pendingStopOwner, subjectsOfTasks, taskSubject, terminal, turnEnded, type HeldTask } from './task-graph.ts'
@@ -21,7 +21,7 @@ import { memberPhaseOf } from './projection.ts'
 import type { Attempts } from './attempts.ts'
 import type { WorkspaceAdmission } from './workspace-admission.ts'
 import type { RefusalRegistry } from './refusals.ts'
-import { type Attempt, type Member, type Mission, type Task } from './types.ts'
+import { type Attempt, type Member, type Mission, type RuntimeConfig, type Task } from './types.ts'
 
 /**
  * The kernel and the two runtime transitions a dispatch drives: a member's
@@ -191,10 +191,10 @@ export function wedgeNotice(board: Board, pass: SchedulingPass, verdict: PassVer
 /* ----------------------------------------------------------------------- *
  * The dispatch sweep's verdicts. Each is a function of the board the sweep
  * reads where it decides (`Scheduling.dispatch`): at a member's boundary
- * (`memberStep`), once the member's worker start settled (`afterStart`) and
- * once the chosen task's preparation settled (`stillDispatchable`,
- * src/board.ts). The sweep acts on each, and reads the board again after
- * every await.
+ * (`memberStep`), once the member's worker start settled (`afterStart`), once
+ * the chosen task's preparation settled (`stillDispatchable`, src/board.ts)
+ * and over the error a preparation threw (`preparationFailure`). The sweep
+ * acts on each, and reads the board again after every await.
  * ----------------------------------------------------------------------- */
 
 /** Where a dispatch sweep stands when it reaches a member of its order (`memberStep`). */
@@ -255,6 +255,44 @@ export function afterStart(board: Board, member: Member): AfterStart {
   if (open !== undefined) return memberPhaseOf(member) !== 'parked' && turnEnded(open) ? { kind: 'close-out', open } : { kind: 'skip' }
   const [task] = board.tasks.filter(candidate => eligible(board, candidate, member)).sort((a, b) => b.priority - a.priority || a.createdAt - b.createdAt)
   return task === undefined ? { kind: 'skip' } : { kind: 'dispatch', task }
+}
+
+/** The error codes of the host failures a preparation is retried after: identified transient conditions. */
+const TRANSIENT_PREPARATION_CODES = ['EAGAIN', 'EBUSY', 'EMFILE', 'ENFILE', 'ETIMEDOUT']
+
+/** What a preparation that threw leaves of the chosen row (`preparationFailure`). */
+export interface PreparationFailure {
+  /** The row at its next epoch with the failure recorded on it: pending until its backoff passes, or blocked. */
+  task: Task & { preparationFailure: NonNullable<Task['preparationFailure']> }
+  /** The owner's request to correct the condition and resume the same task, owed exactly when the failure blocks the row. */
+  notice?: Notice
+}
+
+/**
+ * What a preparation that threw `error` leaves of the row the sweep still
+ * chose (`stillDispatchable`). Only an identified transient host failure (a
+ * transient error code, or a process past its bound) is retried, while the
+ * row's preparation failures stay under its limit: three, or the row's
+ * recovery allowance (`maxRecoveryAttempts`, else `maxTasksPerMember`) when
+ * that is smaller, and at least one. The row is re-pended with a durable
+ * backoff of one second after its first failure and two after its second.
+ * Repeating unchanged deterministic work is not recovery, so any other
+ * failure, and the one that reaches the limit, blocks the row and owes the
+ * owner its notice. `clock` is read for the backoff alone.
+ */
+export function preparationFailure(fresh: Task, error: unknown, clock: () => number, config: Pick<RuntimeConfig, 'maxMessageChars' | 'maxTasksPerMember'>): PreparationFailure {
+  const reason = `Workspace or worker preparation failed: ${String(error).slice(0, Math.max(0, config.maxMessageChars - 650))}`
+  const code = error instanceof Error && 'code' in error ? String(error.code) : ''
+  const transient = TRANSIENT_PREPARATION_CODES.includes(code) || (error instanceof Error && error.name === 'ProcessTimeoutError')
+  const attempts = (fresh.preparationFailure?.attempts ?? 0) + 1
+  const limit = Math.max(1, Math.min(3, fresh.maxRecoveryAttempts ?? config.maxTasksPerMember))
+  const retry = transient && attempts < limit
+  const output = `${reason}\n${retry ? 'The host will retry after bounded backoff.' : `Work remains preserved. Correct the reported condition, then resume this same task with swarm_control(action: "resume", taskId: "${fresh.id}", reason: "condition repaired").`}`
+  const task: PreparationFailure['task'] = { ...fresh,
+    preparationFailure: { reason, transient, attempts, ...(retry ? { retryAt: clock() + 1000 * 2 ** (attempts - 1) } : {}) },
+    output, epoch: fresh.epoch + 1, status: retry ? 'pending' : 'blocked' }
+  if (retry) return { task }
+  return { task, notice: { content: output, subjects: subjectsOfTasks([task], { id: task.missionId }), options: { trigger: 'task/preparation-failed', reason } } }
 }
 
 export class Scheduling {
@@ -410,26 +448,15 @@ export class Scheduling {
             // blocked this task, so the changed-task rule below skips it.
             const fresh = stillDispatchable(failedOn, task, member)
             if (fresh === undefined) continue
-            // Retry only identified transient host failures, with durable bounded
-            // backoff. Repeating unchanged deterministic work is not recovery.
-            const reason = `Workspace or worker preparation failed: ${String(error).slice(0, Math.max(0, this.k.config.maxMessageChars - 650))}`
-            const code = error instanceof Error && 'code' in error ? String(error.code) : ''
-            const transient = ['EAGAIN', 'EBUSY', 'EMFILE', 'ENFILE', 'ETIMEDOUT'].includes(code)
-              || (error instanceof Error && error.name === 'ProcessTimeoutError')
-            const attempts = (fresh.preparationFailure?.attempts ?? 0) + 1
-            const limit = Math.max(1, Math.min(3, fresh.maxRecoveryAttempts ?? this.k.config.maxTasksPerMember))
-            const retry = transient && attempts < limit
-            fresh.preparationFailure = { reason, transient, attempts,
-              ...(retry ? { retryAt: this.k.now() + Math.min(30_000, 1000 * 2 ** (attempts - 1)) } : {}) }
-            fresh.output = `${reason}\n${retry ? 'The host will retry after bounded backoff.' : `Work remains preserved. Correct the reported condition, then resume this same task with swarm_control(action: "resume", taskId: "${fresh.id}", reason: "condition repaired").`}`
-            fresh.epoch++
-            fresh.status = retry ? 'pending' : 'blocked'
+            // The failed row, its events and the notice a block owes are one
+            // transaction: a blocked row is never committed without its notice.
+            const failure = preparationFailure(fresh, error, this.k.now, this.k.config), failed = failure.task
             this.k.commit(missionId, () => {
-              this.k.store.put('tasks', fresh)
-              this.k.store.event(missionId, 'task/preparation-failed', 'runtime', { taskId: fresh.id, epoch: fresh.epoch, reason, ...fresh.preparationFailure, status: fresh.status })
-              if (retry) return
-              this.k.store.event(missionId, 'task/blocked', 'runtime', { taskId: fresh.id, reason: fresh.output })
-              this.notices.notify(missionId, fresh.output!, subjectsOfTasks([fresh], mission), { trigger: 'task/preparation-failed', reason })
+              this.k.store.put('tasks', failed)
+              this.k.store.event(missionId, 'task/preparation-failed', 'runtime', { taskId: failed.id, epoch: failed.epoch, ...failed.preparationFailure, status: failed.status })
+              if (failure.notice === undefined) return
+              this.k.store.event(missionId, 'task/blocked', 'runtime', { taskId: failed.id, reason: failed.output })
+              this.notices.notify(missionId, failure.notice.content, failure.notice.subjects, failure.notice.options)
             })
           }
           } catch (error) {
