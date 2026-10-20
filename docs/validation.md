@@ -310,6 +310,57 @@ Gate at `9234211` (`src` and the environment as at `7782a37`): on 0.1.5-rc.3 `np
 that import `tests/refusal-inventory.mjs` passed 407/407, and `tests/owner-reply.test.mjs` passed 15/15 in three
 rounds of two concurrent copies.
 
+## Batch 14: decide-then-act T1, S10, S16, S5, S6 (2026-10-16)
+
+Merged as `b462a61`. T1 (owner-approved) leaves the task graph one plain read form: an id is refused where it enters,
+and an id a stored row holds that names no task is stuck work the board names within one tick (before, the decision
+sweep failed every tick and no notice was told); the oracle gained the `dangling` scenario. S10 deleted the unreachable
+owner notice-ledger API; S16 found dispatch's second start-success bookkeeping already gone (batch 11) and pinned the
+outage window (the oracle gained the `outage` scenario); S5 and S6 put Notices and Attempts on the kernel and the board.
+The integrator rounds gave task edges one function (`taskEdges`), the open attempt one rule and type guard
+(`openAttempt`, `HeldTask`, `holdsAttempt`) and an assignment's currency one predicate. src +27.
+
+Gates on 0.1.5-rc.3 and 0.1.7-rc.1: typecheck, build, full suite 1813/1813, `test:harness`, `test:replay`,
+`test:oracle` 11/11 identical, pack, profile, bundle, faults 24/24, `smoke-web` 13/13, `smoke-command-web` 11/11.
+
+## Batch 13: decide-then-act S1-S4, a kernel and one read-only board (2026-10-16)
+
+Merged as `b592356`. S1 recorded a full-log oracle (`npm run test:oracle`: every event, store row, delivery and adapter
+call of nine fake-clock scenarios, ids and clock fields normalized) and an F(S) golden before any move, moved the pure
+task helpers into leaves and broke the value-import cycle (`tests/import-cycles.test.mjs`). S2 gave the runtime a
+`Kernel` interface and put the refusal registry below the notices. S3 and S4 made the scheduling, review and task-graph
+decisions functions of one read-only `Board` (bounds read from the live config, the adapter called through and never
+memoized) and replaced `MissionInterpretation` with `interpret(board)`. The integrator rounds gave the outbox pump one
+model (a pending start that same-span requests join, which judges an in-flight sweep against its bound) and one
+renderer of an overdue stop. From this batch on line count is no longer a goal (owner, 2026-10-15). src +77.
+
+Gates on 0.1.5-rc.3 and 0.1.7-rc.1: typecheck, build, full suite 1795/1795, `test:harness`, `test:replay`,
+`test:oracle` 9/9 identical, pack, profile, bundle, faults 24/24, `smoke-web` 13/13, `smoke-command-web` 11/11.
+
+## Live mission on the 5202 preview after batches 10-12 (2026-10-15)
+
+Preview host 0.1.7-rc.1, plugin `68515a4` (batches 10, 11 and 12 merged), 12:07-12:21 CST, driven through the owner
+session's composer with the 2026-09-26 textstats goal (two modules with tests, an integration with `src/index.js` and a
+README section, `package.json` unchanged).
+
+- **Store upgrade on real rows.** The preview's store opened at schema 4: the five deliverables of the 2026-09-26
+  mission now cite their criteria in `covers`.
+- **Acceptance by id.** The planner wrote seven criteria `c1`..`c7`; the wordcount implementation covers `[c1, c2]`,
+  topwords `[c3, c4]`, the integration `[c5, c6, c7]`; no review carries `covers`; the launch met no refusal.
+- **Incident.** The planner gave every member `reasoningEffort: "medium"`, which route `deepseek-official` /
+  `deepseek-flash` rejects, so every worker step failed (`member/failure` x21) and both implementation tasks exhausted
+  close-out and recovery. The owner, woken by guard requests, a stall root and the W3 stall, added four replacement
+  members with no explicit effort, resumed the tasks and re-pointed one review. The field exists since `becba81` (not a
+  regression of batches 10-12); admission refusing an effort the route rejects is a follow-up task.
+- **Outcome.** Mission completed; three deliverables and three reviews accepted (one review cancelled); final artifact
+  `8579177`: `npm test` 21/21, `package.json` unchanged.
+- **Usage (workers).** 160,446 uncached input + 2,620,800 cache read + 93,743 output = 2,874,989 tokens, 73 requests.
+- **Owner rows.** 28: member/failure 7, guard-terminal 5, wake-budget summaries 7, dispatch-question 1, stall-root 1,
+  board-stall 1, fall-through 2, review-blocked 1, escalation 1, integration-gap 1, automatic/completed 1.
+
+`scripts/smoke-deepseek.mjs` on the same day: 0.1.5-rc.3 passed (33,389 tokens, 12 steps), 0.1.7-rc.1 passed (36,232
+tokens, 12 steps; one model call passed a parameter `swarm_verify` does not declare and retried correctly).
+
 ## Round-30 simplification batch 11: one notice ledger (2026-10-14)
 
 **Head**: `5209de7` and this record (documentation only), branch `batch11/ledger` on `29a0268`, 124 commits.
@@ -1054,6 +1105,18 @@ negative; without the upgrade the branch nets −10.
   replace, the template −1. An id is a position, so removing a criterion shifts every later id, and `removeCriterion`
   renumbers each task's `covers` in the same edit; the only structure that needs no renumbering stores an id on each
   criterion, a durable field the design rejected. The Covers box is the one control that writes `covers`.
+
+## Batch 10: every review-blocked exit is its own, and the round-5 leftovers (2026-09-27)
+
+Merged as `29a0268`. Every review-blocked blocker names the exit that removes it, as fixed texts that name every
+allocation a launched mission's admission requires (`ADMIT_REVIEW`, `REPLACE`); the stall is judged once per admission
+pass; the recorded blocker follows the derived one; the sidebar shows a decision in full. Ten low-severity leftovers of
+the 2026-09-24 review landed with it (the resident worker ends where the host ends its agent). F13 and F19 awaited
+their wake deliveries instead of reading them at once (`5bed1d9`): both failed about once in twenty runs on `dfc0825`
+as well, a test race, not a regression. src -68.
+
+Gates on 0.1.5-rc.3 and 0.1.7-rc.1: typecheck, build, full suite 1641/1641, `test:harness`, `test:replay`, pack,
+profile, bundle, faults 24/24, `smoke-web` 13/13, `smoke-command-web` 10/10.
 
 ## Round-29 simplification batch 9: one authorization rule, one exit table, a derived progress clock (2026-09-25)
 
