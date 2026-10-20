@@ -223,7 +223,7 @@ export class Scheduling {
    * The dispatch sweep of one serialized pass (M1a: moved out of `schedule`
    * unchanged). It returns false when the pass must be abandoned exactly where
    * the original early returns did: on shutdown or on a mission that stopped
-   * being active during an adapter await (`halted`). It runs only inside the mission's
+   * being active during an adapter await (`activeBoard`). It runs only inside the mission's
    * serial queue, so no other pass body runs while it awaits.
    *
    * A body also returns false at the next member boundary when the member it
@@ -249,7 +249,9 @@ export class Scheduling {
         // dispatcher would act on differently, and it reads the board again
         // after each await, so it is never staler than the per-step store reads
         // it replaces.
-        const { members, tasks } = this.k.boardOf(missionId)
+        const swept = this.activeBoard(missionId)
+        if (swept === undefined) return false
+        const { members, tasks } = swept
         const from = pass?.sweepFrom === undefined ? -1 : members.findIndex(member => member.id === pass.sweepFrom)
         const rotation = from > 0 ? [...members.slice(from), ...members.slice(0, from)] : members
         const end = pass?.chainFrom === undefined ? -1 : rotation.findIndex((member, index) => index > 0 && member.id === pass.chainFrom)
@@ -262,10 +264,9 @@ export class Scheduling {
         // member, which a chained body's `order` can leave out, so the set is the
         // board's, not the body's. Every ask below then reads the handles that
         // step left, and asking drains nothing. It is the sweep's first adapter
-        // call, so the sweep's guard comes first, and each drain is the first
-        // link of its member's chain (`chainFailed`): a member whose drain threw
-        // (`ended`) has no step in this sweep.
-        if (this.halted(missionId)) return false
+        // call, so the sweep's guard (`activeBoard`) comes first, and each drain
+        // is the first link of its member's chain (`chainFailed`): a member whose
+        // drain threw (`ended`) has no step in this sweep.
         const ended = new Set<string>()
         for (const member of members) if (takesWork(tasks, member) && asksHandle(member)) {
           try { this.k.workers.drainStrandedInbox(member.id) }
@@ -273,7 +274,8 @@ export class Scheduling {
         }
         let memberSince = this.k.now()
         for (const [index, member] of order.entries()) {
-          if (this.halted(missionId)) return false
+          const reached = this.activeBoard(missionId)
+          if (reached === undefined) return false
           if (pass !== undefined && index > 0 && this.k.now() - memberSince >= this.k.bounds.stallPassTimeoutMs) {
             pass.stoppedBefore = member.id
             // A chain whose start member is gone restarts from this body's first one.
@@ -282,21 +284,22 @@ export class Scheduling {
           }
           memberSince = this.k.now()
           progressed(pass, this.k.now())
-          if (ended.has(member.id) || !takesWork(this.k.store.list('tasks', missionId), member)) continue
+          if (ended.has(member.id) || !takesWork(reached.tasks, member)) continue
           // Round 14: the member's step is the last link of its chain (`chainFailed`).
           try {
           // The isolation invariant is decided on the board, a refusal is
           // recorded, and only then is the member skipped or started.
-          const beforeStart = this.k.boardOf(missionId), refused = isolationViolation(beforeStart, member)
-          if (refused !== undefined) { this.workspaceAdmission.recordIsolation(beforeStart, refused); continue }
+          const refused = isolationViolation(reached, member)
+          if (refused !== undefined) { this.workspaceAdmission.recordIsolation(reached, refused); continue }
           try { await awaited(pass, this.k.startWorker(mission, member, { pass }), this.k.now) }
           catch (error) {
             // Disposing the adapter cancels in-flight starts. This is recoverable host
             // shutdown, not a permanent worker failure to persist across restart.
-            if (this.halted(missionId)) return false
+            if (this.activeBoard(missionId) === undefined) return false
             continue
           }
-          if (this.halted(missionId)) return false
+          const board = this.activeBoard(missionId)
+          if (board === undefined) return false
           // R10-09/S3: a parked member is dispatchable. The adapter's idle
           // precondition can be false for a parked agent (a non-idle handle); an
           // assignment is exactly the fresh input that unparks it, so the runtime
@@ -306,8 +309,7 @@ export class Scheduling {
           // question (`startBlocker`), so a member the sweep skipped is never
           // described to the owner with a cause the sweep did not test. The
           // parked-member hatch keeps priority: a parked member is dispatchable.
-          if (startBlocker(this.k.view, member) !== undefined) continue
-          const board = this.k.boardOf(missionId)
+          if (startBlocker(board.view, member) !== undefined) continue
           if (pendingStopOwner(board.tasks, member.id)) continue
           const open = openAttempt(board.tasks, member.id)
           if (open !== undefined) {
@@ -337,8 +339,9 @@ export class Scheduling {
             const { graph } = this.k.boardOf(missionId)
             try { await awaited(pass, this.k.workers.prepareTask(member, { ...task, epoch: task.epoch + 1 }, graph.effectiveDependencies(task), graph.reviewSource(task)), this.k.now) }
             finally { if (pass !== undefined) delete pass.preparing }
-            if (this.halted(missionId)) return false
-            const prepared = this.k.boardOf(missionId), fresh = stillDispatchable(prepared, task, member)
+            const prepared = this.activeBoard(missionId)
+            if (prepared === undefined) return false
+            const fresh = stillDispatchable(prepared, task, member)
             if (fresh === undefined) continue
             // S7: decide the isolation invariant again on the board the external
             // preparation await left. A state change during it (a member added into
@@ -351,10 +354,11 @@ export class Scheduling {
             // Admission control already wrote the durable refusal; the task stays
             // pending and a later tick re-evaluates it when a slot frees up.
             if (error instanceof AdmissionRefusedError) continue
-            if (this.halted(missionId)) return false
+            const failedOn = this.activeBoard(missionId)
+            if (failedOn === undefined) return false
             // A withdrawn authorization was fenced where it was detected, which
             // blocked this task, so the changed-task rule below skips it.
-            const fresh = stillDispatchable(this.k.boardOf(missionId), task, member)
+            const fresh = stillDispatchable(failedOn, task, member)
             if (fresh === undefined) continue
             // Retry only identified transient host failures, with durable bounded
             // backoff. Repeating unchanged deterministic work is not recovery.
@@ -396,29 +400,37 @@ export class Scheduling {
    * scheduler only wrote it to stderr, and every later tick re-entered the
    * same throw: a dead end with no durable record and no exit. The throw is
    * the terminal element's input: escalate with a coded decision request, and
-   * the sweep keeps dispatching the other members (true). On a halted sweep
-   * (`halted`) the throw is the halt's, not a failure of the chain, and the
-   * body is abandoned (false).
+   * the sweep keeps dispatching the other members (true). On an abandoned
+   * sweep (`activeBoard`) the throw is the abandonment's, not a failure of the
+   * chain, and the body is abandoned (false).
    */
   private chainFailed(missionId: string, member: Member, error: unknown): boolean {
-    if (this.halted(missionId)) return false
+    const board = this.activeBoard(missionId)
+    if (board === undefined) return false
     // The terminal of this member's chain, opened by this failure of the work
     // its request names: the same throw over that work on a later pass is the
     // request the owner already holds; other work or another failure is another.
-    const board = this.k.boardOf(missionId), detail = String(error), subjects = noticeSubjectsFor(board, { memberId: member.id })
+    const detail = String(error), subjects = noticeSubjectsFor(board, { memberId: member.id })
     this.notices.record(missionId, guardTerminalNotice(board, 'attempt_lease', { memberId: member.id, detail, subjects, localKey: factKey(missionId, { trigger: `dispatch-failed:${member.id}`, reason: detail, subjects }) }))
     return true
   }
 
   /**
-   * The sweep's guard, asked before each of its adapter calls that follows an
-   * await or opens the sweep: it goes on only while the runtime is up and the
-   * mission is active. A pause, a stop or a budget block commits outside the
-   * mission queue, so one can land while the body awaits (lease recovery's
-   * capture, a worker start, a preparation); a halted sweep asks and wakes
-   * nothing more, and the body is abandoned.
+   * The sweep's guard, asked where the sweep opens, at each member's boundary,
+   * once a worker start or a preparation settles, and where a member's chain
+   * fails: the board the sweep decides on there, while the runtime is up and
+   * the mission is active, and undefined otherwise, which abandons the body. A
+   * pause, a stop or a budget block commits outside the mission queue, so one
+   * can land while the body awaits (lease recovery's capture, a worker start, a
+   * preparation); an abandoned sweep asks and wakes nothing more. Shutdown is
+   * asked first: a body a bounded shutdown left running reads no store that
+   * shutdown may have closed.
    */
-  private halted(missionId: string): boolean { return this.k.shuttingDown || this.k.mission(missionId).status !== 'active' }
+  private activeBoard(missionId: string): Board | undefined {
+    if (this.k.shuttingDown) return undefined
+    const board = this.k.boardOf(missionId)
+    return board.mission.status === 'active' ? board : undefined
+  }
 
   /**
    * The adapter reported from inside a member's `prepareTask` call (a recovery

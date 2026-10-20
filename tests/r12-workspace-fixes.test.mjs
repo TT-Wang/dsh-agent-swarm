@@ -113,8 +113,8 @@ test('stop recovery owns its member until quiescence, including before native st
   const stopping = { id: 'old-task', status: 'blocked', epoch: 3, resumeAfterStop: { epoch: 3, memberId: member.id } }
   const ready = { id: 'new-task', missionId: 'm', title: 'New task', epoch: 0, status: 'pending', dependencies: [], acceptance: [], scope: ['**'], objective: 'New work' }
   let starts = 0
-  const board = { missionId: 'm', tasks: [stopping, ready], members: [member], graph: taskGraphIndex([stopping, ready]), view: { startable: () => true }, records: { list: () => [] }, clock: Date.now }
-  const rt = makeRuntimeStub({ store: { list: () => [stopping, ready] }, boardOf: () => board, mission: () => ({ status: 'active' }), startWorker: async () => { starts++ }, workers: new FakeWorkers({ autoIdle: true }) })
+  const board = { missionId: 'm', mission: { id: 'm', status: 'active' }, tasks: [stopping, ready], members: [member], graph: taskGraphIndex([stopping, ready]), view: { startable: () => true }, records: { list: () => [] }, clock: Date.now }
+  const rt = makeRuntimeStub({ boardOf: () => board, startWorker: async () => { starts++ }, workers: new FakeWorkers({ autoIdle: true }) })
   const scheduling = new Scheduling(rt)
   assert.equal(await scheduling.dispatch({ status: 'active' }, 'm'), true)
   assert.equal(starts, 0)
