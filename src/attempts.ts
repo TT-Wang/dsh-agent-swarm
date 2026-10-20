@@ -8,10 +8,10 @@
 import { id } from './store.ts'
 import { TERMINAL_STATES, blockCauses, holdsAttempt, holdsOpenAttempt, openAttempt, stopPending, taskSubject, terminal, type BlockCause, type HeldTask } from './task-graph.ts'
 import { guardTerminalNotice, parkedHolder, silenceNotice, stopFaultKey, type Notices, type SilentOperation } from './notices.ts'
-import { heldByParkedMember } from './board.ts'
+import { heldByParkedMember, type SchedulingPass } from './board.ts'
 import { memberPhaseOf } from './projection.ts'
 import { PolicyError } from './policy-error.ts'
-import { awaited, type Kernel, type SchedulingPass } from './kernel.ts'
+import { awaited, type Kernel } from './kernel.ts'
 import type { Artifact, Member, Mission, Task, WorkerActivity } from './types.ts'
 
 /**

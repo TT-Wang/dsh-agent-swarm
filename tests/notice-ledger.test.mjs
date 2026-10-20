@@ -15,13 +15,12 @@ import { createHash } from 'node:crypto'
 import { writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { FakeClock, FakeWorkers, MISSION_ACCEPTANCE, acceptThroughReview, blockThroughReview, eventually, events, setup, taskOf } from './faults/harness.mjs'
-import { BOARD_RUNNING, completionError, interpret, isolationIssues, reviewNeed } from '../lib/board.js'
+import { BOARD_RUNNING, completionError, interpret, isolationIssues, passState, reviewNeed } from '../lib/board.js'
 import { assertNamedCalls, ownerTools } from './refusal-inventory.mjs'
 import { NOTICE_TEMPLATES, factKey, guardTerminalNotice, noticeFamily, noticeTemplateKey, reviewBlocked } from '../lib/notices.js'
-import { passState } from '../lib/scheduling.js'
 
 /** The publication state of the body queued or running for `missionId`, judged on its board. */
-const stateOf = (runtime, missionId) => passState(runtime.scheduling.passes.get(missionId), runtime.boardOf(missionId))
+const stateOf = (runtime, missionId) => passState(runtime.boardOf(missionId))
 
 const ownerRows = f => f.runtime.store.list('deliveries', f.mission.id).filter(delivery => delivery.to === 'owner' && delivery.notice !== undefined)
 const stallRow = f => ownerRows(f).find(delivery => delivery.notice.trigger === 'mission/stalled' && delivery.content.startsWith('Mission stalled'))

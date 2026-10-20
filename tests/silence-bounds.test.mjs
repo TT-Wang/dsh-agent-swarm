@@ -48,10 +48,10 @@ import { silenceReport } from './instruments.mjs'
 import { FakeWorkers, eventually, makeRuntime } from './faults/harness.mjs'
 import { noticeFamily } from '../lib/notices.js'
 import { formatSpan } from '../lib/kernel.js'
-import { passState, wedgeVerdict } from '../lib/scheduling.js'
+import { passState, wedgeVerdict } from '../lib/board.js'
 
 /** The body queued or running for `missionId`, judged on its board: its publication state and its verdict. */
-const stateOf = (runtime, missionId) => passState(runtime.scheduling.passes.get(missionId), runtime.boardOf(missionId))
+const stateOf = (runtime, missionId) => passState(runtime.boardOf(missionId))
 const verdictOf = (runtime, missionId) => wedgeVerdict(runtime.scheduling.passes.get(missionId), runtime.boardOf(missionId))
 
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))

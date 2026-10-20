@@ -4,18 +4,18 @@
  * of one serialized pass and the attempt reporting bound. M1a seam 7/7, the top
  * one: it stands on the kernel with the runtime's worker start and assignment,
  * the notices, the attempts, the workspace admission and the refusals. A
- * body's standing is a verdict of the board (`wedgeVerdict`, `passState`),
- * and so is each step of the sweep (`memberStep`, `afterStart`,
- * `stillDispatchable`, `preparationFailure`), over the readiness, review and
- * stall predicates of src/board.ts; the sweep reads the board where it
- * decides, after each of its awaits, and acts on the verdict.
+ * body's standing is a verdict of the board that carries it (`wedgeVerdict`,
+ * `passState`, src/board.ts), and so is each step of the sweep (`memberStep`,
+ * `afterStart`, `stillDispatchable`, `preparationFailure`), over the
+ * readiness, review and stall predicates of src/board.ts; the sweep reads the
+ * board where it decides, after each of its awaits, and acts on the verdict.
  */
 import { id } from './store.ts'
 import { TERMINAL_STATES, holdsOpenAttempt, openAttempt, pendingStopOwner, subjectsOfTasks, taskSubject, terminal, turnEnded, type HeldTask } from './task-graph.ts'
-import { asksHandle, eligible, isolationViolation, liveWork, noticeSubjectsFor, overdueStop, startBlocker, stillDispatchable, takesWork, unschedulable, type Board, type Bounds } from './board.ts'
+import { asksHandle, eligible, isolationViolation, noticeSubjectsFor, overdueStop, passState, pastBound, startBlocker, stillDispatchable, takesWork, unschedulable, wedgeVerdict, type Board, type PassVerdict, type SchedulingPass } from './board.ts'
 import { factKey, guardTerminalNotice, silenceNotice, type Notice, type Notices, type SilentAttempt } from './notices.ts'
 import { AdmissionRefusedError } from './scheduler.ts'
-import { awaited, progressed, type Kernel, type SchedulingPass } from './kernel.ts'
+import { awaited, progressed, type Kernel } from './kernel.ts'
 // R17-G6/G7: the one derivation of the derived member status.
 import { memberPhaseOf } from './projection.ts'
 import type { Attempts } from './attempts.ts'
@@ -31,78 +31,6 @@ import { type Attempt, type Member, type Mission, type RuntimeConfig, type Task 
 export type DispatchKernel = Kernel & {
   startWorker(mission: Mission, member: Member, options: { pass?: SchedulingPass }): Promise<void>
   assign(task: Task, member: Member): Task
-}
-
-/**
- * The scheduling pass state a committed transition is published with
- * (`passState`): a live pass that is not wedged owns the publication, and a
- * wedged one is published with the wedged branch (`Scheduling.transition`).
- */
-export interface PassState { passLive: boolean; wedged: boolean }
-
-/**
- * The one bound predicate: a body is past its bound once it has held the
- * mission for a whole `stallPassTimeoutMs` at `now`. A body's verdict reads it
- * (`wedgeVerdict`), and so does an attempt silence naming the pass
- * (`Scheduling.silentAttempt`), so no instant exists at which the watchdog
- * already names a body, or the publication judges with the wedged branch, and
- * another reader does not yet see it past its bound.
- */
-export function pastBound(pass: SchedulingPass, bounds: Bounds, now: number): boolean {
-  return now - pass.startedAt >= bounds.stallPassTimeoutMs
-}
-
-/** What one scheduling body is on a board at one instant (`wedgeVerdict`). */
-export interface PassVerdict {
-  /** S1/R15-D1: past its declared bound (`pastBound`). It stays so from the first bound until it settles, named or not. */
-  wedged: boolean
-  /** R16-D: the board's live work while the body is past its bound (`liveWork`), none inside it: what holds the body live, and what its naming names as preserved. */
-  liveWork: Task[]
-  /**
-   * The body still owns the dispatcher's decisions: it is not named, and it is
-   * inside its bound or, past it, held by that live work inside its release
-   * bound (`stallPassReleaseBoundMs` = `stallPassTimeoutMs` +
-   * `stallPassLiveGraceMs`), since it may legitimately be inside a long adapter
-   * await for that work. R16-D: past the release bound it is not live however
-   * long a healthy sibling's lease lives. An unnamed body that is not live is
-   * the watchdog's to name (`Scheduling.checkSchedulingPasses`). `kick` does not
-   * read this: it skips while any body is queued or running, because the serial
-   * queue could not run a second one anyway.
-   */
-  live: boolean
-}
-
-/**
- * The verdict of one body on a board at `now` (the tick's one instant when the
- * watchdog asks, else the board's clock). The live work is read at the board's
- * clock: a lease is live while `leaseUntil` is not past.
- */
-export function wedgeVerdict(pass: SchedulingPass, board: Pick<Board, 'tasks' | 'clock' | 'bounds'>, now = board.clock()): PassVerdict {
-  const unnamed = pass.escalatedAt === undefined
-  if (!pastBound(pass, board.bounds, now)) return { wedged: false, liveWork: [], live: unnamed }
-  const work = liveWork(board)
-  return { wedged: true, liveWork: work, live: unnamed && work.length > 0 && now - pass.startedAt < board.bounds.stallPassReleaseBoundMs }
-}
-
-/**
- * R17-G5: the pass state a committed transition is published with, the body
- * queued or running for the mission judged on its board. A body past its bound
- * that has itself made progress within the last bound (`progressAt`: one of its
- * own awaits returned, or it reached a member boundary) is not sitting in the
- * wedged await: it is running and reaches its own dispatch question when it
- * settles (or hands the unswept members to the next body), so the transition
- * publishes as inside a live pass. The wedged branch would instead ask "was not
- * dispatched this tick" about work the same sweep is about to dispatch.
- * Otherwise the body's verdict decides: live while it owns the decisions, and
- * wedged past its bound; a body without progress for a whole bound is wedged
- * again, whatever a worker turn it woke commits.
- */
-export function passState(pass: SchedulingPass | undefined, board: Pick<Board, 'tasks' | 'clock' | 'bounds'>): PassState {
-  if (pass === undefined) return { passLive: false, wedged: false }
-  const now = board.clock()
-  if (pass.progressAt !== undefined && pastBound(pass, board.bounds, pass.progressAt) && now - pass.progressAt <= board.bounds.stallPassTimeoutMs) return { passLive: true, wedged: false }
-  const { live, wedged } = wedgeVerdict(pass, board, now)
-  return { passLive: live, wedged }
 }
 
 /**
@@ -599,7 +527,7 @@ export class Scheduling {
     this.publishingTransition = true
     try {
       const released = this.wedgedReleases.delete(missionId)
-      const state = passState(this.passes.get(missionId), this.k.boardOf(missionId))
+      const state = passState(this.k.boardOf(missionId))
       if (state.passLive && !state.wedged && !released) return
       this.notices.ensureWitness(missionId, state.wedged || released ? { wedged: true } : {})
     } catch {

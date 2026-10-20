@@ -52,7 +52,7 @@
 import assert from 'node:assert/strict'
 import { DatabaseSync } from 'node:sqlite'
 import { FakeWorkers, MISSION_ACCEPTANCE, budget, setup, makeRuntime, eventually, events, runScenario, taskOf } from './harness.mjs'
-import { pastBound, wedgeVerdict } from '../../lib/scheduling.js'
+import { pastBound, wedgeVerdict } from '../../lib/board.js'
 
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
 const wedgeEvents = (runtime, missionId) => events(runtime, missionId, 'mission/stalled').filter(item => item.data.cause === 'scheduling-pass' && item.data.wedged === true)

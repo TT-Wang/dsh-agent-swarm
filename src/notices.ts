@@ -12,8 +12,8 @@ import { guardTerminal, guardTerminalKey, type GuardChainId, type GuardTerminalC
 import { TERMINAL_STATES, holdsAttempt, missionSubject, stopPending, subjectsOfTasks, taskSubject, terminal } from './task-graph.ts'
 import { WriterBusyError, id, type SwarmStore } from './store.ts'
 import type { EventKind } from './events.ts'
-import { awaited, formatSpan, type Kernel, type SchedulingPass } from './kernel.ts'
-import { completionError, dependentsOf, eligible, fingerprintBoard, heldByParkedMember, interpret, isolationIssues, missionFingerprint, newestReviewBlock, noticeSubjectsFor, overdueStop, reviewNeed, reviewPathBlocker, reviewPathStalled, stallRoots, startBlocker, unreviewedSources, waitsLegitimately, type Board, type Interpretation } from './board.ts'
+import { awaited, formatSpan, type Kernel } from './kernel.ts'
+import { completionError, dependentsOf, eligible, fingerprintBoard, heldByParkedMember, interpret, isolationIssues, missionFingerprint, newestReviewBlock, noticeSubjectsFor, overdueStop, reviewNeed, reviewPathBlocker, reviewPathStalled, stallRoots, startBlocker, unreviewedSources, waitsLegitimately, type Board, type Interpretation, type SchedulingPass } from './board.ts'
 import type { Delivery, Escalation, Member, Mission, NoticeClass, Task, WorkerActivity } from './types.ts'
 
 /**

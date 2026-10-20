@@ -7,11 +7,14 @@
  * scheduling and review-admission decisions below are functions of it, and so
  * are the stall classifiers, F(S) and the interpretation the board classifiers
  * read (`interpret`), so a reader builds the board where it decides
- * and every predicate it asks sees those rows; none re-reads a row. Three
+ * and every predicate it asks sees those rows; none re-reads a row. Four
  * inputs are not rows and are never snapshotted: the clock (`clock`, read where
  * a decision needs the time), the adapter (`view`, asked where a decision needs
- * its answer) and the durable log (`records`: task events, tool runs, the
- * deliveries ledger and evidence, read where a decision reads it).
+ * its answer), the durable log (`records`: task events, tool runs, the
+ * deliveries ledger and evidence, read where a decision reads it) and the
+ * scheduling body queued or running for the mission (`pass`, whose stamps the
+ * body writes as it runs), so whether the mission publishes its pass as
+ * wedged is a predicate of the board too (`passState`).
  */
 import { createHash } from 'node:crypto'
 import type { SwarmStore } from './store.ts'
@@ -130,7 +133,70 @@ export interface BoardRecords extends Pick<SwarmStore, 'latestTaskEvent' | 'prog
   list(table: 'starts', missionId: string): AutoStart[]
 }
 
-/** One mission's rows at one instant, with the clock, the bounds, the adapter view and the log every decision over them reads. */
+/**
+ * The scheduling body that is queued or running for one mission. `openPass`
+ * (called by `kick`) records it before the body is queued on the mission's
+ * serial queue (`SwarmRuntime.exclusive`), and `closePass` removes it when the
+ * body settles, so at most one scheduling body per mission is queued or running.
+ * The kernel reads it into every board it builds (`Board.pass`). It is
+ * in-memory on purpose: it describes an operation this process owns, and a
+ * restarted process owns none. The durable row it replaces never gated or
+ * named anything after a restart either (it carried the dead process's
+ * instance id).
+ *
+ * Why no release and no fence: the queue is strictly serial and a waiter past
+ * its bound is refused, never run (`boundedQueueWait`), so a successor body
+ * cannot start until this body settles; a wedged body can never write after its
+ * successor starts. The watchdog therefore only names a body past its bound
+ * (`checkSchedulingPasses`) and marks the mission wedged for notices; the body
+ * itself ends at the bound of whichever await it is in (`workerStartTimeoutMs`,
+ * the per-attempt delivery bound, each git subprocess's `HOST_GIT_TIMEOUT_MS`),
+ * and a member that held it for a whole bound makes it stop at the next member
+ * boundary so the next body resumes from lease recovery (`dispatch`).
+ */
+export interface SchedulingPass {
+  /** The mission's stable pass name (`pass_<missionId>`), named by the stall event and the owner notice. */
+  id: string
+  /** This body's identity; the stall event and the owner notice name it as the run. */
+  operationId: string
+  missionId: string
+  startedAt: number
+  /** Store revision and mission digest when the pass was opened. */
+  revisionBefore: number
+  fingerprintBefore: string
+  /** Set once this body's naming fact is on the deliveries ledger, written by its own naming or already held (`Scheduling.checkSchedulingPasses`); it is then no longer live (`wedgeVerdict`). */
+  escalatedAt?: number
+  /**
+   * The body's own last progress: when one of its own awaits returned (stamped
+   * before it commits the result) or it reached a member boundary (`progressed`).
+   * A call that commits before its promise settles stamps the record the body
+   * handed it at the instant its adapter call settles, before that commit: the
+   * worker start (`SwarmRuntime.startWorker`), the workspace authorization
+   * check and the preparation's recovery-fallback report. Only the body's own
+   * record is stamped, so a worker turn one of its adapter calls woke commits
+   * without crediting the body; progress proves the body is running, not
+   * sitting in an await (`passState`).
+   */
+  progressAt?: number
+  /**
+   * The member whose task this body is preparing, while its `prepareTask` await
+   * is in flight: the adapter's recovery-fallback report, committed from inside
+   * that call, stamps the body's progress first (`Scheduling.preparationReported`).
+   */
+  preparing?: string
+  /** The member this body's sweep starts from: the one its predecessor stopped before. */
+  sweepFrom?: string
+  /**
+   * The member where the chain of early-stopped bodies this body belongs to
+   * started. A chained body's sweep ends before it, so the chain covers at most
+   * one rotation and its last body runs the pass-end steps.
+   */
+  chainFrom?: string
+  /** Set when this body stopped early at a member boundary: the first member it did not sweep. */
+  stoppedBefore?: string
+}
+
+/** One mission's rows at one instant, with the clock, the bounds, the adapter view, the log and the scheduling body every decision over them reads. */
 export interface Board {
   missionId: string
   /** The mission row with its execution clock applied (`readMission`). */
@@ -143,6 +209,8 @@ export interface Board {
   bounds: Bounds
   view: AdapterView
   records: BoardRecords
+  /** The scheduling body queued or running for the mission (`Scheduling.passes`), none between bodies and after a restart. */
+  pass: SchedulingPass | undefined
 }
 
 /** A mission row as every reader sees it: its execution clock applied while it is not terminal. An unknown id is refused. */
@@ -153,11 +221,11 @@ export function readMission(store: Pick<SwarmStore, 'get'>, missionId: string, c
   return mission
 }
 
-/** The board of one mission as the store holds it now. */
-export function readBoard(store: Pick<SwarmStore, 'get' | 'list' | 'latestTaskEvent' | 'progressAt' | 'toolRuns'>, missionId: string, clock: () => number, bounds: Bounds, view: AdapterView): Board {
+/** The board of one mission as the store holds it now, with the scheduling body queued or running for it. */
+export function readBoard(store: Pick<SwarmStore, 'get' | 'list' | 'latestTaskEvent' | 'progressAt' | 'toolRuns'>, missionId: string, clock: () => number, bounds: Bounds, view: AdapterView, pass: SchedulingPass | undefined): Board {
   const mission = readMission(store, missionId, clock)
   const tasks = store.list('tasks', missionId)
-  return { missionId, mission, tasks, members: store.list('members', missionId), graph: taskGraphIndex(tasks), clock, bounds, view, records: store }
+  return { missionId, mission, tasks, members: store.list('members', missionId), graph: taskGraphIndex(tasks), clock, bounds, view, records: store, pass }
 }
 
 /* ----------------------------------------------------------------------- *
@@ -403,7 +471,7 @@ export function stalled(board: Board): boolean {
  * holding an open attempt whose lease has not lapsed at the board's clock. A
  * scheduling body past its bound stays live while the board has some, inside
  * its release bound, and its naming names these as the work that held it
- * (`wedgeVerdict`, src/scheduling.ts). A lapsed lease is not live work, so a
+ * (`wedgeVerdict`). A lapsed lease is not live work, so a
  * body wedged until every lease lapsed is named at its first bound. This is not
  * the stall's running-or-stopping work (`reviewPathStalled`), which counts a
  * running row whatever its lease: the lease path owns a lapsed one.
@@ -411,6 +479,79 @@ export function stalled(board: Board): boolean {
 export function liveWork(board: Pick<Board, 'tasks' | 'clock'>): Task[] {
   const now = board.clock()
   return board.tasks.filter(task => quiescencePending(task) || (holdsOpenAttempt(task) && task.attempt.leaseUntil >= now))
+}
+
+/**
+ * The scheduling pass state a committed transition is published with
+ * (`passState`): a live pass that is not wedged owns the publication, and a
+ * wedged one is published with the wedged branch (`Scheduling.transition`).
+ */
+export interface PassState { passLive: boolean; wedged: boolean }
+
+/**
+ * The one bound predicate: a body is past its bound once it has held the
+ * mission for a whole `stallPassTimeoutMs` at `now`. A body's verdict reads it
+ * (`wedgeVerdict`), and so does an attempt silence naming the pass
+ * (`Scheduling.silentAttempt`), so no instant exists at which the watchdog
+ * already names a body, or the publication judges with the wedged branch, and
+ * another reader does not yet see it past its bound.
+ */
+export function pastBound(pass: SchedulingPass, bounds: Bounds, now: number): boolean {
+  return now - pass.startedAt >= bounds.stallPassTimeoutMs
+}
+
+/** What one scheduling body is on a board at one instant (`wedgeVerdict`). */
+export interface PassVerdict {
+  /** S1/R15-D1: past its declared bound (`pastBound`). It stays so from the first bound until it settles, named or not. */
+  wedged: boolean
+  /** R16-D: the board's live work while the body is past its bound (`liveWork`), none inside it: what holds the body live, and what its naming names as preserved. */
+  liveWork: Task[]
+  /**
+   * The body still owns the dispatcher's decisions: it is not named, and it is
+   * inside its bound or, past it, held by that live work inside its release
+   * bound (`stallPassReleaseBoundMs` = `stallPassTimeoutMs` +
+   * `stallPassLiveGraceMs`), since it may legitimately be inside a long adapter
+   * await for that work. R16-D: past the release bound it is not live however
+   * long a healthy sibling's lease lives. An unnamed body that is not live is
+   * the watchdog's to name (`Scheduling.checkSchedulingPasses`). `kick` does not
+   * read this: it skips while any body is queued or running, because the serial
+   * queue could not run a second one anyway.
+   */
+  live: boolean
+}
+
+/**
+ * The verdict of one body on a board at `now` (the tick's one instant when the
+ * watchdog asks, else the board's clock). The live work is read at the board's
+ * clock: a lease is live while `leaseUntil` is not past.
+ */
+export function wedgeVerdict(pass: SchedulingPass, board: Pick<Board, 'tasks' | 'clock' | 'bounds'>, now = board.clock()): PassVerdict {
+  const unnamed = pass.escalatedAt === undefined
+  if (!pastBound(pass, board.bounds, now)) return { wedged: false, liveWork: [], live: unnamed }
+  const work = liveWork(board)
+  return { wedged: true, liveWork: work, live: unnamed && work.length > 0 && now - pass.startedAt < board.bounds.stallPassReleaseBoundMs }
+}
+
+/**
+ * R17-G5: the pass state a committed transition is published with, the body
+ * queued or running for the mission (`pass`) judged on its board. A body past its bound
+ * that has itself made progress within the last bound (`progressAt`: one of its
+ * own awaits returned, or it reached a member boundary) is not sitting in the
+ * wedged await: it is running and reaches its own dispatch question when it
+ * settles (or hands the unswept members to the next body), so the transition
+ * publishes as inside a live pass. The wedged branch would instead ask "was not
+ * dispatched this tick" about work the same sweep is about to dispatch.
+ * Otherwise the body's verdict decides: live while it owns the decisions, and
+ * wedged past its bound; a body without progress for a whole bound is wedged
+ * again, whatever a worker turn it woke commits.
+ */
+export function passState(board: Pick<Board, 'pass' | 'tasks' | 'clock' | 'bounds'>): PassState {
+  const { pass } = board
+  if (pass === undefined) return { passLive: false, wedged: false }
+  const now = board.clock()
+  if (pass.progressAt !== undefined && pastBound(pass, board.bounds, pass.progressAt) && now - pass.progressAt <= board.bounds.stallPassTimeoutMs) return { passLive: true, wedged: false }
+  const { live, wedged } = wedgeVerdict(pass, board, now)
+  return { passLive: live, wedged }
 }
 
 /**

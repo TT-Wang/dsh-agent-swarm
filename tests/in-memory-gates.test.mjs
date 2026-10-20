@@ -67,7 +67,7 @@ import { fileURLToPath } from 'node:url'
 import { join, relative } from 'node:path'
 import { setup, eventually, events, taskOf, FakeWorkers, SwarmRuntime, budget as sharedBudget, makeRuntime } from './faults/harness.mjs'
 import { persistentCollections } from './source-semantics.mjs'
-import { passState } from '../lib/scheduling.js'
+import { passState } from '../lib/board.js'
 
 const PROJECT = fileURLToPath(new URL('../', import.meta.url))
 
@@ -549,7 +549,7 @@ const GATE_TESTS = {
       const task = f.propose({ title: 'Wedged marker lost' })
       assert.ok(task?.id, 'the durable write is unaffected by the lost wedge marker')
       // The release itself is durable; the next transition still publishes.
-      const state = passState(f.runtime.scheduling.passes.get(f.mission.id), f.runtime.boardOf(f.mission.id))
+      const state = passState(f.runtime.boardOf(f.mission.id))
       assert.equal(typeof state.passLive, 'boolean')
       assert.equal(typeof state.wedged, 'boolean')
     } finally { await f.cleanup() }

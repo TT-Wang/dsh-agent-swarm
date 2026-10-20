@@ -25,11 +25,10 @@ import { join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { setup, makeRuntime, events, taskOf, FakeWorkers, FakeClock, SwarmRuntime, MISSION_ACCEPTANCE } from './faults/harness.mjs'
 import { ownerTools } from './refusal-inventory.mjs'
-import { reviewNeed, stallRoots, stalled, waitsLegitimately } from '../lib/board.js'
-import { passState, wedgeVerdict } from '../lib/scheduling.js'
+import { passState, reviewNeed, stallRoots, stalled, waitsLegitimately, wedgeVerdict } from '../lib/board.js'
 
 /** The body queued or running for `missionId`, judged on its board: its publication state and its verdict. */
-const stateOf = (runtime, missionId) => passState(runtime.scheduling.passes.get(missionId), runtime.boardOf(missionId))
+const stateOf = (runtime, missionId) => passState(runtime.boardOf(missionId))
 const verdictOf = (runtime, missionId) => wedgeVerdict(runtime.scheduling.passes.get(missionId), runtime.boardOf(missionId))
 
 /** `count` ticks of the timer a fake-clock runtime does not run, one tick unit of clock time apart. */
