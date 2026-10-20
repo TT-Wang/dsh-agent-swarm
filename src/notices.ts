@@ -12,7 +12,7 @@ import { guardTerminal, guardTerminalKey, type GuardChainId, type GuardTerminalC
 import { TERMINAL_STATES, holdsAttempt, missionSubject, stopPending, subjectsOfTasks, taskSubject, terminal } from './task-graph.ts'
 import { WriterBusyError, id, type SwarmStore } from './store.ts'
 import type { EventKind } from './events.ts'
-import { awaited, formatSpan, type Kernel, type PassState, type SchedulingPass } from './kernel.ts'
+import { awaited, formatSpan, type Kernel, type SchedulingPass } from './kernel.ts'
 import { completionError, dependentsOf, eligible, fingerprintBoard, heldByParkedMember, interpret, isolationIssues, missionFingerprint, newestReviewBlock, noticeSubjectsFor, overdueStop, reviewNeed, reviewPathBlocker, reviewPathStalled, stallRoots, startBlocker, unreviewedSources, waitsLegitimately, type Board, type Interpretation } from './board.ts'
 import type { Delivery, Escalation, Member, Mission, NoticeClass, Task, WorkerActivity } from './types.ts'
 
@@ -778,35 +778,16 @@ export class Notices {
   /** Followups share the existing absence sweep and owner wake budget. */
   obligationFollowupMs = DEFAULT_ABSENCE_BOUND_MS
   maxObligationFollowups = 2
-  /**
-   * R17-G5: reentrancy guard for transition-driven generation. The classifier
-   * itself commits (its delivery rows), and those commits must not re-enter it.
-   */
-  private publishingTransition = false
-  /**
-   * R17-G5: missions whose committed transitions still owe a fact publication.
-   * Transitions are coalesced within the current task (a burst of commits from
-   * one synchronous operation publishes the FINAL state once), then published
-   * from the runtime's pass state — never from the sampled tick.
-   */
-  private readonly pendingTransitions = new Set<string>()
-  private transitionScheduled = false
-  /**
-   * R17-G5: missions whose scheduling pass was just named wedged. The naming is
-   * the transition that owes the dispatch question the wedged pass never
-   * reached, so its publication runs with the wedged branch even if the body
-   * settles before that publication runs.
-   */
-  private readonly wedgedReleases = new Set<string>()
 
   /**
-   * The notices stand on the kernel and the refusal registry below them:
-   * `refusals` holds the writes a busy writer refused, and a guard terminal it
-   * could not write is queued there (`record`). `passState` is their
-   * one reach above the kernel, the scheduling pass state a publication reads
-   * when it runs (`publishTransition`).
+   * The notices stand on the kernel and the refusal registry below them, and
+   * reach nothing above: `refusals` holds the writes a busy writer refused, and
+   * a guard terminal it could not write is queued there (`record`). When a
+   * committed transition is published is the scheduling pass guard's decision
+   * (`Scheduling.transition`), which hands the judgement its branch
+   * (`ensureWitness`).
    */
-  constructor(private readonly k: Kernel, private readonly refusals: RefusalRegistry, private readonly passState: (missionId: string) => PassState) {}
+  constructor(private readonly k: Kernel, private readonly refusals: RefusalRegistry) {}
 
   /**
    * Owner notices wake the primary agent and replay its whole context, so only
@@ -1282,64 +1263,9 @@ export class Notices {
   }
 
   /**
-   * R17-G5: publish the facts of ONE committed transition. A state change now
-   * drives generation: the caller (the runtime's commit funnel) invokes this
-   * after the transaction that changed the board, so the decision families run
-   * against the state the change produced rather than against a later sample of
-   * it. The pass state decides the one branch that is only meaningful at the end
-   * of a pass (the dispatcher's "ready but not dispatched" question): it runs
-   * off-pass, and a wedged pass keeps its own subject. Reentrant calls (the
-   * classifier's own commits) are ignored. The sampled tick path emits exactly
-   * two absence instruments and no cause: the absence net here and the retained
-   * attempt-silence escalation (`Scheduling.sweepSilentAttempts`, bounded by
-   * `attemptSilenceBoundMs`).
-   */
-  transition(missionId: string): void {
-    if (this.publishingTransition) return
-    this.pendingTransitions.add(missionId)
-    if (this.transitionScheduled) return
-    this.transitionScheduled = true
-    queueMicrotask(() => {
-      this.transitionScheduled = false
-      const pending = [...this.pendingTransitions]
-      this.pendingTransitions.clear()
-      for (const id of pending) this.publishTransition(id)
-    })
-  }
-
-  /** R17-G5: a wedged pass was just named, by a new row or by the one the owner holds: that is a transition, published with the wedged branch. */
-  expectWedgedRelease(missionId: string): void { this.wedgedReleases.add(missionId); this.transition(missionId) }
-
-  /** R17-G5: publish one mission's committed transitions against its settled state. */
-  private publishTransition(missionId: string): void {
-    if (this.publishingTransition) return
-    this.publishingTransition = true
-    try {
-      // A live pass owns the dispatcher's "ready but not dispatched" question
-      // (R15-D3: generation must not invent the cause the pass is about to
-      // resolve); the question is asked by the transition that ends or names
-      // the pass, and by a wedged pass, which never reached its own question; a
-      // body that made progress of its own within the last bound past its bound
-      // is running, not wedged (`passState`, src/scheduling.ts).
-      const state = this.passState(missionId)
-      const released = this.wedgedReleases.delete(missionId)
-      // A live, un-wedged pass owns generation: it will publish at its own close
-      // (the commit that closes the pass is a transition of this same funnel), so
-      // a mid-pass commit cannot describe a board the dispatcher is still acting
-      // on — the D3/R15-A4 rule, now applied without sampling.
-      if (state.passLive && !state.wedged && !released) return
-      this.ensureWitness(missionId, state.wedged || released ? { wedged: true } : {})
-    } catch {
-      // A generation failure must never break the commit that triggered it; the
-      // next transition (or the absence net) re-derives the same facts.
-    } finally {
-      this.publishingTransition = false
-    }
-  }
-
-  /**
    * No-silent-state backstop (docs/no-silent-state-spec.md §2): every
-   * publication and every pass end records what the board owes the owner
+   * publication (`Scheduling.transition`, which decides when one runs and with
+   * which branch) and every pass end records what the board owes the owner
    * (`judge`), each notice as it is decided. Each family deduplicates its own
    * fact on the ledger, so a judgement of a board whose facts the owner holds
    * writes nothing.

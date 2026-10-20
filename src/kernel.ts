@@ -111,15 +111,6 @@ export interface SchedulingPass {
 }
 
 /**
- * The scheduling pass state a committed transition is published with
- * (`passState`, src/scheduling.ts): a live pass that is not wedged owns the
- * publication, and a wedged one is published with the wedged branch. The
- * notices read it through the closure the runtime hands them, their one reach
- * above the kernel.
- */
-export interface PassState { passLive: boolean; wedged: boolean }
-
-/**
  * A scheduling body's own progress stamp (`SchedulingPass.progressAt`). The body
  * calls it itself, with the record `kick` handed it, when it starts, at each
  * member boundary and when one of its own awaits returns (`awaited`). A call

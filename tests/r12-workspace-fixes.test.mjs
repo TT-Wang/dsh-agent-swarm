@@ -50,9 +50,9 @@ test('M2-1: a repeated pass-timeout naming is recorded once, through the ledger'
     put: (table, row) => { assert.equal(table, 'deliveries'); deliveries.push(row) } },
     bounds, fingerprint: () => 'same', commit: (_id, fn) => fn(),
     boardOf: missionId => ({ missionId, mission, tasks: [], members: [], graph: taskGraphIndex([]), clock: () => Date.now(), bounds }) })
-  // The runtime's own telling, over this store; the publication is outside this test.
-  const notices = new Notices(rt, new RefusalRegistry(rt), () => ({ passLive: false, wedged: false }))
-  const scheduling = new Scheduling(rt, { record: notices.record.bind(notices), expectWedgedRelease() {}, transition() {} })
+  // The runtime's own telling, over this store; the publication the naming queues judges nothing here.
+  const notices = new Notices(rt, new RefusalRegistry(rt))
+  const scheduling = new Scheduling(rt, { record: notices.record.bind(notices), ensureWitness() {} })
   // Two bodies wedge in turn on one naming fact. The first naming's row is the
   // record: the second body is marked named and writes neither row nor event.
   const named = []

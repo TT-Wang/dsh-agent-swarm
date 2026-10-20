@@ -1,18 +1,20 @@
 /**
- * The scheduling seam: the in-memory pass guard (open/close and the wedge
- * watchdog), the dispatch sweep of one serialized pass and the attempt
- * reporting bound. M1a seam 7/7, the top one: it stands on the kernel with the
- * runtime's worker start and assignment, the notices, the attempts, the
- * workspace admission and the refusals. The readiness, review and stall
- * predicates the sweep asks are functions of the board (src/board.ts); the
- * sweep reads the board where it decides, after each of its awaits.
+ * The scheduling seam: the in-memory pass guard (open/close, the wedge
+ * watchdog and the publication of committed transitions), the dispatch sweep
+ * of one serialized pass and the attempt reporting bound. M1a seam 7/7, the top
+ * one: it stands on the kernel with the runtime's worker start and assignment,
+ * the notices, the attempts, the workspace admission and the refusals. A
+ * body's standing is a verdict of the board (`wedgeVerdict`, `passState`),
+ * and so are the readiness, review and stall predicates the sweep asks
+ * (src/board.ts); the sweep reads the board where it decides, after each of
+ * its awaits.
  */
 import { id } from './store.ts'
 import { TERMINAL_STATES, holdsOpenAttempt, openAttempt, pendingStopOwner, subjectsOfTasks, taskSubject, terminal, turnEnded } from './task-graph.ts'
 import { asksHandle, eligible, isolationViolation, liveWork, noticeSubjectsFor, overdueStop, startBlocker, stillDispatchable, takesWork, unschedulable, type Board, type Bounds } from './board.ts'
 import { factKey, guardTerminalNotice, silenceNotice, type Notice, type Notices, type SilentAttempt } from './notices.ts'
 import { AdmissionRefusedError } from './scheduler.ts'
-import { awaited, progressed, type Kernel, type PassState, type SchedulingPass } from './kernel.ts'
+import { awaited, progressed, type Kernel, type SchedulingPass } from './kernel.ts'
 // R17-G6/G7: the one derivation of the derived member status.
 import { memberPhaseOf } from './projection.ts'
 import type { Attempts } from './attempts.ts'
@@ -29,6 +31,13 @@ export type DispatchKernel = Kernel & {
   startWorker(mission: Mission, member: Member, options: { pass?: SchedulingPass }): Promise<void>
   assign(task: Task, member: Member): Task
 }
+
+/**
+ * The scheduling pass state a committed transition is published with
+ * (`passState`): a live pass that is not wedged owns the publication, and a
+ * wedged one is published with the wedged branch (`Scheduling.transition`).
+ */
+export interface PassState { passLive: boolean; wedged: boolean }
 
 /**
  * The one bound predicate: a body is past its bound once it has held the
@@ -186,6 +195,27 @@ export class Scheduling {
    * `startedAt` to name a body past its bound.
    */
   readonly passes = new Map<string, SchedulingPass>()
+  /**
+   * R17-G5: missions whose committed transitions still owe a publication
+   * (`transition`). Transitions are coalesced within the current task (a burst
+   * of commits from one synchronous operation publishes the FINAL state once),
+   * then published from the pass state when the publication runs, never from
+   * the sampled tick.
+   */
+  private readonly pendingTransitions = new Set<string>()
+  private transitionScheduled = false
+  /**
+   * R17-G5: reentrancy guard. The judgement a publication runs commits its own
+   * delivery rows, and those commits are not transitions of their own.
+   */
+  private publishingTransition = false
+  /**
+   * R17-G5: missions whose body was just named. The naming is the transition
+   * that owes the dispatch question the wedged body never reached, so its
+   * publication runs with the wedged branch even if the body settles before
+   * that publication runs (`expectWedgedRelease`).
+   */
+  private readonly wedgedReleases = new Set<string>()
 
   constructor(private readonly k: DispatchKernel, private readonly notices: Notices, private readonly attempts: Attempts, private readonly workspaceAdmission: WorkspaceAdmission, private readonly refusals: RefusalRegistry) {}
 
@@ -424,13 +454,71 @@ export class Scheduling {
   /**
    * Close a pass when its body settles: remove the in-memory record (so the
    * next kick may queue a successor) and publish the pass end. R17-G5: the close
-   * is a transition. While the pass was live, notices left its mid-pass commits
-   * unpublished for the pass end to publish; that publication judges the board,
-   * the one emitter of "it cannot progress".
+   * is a transition. While the pass was live, the publication left its mid-pass
+   * commits for the pass end to publish (`publish`); that publication judges
+   * the board, the one emitter of "it cannot progress".
    */
   closePass(missionId: string, pass: SchedulingPass): void {
     if (this.passes.get(missionId) === pass) this.passes.delete(missionId)
-    if (!this.k.closed) this.notices.transition(missionId)
+    if (!this.k.closed) this.transition(missionId)
+  }
+
+  /**
+   * R17-G5: publish the facts of ONE committed transition: the runtime's commit
+   * funnel calls this after the transaction that changed the board
+   * (`SwarmRuntime.commit`), and so do a body's close (`closePass`) and its
+   * naming (`expectWedgedRelease`). The decision families then run against the
+   * state the change produced rather than against a later sample of it. The
+   * pass state decides the one branch that is only meaningful at the end of a
+   * pass (the dispatcher's "ready but not dispatched" question): it runs
+   * off-pass, and a wedged pass keeps its own subject. It is read when the
+   * publication runs, so a body a kick opened after the commit owns that
+   * commit's publication. The sampled tick path emits exactly two absence
+   * instruments and no cause: the absence net (`Notices.absenceNet`) and the
+   * attempt-silence escalation (`sweepSilentAttempts`, bounded by
+   * `attemptSilenceBoundMs`).
+   */
+  transition(missionId: string): void {
+    if (this.publishingTransition) return
+    this.pendingTransitions.add(missionId)
+    if (this.transitionScheduled) return
+    this.transitionScheduled = true
+    queueMicrotask(() => {
+      this.transitionScheduled = false
+      const pending = [...this.pendingTransitions]
+      this.pendingTransitions.clear()
+      for (const id of pending) this.publish(id)
+    })
+  }
+
+  /** R17-G5: a body was just named, by a new row or by the one the owner holds: that is a transition, published with the wedged branch. */
+  expectWedgedRelease(missionId: string): void { this.wedgedReleases.add(missionId); this.transition(missionId) }
+
+  /**
+   * R17-G5: publish one mission's committed transitions against its settled
+   * state. A live pass owns the dispatcher's "ready but not dispatched"
+   * question (R15-D3: generation must not invent the cause the pass is about to
+   * resolve), so a live, un-wedged body's mid-pass commits are left to the
+   * publication of its own close, which cannot describe a board the dispatcher
+   * is still acting on. The question is asked by the transition that ends or
+   * names the body, and by a wedged body, which never reached its own question:
+   * the board is judged (`Notices.ensureWitness`) with the wedged branch while
+   * the body is wedged (`passState`) or its naming is owed one.
+   */
+  private publish(missionId: string): void {
+    if (this.publishingTransition) return
+    this.publishingTransition = true
+    try {
+      const released = this.wedgedReleases.delete(missionId)
+      const state = passState(this.passes.get(missionId), this.k.boardOf(missionId))
+      if (state.passLive && !state.wedged && !released) return
+      this.notices.ensureWitness(missionId, state.wedged || released ? { wedged: true } : {})
+    } catch {
+      // A generation failure must never break the commit that triggered it; the
+      // next transition (or the absence net) re-derives the same facts.
+    } finally {
+      this.publishingTransition = false
+    }
   }
 
   /**
@@ -479,7 +567,7 @@ export class Scheduling {
       // board its live window left unpublished, so a publication is queued that
       // runs with the wedged branch even if the body settles first.
       pass.escalatedAt = now
-      this.notices.expectWedgedRelease(missionId)
+      this.expectWedgedRelease(missionId)
     }
   }
 

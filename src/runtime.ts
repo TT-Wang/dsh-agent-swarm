@@ -9,7 +9,7 @@ import { recordedClaim, type WorkspaceClaim } from './authorization.ts'
 import { WorkspaceAdmission, deniedGitWrite, gitWriteDeniedMessage, TEMP_RENDEZVOUS_WINDOW_MS } from './workspace-admission.ts'
 import { Notices, NOTICE_TEMPLATES, REJECTION_DECISION_TRIGGER, assignmentCurrent, guardTerminalNotice, integrationGap, renderNotice, reviewBlocked } from './notices.ts'
 import { RefusalRegistry, requireStrings, requireText, sameChecks, unsupportedEffort, validatedBudget } from './refusals.ts'
-import { Scheduling, passState } from './scheduling.ts'
+import { Scheduling } from './scheduling.ts'
 import { progressed, type Kernel, type SchedulingPass } from './kernel.ts'
 import { ADMISSION_REFUSED, AUTOMATIC_REVIEW_PREFIX, bounds, capable, completionError, fingerprintBoard, inFlightEstimate, missionFingerprint, noticeSubjectsFor, readBoard, readinessBlocker, readMission, ready, rerouteTarget, reviewable, reviewNeed, reviewPathBlocker, reviewPathStalled, stillChosen, unreviewedSources, unschedulable, type AdapterView, type Board, type Bounds, type ReviewNeed } from './board.ts'
 // R17-G6/G7: the one derivation of mission derived state and its host projection.
@@ -225,10 +225,8 @@ export class SwarmRuntime implements Kernel {
    * delivers them, on the kernel and the refusal registry, where a guard
    * terminal a busy writer refused is queued. Every caller reaches it as
    * `notices`: the runtime's body, the seams, index.ts, roles.ts and the tests.
-   * Its one reach above the kernel is the scheduling pass state its
-   * publication reads, handed down as a closure over `scheduling`.
    */
-  readonly notices = new Notices(this, this.refusals, missionId => passState(this.scheduling.passes.get(missionId), this.boardOf(missionId)))
+  readonly notices = new Notices(this, this.refusals)
 
   /**
    * M1a seam 1/7: lease and attempt accounting, on the kernel and the notices.
@@ -606,7 +604,7 @@ export class SwarmRuntime implements Kernel {
       return value
     }) } finally { this.commitDepth -= 1 }
     for (const listener of this.listeners) { try { listener(missionId) } catch { /* A UI subscriber cannot roll back committed work. */ } }
-    this.notices.transition(missionId)
+    this.scheduling.transition(missionId)
     return result
   }
   /** Subscribe to committed state changes. */

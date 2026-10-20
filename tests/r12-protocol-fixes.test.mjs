@@ -94,7 +94,7 @@ function refusalFixture() {
       event: (missionId, type, actor, data) => events.push({ missionId, type, actor, data }),
     }, boardOf: missionId => ({ missionId, mission: { id: missionId, status: 'active' }, tasks: [] }),
   })
-  const registry = new RefusalRegistry(kernel), notices = new Notices(kernel, registry, () => ({ passLive: false, wedged: false }))
+  const registry = new RefusalRegistry(kernel), notices = new Notices(kernel, registry)
   const endChain = (missionId, chain, context) => notices.record(missionId, guardTerminalNotice(kernel.boardOf(missionId), chain, context))
   return { registry, notices, endChain, admissions, events, release: () => { busy = false } }
 }

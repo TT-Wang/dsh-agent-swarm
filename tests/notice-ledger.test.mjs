@@ -454,7 +454,7 @@ test('D3: a submission whose review need ripened, beside a dependent that waits 
       f.workers.reportActivity(f.author.id, undefined)
       await Promise.resolve()
     },
-    'a wedged publication': async f => { f.runtime.notices.expectWedgedRelease(f.mission.id); await Promise.resolve() },
+    'a wedged publication': async f => { f.runtime.scheduling.expectWedgedRelease(f.mission.id); await Promise.resolve() },
   }
   for (const [route, judge] of Object.entries(routes)) {
     const f = await setup({ clock: new FakeClock() })
@@ -495,7 +495,7 @@ test('D3: a submission whose review need ripened, beside a dependent that waits 
   const deferred = ownerRows(recorded).filter(delivery => delivery.notice.dedupKey.startsWith(`review-blocked:${recorded.mission.id}:${source.id}:`))
   assert.deepEqual([reviewNeed(recorded.runtime.boardOf(recorded.mission.id), taskOf(recorded.runtime, source.id)).recorded, deferred.map(delivery => delivery.notice.reason), admitted(recorded, source)], [true, [BOARD_RUNNING], undefined], 'the admission recorded the need by deferring its review while the other work runs')
   recorded.runtime.cancel(recorded.owner, recorded.mission.id, { taskId: running.id, reason: 'Not needed' })
-  recorded.runtime.notices.expectWedgedRelease(recorded.mission.id)
+  recorded.runtime.scheduling.expectWedgedRelease(recorded.mission.id)
   await Promise.resolve()
   assert.deepEqual(told(recorded), [[], []], 'the recorded need: the wedged publication tells no W3 stall once the running work ends')
   await recorded.runtime.tick()

@@ -116,7 +116,7 @@ test('a busy writer\'s refusal is queued only for a guard terminal\'s notice; an
   })
   const refusals = new RefusalRegistry(kernel)
   refusals.queueWriterBusy = recovery => queued.push(recovery)
-  const notices = new Notices(kernel, refusals, () => ({ passLive: false, wedged: false }))
+  const notices = new Notices(kernel, refusals)
   const notice = { content: 'A fact', subjects: ['mission:m'], options: { dedupKey: 'probe:m' } }
   assert.throws(() => notices.record('m', notice), WriterBusyError, 'an ordinary notice is not the busy writer\'s to absorb')
   assert.deepEqual(queued, [])
