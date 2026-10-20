@@ -7,6 +7,111 @@ Current **0.7.0** working-tree checks and the historical **0.6.0** baseline are 
 | `0.1.5-rc.3` (npm `latest`, default host) | `a4c74a91e06b00fe0b0937bde982170c526cc842` |
 | `0.1.7-rc.1` (npm `next`) | `46a7f68b0922371ce7144b668b90e377d8e799f4` |
 
+## Batch 17: decide-then-act S12, S13, S14, S15 (2026-10-20)
+
+**Head**: this record on `b7f53a3`, branch `batch17/kernel` on `f8cee82`, not merged; written in the batch's first
+integrator repair round. `src` against `f8cee82`: +1069 −928, net +141. By slice: S12 +66 (`30a1a60` to `7ba3207`),
+S13 +1, S14 −29, S15 +89, and this round +14 (`3cee26a` +8, `7b332a7` +6).
+
+**The full-log oracle at the head against `f8cee82`** (`npm run test:oracle`, three identical runs at the head).
+Every event, row, delivery and adapter call is identical in the 11 scenarios recorded at `f8cee82`, at every slice
+head and at this head. The 12th scenario, `prep` (`e80ac1f`: preparations that throw, re-pended with backoff up to
+their limit and blocked with the owner told), was recorded on `f2e9dc8` before any S15 move, and its log is also
+reproduced by an `f8cee82` build. No commit of the batch changed a log. The two behaviour changes, `6919778`'s and
+`7b332a7`'s, are owner-approved and lie where no scenario reaches: no scenario reaches an obligation follow-up, and
+F21 and paths deliver their wedged-pass namings while the body is still wedged.
+
+**What each slice leaves at the head.**
+
+- **S12, a notice is a value with one executor** (`30a1a60`, `6919778`, `3df1690`, `f2664c8`, and the repair
+  `58a464e`, `7ba3207`). `Notice` is a value; `Notices.record(missionId, notice)` is its one executor (a held notice
+  commits nothing, else one commit writes the row and then its event; only a guard terminal opts into the pump and
+  the busy-writer queue), and `judge(view, { wedged })` yields what a board owes the owner and writes nothing.
+  `6919778` (owner-approved): each family judged by the subjects it names has one rule, `Notices.outstanding`, that
+  its delivery and its reminders both read, so a parked holder, a dispatch question, a wedged pass's naming and a
+  fall-through are reminded exactly while they would be delivered. Regressions: `tests/notice-judge.test.mjs` and
+  `tests/outstanding-subjects.test.mjs`. The repair kept a wedged pass's naming of the mission root outstanding
+  while the mission was unfinished, on any later board; the owner decided otherwise, and this round applies it.
+- **S13, one silence notice and one guard-terminal notice** (`48e12dd`, `7ee6c80`, `1a9d786`). An operation
+  silence and an attempt silence are verdicts their predicates return, with the holder row they read, and
+  `silenceNotice(task, silence)` is their one notice; `guardTerminalNotice(board, chain, context)` is the notice a
+  guard chain ends with, a function of the board its site records. Refactor. Regressions: the builders in
+  `tests/notice-judge.test.mjs`, and `tests/execution-ownership.test.mjs` pins that a queue keyed by no mission
+  refuses its waiter and tells no mission.
+- **S14, pass bookkeeping as verdicts** (`07dce11`, `832dbff`, `31ff2f6`, `7fbe56e`, `f2e9dc8`). A body's standing
+  is one verdict over its board, `wedgeVerdict`; live work is one board predicate, `liveWork` (a stop in flight, or
+  an open attempt whose lease has not lapsed); the naming is `wedgeNotice`. The publication of a committed
+  transition is the pass guard's (`Scheduling.transition`, `publish`), so the notices stand on the kernel and the
+  refusals alone. Refactor. Regression: `7fbe56e` pins that a body named and settled in one turn is published once,
+  with the wedged branch its naming owes. **S14c did not apply**: its `closeVerdict(pass, board, noProgress,
+  stallPasses)` judged the no-progress watchdog, which batch 11 deleted (`noProgress`, `stallPasses`,
+  `boardCannotProgress`, `escalateSchedulingStall` and `stallNotice` are absent at `f8cee82`). The one decision a
+  close still makes, whether it chains the next body, is `kick`'s one-line condition over the pass record
+  (`stoppedBefore`) and the mission row (active, `budgetPause.quiesced`), its only reader.
+- **S15, the dispatch sweep's verdicts** (`e80ac1f`, `c306db5`, `7888217`, `971f24f`). The sweep decides on the
+  board of an active mission, `activeBoard(missionId)`, and no board is the abandon verdict; at a member's boundary
+  and after its worker start it acts on `memberStep` and `afterStart`; a preparation that threw leaves the row
+  `preparationFailure` returns, with the notice a block owes, committed in one transaction. Refactor, proven by the
+  `prep` scenario and `tests/dispatch-verdicts.test.mjs`. **S15d did not apply**: sharing the fresh-row check
+  between dispatch and claim had landed in batch 16 R1. `stillChosen(board, chosen)` is the one fresh-row rule;
+  dispatch asks `stillDispatchable` (`stillChosen` while the member is `eligible`), and claim asks `stillChosen` and
+  then `ready` on one board and keeps its coded `task_changed_during_preparation` refusal, as R1 decided.
+  `tests/board-read-points.test.mjs` pins each of the four fresh-row clauses through both (`66febb2`).
+- **F2 stays withdrawn** (the W1 follow-up). Nothing in this batch touches `Attempts.fenceRow` or `controlTask`'s own
+  stop owner. W1, recovering a finished attempt from the capture its verdict or submission recorded (a
+  `WorkerAdapter` change the owner decides), comes first; F2 then lands as one fence.
+- **R20, one wording per condition, stays open** (stopped in S12; not attempted in this round). Stuck work is always
+  named: the board's own namings (a stall root, the W3 stall, the dispatch question, the fall-through) are told
+  whenever their own condition holds, whatever decision already names the same work. So the same stuck task can be
+  named in two or more wordings (docs/known-limitations.md lists them). Binding R20 needs an openness bound to its
+  own cause for each decision a naming could defer to. Most guard-chain requests and the other decisions that name a
+  task are open by their subjects' state, and a closed-out failure and a revocation leave no durable cause to bind
+  to. It also needs member-scoped requests narrowed to the work their cause holds, a deferral that speaks again once
+  its cover closes (a covered row is held forever), and the namings of a chain of wedged bodies as one cover.
+
+**Integrator repair round 1** (`3cee26a` to `b7f53a3`, and this record).
+
+- `3cee26a` (refactor): the board carries the scheduling body queued or running for its mission (`Board.pass`),
+  which the runtime reads into every board it builds. `SchedulingPass` moves beside `Board` in src/board.ts, and
+  `pastBound`, `wedgeVerdict` and `passState(board)` are board predicates there, so a reader below the scheduling
+  seam reads the wedge as data, with no closure. The oracle is identical; the 19 test files that name the moved
+  symbols pass 309/309, and faults F13, F19 and F21 pass.
+- `7b332a7` (fix, owner decision): a wedged pass's naming is outstanding while the mission publishes its pass as
+  wedged (`passState(board).wedged`), for the mission root it named, which follows the wedge alone, and for the work
+  it named that is unfinished at its epoch. `claimed`'s mission-root clause is deleted: only this family names the
+  mission root. Delta against `f8cee82`: a queued naming is delivered only while a body is wedged (before, while any
+  named task was unfinished at its epoch, a restart included); a delivered naming the owner has not read is
+  withdrawn from the owner's inbox once no body is wedged; while a body is wedged it is reminded of each named task
+  unfinished at its epoch and of the mission root (before, a task only while no live path advanced it, the root only
+  on a blocked, paused, stalled or all-terminal board), and it is not reminded once none is. Regressions, each
+  failing on a detached `f8cee82` build and at `3cee26a`: `tests/outstanding-subjects.test.mjs` (a task naming and
+  a mission-root naming, reminded while wedged and not on a later healthy board),
+  `tests/notice-ledger.test.mjs` (withheld once the body settled, delivered and reminded while a later body wedges
+  on the same fact, ended when the work moves on) and `tests/harness-owner-notices.test.mjs` (real Harness
+  composition: withdrawn unread from a busy owner's inbox when its body settles, and a later body on its fact told by
+  the row's reminder). The oracle is identical.
+- `a9bc975` (test): `liveWork`'s lease clause was pinned by no test. A board whose only running attempt's lease
+  lapsed gives a body at its bound the verdict `{ wedged: true, liveWork: [], live: false }`, and the watchdog names
+  it at its first bound (`tests/scheduling-pass.test.mjs`). The built-lib mutant that drops the clause fails it.
+- `b7f53a3` (test): `afterStart`'s stop-owed clause was pinned by no test (its case passed through `eligible`). A
+  member that owes a stop while it holds an open attempt whose turn ended is skipped, not closed out
+  (`tests/dispatch-verdicts.test.mjs`). The built-lib mutant that drops the clause fails it.
+- This record answers the missing batch-17 record, R20's statement here and in README.md and README.zh-CN.md, F2,
+  S14c and S15d.
+
+Open after this round: a row the outbox already delivered is not sent again. A wedged pass's naming the owner's
+inbox withdrew unread when its body settled therefore reaches the owner again, when a later body wedges on the
+same fact, only through its reminders (at most two, the first `obligationFollowupMs` after its delivery, at a tick
+when a body is wedged). Re-sending a withdrawn row is a transport change the owner has not decided.
+
+Gate at `b7f53a3` (docs-only commits follow). On 0.1.5-rc.3 these passed: `npm run typecheck`, `npm run build`,
+`npm run test:oracle` (12 scenarios identical over three runs), `npm run test:harness` (with
+`UPDATE_SMOKE_SNAPSHOT=1` the model-visible fixture does not drift), `npm run test:replay` (digest
+`sha256:61a921e64088b78b957cd6aeaa563d5436d4a6eae4b0130725d1f3c74c6f971e`, unchanged), the fault suite (24/24),
+`scripts/smoke-web.mjs` and `scripts/smoke-command-web.mjs` (each `passed: true`). Each touched test file passed
+three rounds of two concurrent copies. On 0.1.7-rc.1 (a detached scratch worktree on its link farm, since removed):
+typecheck, build, `test:harness`, and the eight touched or named test files 188/188.
+
 ## Batch 16: decide-then-act A1, R1, F2 (reverted), F3, V1, I1 (2026-10-19)
 
 **Head**: `c7fed65` and this record (documentation only), branch `batch16/kernel` on `6d5da9d`, not merged; this entry
