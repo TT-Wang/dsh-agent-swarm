@@ -1257,6 +1257,37 @@ test('S1/R16-D: a long pass inside its declared live-work bound is progress and 
   } finally { if (long !== undefined) scheduling.closePass(f.mission.id, long); await f.cleanup() }
 })
 
+test('S1/R16-D: a lapsed lease is not live work: a body past its bound on a board whose only running attempt has a lapsed lease is not live, and the watchdog names it at its first bound, inside the live-work bound', async () => {
+  // The running row still holds its attempt (the lease path owns its expiry),
+  // but its lease is past: it is not work the body may legitimately be inside
+  // an adapter await for, so it cannot hold the naming to the live-work bound
+  // (`liveWork`). The clock is driven by hand.
+  const clock = new FakeClock()
+  const f = await setup({ clock, config: { tickMs: 20, stallPassTimeoutMs: 100 } })
+  const scheduling = f.runtime.scheduling
+  let body
+  try {
+    const task = f.propose()
+    await f.runtime.claim(f.actor(f.author), f.mission.id, task.id)
+    await f.runtime.settle(f.mission.id)
+    assert.equal(scheduling.passes.get(f.mission.id), undefined, 'the passes the claim kicked must settle')
+    const running = taskOf(f.runtime, task.id)
+    f.runtime.store.transaction(() => f.runtime.store.put('tasks', { ...running, attempt: { ...running.attempt, leaseUntil: clock.now() - 1 } }))
+    assert.deepEqual([taskOf(f.runtime, task.id).status, taskOf(f.runtime, task.id).attempt.id], ['running', running.attempt.id], 'the row still runs its attempt, whose lease lapsed')
+    // A body exactly at its bound, a whole grace inside its live-work bound.
+    body = { id: scheduling.passKey(f.mission.id), operationId: 'operation_test_lapsed', missionId: f.mission.id, startedAt: clock.now() - f.runtime.bounds.stallPassTimeoutMs,
+      revisionBefore: f.runtime.store.revision(), fingerprintBefore: f.runtime.fingerprint(f.mission.id) }
+    scheduling.passes.set(f.mission.id, body)
+    assert.ok(clock.now() - body.startedAt < f.runtime.bounds.stallPassReleaseBoundMs, 'inside the live-work bound')
+    assert.deepEqual(verdictOf(f.runtime, f.mission.id), { wedged: true, liveWork: [], live: false }, 'the lapsed lease holds nothing live, so the body is not live past its bound')
+    scheduling.checkSchedulingPasses()
+    const named = wedgeEvents(f).filter(item => item.data.runId === body.operationId)
+    assert.equal(named.length, 1, 'the watchdog names the body at its first bound')
+    assert.deepEqual([named[0].data.releasedWhileLive, named[0].data.releaseBoundMs, named[0].data.liveSubjects], [false, f.runtime.bounds.stallPassTimeoutMs, []],
+      'measured against the pass bound, with no live work holding it')
+  } finally { if (body !== undefined) scheduling.closePass(f.mission.id, body); await f.cleanup() }
+})
+
 test('S5: clearing every in-memory scheduling cache leaves the durable outcome unchanged', async () => {
   // The clock and the ticks are driven by hand.
   const f = await setup({ clock: new FakeClock(), config: { tickMs: 10, stallPassTimeoutMs: 200 } })
