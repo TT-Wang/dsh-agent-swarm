@@ -1320,7 +1320,7 @@ export class Notices {
       // resolve); the question is asked by the transition that ends or names
       // the pass, and by a wedged pass, which never reached its own question; a
       // body that made progress of its own within the last bound past its bound
-      // is running, not wedged (`Scheduling.passState`).
+      // is running, not wedged (`passState`, src/scheduling.ts).
       const state = this.passState(missionId)
       const released = this.wedgedReleases.delete(missionId)
       // A live, un-wedged pass owns generation: it will publish at its own close

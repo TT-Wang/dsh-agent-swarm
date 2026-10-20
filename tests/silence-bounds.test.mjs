@@ -48,6 +48,11 @@ import { silenceReport } from './instruments.mjs'
 import { FakeWorkers, eventually, makeRuntime } from './faults/harness.mjs'
 import { noticeFamily } from '../lib/notices.js'
 import { formatSpan } from '../lib/kernel.js'
+import { passState, wedgeVerdict } from '../lib/scheduling.js'
+
+/** The body queued or running for `missionId`, judged on its board: its publication state and its verdict. */
+const stateOf = (runtime, missionId) => passState(runtime.scheduling.passes.get(missionId), runtime.boardOf(missionId))
+const verdictOf = (runtime, missionId) => wedgeVerdict(runtime.scheduling.passes.get(missionId), runtime.boardOf(missionId))
 
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
 
@@ -100,7 +105,7 @@ async function wedgeNextPass(f, workers) {
   f.runtime.kick(f.mission.id)
   const wedged = await eventually(() => {
     const pass = f.pass()
-    return pass !== undefined && f.runtime.scheduling.passWedged(f.mission.id) ? pass : undefined
+    return pass !== undefined && verdictOf(f.runtime, f.mission.id).wedged ? pass : undefined
   }, 'a pass must wedge past its declared bound', 5000)
   return wedged
 }
@@ -151,7 +156,7 @@ test('R16-D1: a pass wedged on live work is named inside its declared live-work 
   // R16-D1(d): the named body no longer owns generation: the mission publishes
   // as wedged, not as inside a live pass, while the sibling lease still lives.
   // No second body is queued behind the one the queue still owns.
-  assert.deepEqual(f.runtime.scheduling.passState(f.mission.id), { passLive: false, wedged: true }, 'the sibling lease does not keep the named pass live')
+  assert.deepEqual(stateOf(f.runtime, f.mission.id), { passLive: false, wedged: true }, 'the sibling lease does not keep the named pass live')
   assert.equal(f.pass(), wedged, 'no later tick queued a second body behind the wedged one')
 })
 
@@ -203,8 +208,8 @@ test('R16-D3 pair: a control-path kick neither supersedes nor duplicates a wedge
   }
   f.runtime.scheduling.passes.set(f.mission.id, wedged)
   t.after(() => f.runtime.scheduling.closePass(f.mission.id, wedged))
-  assert.equal(f.runtime.scheduling.livePass(f.mission.id), undefined, 'past the live-work bound the body no longer owns generation')
-  assert.equal(f.runtime.scheduling.passWedged(f.mission.id), true, 'but it is still the wedged subject')
+  assert.equal(verdictOf(f.runtime, f.mission.id).live, false, 'past the live-work bound the body no longer owns generation')
+  assert.equal(verdictOf(f.runtime, f.mission.id).wedged, true, 'but it is still the wedged subject')
   f.runtime.kick(f.mission.id)
   assert.equal(f.pass(), wedged, 'the kick neither superseded nor duplicated the wedged body')
   f.runtime.scheduling.checkSchedulingPasses()
@@ -324,12 +329,12 @@ test('R16-D7 pair: the attempt bound fires from the queue-external tick while th
   const task = f.propose('Silent while the pass is wedged', { assigneeId: builder.id })
   const claimed = await f.runtime.claim(f.actorFor(builder), f.mission.id, task.id)
   const wedged = await wedgeNextPass(f, workers)
-  assert.equal(f.runtime.scheduling.passWedged(f.mission.id), true, 'the pass really is wedged')
+  assert.equal(verdictOf(f.runtime, f.mission.id).wedged, true, 'the pass really is wedged')
   const escalation = await eventually(() => f.escalations('attempt-silent:').find(delivery => delivery.notice.dedupKey.startsWith(`attempt-silent:${claimed.attempt.id}:`)),
     'the tick names the attempt even though the in-pass recovery sweep cannot run', 3000)
   assert.match(escalation.content, new RegExp(`scheduling pass ${wedged.operationId} is wedged past its 120ms bound`),
     'the notice names the wedged pass that cannot report it')
-  assert.equal(f.runtime.scheduling.passWedged(f.mission.id), true, 'and the pass is still wedged: its body has not settled')
+  assert.equal(verdictOf(f.runtime, f.mission.id).wedged, true, 'and the pass is still wedged: its body has not settled')
 })
 
 test('R16-D8: the silence projection reads both gaps, the wedge record and the unreported ends from the store alone', async t => {

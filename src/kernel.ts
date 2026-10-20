@@ -78,7 +78,7 @@ export interface SchedulingPass {
   /** Store revision and mission digest when the pass was opened. */
   revisionBefore: number
   fingerprintBefore: string
-  /** Set once this body's naming fact is on the deliveries ledger, written by its own naming or already held (`escalateWedge`); it is then wedged, not live. */
+  /** Set once this body's naming fact is on the deliveries ledger, written by its own naming or already held (`Scheduling.checkSchedulingPasses`); it is then no longer live (`wedgeVerdict`). */
   escalatedAt?: number
   /**
    * The body's own last progress: when one of its own awaits returned (stamped
@@ -112,7 +112,7 @@ export interface SchedulingPass {
 
 /**
  * The scheduling pass state a committed transition is published with
- * (`Scheduling.passState`): a live pass that is not wedged owns the
+ * (`passState`, src/scheduling.ts): a live pass that is not wedged owns the
  * publication, and a wedged one is published with the wedged branch. The
  * notices read it through the closure the runtime hands them, their one reach
  * above the kernel.

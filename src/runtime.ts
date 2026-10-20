@@ -9,7 +9,7 @@ import { recordedClaim, type WorkspaceClaim } from './authorization.ts'
 import { WorkspaceAdmission, deniedGitWrite, gitWriteDeniedMessage, TEMP_RENDEZVOUS_WINDOW_MS } from './workspace-admission.ts'
 import { Notices, NOTICE_TEMPLATES, REJECTION_DECISION_TRIGGER, assignmentCurrent, guardTerminalNotice, integrationGap, renderNotice, reviewBlocked } from './notices.ts'
 import { RefusalRegistry, requireStrings, requireText, sameChecks, unsupportedEffort, validatedBudget } from './refusals.ts'
-import { Scheduling } from './scheduling.ts'
+import { Scheduling, passState } from './scheduling.ts'
 import { progressed, type Kernel, type SchedulingPass } from './kernel.ts'
 import { ADMISSION_REFUSED, AUTOMATIC_REVIEW_PREFIX, bounds, capable, completionError, fingerprintBoard, inFlightEstimate, missionFingerprint, noticeSubjectsFor, readBoard, readinessBlocker, readMission, ready, rerouteTarget, reviewable, reviewNeed, reviewPathBlocker, reviewPathStalled, stillChosen, unreviewedSources, unschedulable, type AdapterView, type Board, type Bounds, type ReviewNeed } from './board.ts'
 // R17-G6/G7: the one derivation of mission derived state and its host projection.
@@ -228,7 +228,7 @@ export class SwarmRuntime implements Kernel {
    * Its one reach above the kernel is the scheduling pass state its
    * publication reads, handed down as a closure over `scheduling`.
    */
-  readonly notices = new Notices(this, this.refusals, missionId => this.scheduling.passState(missionId))
+  readonly notices = new Notices(this, this.refusals, missionId => passState(this.scheduling.passes.get(missionId), this.boardOf(missionId)))
 
   /**
    * M1a seam 1/7: lease and attempt accounting, on the kernel and the notices.
@@ -3727,7 +3727,7 @@ export class SwarmRuntime implements Kernel {
    * same synchronous step that closes the stopped body, so the close publishes
    * as inside that live pass, never as a finished sweep that left the unswept
    * members' work undispatched. The body is handed its own record (`schedule`),
-   * which it stamps with its own progress (`Scheduling.passState`).
+   * which it stamps with its own progress (`passState`).
    */
   kick(missionId: string, after?: SchedulingPass): void {
     if (this.shuttingDown || this.closed) return

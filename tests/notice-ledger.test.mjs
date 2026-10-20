@@ -18,6 +18,10 @@ import { FakeClock, FakeWorkers, MISSION_ACCEPTANCE, acceptThroughReview, blockT
 import { BOARD_RUNNING, completionError, interpret, isolationIssues, reviewNeed } from '../lib/board.js'
 import { assertNamedCalls, ownerTools } from './refusal-inventory.mjs'
 import { NOTICE_TEMPLATES, factKey, guardTerminalNotice, noticeFamily, noticeTemplateKey, reviewBlocked } from '../lib/notices.js'
+import { passState } from '../lib/scheduling.js'
+
+/** The publication state of the body queued or running for `missionId`, judged on its board. */
+const stateOf = (runtime, missionId) => passState(runtime.scheduling.passes.get(missionId), runtime.boardOf(missionId))
 
 const ownerRows = f => f.runtime.store.list('deliveries', f.mission.id).filter(delivery => delivery.to === 'owner' && delivery.notice !== undefined)
 const stallRow = f => ownerRows(f).find(delivery => delivery.notice.trigger === 'mission/stalled' && delivery.content.startsWith('Mission stalled'))
@@ -541,9 +545,9 @@ test('coverage-complete is told whenever completion is allowed, whatever the sta
   })
   await acceptThroughReview(f, f.propose())
   // The held stop is the one operation left: every pass and publication since has settled.
-  await eventually(() => !f.runtime.scheduling.passState(f.mission.id).passLive, 'the last pass ends')
+  await eventually(() => !stateOf(f.runtime, f.mission.id).passLive, 'the last pass ends')
   await ticks(f, 1)
-  await eventually(() => !f.runtime.scheduling.passState(f.mission.id).passLive, 'the tick\'s pass ends')
+  await eventually(() => !stateOf(f.runtime, f.mission.id).passLive, 'the tick\'s pass ends')
   const view = interpret(f.runtime.boardOf(f.mission.id))
   assert.deepEqual([completionError(view), view.stalled, taskOf(f.runtime, experiment.id).status], [undefined, false, 'blocked'], 'completion is allowed on a board the stall predicate calls live')
   assert.equal(ownerRows(f).filter(delivery => noticeFamily(delivery) === 'coverage-complete').length, 1, 'coverage-complete is told')
@@ -1185,7 +1189,7 @@ test('a wedged pass\'s naming is outstanding while the work it named is unfinish
   assert.deepEqual(naming.subjects, [`${task.id}@${taskOf(f.runtime, task.id).epoch}`], 'the naming names the work the pass never reached')
   // The hung call returns at its own bound before the owner has read the naming.
   scheduling.closePass(f.mission.id, first)
-  assert.deepEqual([f.runtime.scheduling.passState(f.mission.id).wedged, relevant(f, naming)], [false, true], 'no body is wedged, and the naming is still the owner\'s to read')
+  assert.deepEqual([stateOf(f.runtime, f.mission.id).wedged, relevant(f, naming)], [false, true], 'no body is wedged, and the naming is still the owner\'s to read')
   // Later bodies wedge on the same fact and settle: the one row tells them, in every phase.
   for (const operationId of ['operation_wedge_2', 'operation_wedge_3']) {
     const body = wedgedBody(t, f, operationId)
@@ -1593,7 +1597,7 @@ test('a wedged pass\'s naming of several tasks is outstanding for the work still
     // The owner withdraws one named task. The body is still wedged, and a body is named once.
     f.runtime.cancel(f.owner, f.mission.id, { taskId: two.id, reason: 'Not needed' })
     await ticks(f, 2)
-    assert.deepEqual([f.runtime.scheduling.passState(f.mission.id).wedged, f.runtime.scheduling.passes.get(f.mission.id) === body, wedgeRows(f).length, taskOf(f.runtime, one.id).status], [true, true, 1, 'pending'],
+    assert.deepEqual([stateOf(f.runtime, f.mission.id).wedged, f.runtime.scheduling.passes.get(f.mission.id) === body, wedgeRows(f).length, taskOf(f.runtime, one.id).status], [true, true, 1, 'pending'],
       'the body is still wedged on work it named, and nothing names it again')
     assert.equal(relevant(f, naming), true, `the ${delivered ? 'delivered naming stays in the owner\'s inbox' : 'queued naming is still delivered'}: it is the one record of the wedge that holds the remaining work`)
     assert.deepEqual((await remind(f, naming)).map(delivery => delivery.subjects), [[subjectOf(f, one)]], 'its reminder names the work still unfinished')

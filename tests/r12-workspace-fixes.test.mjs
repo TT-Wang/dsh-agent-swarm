@@ -44,12 +44,12 @@ async function fixture(t) {
 }
 
 test('M2-1: a repeated pass-timeout naming is recorded once, through the ledger', () => {
-  const mission = { id: 'mission', status: 'active' }, records = [], deliveries = []
+  const mission = { id: 'mission', status: 'active' }, records = [], deliveries = [], bounds = { stallPassTimeoutMs: 1000 }
   // The stub store writes only ledger rows: a naming that wrote the mission row would throw.
   const rt = makeRuntimeStub({ store: { get: () => structuredClone(mission), list: table => table === 'deliveries' ? deliveries : [], event: (_m, _t, _a, data) => records.push(data), revision: () => 0,
     put: (table, row) => { assert.equal(table, 'deliveries'); deliveries.push(row) } },
-    bounds: { stallPassTimeoutMs: 1000 }, fingerprint: () => 'same', commit: (_id, fn) => fn(),
-    boardOf: missionId => ({ missionId, mission, tasks: [], members: [], graph: taskGraphIndex([]) }) })
+    bounds, fingerprint: () => 'same', commit: (_id, fn) => fn(),
+    boardOf: missionId => ({ missionId, mission, tasks: [], members: [], graph: taskGraphIndex([]), clock: () => Date.now(), bounds }) })
   // The runtime's own telling, over this store; the publication is outside this test.
   const notices = new Notices(rt, new RefusalRegistry(rt), () => ({ passLive: false, wedged: false }))
   const scheduling = new Scheduling(rt, { record: notices.record.bind(notices), expectWedgedRelease() {}, transition() {} })

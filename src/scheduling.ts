@@ -8,9 +8,9 @@
  * sweep reads the board where it decides, after each of its awaits.
  */
 import { id } from './store.ts'
-import { TERMINAL_STATES, holdsOpenAttempt, openAttempt, pendingStopOwner, quiescencePending, subjectsOfTasks, taskSubject, terminal, turnEnded } from './task-graph.ts'
-import { asksHandle, eligible, isolationViolation, noticeSubjectsFor, overdueStop, startBlocker, stillDispatchable, takesWork, unschedulable } from './board.ts'
-import { factKey, guardTerminalNotice, silenceNotice, type Notices, type SilentAttempt } from './notices.ts'
+import { TERMINAL_STATES, holdsOpenAttempt, openAttempt, pendingStopOwner, subjectsOfTasks, taskSubject, terminal, turnEnded } from './task-graph.ts'
+import { asksHandle, eligible, isolationViolation, liveWork, noticeSubjectsFor, overdueStop, startBlocker, stillDispatchable, takesWork, unschedulable, type Board, type Bounds } from './board.ts'
+import { factKey, guardTerminalNotice, silenceNotice, type Notice, type Notices, type SilentAttempt } from './notices.ts'
 import { AdmissionRefusedError } from './scheduler.ts'
 import { awaited, progressed, type Kernel, type PassState, type SchedulingPass } from './kernel.ts'
 // R17-G6/G7: the one derivation of the derived member status.
@@ -28,6 +28,154 @@ import { type Attempt, type Member, type Mission, type Task } from './types.ts'
 export type DispatchKernel = Kernel & {
   startWorker(mission: Mission, member: Member, options: { pass?: SchedulingPass }): Promise<void>
   assign(task: Task, member: Member): Task
+}
+
+/**
+ * The one bound predicate: a body is past its bound once it has held the
+ * mission for a whole `stallPassTimeoutMs` at `now`. A body's verdict reads it
+ * (`wedgeVerdict`), and so does an attempt silence naming the pass
+ * (`Scheduling.silentAttempt`), so no instant exists at which the watchdog
+ * already names a body, or the publication judges with the wedged branch, and
+ * another reader does not yet see it past its bound.
+ */
+export function pastBound(pass: SchedulingPass, bounds: Bounds, now: number): boolean {
+  return now - pass.startedAt >= bounds.stallPassTimeoutMs
+}
+
+/** What one scheduling body is on a board at one instant (`wedgeVerdict`). */
+export interface PassVerdict {
+  /** S1/R15-D1: past its declared bound (`pastBound`). It stays so from the first bound until it settles, named or not. */
+  wedged: boolean
+  /** R16-D: the board's live work while the body is past its bound (`liveWork`), none inside it: what holds the body live, and what its naming names as preserved. */
+  liveWork: Task[]
+  /**
+   * The body still owns the dispatcher's decisions: it is not named, and it is
+   * inside its bound or, past it, held by that live work inside its release
+   * bound (`stallPassReleaseBoundMs` = `stallPassTimeoutMs` +
+   * `stallPassLiveGraceMs`), since it may legitimately be inside a long adapter
+   * await for that work. R16-D: past the release bound it is not live however
+   * long a healthy sibling's lease lives. An unnamed body that is not live is
+   * the watchdog's to name (`Scheduling.checkSchedulingPasses`). `kick` does not
+   * read this: it skips while any body is queued or running, because the serial
+   * queue could not run a second one anyway.
+   */
+  live: boolean
+}
+
+/**
+ * The verdict of one body on a board at `now` (the tick's one instant when the
+ * watchdog asks, else the board's clock). The live work is read at the board's
+ * clock: a lease is live while `leaseUntil` is not past.
+ */
+export function wedgeVerdict(pass: SchedulingPass, board: Pick<Board, 'tasks' | 'clock' | 'bounds'>, now = board.clock()): PassVerdict {
+  const unnamed = pass.escalatedAt === undefined
+  if (!pastBound(pass, board.bounds, now)) return { wedged: false, liveWork: [], live: unnamed }
+  const work = liveWork(board)
+  return { wedged: true, liveWork: work, live: unnamed && work.length > 0 && now - pass.startedAt < board.bounds.stallPassReleaseBoundMs }
+}
+
+/**
+ * R17-G5: the pass state a committed transition is published with, the body
+ * queued or running for the mission judged on its board. A body past its bound
+ * that has itself made progress within the last bound (`progressAt`: one of its
+ * own awaits returned, or it reached a member boundary) is not sitting in the
+ * wedged await: it is running and reaches its own dispatch question when it
+ * settles (or hands the unswept members to the next body), so the transition
+ * publishes as inside a live pass. The wedged branch would instead ask "was not
+ * dispatched this tick" about work the same sweep is about to dispatch.
+ * Otherwise the body's verdict decides: live while it owns the decisions, and
+ * wedged past its bound; a body without progress for a whole bound is wedged
+ * again, whatever a worker turn it woke commits.
+ */
+export function passState(pass: SchedulingPass | undefined, board: Pick<Board, 'tasks' | 'clock' | 'bounds'>): PassState {
+  if (pass === undefined) return { passLive: false, wedged: false }
+  const now = board.clock()
+  if (pass.progressAt !== undefined && pastBound(pass, board.bounds, pass.progressAt) && now - pass.progressAt <= board.bounds.stallPassTimeoutMs) return { passLive: true, wedged: false }
+  const { live, wedged } = wedgeVerdict(pass, board, now)
+  return { passLive: live, wedged }
+}
+
+/**
+ * R16-D: what the naming of a body its verdict no longer counts live owes the
+ * owner (`Scheduling.checkSchedulingPasses` records it): the notice that names
+ * the body and the live work that held it, with the durable stall event that
+ * carries the notice's key. `naming` is what the watchdog read where it named
+ * the body: the instant, F(S) (`Kernel.fingerprint`) and the store revision.
+ *
+ * The deliveries ledger is the one record of the naming. Its fact is the
+ * mission's unfinished work (the live work that held the body is part of it)
+ * and each member's counted consecutive start failures, under its own
+ * `scheduling-pass` family, so no other notice about those subjects can
+ * consume it. A body whose fact the owner already holds writes nothing: a
+ * wedge that recurs on that fact (a provider outage counts no start failure)
+ * is told once, and a newly counted failure is a new fact (the member is one
+ * failure nearer retirement, which bounds the renaming).
+ */
+export function wedgeNotice(board: Board, pass: SchedulingPass, verdict: PassVerdict, naming: { at: number; fingerprint: string; revision: number }): Notice {
+  const { missionId, mission, tasks, members, bounds } = board
+  const { at, fingerprint, revision } = naming
+  // R15-A1/A2: a wedged pass names the work it never reached, so
+  // the notice carries subjects even though `unschedulable` is legitimately
+  // empty (nothing is unschedulable: the pass simply never ran to a decision).
+  // Guard pair: scheduling-pass stall x stall-root classifier — both can fire for
+  // one board, and each keeps its own subject and dedup key; the mission root is
+  // the fallback only when the board has no non-terminal task left.
+  const unreached = tasks.filter(task => !TERMINAL_STATES.has(task.status))
+  // R16-D: the live work that held a naming to its second bound is unfinished
+  // (`liveWork`: running, or blocked on its stop), so it is among these
+  // subjects: the owner sees which subjects made the wait unavoidable, and
+  // that the naming preserved them (it cancels no task, drops no attempt and
+  // changes no lease). Guard pair: this naming x its wedged publication — the
+  // classifier names what no live path advances, this names every unfinished task; both
+  // carry task@epoch and neither consumes the other's dedup key.
+  const subjects = subjectsOfTasks(unreached, mission)
+  const failures = members
+    .flatMap(member => member.startFailures === undefined ? [] : [`${member.id}:${member.startFailures}`])
+  const reason = ['pass-timeout', ...failures].join(' ')
+  const noticeKey = factKey(missionId, { trigger: 'scheduling-pass', reason, subjects })
+  const bound = bounds.stallPassTimeoutMs
+  const heldByLiveWork = verdict.liveWork.length > 0
+  const releaseBoundMs = heldByLiveWork ? bounds.stallPassReleaseBoundMs : bound
+  const stuck = unschedulable(board).map(task => `${task.id} (${task.status})`)
+  // Each holder is named with the member holding it: its attempt's owner, else its assignee.
+  const holders = verdict.liveWork.map(task => { const memberId = task.attempt?.ownerId ?? task.assigneeId; return memberId === undefined ? taskSubject(task) : `${taskSubject(task)} held by ${memberId}` })
+  const heldText = heldByLiveWork ? ` The naming was held to its ${releaseBoundMs}ms live-work bound by work that is preserved untouched: ${holders.join(', ')}.` : ''
+  const unreachedText = unreached.length ? unreached.map(task => `${task.id} (${task.status})`).join(', ') : 'none'
+  // R15-D2: when a subject of this escalation is a blocked task whose stop is
+  // past its declared bound (or carries no recorded start), the escalation
+  // states that row-supported fact — the wedged pass is exactly what makes
+  // the stop unbounded.
+  const stopFacts = unreached.flatMap(task => { const fact = overdueStop(board, task); return fact === undefined ? [] : [`${task.id} is blocked and ${fact}`] })
+  const stopText = stopFacts.length ? ` Stop state: ${stopFacts.join('; ')}.` : ''
+  return { content: `Scheduling pass ${pass.id} (run ${pass.operationId}) for mission ${missionId} did not return within ${bound}ms and produced no durable state change (fingerprint ${fingerprint.slice(0, 12)}). This pass keeps the mission's scheduling until the call it awaits returns at its own bound; the next pass then resumes from lease recovery. Unschedulable: ${stuck.join(', ') || 'none'}.${heldText} Work the pass never reached: ${unreachedText}.${stopText} Decide: inspect the named tasks, admit a repair with swarm_propose, or withdraw the blocking work with swarm_cancel.`, subjects,
+    options: { dedupKey: noticeKey, reason },
+    // Reuse the registered board-stall event rather than inventing a new type:
+    // `cause: 'scheduling-pass'` and `wedged` make the pass-level escalation
+    // distinguishable in the durable log and in every existing read path. It
+    // exists only with the row its `noticeKey` names.
+    event: { type: 'mission/stalled', data: {
+      cause: 'scheduling-pass',
+      passId: pass.id, runId: pass.operationId,
+      reason: `scheduling pass did not return within its ${bound}ms bound and advanced no durable state`,
+      wedged: true,
+      passStartedAt: pass.startedAt, boundMs: bound,
+      revisionBefore: pass.revisionBefore, revisionAtStall: revision,
+      missionFingerprint: fingerprint, stateUnchanged: pass.fingerprintBefore === fingerprint, unschedulable: stuck, noticeKey,
+      // R16-D: what the wedge was measured against, whether live work held it,
+      // and the subjects whose work it preserved. Nothing is released; the
+      // `release*` names are kept for every existing reader and describe the
+      // naming: `releasedAt` is the instant of the tick whose naming committed,
+      // `releaseGapMs` how long the body had held the mission by then,
+      // `releaseBoundMs` the bound the naming was measured against (the
+      // live-work bound when live work held it) and `releasedWhileLive` whether
+      // live work held it. `boundMs` keeps its original meaning (the pass's own
+      // stall bound).
+      releasedAt: at,
+      releaseBoundMs,
+      releaseGapMs: Math.max(0, at - pass.startedAt),
+      releasedWhileLive: heldByLiveWork,
+      liveSubjects: verdict.liveWork.map(task => taskSubject(task)),
+    } } }
 }
 
 export class Scheduling {
@@ -257,101 +405,6 @@ export class Scheduling {
   passKey(missionId: string): string { return `pass_${missionId}` }
 
   /**
-   * The pass that still owns the dispatcher's decisions: the body queued or
-   * running for the mission, inside its declared bound and not yet named wedged.
-   *
-   * While the mission has live work (a renewed lease, an in-flight quiescence)
-   * the body stays live inside the second, bounded window
-   * (`stallPassReleaseBoundMs` = `stallPassTimeoutMs` + `stallPassLiveGraceMs`):
-   * it may legitimately be inside a long adapter await for that live attempt.
-   * R16-D: past that window it is not live however long a healthy sibling's
-   * lease lives, and the watchdog names it. `kick` does not read this: it skips
-   * while any body is queued or running, because the serial queue could not run
-   * a second one anyway.
-   */
-  livePass(missionId: string): SchedulingPass | undefined {
-    const pass = this.passes.get(missionId)
-    if (pass === undefined || pass.escalatedAt !== undefined) return undefined
-    const now = this.k.now()
-    if (!this.pastBound(pass, now)) return pass
-    // Past the declared pass bound the body is live only while the mission has
-    // live work to progress AND the bounded live-work hold has not elapsed.
-    if (now - pass.startedAt < this.k.bounds.stallPassReleaseBoundMs && this.hasLiveWork(missionId)) return pass
-    return undefined
-  }
-
-  /**
-   * The subjects whose live work keeps `hasLiveWork` true: a running attempt
-   * under a live lease, or a task in its durable stop transition. The wedge
-   * notice names them so the owner can see what held it, and that it preserved
-   * them (it cancels no task, drops no attempt and changes no lease).
-   */
-  liveWorkHolders(missionId: string): Array<{ subject: string; memberId?: string }> {
-    const now = this.k.now()
-    const holders: Array<{ subject: string; memberId?: string }> = []
-    for (const task of this.k.store.list('tasks', missionId)) {
-      const live = quiescencePending(task) || (holdsOpenAttempt(task) && task.attempt.leaseUntil >= now)
-      if (!live) continue
-      const memberId = task.attempt?.ownerId ?? task.assigneeId
-      holders.push({ subject: taskSubject(task), ...(memberId === undefined ? {} : { memberId }) })
-    }
-    return holders
-  }
-
-  /**
-   * R15-D1/D2: a pass body that is still queued or running past its declared
-   * bound. `livePass` deliberately keeps such a body live while the mission has
-   * live work (a sibling lease, an in-flight stop acknowledgement), so the
-   * watchdog does not name a pass that may legitimately be inside a long adapter
-   * await. That hold must not silence another subject's clock: the notices
-   * publish with the wedged branch while this is true, and the attempt-silence
-   * escalation says the pass is wedged.
-   *
-   * Co-firing guards: `livePass` (still the generation owner inside the bounded
-   * live-work window), the wedge watchdog (`checkSchedulingPasses`, which names
-   * the body inside the declared bound or the bounded live-work window), the
-   * notice publication (`passState`) and `hasLiveWork`. It stays
-   * true from the first bound until the body settles, named or not.
-   */
-  passWedged(missionId: string): boolean {
-    const pass = this.passes.get(missionId)
-    return pass !== undefined && this.pastBound(pass)
-  }
-
-  /**
-   * The one bound predicate: a body is past its bound once it has held the
-   * mission for a whole `stallPassTimeoutMs`. The watchdog names it by this
-   * (`checkSchedulingPasses`), the notices publish it wedged by this
-   * (`passWedged`, `livePass`, `passState`) and the sweep stops it early by
-   * this, so no instant exists at which one of them already acts on the bound
-   * and another does not yet.
-   */
-  pastBound(pass: SchedulingPass, now = this.k.now()): boolean {
-    return now - pass.startedAt >= this.k.bounds.stallPassTimeoutMs
-  }
-
-  /**
-   * R17-G5: the pass state a committed transition publishes with, which the
-   * notice publication reads through the closure the runtime hands `Notices`
-   * (`Notices.publishTransition`). A body past its bound that has itself made
-   * progress within the last bound (`progressAt`:
-   * one of its own awaits returned, or it reached a member boundary) is not
-   * sitting in the wedged await: it is running and reaches its own dispatch
-   * question when it settles (or hands the unswept members to the next body),
-   * so the transition publishes as inside a live pass. The wedged branch would
-   * instead ask "was not dispatched this tick" about work the same sweep is
-   * about to dispatch. Otherwise the body is live inside its bound (`livePass`)
-   * and wedged past it (`passWedged`), as before; a body without progress for a
-   * whole bound is wedged again, whatever a worker turn it woke commits.
-   */
-  passState(missionId: string): PassState {
-    const pass = this.passes.get(missionId)
-    const bound = this.k.bounds.stallPassTimeoutMs
-    if (pass?.progressAt !== undefined && this.pastBound(pass, pass.progressAt) && this.k.now() - pass.progressAt <= bound) return { passLive: true, wedged: false }
-    return { passLive: this.livePass(missionId) !== undefined, wedged: this.passWedged(missionId) }
-  }
-
-  /**
    * Record the scheduling body `kick` is about to queue, or return undefined
    * when one is already queued or running for the mission: the serial queue
    * could not start a second body before that one settles.
@@ -369,96 +422,6 @@ export class Scheduling {
   }
 
   /**
-   * R16-D: record the naming of a body past its bound, for the tick watchdog
-   * (`checkSchedulingPasses`): the owner notice that names the body and the
-   * live work that held it, and the durable stall event that carries the
-   * notice's key.
-   *
-   * The deliveries ledger is the one record of the naming. Its fact is the
-   * mission's unfinished work (the live work that held the body is part of it)
-   * and each member's counted consecutive start failures, under its own
-   * `scheduling-pass` family, so no other notice about those subjects can
-   * consume it. A body whose fact the owner already holds writes nothing: a
-   * wedge that recurs on that fact (a provider outage counts no start failure)
-   * is told once, and a newly counted failure is a new fact (the member is one
-   * failure nearer retirement, which bounds the renaming). A naming that did
-   * not commit (a busy writer on that tick) throws, so the watchdog leaves the
-   * body unnamed and the next tick retries.
-   *
-   * This revokes nothing: the operation queue keeps the body as the physical
-   * owner until it actually returns, and a later kick is skipped until then.
-   * The independent watchdog and outbox keep reporting the blocker.
-   */
-  private escalateWedge(mission: Mission, pass: SchedulingPass, heldByLiveWork: boolean, holders: Array<{ subject: string; memberId?: string }>): void {
-    const missionId = mission.id
-    const now = this.k.now()
-    const board = this.k.boardOf(missionId), { tasks, members } = board
-    // R15-A1/A2: a wedged pass names the work it never reached, so
-    // the notice carries subjects even though `unschedulable` is legitimately
-    // empty (nothing is unschedulable: the pass simply never ran to a decision).
-    // Guard pair: scheduling-pass stall x stall-root classifier — both can fire for
-    // one board, and each keeps its own subject and dedup key; the mission root is
-    // the fallback only when the board has no non-terminal task left.
-    const unreached = tasks.filter(task => !TERMINAL_STATES.has(task.status))
-    // R16-D: the live work that held a naming to its second bound is unfinished
-    // (`liveWorkHolders`: running, or blocked on its stop), so it is among these
-    // subjects: the owner sees which subjects made the wait unavoidable, and
-    // that the naming preserved them (it cancels no task, drops no attempt and
-    // changes no lease). Guard pair: this naming x its wedged publication — the
-    // classifier names what no live path advances, this names every unfinished task; both
-    // carry task@epoch and neither consumes the other's dedup key.
-    const subjects = subjectsOfTasks(unreached, mission)
-    const failures = members
-      .flatMap(member => member.startFailures === undefined ? [] : [`${member.id}:${member.startFailures}`])
-    const reason = ['pass-timeout', ...failures].join(' ')
-    const noticeKey = factKey(missionId, { trigger: 'scheduling-pass', reason, subjects })
-    const fingerprint = this.k.fingerprint(missionId)
-    const revision = this.k.store.revision()
-    const bound = this.k.bounds.stallPassTimeoutMs
-    const releaseBoundMs = heldByLiveWork ? this.k.bounds.stallPassReleaseBoundMs : bound
-    const stuck = unschedulable(board).map(task => `${task.id} (${task.status})`)
-    const heldText = heldByLiveWork && holders.length
-      ? ` The naming was held to its ${releaseBoundMs}ms live-work bound by work that is preserved untouched: ${holders.map(holder => holder.memberId === undefined ? holder.subject : `${holder.subject} held by ${holder.memberId}`).join(', ')}.`
-      : ''
-    const unreachedText = unreached.length ? unreached.map(task => `${task.id} (${task.status})`).join(', ') : 'none'
-    // R15-D2: when a subject of this escalation is a blocked task whose stop is
-    // past its declared bound (or carries no recorded start), the escalation
-    // states that row-supported fact — the wedged pass is exactly what makes
-    // the stop unbounded.
-    const stopFacts = unreached.flatMap(task => { const fact = overdueStop(board, task); return fact === undefined ? [] : [`${task.id} is blocked and ${fact}`] })
-    const stopText = stopFacts.length ? ` Stop state: ${stopFacts.join('; ')}.` : ''
-    this.notices.record(missionId, { content: `Scheduling pass ${pass.id} (run ${pass.operationId}) for mission ${missionId} did not return within ${bound}ms and produced no durable state change (fingerprint ${fingerprint.slice(0, 12)}). This pass keeps the mission's scheduling until the call it awaits returns at its own bound; the next pass then resumes from lease recovery. Unschedulable: ${stuck.join(', ') || 'none'}.${heldText} Work the pass never reached: ${unreachedText}.${stopText} Decide: inspect the named tasks, admit a repair with swarm_propose, or withdraw the blocking work with swarm_cancel.`, subjects,
-      options: { dedupKey: noticeKey, reason },
-      // Reuse the registered board-stall event rather than inventing a new type:
-      // `cause: 'scheduling-pass'` and `wedged` make the pass-level escalation
-      // distinguishable in the durable log and in every existing read path. It
-      // exists only with the row its `noticeKey` names.
-      event: { type: 'mission/stalled', data: {
-        cause: 'scheduling-pass',
-        passId: pass.id, runId: pass.operationId,
-        reason: `scheduling pass did not return within its ${bound}ms bound and advanced no durable state`,
-        wedged: true,
-        passStartedAt: pass.startedAt, boundMs: bound,
-        revisionBefore: pass.revisionBefore, revisionAtStall: revision,
-        missionFingerprint: fingerprint, stateUnchanged: pass.fingerprintBefore === fingerprint, unschedulable: stuck, noticeKey,
-        // R16-D: what the wedge was measured against, whether live work held it,
-        // and the subjects whose work it preserved. Nothing is released; the
-        // `release*` names are kept for every existing reader and describe the
-        // naming: `releasedAt` is the instant of the tick whose naming committed,
-        // `releaseGapMs` how long the body had held the mission by then,
-        // `releaseBoundMs` the bound the naming was measured against (the
-        // live-work bound when live work held it) and `releasedWhileLive` whether
-        // live work held it. `boundMs` keeps its original meaning (the pass's own
-        // stall bound).
-        releasedAt: now,
-        releaseBoundMs,
-        releaseGapMs: Math.max(0, now - pass.startedAt),
-        releasedWhileLive: heldByLiveWork,
-        liveSubjects: holders.map(holder => holder.subject),
-      } } })
-  }
-
-  /**
    * Close a pass when its body settles: remove the in-memory record (so the
    * next kick may queue a successor) and publish the pass end. R17-G5: the close
    * is a transition. While the pass was live, notices left its mid-pass commits
@@ -472,10 +435,10 @@ export class Scheduling {
 
   /**
    * S1/S2: the wedge detector. Runs from the tick timer, outside every mission
-   * queue and outside the pass it watches. A body still queued or running past
-   * the declared bound is named: the durable stall event is committed, the owner
-   * notice is delivered by the tick's queue-external outbox pump, never by the
-   * wedged mission queue, and the mission publishes as wedged until the body
+   * queue and outside the pass it watches. A body the verdict no longer counts
+   * live (`wedgeVerdict`) is named: the durable stall event is committed, the
+   * owner notice is delivered by the tick's queue-external outbox pump, never by
+   * the wedged mission queue, and the mission publishes as wedged until the body
    * settles. The queue keeps the body as the physical owner; each await it can
    * be in carries its own bound.
    *
@@ -483,30 +446,33 @@ export class Scheduling {
    * live lease or an in-flight quiescence may be progress, so the body is not
    * named at the first bound; but a healthy sibling's lease must not own the
    * whole board's clock forever, so past `stallPassReleaseBoundMs` it is named
-   * anyway, with the live work it was held by named and preserved untouched.
-   * Co-firing guards, named: `livePass` (mirrors the same bound, so no notice
-   * stays suppressed after the naming), the wedged publication (which judges
-   * the board while the body is wedged and names what no live path advances), the
-   * notice dedup (one naming per body and per naming fact) and the
-   * lease-renewal path (the naming changes no task, attempt or lease). `now` is
-   * the tick's one instant, read once for every body (`pastBound`).
+   * anyway, with the live work it was held by named and preserved untouched
+   * (`wedgeNotice`). The naming revokes nothing: the operation queue keeps the
+   * body as the physical owner until it actually returns, and a later kick is
+   * skipped until then. Co-firing guards, named: the verdict's `live` (the same
+   * bound, so no notice stays suppressed after the naming), the wedged
+   * publication (which judges the board while the body is wedged and names what
+   * no live path advances), the notice dedup (one naming per body and per naming
+   * fact) and the lease-renewal path (the naming changes no task, attempt or
+   * lease). `now` is the tick's one instant, read once for every body.
    */
   checkSchedulingPasses(now = this.k.now()): void {
     if (this.k.closed || this.k.shuttingDown) return
     for (const [missionId, pass] of this.passes) {
       if (pass.escalatedAt !== undefined) continue
-      const mission = this.k.store.get('missions', missionId)
+      const board = this.k.boardOf(missionId)
       // A paused or blocked mission is not named now; the body stays unnamed and
       // the first tick after the owner resumes it names the body if it is still
       // held (the resume does not go through the mission queue).
-      if (mission?.status !== 'active') continue
-      if (!this.pastBound(pass, now)) continue
-      const held = this.hasLiveWork(missionId)
-      // Inside the second bound live work keeps the body live: a pass that may
-      // legitimately be inside a long adapter await for that work is not named.
-      // Past it the window is over, and the notice names the subject that held it.
-      if (held && now - pass.startedAt < this.k.bounds.stallPassReleaseBoundMs) continue
-      this.escalateWedge(mission, pass, held, held ? this.liveWorkHolders(missionId) : [])
+      if (board.mission.status !== 'active') continue
+      // Inside its bound, or inside the release bound while live work holds it,
+      // the body may legitimately be inside a long adapter await: not named.
+      const verdict = wedgeVerdict(pass, board, now)
+      if (verdict.live) continue
+      // A naming that did not commit (a busy writer on that tick) throws, so the
+      // body stays unnamed and the next tick retries. Its F(S) is the kernel's
+      // digest of the board at this revision.
+      this.notices.record(missionId, wedgeNotice(board, pass, verdict, { at: this.k.now(), fingerprint: this.k.fingerprint(missionId), revision: this.k.store.revision() }))
       // The body counts as named once its naming fact is durable: written just
       // now, or held by the owner already. R17-G5: naming it is a transition
       // either way. It owes the wedged pass's own dispatch question and the
@@ -515,20 +481,6 @@ export class Scheduling {
       pass.escalatedAt = now
       this.notices.expectWedgedRelease(missionId)
     }
-  }
-
-  /**
-   * A live lease renewed by recorded operations, or a stop whose acknowledgement
-   * is in flight, is progress: the runtime must not report a stall while one
-   * exists (a false stall notice is a defect of the same severity as a missing
-   * one). A lease is only live while `leaseUntil` is in the future, so a pass
-   * that wedged long enough for every lease to lapse is still detected.
-   */
-  hasLiveWork(missionId: string): boolean {
-    const now = this.k.now()
-    return this.k.store.list('tasks', missionId).some(task =>
-      quiescencePending(task)
-      || (holdsOpenAttempt(task) && task.attempt.leaseUntil >= now))
   }
 
   /* ----------------------------------------------------------------------- *
@@ -596,7 +548,7 @@ export class Scheduling {
     if (silentMs < boundMs) return undefined
     const pass = this.passes.get(mission.id)
     return { family: 'attempt-silent', holder: member, subject: taskSubject(task), attemptId: attempt.id, lastDurableAt, silentMs, boundMs,
-      ...(pass !== undefined && this.pastBound(pass) ? { wedgedPass: { operationId: pass.operationId, boundMs: this.k.bounds.stallPassTimeoutMs } } : {}) }
+      ...(pass !== undefined && pastBound(pass, this.k.bounds, now) ? { wedgedPass: { operationId: pass.operationId, boundMs: this.k.bounds.stallPassTimeoutMs } } : {}) }
   }
 
   /**

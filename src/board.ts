@@ -398,6 +398,22 @@ export function stalled(board: Board): boolean {
 }
 
 /**
+ * R16-D: the board's live work, which may be progress while nothing is
+ * recorded: a task in its durable stop transition (`quiescencePending`), or one
+ * holding an open attempt whose lease has not lapsed at the board's clock. A
+ * scheduling body past its bound stays live while the board has some, inside
+ * its release bound, and its naming names these as the work that held it
+ * (`wedgeVerdict`, src/scheduling.ts). A lapsed lease is not live work, so a
+ * body wedged until every lease lapsed is named at its first bound. This is not
+ * the stall's running-or-stopping work (`reviewPathStalled`), which counts a
+ * running row whatever its lease: the lease path owns a lapsed one.
+ */
+export function liveWork(board: Pick<Board, 'tasks' | 'clock'>): Task[] {
+  const now = board.clock()
+  return board.tasks.filter(task => quiescencePending(task) || (holdsOpenAttempt(task) && task.attempt.leaseUntil >= now))
+}
+
+/**
  * R5-02: the live members a failed attempt may be re-routed to, in store
  * order: capable of the task, and never the member one of its own reviews is
  * bound to (`strandedReview`), whom a reroute would make that review's author.
