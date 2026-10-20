@@ -5,12 +5,13 @@
  * one: it stands on the kernel with the runtime's worker start and assignment,
  * the notices, the attempts, the workspace admission and the refusals. A
  * body's standing is a verdict of the board (`wedgeVerdict`, `passState`),
- * and so are the readiness, review and stall predicates the sweep asks
- * (src/board.ts); the sweep reads the board where it decides, after each of
- * its awaits.
+ * and so is each step of the sweep (`memberStep`, `afterStart`,
+ * `stillDispatchable`), over the readiness, review and stall predicates of
+ * src/board.ts; the sweep reads the board where it decides, after each of its
+ * awaits, and acts on the verdict.
  */
 import { id } from './store.ts'
-import { TERMINAL_STATES, holdsOpenAttempt, openAttempt, pendingStopOwner, subjectsOfTasks, taskSubject, terminal, turnEnded } from './task-graph.ts'
+import { TERMINAL_STATES, holdsOpenAttempt, openAttempt, pendingStopOwner, subjectsOfTasks, taskSubject, terminal, turnEnded, type HeldTask } from './task-graph.ts'
 import { asksHandle, eligible, isolationViolation, liveWork, noticeSubjectsFor, overdueStop, startBlocker, stillDispatchable, takesWork, unschedulable, type Board, type Bounds } from './board.ts'
 import { factKey, guardTerminalNotice, silenceNotice, type Notice, type Notices, type SilentAttempt } from './notices.ts'
 import { AdmissionRefusedError } from './scheduler.ts'
@@ -187,6 +188,75 @@ export function wedgeNotice(board: Board, pass: SchedulingPass, verdict: PassVer
     } } }
 }
 
+/* ----------------------------------------------------------------------- *
+ * The dispatch sweep's verdicts. Each is a function of the board the sweep
+ * reads where it decides (`Scheduling.dispatch`): at a member's boundary
+ * (`memberStep`), once the member's worker start settled (`afterStart`) and
+ * once the chosen task's preparation settled (`stillDispatchable`,
+ * src/board.ts). The sweep acts on each, and reads the board again after
+ * every await.
+ * ----------------------------------------------------------------------- */
+
+/** Where a dispatch sweep stands when it reaches a member of its order (`memberStep`). */
+export interface SweepCursor {
+  /** The member's place in the body's order. */
+  index: number
+  /** When the sweep reached the member before it (for the first member, when the sweep opened). */
+  since: number
+  /** Whether the body is a kicked one, handed its own record (`SchedulingPass`): only such a body stops early. */
+  timed: boolean
+  /** The members whose drain ended their chain in this sweep (`Scheduling.chainFailed`). */
+  ended: ReadonlySet<string>
+}
+
+/**
+ * What a dispatch sweep does at a member's boundary, on the board it reads
+ * there. `stop-early`: the member before it held a kicked body for a whole
+ * bound (`stallPassTimeoutMs`), so the body stops here and the next body
+ * sweeps from this member; the first member of an order is always stepped.
+ * `skip`: a member whose drain ended its chain, or that takes no work
+ * (`takesWork`). Otherwise `start` the member.
+ */
+export function memberStep(board: Pick<Board, 'tasks' | 'clock' | 'bounds'>, member: Member, cursor: SweepCursor): 'stop-early' | 'skip' | 'start' {
+  if (cursor.timed && cursor.index > 0 && board.clock() - cursor.since >= board.bounds.stallPassTimeoutMs) return 'stop-early'
+  return cursor.ended.has(member.id) || !takesWork(board.tasks, member) ? 'skip' : 'start'
+}
+
+/** What a dispatch sweep does with a member once its worker start settled (`afterStart`). */
+export type AfterStart = { kind: 'skip' } | { kind: 'close-out'; open: HeldTask } | { kind: 'dispatch'; task: Task }
+
+/**
+ * What a dispatch sweep does with the member it reached (`member`, the row it
+ * swept) once the member's worker start settled, on the board it reads after
+ * that await:
+ * - `skip` a member whose handle cannot take an assignment (`startBlocker`) or
+ *   that owes a stop. R15-A4/A5: the sweep and the owner-facing dispatch
+ *   question ask the same question, so a member the sweep skipped is never
+ *   described to the owner with a cause the sweep did not test. R10-09/S3: the
+ *   parked-member hatch keeps priority, so a parked member is dispatchable even
+ *   when the adapter reports its handle busy, since an assignment is exactly
+ *   the fresh input that unparks it;
+ * - a member that holds an open attempt is the W6 idle close-out's: `close-out`
+ *   when its worker ended its turn on that attempt (`turnEnded`), which nudges
+ *   it within a bounded retry and then checkpoints the workspace and re-pends
+ *   the task instead of leaving it a zombie until lease expiry. A parked owner
+ *   is not an abandoned turn (the lease path re-pends it without a credit), so
+ *   it is skipped, as is a turn that has not ended;
+ * - otherwise `dispatch` the first task the member is `eligible` for, by
+ *   priority and then age, or `skip` when there is none. R12-F9 (a task whose
+ *   text assumes prior work no content-carrying edge provides) is refused where
+ *   a dependency set is written: plan validation, propose() and the owner's
+ *   `changes.dependencies` amendment. Dispatch takes the first ready task as
+ *   admitted.
+ */
+export function afterStart(board: Board, member: Member): AfterStart {
+  if (startBlocker(board.view, member) !== undefined || pendingStopOwner(board.tasks, member.id)) return { kind: 'skip' }
+  const open = openAttempt(board.tasks, member.id)
+  if (open !== undefined) return memberPhaseOf(member) !== 'parked' && turnEnded(open) ? { kind: 'close-out', open } : { kind: 'skip' }
+  const [task] = board.tasks.filter(candidate => eligible(board, candidate, member)).sort((a, b) => b.priority - a.priority || a.createdAt - b.createdAt)
+  return task === undefined ? { kind: 'skip' } : { kind: 'dispatch', task }
+}
+
 export class Scheduling {
   /**
    * The scheduling body queued or running per mission (see `SchedulingPass`).
@@ -276,15 +346,18 @@ export class Scheduling {
         for (const [index, member] of order.entries()) {
           const reached = this.activeBoard(missionId)
           if (reached === undefined) return false
-          if (pass !== undefined && index > 0 && this.k.now() - memberSince >= this.k.bounds.stallPassTimeoutMs) {
-            pass.stoppedBefore = member.id
+          const step = memberStep(reached, member, { index, since: memberSince, timed: pass !== undefined, ended })
+          if (step === 'stop-early') {
+            // Only a kicked body stops early (`SweepCursor.timed`).
+            const stopped = pass!
+            stopped.stoppedBefore = member.id
             // A chain whose start member is gone restarts from this body's first one.
-            pass.chainFrom = end > 0 ? pass.chainFrom : order[0]!.id
+            stopped.chainFrom = end > 0 ? stopped.chainFrom : order[0]!.id
             return false
           }
           memberSince = this.k.now()
           progressed(pass, this.k.now())
-          if (ended.has(member.id) || !takesWork(reached.tasks, member)) continue
+          if (step === 'skip') continue
           // Round 14: the member's step is the last link of its chain (`chainFailed`).
           try {
           // The isolation invariant is decided on the board, a refusal is
@@ -298,35 +371,12 @@ export class Scheduling {
             if (this.activeBoard(missionId) === undefined) return false
             continue
           }
-          const board = this.activeBoard(missionId)
-          if (board === undefined) return false
-          // R10-09/S3: a parked member is dispatchable. The adapter's idle
-          // precondition can be false for a parked agent (a non-idle handle); an
-          // assignment is exactly the fresh input that unparks it, so the runtime
-          // must not let that precondition leave the board silent.
-          const parkedMember = memberPhaseOf(member) === 'parked'
-          // R15-A4/A5: the sweep and the owner-facing explanation ask the same
-          // question (`startBlocker`), so a member the sweep skipped is never
-          // described to the owner with a cause the sweep did not test. The
-          // parked-member hatch keeps priority: a parked member is dispatchable.
-          if (startBlocker(board.view, member) !== undefined) continue
-          if (pendingStopOwner(board.tasks, member.id)) continue
-          const open = openAttempt(board.tasks, member.id)
-          if (open !== undefined) {
-            // W6: the worker ended its turn with an open attempt. Nudge within a
-            // bounded retry, then checkpoint the workspace and re-pend the task
-            // instead of leaving it a zombie until lease expiry. A parked owner is
-            // not an abandoned turn: the lease path re-pends it without a credit.
-            if (!parkedMember && turnEnded(open)) await this.attempts.closeOutIdleAttempt(mission, member, open, pass)
-            continue
-          }
-          const choices = board.tasks.filter(t => eligible(board, t, member)).sort((a, b) => b.priority - a.priority || a.createdAt - b.createdAt)
-          // R12-F9 (a task whose text assumes prior work no content-carrying edge
-          // provides) is refused where a dependency set is written: plan
-          // validation, propose() and the owner's `changes.dependencies`
-          // amendment. Dispatch takes the first ready task as admitted.
-          const task = choices[0]
-          if (!task) continue
+          const started = this.activeBoard(missionId)
+          if (started === undefined) return false
+          const next = afterStart(started, member)
+          if (next.kind === 'skip') continue
+          if (next.kind === 'close-out') { await this.attempts.closeOutIdleAttempt(mission, member, next.open, pass); continue }
+          const { task } = next
           try {
             // Revocation fencing: a mission whose human authorization was withdrawn
             // is blocked here, before any adapter prepares a workspace or checkout.
