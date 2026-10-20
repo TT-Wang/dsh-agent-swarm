@@ -4,6 +4,7 @@ import type { Delivery, Mission } from './types.ts'
 import { terminal } from './task-graph.ts'
 import { openAsks } from './arena.ts'
 import { noticeSubjectsFor } from './board.ts'
+import { guardTerminalNotice } from './notices.ts'
 
 /** The nudge body: the question, the exact call, and the rule the owner must know. */
 function ownerReplyNudge(delivery: Delivery, attempt: number, limit: number): string {
@@ -147,12 +148,12 @@ export class OwnerReplyGuard {
     if (spent >= this.options.maxNudges) {
       // Idempotent by its own dedup key: the terminal is emitted once and later
       // turns re-derive the same decision without a second notice.
-      this.rt.notices.emitGuardTerminal(missionId, 'owner_reply', {
+      this.rt.notices.record(missionId, guardTerminalNotice(this.rt.boardOf(missionId), 'owner_reply', {
         detail: `question ${deliveryId} from ${from} still has no answer after ${spent} nudge(s)`,
         memberId: from,
         questionId: deliveryId,
         ...(taskId === undefined ? {} : { taskId }),
-      })
+      }))
       return
     }
     this.rt.commit(missionId, () => {

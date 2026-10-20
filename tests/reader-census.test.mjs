@@ -206,6 +206,9 @@ function writersOf(kind) {
 test('event writer discovery follows nested conditional type branches without counting unrelated strings', () => {
   const source = "store.event(mission, handoff ? 'task/handoff-ready' : closeout ? (exhausted ? 'task/closeout-exhausted' : 'task/closeout-ready') : 'task/quiescence-recovered', 'runtime', { note: 'not-an-event' });"
   assert.deepEqual(emittedEventTypes(source).sort(), ['task/handoff-ready', 'task/closeout-exhausted', 'task/closeout-ready', 'task/quiescence-recovered'].sort())
+  // A notice's event is written by its record: its type is a writer too, and a property named `event` that holds no type is not.
+  const notice = "notices.record(missionId, { content, subjects, options, event: { type: 'task/review-blocked', data: { reason } } }); const row = { event: { kind: 'not-an-event' } }"
+  assert.deepEqual(emittedEventTypes(notice), ['task/review-blocked'])
 })
 
 /** Coverage: every registry entry has exactly one row and no row is stale. */

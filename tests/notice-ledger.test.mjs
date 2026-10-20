@@ -15,9 +15,12 @@ import { createHash } from 'node:crypto'
 import { writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { FakeClock, FakeWorkers, MISSION_ACCEPTANCE, acceptThroughReview, blockThroughReview, eventually, events, setup, taskOf } from './faults/harness.mjs'
-import { BOARD_RUNNING, completionError, interpret, isolationIssues, reviewNeed } from '../lib/board.js'
+import { BOARD_RUNNING, completionError, interpret, isolationIssues, passState, reviewNeed } from '../lib/board.js'
 import { assertNamedCalls, ownerTools } from './refusal-inventory.mjs'
-import { NOTICE_TEMPLATES, factKey, noticeFamily, noticeTemplateKey } from '../lib/notices.js'
+import { NOTICE_TEMPLATES, factKey, guardTerminalNotice, noticeFamily, noticeTemplateKey, reviewBlocked } from '../lib/notices.js'
+
+/** The publication state of the body queued or running for `missionId`, judged on its board. */
+const stateOf = (runtime, missionId) => passState(runtime.boardOf(missionId))
 
 const ownerRows = f => f.runtime.store.list('deliveries', f.mission.id).filter(delivery => delivery.to === 'owner' && delivery.notice !== undefined)
 const stallRow = f => ownerRows(f).find(delivery => delivery.notice.trigger === 'mission/stalled' && delivery.content.startsWith('Mission stalled'))
@@ -450,7 +453,7 @@ test('D3: a submission whose review need ripened, beside a dependent that waits 
       f.workers.reportActivity(f.author.id, undefined)
       await Promise.resolve()
     },
-    'a wedged publication': async f => { f.runtime.notices.expectWedgedRelease(f.mission.id); await Promise.resolve() },
+    'a wedged publication': async f => { f.runtime.scheduling.expectWedgedRelease(f.mission.id); await Promise.resolve() },
   }
   for (const [route, judge] of Object.entries(routes)) {
     const f = await setup({ clock: new FakeClock() })
@@ -491,7 +494,7 @@ test('D3: a submission whose review need ripened, beside a dependent that waits 
   const deferred = ownerRows(recorded).filter(delivery => delivery.notice.dedupKey.startsWith(`review-blocked:${recorded.mission.id}:${source.id}:`))
   assert.deepEqual([reviewNeed(recorded.runtime.boardOf(recorded.mission.id), taskOf(recorded.runtime, source.id)).recorded, deferred.map(delivery => delivery.notice.reason), admitted(recorded, source)], [true, [BOARD_RUNNING], undefined], 'the admission recorded the need by deferring its review while the other work runs')
   recorded.runtime.cancel(recorded.owner, recorded.mission.id, { taskId: running.id, reason: 'Not needed' })
-  recorded.runtime.notices.expectWedgedRelease(recorded.mission.id)
+  recorded.runtime.scheduling.expectWedgedRelease(recorded.mission.id)
   await Promise.resolve()
   assert.deepEqual(told(recorded), [[], []], 'the recorded need: the wedged publication tells no W3 stall once the running work ends')
   await recorded.runtime.tick()
@@ -541,9 +544,9 @@ test('coverage-complete is told whenever completion is allowed, whatever the sta
   })
   await acceptThroughReview(f, f.propose())
   // The held stop is the one operation left: every pass and publication since has settled.
-  await eventually(() => !f.runtime.scheduling.passState(f.mission.id).passLive, 'the last pass ends')
+  await eventually(() => !stateOf(f.runtime, f.mission.id).passLive, 'the last pass ends')
   await ticks(f, 1)
-  await eventually(() => !f.runtime.scheduling.passState(f.mission.id).passLive, 'the tick\'s pass ends')
+  await eventually(() => !stateOf(f.runtime, f.mission.id).passLive, 'the tick\'s pass ends')
   const view = interpret(f.runtime.boardOf(f.mission.id))
   assert.deepEqual([completionError(view), view.stalled, taskOf(f.runtime, experiment.id).status], [undefined, false, 'blocked'], 'completion is allowed on a board the stall predicate calls live')
   assert.equal(ownerRows(f).filter(delivery => noticeFamily(delivery) === 'coverage-complete').length, 1, 'coverage-complete is told')
@@ -799,7 +802,7 @@ test('a review-blocked decision an older build wrote for a submission without an
     await f.runtime.settle(f.mission.id)
     // The decision 29a0268 wrote for this source past its grace, through the same emitter, with its event: the running board's cause.
     const row = taskOf(f.runtime, source.id)
-    f.runtime.notices.notifyReviewBlocked(f.runtime.mission(f.mission.id), row, reviewNeed(f.runtime.boardOf(f.mission.id), row).id, BOARD_RUNNING)
+    f.runtime.notices.record(f.mission.id, reviewBlocked(f.runtime.boardOf(f.mission.id), row, reviewNeed(f.runtime.boardOf(f.mission.id), row).id, BOARD_RUNNING))
     const [legacy] = ownerRows(f).filter(delivery => noticeFamily(delivery) === 'review-blocked')
     assert.equal(legacy.notice.dedupKey, `review-blocked:${f.mission.id}:${source.id}:${reviewNeed(f.runtime.boardOf(f.mission.id), row).id}:${BOARD_RUNNING}`, `running=${running}: the older build's key`)
     // After the upgrade the running work goes on, or the owner withdraws it and the board has nothing else to do.
@@ -1174,7 +1177,7 @@ test('a judgement of a board whose fact the owner holds commits nothing, and a t
   }
 })
 
-test('a wedged pass\'s naming is outstanding while the work it named is unfinished at the epochs it named, whatever a body does now: it stays the owner\'s to read once the body settles, a later body on the same fact is told by that row, and it ends when the named work moves on', async t => {
+test('a wedged pass\'s naming is outstanding while the mission publishes its pass as wedged and the work it named is unfinished at the epochs it named: withheld once its body settled, told by its row while a later body wedges on the same fact, and ended when the named work moves on', async t => {
   const f = await setup({ clock: new FakeClock() })
   t.after(f.cleanup)
   const task = f.propose({ title: 'Never reached' })
@@ -1183,26 +1186,31 @@ test('a wedged pass\'s naming is outstanding while the work it named is unfinish
   const first = wedgedBody(t, f, 'operation_wedge_open')
   const [naming] = wedgeRows(f)
   assert.deepEqual(naming.subjects, [`${task.id}@${taskOf(f.runtime, task.id).epoch}`], 'the naming names the work the pass never reached')
-  // The hung call returns at its own bound before the owner has read the naming.
+  assert.deepEqual([stateOf(f.runtime, f.mission.id).wedged, relevant(f, naming)], [true, true], 'it is outstanding while the body is wedged')
+  // The hung call returns at its own bound before the naming was delivered.
   scheduling.closePass(f.mission.id, first)
-  assert.deepEqual([f.runtime.scheduling.passState(f.mission.id).wedged, relevant(f, naming)], [false, true], 'no body is wedged, and the naming is still the owner\'s to read')
-  // Later bodies wedge on the same fact and settle: the one row tells them, in every phase.
-  for (const operationId of ['operation_wedge_2', 'operation_wedge_3']) {
-    const body = wedgedBody(t, f, operationId)
-    assert.deepEqual([body.escalatedAt !== undefined, wedgeRows(f).length, relevant(f, naming)], [true, 1, true], 'a body on the held fact writes no row: the row the owner can read tells it')
-    scheduling.closePass(f.mission.id, body)
-    assert.equal(relevant(f, naming), true)
-  }
+  assert.deepEqual([stateOf(f.runtime, f.mission.id).wedged, relevant(f, naming)], [false, false], 'no body is wedged, so the wedge it names has ended')
   await f.runtime.notices.flushOutbox(f.mission.id)
-  assert.ok(f.runtime.store.get('deliveries', naming.id).deliveredAt !== undefined, 'it is delivered with no body wedged')
+  assert.equal(f.runtime.store.get('deliveries', naming.id).deliveredAt, undefined, 'and the queued naming is withheld')
+  // A later body wedges on the same fact: the row the ledger holds tells it, delivered and reminded while that body is wedged.
+  const second = wedgedBody(t, f, 'operation_wedge_2')
+  assert.deepEqual([second.escalatedAt !== undefined, wedgeRows(f).length, relevant(f, naming)], [true, 1, true], 'a body on the held fact writes no row: the row the ledger holds tells it')
+  await f.runtime.notices.flushOutbox(f.mission.id)
+  assert.ok(f.runtime.store.get('deliveries', naming.id).deliveredAt !== undefined, 'it is delivered while that body is wedged')
   const reminder = ordinal => ownerRows(f).find(delivery => delivery.notice.dedupKey === `obligation-followup:${naming.id}:${ordinal}`)
   f.clock.advance(f.runtime.notices.obligationFollowupMs)
   f.runtime.notices.absenceNet(f.mission.id)
-  assert.deepEqual(reminder(1)?.subjects, naming.subjects, 'and reminded while no live path advances the work it named')
-  // A later pass reaches the work: its member takes it, at a new epoch.
+  assert.deepEqual(reminder(1)?.subjects, naming.subjects, 'and reminded while that body is wedged and the work it named is unfinished')
+  scheduling.closePass(f.mission.id, second)
+  f.clock.advance(f.runtime.notices.obligationFollowupMs)
+  f.runtime.notices.absenceNet(f.mission.id)
+  assert.equal(reminder(2), undefined, 'not once that body settled, with a reminder left')
+  // A third body wedges on the fact, and the work moves on under it: its member takes it, at a new epoch.
+  wedgedBody(t, f, 'operation_wedge_3')
+  assert.equal(relevant(f, naming), true)
   await f.runtime.claim(f.actor(f.author), f.mission.id, task.id)
   assert.notEqual(`${task.id}@${taskOf(f.runtime, task.id).epoch}`, naming.subjects[0])
-  assert.equal(relevant(f, naming), false, 'the naming ends when the work it named moves on')
+  assert.deepEqual([stateOf(f.runtime, f.mission.id).wedged, relevant(f, naming)], [true, false], 'the naming ends when the work it named moves on, though a body is wedged')
   f.clock.advance(f.runtime.notices.obligationFollowupMs)
   f.runtime.notices.absenceNet(f.mission.id)
   assert.equal(reminder(2), undefined, 'and so do its reminders')
@@ -1593,7 +1601,7 @@ test('a wedged pass\'s naming of several tasks is outstanding for the work still
     // The owner withdraws one named task. The body is still wedged, and a body is named once.
     f.runtime.cancel(f.owner, f.mission.id, { taskId: two.id, reason: 'Not needed' })
     await ticks(f, 2)
-    assert.deepEqual([f.runtime.scheduling.passState(f.mission.id).wedged, f.runtime.scheduling.passes.get(f.mission.id) === body, wedgeRows(f).length, taskOf(f.runtime, one.id).status], [true, true, 1, 'pending'],
+    assert.deepEqual([stateOf(f.runtime, f.mission.id).wedged, f.runtime.scheduling.passes.get(f.mission.id) === body, wedgeRows(f).length, taskOf(f.runtime, one.id).status], [true, true, 1, 'pending'],
       'the body is still wedged on work it named, and nothing names it again')
     assert.equal(relevant(f, naming), true, `the ${delivered ? 'delivered naming stays in the owner\'s inbox' : 'queued naming is still delivered'}: it is the one record of the wedge that holds the remaining work`)
     assert.deepEqual((await remind(f, naming)).map(delivery => delivery.subjects), [[subjectOf(f, one)]], 'its reminder names the work still unfinished')
@@ -1908,7 +1916,7 @@ test('the fall-through names stuck work at its epoch, once, beside an open reque
       // Work only the reviewer may take, dead once the reviewer is gone, with a request raised for it.
       const stuck = f.propose({ title: 'Reviewer-only work', kind: 'research', checks: [], assigneeId: f.reviewer.id })
       f.runtime.commit(f.mission.id, () => f.runtime.store.put('members', { ...f.runtime.store.get('members', f.reviewer.id), phase: 'stopped' }))
-      f.runtime.notices.emitGuardTerminal(f.mission.id, 'attempt_lease', { taskId: stuck.id, localKey: 'closeout-abandoned:attempt_abandoned', detail: 'idle close-out abandoned attempt attempt_abandoned and re-pended the task' })
+      f.runtime.notices.record(f.mission.id, guardTerminalNotice(f.runtime.boardOf(f.mission.id), 'attempt_lease', { taskId: stuck.id, localKey: 'closeout-abandoned:attempt_abandoned', detail: 'idle close-out abandoned attempt attempt_abandoned and re-pended the task' }))
       await quiet(f)
       // The board digest moves: work queued behind the author's live lease.
       f.propose({ title: 'Queued work', kind: 'research', checks: [] })

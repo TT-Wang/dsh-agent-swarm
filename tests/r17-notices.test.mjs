@@ -39,7 +39,7 @@ import { fileURLToPath } from 'node:url'
 import { Context } from '@deepseek-ai/cordis'
 import ts from 'typescript'
 import { SwarmRuntime } from '../lib/runtime.js'
-import { NOTICE_TEMPLATES, noticeTemplateKey } from '../lib/notices.js'
+import { NOTICE_TEMPLATES, judge, noticeTemplateKey, parkedHolder } from '../lib/notices.js'
 import { OwnerReplyGuard } from '../lib/owner-reply.js'
 import { tempDirectory } from './temp-root.mjs'
 import { FakeClock, FakeWorkers, NO_GRANTS } from './faults/harness.mjs'
@@ -271,6 +271,10 @@ function blockTask(f, task) {
   f.runtime.store.put('tasks', row)
   return row
 }
+/** Records the notices of one family that the judgement of `view` (by default the board as it is now) owes the owner. */
+function tellFamily(f, family, view = interpret(f.runtime.boardOf(f.mission.id))) {
+  for (const notice of judge(view)) if ((notice.options.statement?.family ?? notice.options.dedupKey?.split(':')[0]) === family) f.runtime.notices.record(f.mission.id, notice)
+}
 /** Makes a proposed task wait on another, as the store would hold it. */
 function dependOn(f, task, dependency) {
   const row = f.runtime.store.get('tasks', task.id)
@@ -287,7 +291,7 @@ test('R17-G2a: the stall-root body replays from the blocked row alone', async t 
   const stranding = blockTask(f, f.propose('Blocked work', { assigneeId: member.id }))
   const lone = blockTask(f, f.propose('Blocked alone', { assigneeId: member.id }))
   dependOn(f, f.propose('Waits on the blocked work'), stranding)
-  f.runtime.notices.notifyStallRoots(interpret(f.runtime.boardOf(f.mission.id)))
+  tellFamily(f, 'stall-root')
   for (const task of [stranding, lone]) {
     const root = f.runtime.store.get('tasks', task.id)
     const notice = ownerNotice(f, `stall-root:${f.mission.id}:${subjectOf(root)}`)
@@ -315,7 +319,7 @@ test('R17-G2b: the W3 stall body replays from the unschedulable rows alone', asy
   dependOn(f, prerequisite, waiting)
   const stall = () => {
     const view = interpret(f.runtime.boardOf(f.mission.id))
-    f.runtime.notices.notifyBoard(view)
+    tellFamily(f, 'board-stall', view)
     return { view, reason: completionError(view), notice: f.ownerNotices().filter(delivery => delivery.notice.dedupKey.startsWith('board-stall:')).at(-1) }
   }
   // First nothing is unschedulable: two pending rows wait on each other, so the
@@ -392,7 +396,7 @@ test('R17-G2d: the integration-gap and coverage-complete bodies replay from the 
     f.runtime.store.put('tasks', { ...accepted, status: 'accepted', covers: f.mission.acceptance.map((_, index) => `c${index + 1}`), artifact: { commit: 'c', baseCommit: 'b', workspace: '/isolated', changedPaths: [] } })
     f.runtime.store.put('tasks', { ...withdrawn, status: 'cancelled' })
   })
-  f.runtime.notices.notifyBoard(interpret(f.runtime.boardOf(f.mission.id)))
+  tellFamily(f, 'coverage-complete')
   const coverage = ownerNotice(f, 'coverage-complete:')
   assert.ok(coverage, 'the coverage-complete notice was reported')
   assert.deepEqual(coverage.notice.statement, { family: 'coverage-complete', counts: {} }, 'the body is the coverage-complete template and states no count')
@@ -410,7 +414,7 @@ test('R17-G2e: the parked-holder body replays from the running task row alone', 
   const parked = f.runtime.store.get('members', member.id)
   parked.phase = 'parked'
   f.runtime.store.put('members', parked)
-  f.runtime.notices.notifyParkedHolder(f.runtime.store.get('missions', f.mission.id), f.runtime.store.get('tasks', task.id))
+  f.runtime.notices.record(f.mission.id, parkedHolder(f.mission.id, f.runtime.store.get('tasks', task.id)))
   const notice = ownerNotice(f, 'parked:')
   assert.ok(notice, 'the parked holder was reported')
   const row = f.runtime.store.get('tasks', task.id)
@@ -494,7 +498,7 @@ test('R17-G2: every reviewed notice body replays from the rows it cites', async 
   const row = f.runtime.store.get('tasks', blocked.id)
   row.status = 'blocked'; row.epoch += 1; row.output = 'blocked for repair'
   f.runtime.store.put('tasks', row)
-  await f.runtime.notices.notifyStallRoots(interpret(f.runtime.boardOf(f.mission.id)))
+  tellFamily(f, 'stall-root')
 
   const deliveries = f.ownerNotices().filter(delivery => noticeTemplateKey(delivery) !== undefined)
   assert.ok(deliveries.length >= 1, 'a reviewed template was emitted')

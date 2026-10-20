@@ -7,11 +7,11 @@ import { PolicyError } from './policy-error.ts'
 export { WorkspaceRevokedError } from './authorization.ts'
 import { recordedClaim, type WorkspaceClaim } from './authorization.ts'
 import { WorkspaceAdmission, deniedGitWrite, gitWriteDeniedMessage, TEMP_RENDEZVOUS_WINDOW_MS } from './workspace-admission.ts'
-import { Notices, NOTICE_TEMPLATES, REJECTION_DECISION_TRIGGER, assignmentCurrent, renderNotice } from './notices.ts'
+import { Notices, NOTICE_TEMPLATES, REJECTION_DECISION_TRIGGER, assignmentCurrent, guardTerminalNotice, integrationGap, renderNotice, reviewBlocked } from './notices.ts'
 import { RefusalRegistry, requireStrings, requireText, sameChecks, unsupportedEffort, validatedBudget } from './refusals.ts'
 import { Scheduling } from './scheduling.ts'
-import { progressed, type Kernel, type SchedulingPass } from './kernel.ts'
-import { ADMISSION_REFUSED, AUTOMATIC_REVIEW_PREFIX, bounds, capable, completionError, fingerprintBoard, inFlightEstimate, missionFingerprint, noticeSubjectsFor, readBoard, readinessBlocker, readMission, ready, rerouteTarget, reviewable, reviewNeed, reviewPathBlocker, reviewPathStalled, stillChosen, unreviewedSources, unschedulable, type AdapterView, type Board, type Bounds, type ReviewNeed } from './board.ts'
+import { progressed, type Kernel } from './kernel.ts'
+import { ADMISSION_REFUSED, AUTOMATIC_REVIEW_PREFIX, bounds, capable, completionError, fingerprintBoard, inFlightEstimate, missionFingerprint, noticeSubjectsFor, readBoard, readinessBlocker, readMission, ready, rerouteTarget, reviewable, reviewNeed, reviewPathBlocker, reviewPathStalled, stillChosen, unreviewedSources, unschedulable, type AdapterView, type Board, type Bounds, type ReviewNeed, type SchedulingPass } from './board.ts'
 // R17-G6/G7: the one derivation of mission derived state and its host projection.
 import { deriveMemberStatus, memberPhaseOf, memberDeliveryHealth, type MissionBoardMember } from './projection.ts'
 export { emptyUsage, addUsage } from './gates.ts'
@@ -225,10 +225,8 @@ export class SwarmRuntime implements Kernel {
    * delivers them, on the kernel and the refusal registry, where a guard
    * terminal a busy writer refused is queued. Every caller reaches it as
    * `notices`: the runtime's body, the seams, index.ts, roles.ts and the tests.
-   * Its one reach above the kernel is the scheduling pass state its
-   * publication reads, handed down as a closure over `scheduling`.
    */
-  readonly notices = new Notices(this, this.refusals, missionId => this.scheduling.passState(missionId))
+  readonly notices = new Notices(this, this.refusals)
 
   /**
    * M1a seam 1/7: lease and attempt accounting, on the kernel and the notices.
@@ -560,8 +558,11 @@ export class SwarmRuntime implements Kernel {
       operation.id = id('operation')
       return await fn()
     } catch (error) {
-      if (error instanceof Error && error.message.startsWith('[mission_operation_pending]')) {
-        this.notices.emitGuardTerminal(missionId, 'workspace', { localKey: `mission-operation-pending:${operation.id}`, detail: error.message })
+      // A mission's queue that refused a wait ends that mission's workspace
+      // chain. A start request's, a draft's or a delivery's queue has no
+      // mission to tell: its caller alone is refused.
+      if (error instanceof Error && error.message.startsWith('[mission_operation_pending]') && this.store.get('missions', missionId) !== undefined) {
+        this.notices.record(missionId, guardTerminalNotice(this.boardOf(missionId), 'workspace', { localKey: `mission-operation-pending:${operation.id}`, detail: error.message }))
       }
       throw error
     } finally {
@@ -603,7 +604,7 @@ export class SwarmRuntime implements Kernel {
       return value
     }) } finally { this.commitDepth -= 1 }
     for (const listener of this.listeners) { try { listener(missionId) } catch { /* A UI subscriber cannot roll back committed work. */ } }
-    this.notices.transition(missionId)
+    this.scheduling.transition(missionId)
     return result
   }
   /** Subscribe to committed state changes. */
@@ -644,8 +645,8 @@ export class SwarmRuntime implements Kernel {
    * and end.
    */
   readonly view: AdapterView = { startable: memberId => this.workers.isIdle(memberId), activity: memberId => this.workers.currentActivity(memberId) }
-  /** One mission's board as the store holds it now: a decision reads it where it decides. */
-  boardOf(missionId: string): Board { return readBoard(this.store, missionId, this.now, this.bounds, this.view) }
+  /** One mission's board as the store holds it now, with the scheduling body queued or running for it: a decision reads it where it decides. */
+  boardOf(missionId: string): Board { return readBoard(this.store, missionId, this.now, this.bounds, this.view, this.scheduling.passes.get(missionId)) }
   participant(actor: Actor, missionId: string): { mission: Mission; member?: Member; key: string; owner: boolean } {
     const mission = this.mission(missionId)
     if (mission.ownerSessionId === actor.sessionId) return { mission, key: 'owner', owner: true }
@@ -1036,7 +1037,7 @@ export class SwarmRuntime implements Kernel {
     // so its tool result carries it; the owner's own is thrown below.
     const refuse = (budget: 'task' | 'experiment', admitted: number, limit: number): void => {
       const reason = `mission ${budget} budget exhausted (${admitted}/${limit} ${budget}s admitted)`
-      this.notices.emitGuardTerminal(mission.id, 'task_ceiling', { detail: reason, localKey: `${budget}-budget:${limit}` })
+      this.notices.record(mission.id, guardTerminalNotice(this.boardOf(mission.id), 'task_ceiling', { detail: reason, localKey: `${budget}-budget:${limit}` }))
       if (owner) return
       this.commit(mission.id, () => this.store.event(mission.id, 'task/proposal-refused', key, { memberId: key, title: input.title, reason, limit }))
       throw new Error(`Worker ${key} cannot propose ${JSON.stringify(input.title)}: ${reason} (limit ${limit}). The owner can raise the mission ceiling with swarm_budget or admit the work with swarm_propose.`)
@@ -1134,7 +1135,7 @@ export class SwarmRuntime implements Kernel {
       for (const change of checkChanges) this.store.event(missionId, 'task/check-changed', key, { taskId: task.id, reason: 'replacement', ...change })
     })
     this.gates.warnBudget(this.mission(missionId))
-    this.notices.warnIntegrationGap(mission, task)
+    this.notices.record(missionId, integrationGap(this.boardOf(missionId), task))
     this.kick(missionId)
     return owner ? task : memberTask(this.boardOf(missionId), task)
   }
@@ -2038,8 +2039,9 @@ export class SwarmRuntime implements Kernel {
       const need = reviewNeed(this.boardOf(mission.id), source)
       if (!need.ripe) continue
       if (!need.recorded) this.reportMissingReview(mission, source)
-      const blocked = reviewPathBlocker(this.boardOf(mission.id), source, need, stalled)
-      if (blocked !== undefined) this.notices.notifyReviewBlocked(mission, source, need.id, blocked)
+      const board = this.boardOf(mission.id)
+      const blocked = reviewPathBlocker(board, source, need, stalled)
+      if (blocked !== undefined) this.notices.record(mission.id, reviewBlocked(board, source, need.id, blocked))
       else this.admitAutomaticReview(mission, source, need)
     }
   }
@@ -2068,7 +2070,7 @@ export class SwarmRuntime implements Kernel {
       // what to admit instead. A busy writer or any other failure is not a
       // refusal: it leaves the pass, and the next pass proposes again.
       if (!(error instanceof PolicyError)) throw error
-      this.notices.notifyReviewBlocked(mission, source, need.id, `${ADMISSION_REFUSED}${error instanceof Error ? error.message : String(error)}`)
+      this.notices.record(mission.id, reviewBlocked(this.boardOf(mission.id), source, need.id, `${ADMISSION_REFUSED}${error instanceof Error ? error.message : String(error)}`))
       return
     }
     // The review already exists and its task/proposed event is durable; a busy
@@ -3020,7 +3022,7 @@ export class SwarmRuntime implements Kernel {
   /** Automatic completion consumes accepted obligations; it never withdraws unfinished work.
    * Owner-assembled missions retain explicit completion (R10-14: an owner-assembled
    * mission may still be extending its plan); the board classifier tells the owner
-   * of a stalled board or a coverage-complete owner-assembled mission (`Notices.judgeBoard`).
+   * of a stalled board or a coverage-complete owner-assembled mission (`judge`, src/notices.ts).
    */
   private completeAutomatic(missionId: string): boolean {
     const mission = this.mission(missionId)
@@ -3402,8 +3404,8 @@ export class SwarmRuntime implements Kernel {
     })
     // S4b: the durable event carried the code, the owner notice did not. The
     // shared coded terminal names the task, the dimension and the exits.
-    this.notices.emitGuardTerminal(mission.id, 'task_ceiling', { taskId: task.id, ...(ownerId === undefined ? {} : { memberId: ownerId }), localKey: `ceiling:${taskSubject(task)}:${ceiling.dimension}`,
-      detail: `${task.title} (${task.id}) exhausted its own ${ceiling.dimension} ceiling (${ceiling.used}/${ceiling.limit}) and blocked` })
+    this.notices.record(mission.id, guardTerminalNotice(this.boardOf(mission.id), 'task_ceiling', { taskId: task.id, ...(ownerId === undefined ? {} : { memberId: ownerId }), localKey: `ceiling:${taskSubject(task)}:${ceiling.dimension}`,
+      detail: `${task.title} (${task.id}) exhausted its own ${ceiling.dimension} ceiling (${ceiling.used}/${ceiling.limit}) and blocked` }))
     this.attempts.resumeStoppedAttempt(mission.id, task)
     this.kick(mission.id)
   }
@@ -3723,7 +3725,7 @@ export class SwarmRuntime implements Kernel {
    * same synchronous step that closes the stopped body, so the close publishes
    * as inside that live pass, never as a finished sweep that left the unswept
    * members' work undispatched. The body is handed its own record (`schedule`),
-   * which it stamps with its own progress (`Scheduling.passState`).
+   * which it stamps with its own progress (`passState`).
    */
   kick(missionId: string, after?: SchedulingPass): void {
     if (this.shuttingDown || this.closed) return

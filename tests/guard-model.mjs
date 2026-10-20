@@ -3,8 +3,8 @@
  *
  * The kernel obligation is structural: every guard chain ends in an escalation
  * that has no conditions of its own, so a dead end is impossible. In production
- * that terminal element is `Notices.emitGuardTerminal` (src/notices.ts), which every
- * chain calls directly with `guardTerminal`'s coded request. This module is the
+ * that terminal element is `guardTerminalNotice` (src/notices.ts), which every
+ * chain records directly with `guardTerminal`'s coded request. This module is the
  * vocabulary the property test and the dead-end census use to CHECK that claim
  * over a generated board space: `guardDispatchActions` and `guardProgressActions`
  * describe every action an earlier element of a chain can still produce;
@@ -14,7 +14,7 @@
  *
  * It lived in src/scheduling.ts until nothing in src/ called it: the dispatch
  * path decides with its own predicates and escalates through
- * `emitGuardTerminal`, never through `guardActions`. Moving it here keeps the
+ * `guardTerminalNotice`, never through `guardActions`. Moving it here keeps the
  * census and the property test while shipping no decision code production does
  * not run.
  *
@@ -171,7 +171,7 @@ export function terminalEscalation(board) {
  * True only for the mission statuses no actor can bring back: `completed` and
  * `stopped`. Everything else — including `blocked` (a budget stop) and `paused` —
  * still owes the owner an executable action, which is the whole point of the
- * terminal element (`emitGuardTerminal` bails only on a terminal mission).
+ * terminal element (`guardTerminalNotice` owes nothing only on a terminal mission).
  */
 export function guardMissionTerminal(board) {
   return board.mission.status === 'completed' || board.mission.status === 'stopped'

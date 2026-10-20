@@ -34,7 +34,11 @@ export function persistentCollections(text, filename) {
   return found
 }
 
-/** Read only the event type argument, including nested conditional branches and named literals. */
+/**
+ * Read only the event type argument, including nested conditional branches and
+ * named literals: of a `store.event(missionId, type, …)` call, and of a
+ * notice's event (`event: { type, data }`, which `Notices.record` writes).
+ */
 export function emittedEventTypes(text, filename, constants = new Map()) {
   const tree = sourceTree(text, filename), result = new Set()
   const read = expression => {
@@ -46,6 +50,9 @@ export function emittedEventTypes(text, filename, constants = new Map()) {
   }
   const visit = node => {
     if (ts.isCallExpression(node) && ts.isPropertyAccessExpression(node.expression) && node.expression.name.text === 'event') read(node.arguments[1])
+    if (ts.isPropertyAssignment(node) && ts.isIdentifier(node.name) && node.name.text === 'event' && ts.isObjectLiteralExpression(node.initializer)) {
+      read(node.initializer.properties.find(property => ts.isPropertyAssignment(property) && ts.isIdentifier(property.name) && property.name.text === 'type')?.initializer)
+    }
     ts.forEachChild(node, visit)
   }
   visit(tree)

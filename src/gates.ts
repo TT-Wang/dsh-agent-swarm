@@ -12,13 +12,13 @@
  */
 import { createHash } from 'node:crypto'
 import { id } from './store.ts'
-import { arenaView as projectArenaView, hasNotice, openAsks } from './arena.ts'
+import { arenaView as projectArenaView, openAsks } from './arena.ts'
 import { TERMINAL_STATES, currentEvidenceIds, holdsOpenAttempt, subjectsOfTasks, terminal } from './task-graph.ts'
 import { excerpt } from './check-results.ts'
 import type { DeclaredChecks } from './declared-checks.ts'
 import { executionElapsed, exhaustedDimensions } from './resource-time.ts'
 import { dispatchable, inFlightEstimate, stepsInFlight } from './board.ts'
-import { noticeFamily, noticeIdentity, type Notices } from './notices.ts'
+import { guardTerminalNotice, held, noticeFamily, noticeIdentity, type Notices } from './notices.ts'
 import type { RefusalRegistry } from './refusals.ts'
 import type { Kernel } from './kernel.ts'
 import type { Delivery, Mission, Post, Task, UsageBuckets, UsageSnapshotSource } from './types.ts'
@@ -247,7 +247,7 @@ export class RuntimeGates {
       const crossed = thresholds.filter(threshold => projected / item.limit >= threshold).at(-1)
       const review = `budget-review:${mission.id}:${item.task?.id ?? 'mission'}:${item.dimension}:${item.limit}`, subjects = subjectsOfTasks(item.task === undefined ? [] : [item.task], mission)
       if (crossed === undefined || thresholds.some(threshold => threshold >= crossed
-        && hasNotice(ledger ??= this.k.store.list('deliveries', mission.id), noticeIdentity(mission.id, subjects, { noticeClass: 'budget', dedupKey: `${review}:${threshold}` }).identity))) continue
+        && held(ledger ??= this.k.store.list('deliveries', mission.id), mission.id, { subjects, options: { noticeClass: 'budget', dedupKey: `${review}:${threshold}` } }))) continue
       // This is only the numeric floor that restores threshold headroom, never
       // an estimate of the resources needed to finish the mission.
       const recommendation = Math.max(item.limit + 1, Math.ceil(Number((projected / thresholds[0]!).toFixed(6))))
@@ -302,12 +302,12 @@ export class RuntimeGates {
     // S4b: the budget chain's terminal. The mission is durably blocked and the
     // in-flight attempts are preserved; the owner gets the shared coded decision
     // request (chain budget, exits swarm_budget/swarm_cancel/swarm_control)
-    // instead of a prose-only reason. `emitGuardTerminal` proceeds for the
+    // instead of a prose-only reason. `guardTerminalNotice` owes it for the
     // non-terminal `blocked` status (S4r-D5), which is exactly this state.
     // Co-firing guards: the budget guard fires with the attempt/lease chain (the
     // preserved attempts) and with the dispatch sweep (nothing new is admitted
     // while the pause holds).
-    this.notices.emitGuardTerminal(mission.id, 'budget', { detail: mission.reason!, localKey: `budget-pause:${mission.budgetPause.id}` })
+    this.notices.record(mission.id, guardTerminalNotice(this.k.boardOf(mission.id), 'budget', { detail: mission.reason!, localKey: `budget-pause:${mission.budgetPause.id}` }))
     this.beginBudgetStop(mission.id, mission.budgetPause.id)
   }
 

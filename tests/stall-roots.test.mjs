@@ -775,15 +775,15 @@ test('a back-off whose bound passes while a pass judges the board is still judge
   const notices = f.runtime.notices
   const namedB = () => f.fallthroughs().find(delivery => delivery.subjects?.includes(bSubject))
   let spun
-  const judge = notices.judgeBoard.bind(notices)
-  notices.judgeBoard = (...args) => {
+  const ensure = notices.ensureWitness.bind(notices)
+  notices.ensureWitness = (missionId, options) => {
     const start = f.clock.now()
-    const result = judge(...args)
+    const result = ensure(missionId, options)
     // The first judgement after A's bound runs past B's bound: a slow tail. What
     // it found is read before the clock moves: B's wait on the board it judged
-    // (the classifier it asks, at its instant), and whether it named B.
+    // (the classifier it asks, on that board's rows at its instant), and whether it named B.
     if (spun === undefined && start > boundA && start < boundB) {
-      const [view] = args
+      const view = interpret(f.runtime.boardOf(missionId))
       spun = { waits: waitsLegitimately(view, view.tasks.find(task => task.id === b.id)), named: namedB() !== undefined }
       f.clock.advance(boundB + 2 - f.clock.now()) /* a slow judgement */
     }

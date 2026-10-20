@@ -8,7 +8,8 @@
  * ceilings and dispatch preconditions (the owner-reply receipt chain is
  * tests/owner-reply.test.mjs's). When every earlier element answers "no",
  * `terminalEscalation` names the chain and `guardTerminal` renders the coded
- * decision request that `emitGuardTerminal` records durably.
+ * decision request whose notice (`guardTerminalNotice`) `Notices.record`
+ * records durably.
  *
  * Three things are checked here, and none of them is a hand-picked sample:
  *
@@ -49,6 +50,7 @@ import assert from 'node:assert/strict'
 import { setTimeout as sleep } from 'node:timers/promises'
 import { guardActions, guardBoard, guardDispatchActions, guardMissionTerminal, guardProgressActions, guardTerminalChain, terminalEscalation } from './guard-model.mjs'
 import { guardTerminal } from '../lib/refusals.js'
+import { guardTerminalNotice } from '../lib/notices.js'
 import { dependencyAssumptions, reconcileTaskAdmission } from '../lib/admission.js'
 import { assessText, ownerTools, sessionTools, toolSchemaIndex } from './refusal-inventory.mjs'
 import { setup, eventually, events, FakeClock, budget } from './faults/harness.mjs'
@@ -435,20 +437,23 @@ test('R14 runtime (task ceiling chain): a refused worker proposal escalates as t
   } finally { await f.cleanup() }
 })
 
-test('R14 hand-off mechanism: emitGuardTerminal lets any call site opt in mechanically, and deduplicates per opener', async () => {
-  // The hand-off is this call: a site builds nothing, it names its chain and
-  // passes the scope it already has with the fact that opened the terminal. The
-  // test proves the path end to end, so a site can be wired without guessing
-  // what the mechanism returns or how a repeat is suppressed.
+test('R14 hand-off mechanism: guardTerminalNotice lets any call site opt in mechanically, and its record deduplicates per opener', async () => {
+  // The hand-off is this call: a site names its chain and passes the scope it
+  // already has with the fact that opened the terminal, on the board, and
+  // records the notice. The test proves the path end to end, so a site can be
+  // wired without guessing what the mechanism returns or how a repeat is
+  // suppressed.
   const f = await setup()
   try {
     const task = f.propose({ title: 'Held work' })
     const context = { taskId: task.id, memberId: f.author.id, detail: 'the workspace guard refused the close-out (Member has uncommitted commits)', localKey: `closeout-refused:${task.id}@${task.epoch}` }
-    const terminal = f.runtime.notices.emitGuardTerminal(f.mission.id, 'attempt_lease', context)
-    assert.ok(terminal, 'the call site always gets a terminal back')
-    assert.equal(terminal.chain, 'attempt_lease')
-    assert.equal(terminal.code, 'attempt_terminal')
-    assert.deepEqual(lintRefusal(terminal.message), [])
+    const endChain = () => f.runtime.notices.record(f.mission.id, guardTerminalNotice(f.runtime.boardOf(f.mission.id), 'attempt_lease', context))
+    const terminal = guardTerminalNotice(f.runtime.boardOf(f.mission.id), 'attempt_lease', context)
+    assert.ok(terminal, 'an active mission always owes the terminal')
+    assert.deepEqual([terminal.terminal.chain, terminal.event.data.chain], ['attempt_lease', 'attempt_lease'])
+    assert.equal(terminal.event.data.code, 'attempt_terminal')
+    assert.deepEqual(lintRefusal(terminal.content), [])
+    assert.equal(endChain(), true, 'the call site records it')
     await eventually(() => events(f.runtime, f.mission.id, 'mission/stalled')
       .filter(item => item.data.cause === 'guard-terminal' && item.data.chain === 'attempt_lease').length === 1,
       'the opt-in call records the durable decision request', 8_000)
@@ -460,7 +465,7 @@ test('R14 hand-off mechanism: emitGuardTerminal lets any call site opt in mechan
     // The same call under the same opener is the same decision request: the
     // repeat is suppressed because the request is durable, not because the
     // caller chose to stay silent.
-    assert.ok(f.runtime.notices.emitGuardTerminal(f.mission.id, 'attempt_lease', context))
+    assert.equal(endChain(), false, 'the ledger holds it')
     await sleep(60)
     assert.equal(events(f.runtime, f.mission.id, 'mission/stalled')
       .filter(item => item.data.cause === 'guard-terminal' && item.data.chain === 'attempt_lease').length, 1,
@@ -564,7 +569,7 @@ test('S4r-D5: a budget-blocked mission still escalates, and the terminal emissio
     assert.ok(escalation, 'a blocked mission still has an executable action')
     assert.equal(escalation.chain, 'budget', 'the terminal names the budget chain')
     assert.deepEqual(lintRefusal(escalation.message), [])
-    // The verifier's probe: emitGuardTerminal returned undefined here. S4b made
+    // The verifier's probe: the guard terminal was not emitted here. S4b made
     // the block path emit it itself, so no manual call is needed.
     const event = await eventually(() => events(f.runtime, f.mission.id, 'mission/stalled')
       .filter(item => item.data.cause === 'guard-terminal' && item.data.chain === 'budget').at(-1),
@@ -575,9 +580,9 @@ test('S4r-D5: a budget-blocked mission still escalates, and the terminal emissio
       'the budget block delivers the coded owner decision request', 8_000)
     assert.deepEqual(lintRefusal(notice.content), [])
     // The emission is still unconditional and idempotent for the same state.
-    const terminal = f.runtime.notices.emitGuardTerminal(f.mission.id, 'budget', { detail: 'budget-blocked probe', localKey: 'budget-blocked-probe' })
+    const terminal = guardTerminalNotice(f.runtime.boardOf(f.mission.id), 'budget', { detail: 'budget-blocked probe', localKey: 'budget-blocked-probe' })
     assert.ok(terminal, 'the terminal emission is unconditional for a blocked mission')
-    assert.equal(terminal.code, 'budget_terminal')
+    assert.equal(terminal.event.data.code, 'budget_terminal')
   } finally { await f.cleanup() }
 })
 

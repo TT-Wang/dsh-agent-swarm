@@ -3,8 +3,8 @@
  * stable reason, refusals are deduplicated on the durable ledger, and a
  * writer-busy retry is recorded as its own recovery. M1a seam 4/7, the lowest:
  * it stands on the kernel alone. The guard-terminal vocabulary below
- * (`guardTerminal`, `guardTerminalKey`) is pure; `Notices.emitGuardTerminal`
- * tells it.
+ * (`guardTerminal`, `guardTerminalKey`) is pure; its notice is
+ * `guardTerminalNotice` (src/notices.ts).
  */
 import { AdmissionRefusedError, admissionRowId, decideAdmission, defaultLimitRules, scopeKeysOverlap, type AdmissionCandidate, type AdmissionDecision, type AdmissionRecord, type AdmissionUsage, type LimitRule } from './scheduler.ts'
 import { WriterBusyError } from './store.ts'
@@ -258,8 +258,8 @@ export class RefusalRegistry {
  * the fact that the *same* decision request, its chain and the fact that opened
  * it, is already on the deliveries ledger.
  *
- * `guardTerminal` is the single builder of those requests, so the one emitter
- * (`Notices.emitGuardTerminal`), the test-side board model in
+ * `guardTerminal` is the single builder of those requests, so the one notice
+ * (`guardTerminalNotice`), the test-side board model in
  * `tests/guard-model.mjs` and the property test in
  * `tests/guard-terminals.test.mjs` all speak one vocabulary.
  * The R12-F9 dependency-assumption guard is not a chain: it refuses at the call
@@ -324,8 +324,8 @@ const described = (context: GuardTerminalScope, fallback: string): string => con
 /**
  * Build the unconditional terminal escalation of one guard chain. Pure and
  * total: it never returns undefined and it reads no board state, so no earlier
- * element of the chain can prevent it from existing. `Notices.emitGuardTerminal`
- * tells the result as the owner's decision request with its durable event.
+ * element of the chain can prevent it from existing. `guardTerminalNotice`
+ * renders the result as the owner's decision request with its durable event.
  */
 export function guardTerminal(chain: GuardChainId, context: GuardTerminalScope = {}): GuardTerminal {
   const task = context.taskId ?? 'the held work'

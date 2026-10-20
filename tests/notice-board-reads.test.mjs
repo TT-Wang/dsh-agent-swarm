@@ -19,6 +19,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { interpret } from '../lib/board.js'
+import { reviewBlocked } from '../lib/notices.js'
 import { FakeClock, MISSION_ACCEPTANCE, acceptThroughReview, setup, taskOf } from './faults/harness.mjs'
 
 /**
@@ -27,8 +28,10 @@ import { FakeClock, MISSION_ACCEPTANCE, acceptThroughReview, setup, taskOf } fro
  * every idleness and activity ask; for each owner notice written inside a
  * commit, the asks that commit made before it (`asked`) and the asks the
  * interpretation of the board it saw makes (`judged`); and for each named
- * Notices method, the asks made while it ran and the asks the interpretation of
- * the board it saw makes. The commit funnel's own ask, the execution clock it
+ * Notices method, its arguments, the asks made while it ran and the asks the
+ * interpretation of the board it saw makes. A notice built from rows alone
+ * (`parkedHolder`, `integrationGap`, `reviewBlocked`) takes no adapter view, so
+ * building it cannot ask; recording it (`Notices.record`) is watched. The commit funnel's own ask, the execution clock it
  * settles after a commit's body for each running attempt's owner (a kept
  * interleaving), is no notice's and is not recorded.
  */
@@ -63,7 +66,7 @@ async function preferredToBusy(t, options = {}) {
       f.runtime.notices[name] = (...args) => {
         const judged = judge(), from = asked.length
         const result = method(...args)
-        calls.push({ name, asked: asked.slice(from), judged })
+        calls.push({ name, args, asked: asked.slice(from), judged })
         return result
       }
     }
@@ -71,6 +74,9 @@ async function preferredToBusy(t, options = {}) {
   }
   return { ...f, busy, preferred, watch }
 }
+
+/** The watched `Notices.record` calls whose notice's key starts with `prefix`. */
+const recorded = (calls, prefix) => calls.filter(call => call.name === 'record' && call.args[1].options.dedupKey?.startsWith(prefix))
 
 /** Each record names Busy in what the interpretation of its board asks, and recorded no ask of its own. */
 function assertAskedNothing(f, records, label) {
@@ -104,7 +110,7 @@ test('a challenge is told inside its commit, and an integration gap is warned of
       claim: 'the source works', outcome: 'supported', status: 'verified', toolRunIds: [], supersedes: [], challenges: [], createdAt: f.clock.now() })
   })
   await f.runtime.settle(f.mission.id)
-  const { notices, calls } = f.watch(['warnIntegrationGap'])
+  const { notices, calls } = f.watch(['record'])
   // The owner disputes the source's claim: the notice names the source.
   f.runtime.challenge(f.owner, f.mission.id, { evidenceId: 'e-source', reason: 'a counterexample', toolRunIds: [] })
   assertAskedNothing(f, notices.filter(notice => notice.trigger === 'evidence/challenged'), 'the challenge')
@@ -112,7 +118,7 @@ test('a challenge is told inside its commit, and an integration gap is warned of
   const third = f.propose({ title: 'Third implementation' })
   assert.ok(f.runtime.store.list('deliveries', f.mission.id).some(delivery => delivery.notice?.dedupKey === `integration-gap:${f.mission.id}:3` && delivery.subjects.includes(`${third.id}@${third.epoch}`)),
     'the integration gap was told, naming the new branch')
-  assertAskedNothing(f, calls, 'the integration-gap warning')
+  assertAskedNothing(f, recorded(calls, 'integration-gap:'), 'the integration-gap warning')
 })
 
 test('a provider outage is told inside its commit without one adapter ask', async t => {
@@ -186,11 +192,11 @@ test('a parked holder the lease sweep finds is told without one adapter ask', as
   const held = f.propose({ title: 'Held' })
   await f.runtime.claim(f.actor(f.author), f.mission.id, held.id)
   f.runtime.commit(f.mission.id, () => f.runtime.store.put('members', { ...f.runtime.store.get('members', f.author.id), phase: 'parked' }))
-  const { calls } = f.watch(['notifyParkedHolder'])
+  const { calls } = f.watch(['record'])
   f.runtime.kick(f.mission.id)
   await f.runtime.settle(f.mission.id)
   assert.ok(f.runtime.store.list('deliveries', f.mission.id).some(delivery => delivery.notice?.dedupKey === `parked:${f.mission.id}:${held.id}:${taskOf(f.runtime, held.id).epoch}`), 'the parked holder was told')
-  assertAskedNothing(f, calls, 'the parked holder')
+  assertAskedNothing(f, recorded(calls, 'parked:'), 'the parked holder')
 })
 
 test('a review-blocked source is told without one adapter ask', async t => {
@@ -198,10 +204,10 @@ test('a review-blocked source is told without one adapter ask', async t => {
   const source = f.propose({ title: 'Submitted source' })
   const claimed = await f.runtime.claim(f.actor(f.author), f.mission.id, source.id)
   await f.runtime.submit(f.actor(f.author), f.mission.id, { taskId: source.id, attemptId: claimed.attempt.id, output: 'candidate' })
-  const { calls } = f.watch(['notifyReviewBlocked'])
-  f.runtime.notices.notifyReviewBlocked(f.runtime.mission(f.mission.id), taskOf(f.runtime, source.id), 'need', 'no live independent review admits it')
+  const { calls } = f.watch(['record'])
+  f.runtime.notices.record(f.mission.id, reviewBlocked(f.runtime.boardOf(f.mission.id), taskOf(f.runtime, source.id), 'need', 'no live independent review admits it'))
   assert.ok(f.runtime.store.list('deliveries', f.mission.id).some(delivery => delivery.notice?.dedupKey?.startsWith(`review-blocked:${f.mission.id}:${source.id}:`)), 'the review-blocked source was told')
-  assertAskedNothing(f, calls, 'the review-blocked source')
+  assertAskedNothing(f, recorded(calls, 'review-blocked:'), 'the review-blocked source')
 })
 
 test('a parked notice is outstanding exactly while a parked member holds its task, and judging that asks the adapter nothing', async t => {

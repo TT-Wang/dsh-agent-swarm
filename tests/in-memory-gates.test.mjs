@@ -67,6 +67,7 @@ import { fileURLToPath } from 'node:url'
 import { join, relative } from 'node:path'
 import { setup, eventually, events, taskOf, FakeWorkers, SwarmRuntime, budget as sharedBudget, makeRuntime } from './faults/harness.mjs'
 import { persistentCollections } from './source-semantics.mjs'
+import { passState } from '../lib/board.js'
 
 const PROJECT = fileURLToPath(new URL('../', import.meta.url))
 
@@ -149,8 +150,6 @@ const CENSUS = [
   ["src/notices.ts",3,"Set","const replaced = new Set<string>()","local","","function-local: created and discarded inside one synchronous call (the shared lineage helper `replacementCoverage`), so it cannot gate a later call"],
   ["src/notices.ts",4,"Set","const roots = new Set(stallRootsFor(rt, tasks).map(task => taskSubject(task)))","local","","function-local: created and discarded inside the one synchronous call of the R17-G9 refusal predicate, which re-reads the durable task rows on every call, so it cannot gate a later call"],
   ["src/notices.ts",8,"Map","private readonly delivering = new Map<string, number>()","gate","cache-only","per-attempt claim; the durable deliveredAt row is the real gate and adapter acceptance is idempotent"],
-  ["src/notices.ts",9,"Set","private readonly pendingTransitions = new Set<string>()","gate","derivable","R17-G5: the missions whose committed transition still owes a publication. The durable commit is the gate; losing the pending set skips at most one publication, which the next commit (or the absence net) re-derives, and the probe below clears it and observes the fact still published by a later transition"],
-  ["src/notices.ts",10,"Set","private readonly wedgedReleases = new Set<string>()","gate","derivable","R17-G5: missions whose pass was just named wedged, so the publication that naming queues runs the wedged branch. The naming is durable (the scheduling-pass row the owner holds, written with its mission/stalled event); losing the marker degrades that publication to the ordinary off-pass branch, which the probe below exercises"],
   ["src/notices.ts",11,"Set","const roots = new Set(view.stallRoots.map(task => task.id))","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
   ["src/notices.ts",12,"Map","const found = new Map<string, Task>()","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
   // L2 owner-reply guard: a plugin-side observer of host session events, not a
@@ -213,6 +212,8 @@ const CENSUS = [
   // durable rows inside one synchronous call and discarded with it;
   // it is not retained, not read by a later call and cannot gate one.
   ["src/scheduling.ts",4,"Set","const subjects = [...new Set([...subjectsOfTasks(unreached, mission), ...holders.map(holder => holder.subject)])]","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
+  ["src/scheduling.ts",5,"Set","private readonly pendingTransitions = new Set<string>()","gate","derivable","R17-G5: the missions whose committed transition still owes a publication. The durable commit is the gate; losing the pending set skips at most one publication, which the next commit (or the absence net) re-derives, and the probe below clears it and observes the fact still published by a later transition"],
+  ["src/scheduling.ts",6,"Set","private readonly wedgedReleases = new Set<string>()","gate","derivable","R17-G5: missions whose pass was just named wedged, so the publication that naming queues runs the wedged branch. The naming is durable (the scheduling-pass row the owner holds, written with its mission/stalled event); losing the marker degrades that publication to the ordinary off-pass branch, which the probe below exercises"],
   ["src/store.ts",1,"Set","private readonly listeners = new Set<() => void>()","gate","cache-only","observer fan-out for committed changes; the durable revision and change cursor carry the state"],
   ["src/store.ts",2,"Set","this.transactionScopes = new Set()","transient","","created and destroyed inside one store transaction; the revision-bump decision it feeds is re-derived on every call"],
   ["src/store.ts",3,"Set","let liveOwners = new Set<string>()","local","","R17-G7 function-local: the live-attempt owner ids for the member rows being hydrated, created and discarded inside one synchronous read, so it cannot gate a later call"],
@@ -526,12 +527,12 @@ const GATE_TESTS = {
       assert.equal(inside, after, 'inside a transaction the cache is bypassed (commitDepth), so it can never gate on a stale board')
     } finally { await f.cleanup() }
   },
-  'src/notices.ts:9': async t => {
+  'src/scheduling.ts:5': async t => {
     const f = await setup({ config: { tickMs: 10 } })
     try {
-      f.runtime.notices.pendingTransitions.add('probe-mission')   // the loss must be exercised on a non-empty collection
-      assert.ok(f.runtime.notices.pendingTransitions.size > 0)
-      f.runtime.notices.pendingTransitions.clear()   // the loss
+      f.runtime.scheduling.pendingTransitions.add('probe-mission')   // the loss must be exercised on a non-empty collection
+      assert.ok(f.runtime.scheduling.pendingTransitions.size > 0)
+      f.runtime.scheduling.pendingTransitions.clear()   // the loss
       // The commit itself is the gate: a durable notice still lands after the
       // publication queue was lost, because the write and its fact are committed.
       f.runtime.commit(f.mission.id, () => f.runtime.notices.notify(f.mission.id, 'probe after a lost queue', [`mission:${f.mission.id}`], { trigger: 'probe/lost-queue', reason: 'probe' }))
@@ -539,16 +540,16 @@ const GATE_TESTS = {
       assert.equal(queued.length, 1, 'the durable outbox is unaffected by the lost publication queue')
     } finally { await f.cleanup() }
   },
-  'src/notices.ts:10': async t => {
+  'src/scheduling.ts:6': async t => {
     const f = await setup({ config: { tickMs: 10 } })
     try {
-      f.runtime.notices.wedgedReleases.add(f.mission.id)   // the loss must be exercised on a non-empty collection
-      assert.ok(f.runtime.notices.wedgedReleases.size > 0)
-      f.runtime.notices.wedgedReleases.clear()   // the loss
+      f.runtime.scheduling.wedgedReleases.add(f.mission.id)   // the loss must be exercised on a non-empty collection
+      assert.ok(f.runtime.scheduling.wedgedReleases.size > 0)
+      f.runtime.scheduling.wedgedReleases.clear()   // the loss
       const task = f.propose({ title: 'Wedged marker lost' })
       assert.ok(task?.id, 'the durable write is unaffected by the lost wedge marker')
       // The release itself is durable; the next transition still publishes.
-      const state = f.runtime.scheduling.passState(f.mission.id)
+      const state = passState(f.runtime.boardOf(f.mission.id))
       assert.equal(typeof state.passLive, 'boolean')
       assert.equal(typeof state.wedged, 'boolean')
     } finally { await f.cleanup() }

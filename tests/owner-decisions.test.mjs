@@ -96,7 +96,7 @@ async function scenario(t, { workers = new Workers(), config = {} } = {}) {
 test('R15-A1: the guard-terminal owner notice behind the task-ceiling path carries subjects in its own durable row', async t => {
   const f = await scenario(t)
   const member = await f.addMember('Builder')
-  // mission task budget exhausted -> the same `emitGuardTerminal` task-ceiling
+  // mission task budget exhausted -> the same `guardTerminalNotice` task-ceiling
   // entry the round-14 review read back with `subjects: ABSENT`.
   const limited = await fixture(t, { maxTasks: 1 })
   await limited.runtime.start()

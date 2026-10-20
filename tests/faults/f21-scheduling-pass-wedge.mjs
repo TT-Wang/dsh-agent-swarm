@@ -52,6 +52,7 @@
 import assert from 'node:assert/strict'
 import { DatabaseSync } from 'node:sqlite'
 import { FakeWorkers, MISSION_ACCEPTANCE, budget, setup, makeRuntime, eventually, events, runScenario, taskOf } from './harness.mjs'
+import { pastBound, wedgeVerdict } from '../../lib/board.js'
 
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
 const wedgeEvents = (runtime, missionId) => events(runtime, missionId, 'mission/stalled').filter(item => item.data.cause === 'scheduling-pass' && item.data.wedged === true)
@@ -108,7 +109,7 @@ async function namingCommitFailsOnce() {
     // Keyed on the watchdog's own predicate at the tick's own instant.
     scheduling.checkSchedulingPasses = (now = Date.now()) => {
       const pass = scheduling.passes.get(mission.id)
-      if (locked !== undefined || pass === undefined || !scheduling.pastBound(pass, now)) return check(now)
+      if (locked !== undefined || pass === undefined || !pastBound(pass, runtime.bounds, now)) return check(now)
       const other = new DatabaseSync(statePath)
       other.exec('BEGIN IMMEDIATE')
       try { return check(now) } finally { other.exec('ROLLBACK'); other.close(); locked = { events: wedgeEvents(runtime, mission.id).length } }
@@ -142,7 +143,7 @@ async function pauseAndResumeAcrossTheBound() {
     await eventually(() => workers.enteredAt !== undefined ? true : undefined, 'I6: the pass body must enter its long preparation', 4_000)
     f.runtime.control(f.owner, f.mission.id, 'pause', 'owner pause while the pass body waits')
     await sleep(200)
-    assert.equal(f.runtime.scheduling.passWedged(f.mission.id), true, 'I6: the body passed its bound while the mission was paused')
+    assert.equal(wedgeVerdict(f.runtime.scheduling.passes.get(f.mission.id), f.runtime.boardOf(f.mission.id)).wedged, true, 'I6: the body passed its bound while the mission was paused')
     assert.equal(wedgeEvents(f.runtime, f.mission.id).length, 0, 'I6: a paused mission is not named')
     const resumedAt = Date.now()
     f.runtime.control(f.owner, f.mission.id, 'resume', 'owner resumes')

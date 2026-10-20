@@ -9,12 +9,11 @@
 import { tmpdir } from 'node:os'
 import { stopPending, subjectsOfTasks, terminal } from './task-graph.ts'
 import { claimFor, isContained, reauthorizeWorkspace, WorkspaceRevokedError, WORKSPACE_AUTHORIZATION_CODE, type WorkspaceClaim } from './authorization.ts'
-import { hasNotice } from './arena.ts'
-import { isolationOpener, noticeIdentity, type Notices } from './notices.ts'
-import { noticeSubjectsFor, type Board, type IsolationIssue } from './board.ts'
+import { guardTerminalNotice, held, isolationOpener, type Notices } from './notices.ts'
+import { noticeSubjectsFor, type Board, type IsolationIssue, type SchedulingPass } from './board.ts'
 import { guardTerminalKey } from './refusals.ts'
 import type { Attempts } from './attempts.ts'
-import { progressed, type Kernel, type SchedulingPass } from './kernel.ts'
+import { progressed, type Kernel } from './kernel.ts'
 import { absoluteCheckPaths, shellSegments } from './admission.ts'
 import type { Mission } from './types.ts'
 
@@ -437,7 +436,7 @@ export class WorkspaceAdmission {
     const revocation = `workspace-revoked:${this.k.instanceId}`
     // Idempotent from mission state: nothing left to block, and the owner already
     // holds this revocation's request, under the identity it is told with, means the mission is fenced.
-    if (blocked.length === 0 && hasNotice(this.k.store.list('deliveries', missionId), noticeIdentity(missionId, subjectsOfTasks(blocked, mission), { dedupKey: guardTerminalKey('workspace', { localKey: revocation }) }).identity)) return
+    if (blocked.length === 0 && held(this.k.store.list('deliveries', missionId), missionId, { subjects: subjectsOfTasks(blocked, mission), options: { dedupKey: guardTerminalKey('workspace', { localKey: revocation }) } })) return
     this.k.commit(missionId, () => {
       for (const task of blocked) {
         // A running task here holds a live attempt and a live handle. Setting the
@@ -458,7 +457,7 @@ export class WorkspaceAdmission {
     // S4b: the fence reaches the shared coded workspace terminal. A revocation
     // is a local fault, not a board state, so the decision is keyed by it and
     // the owner is woken once per revocation however the board moves afterwards.
-    this.notices.emitGuardTerminal(missionId, 'workspace', { detail: reason, localKey: revocation, subjects: subjectsOfTasks(blocked, mission) })
+    this.notices.record(missionId, guardTerminalNotice(this.k.boardOf(missionId), 'workspace', { detail: reason, localKey: revocation, subjects: subjectsOfTasks(blocked, mission) }))
   }
 
   /**
@@ -507,7 +506,7 @@ export class WorkspaceAdmission {
    * new one.
    */
   recordIsolation(board: Board, violation: IsolationIssue): void {
-    this.notices.emitGuardTerminal(board.missionId, 'workspace', { subjects: violation.memberIds.flatMap(id => noticeSubjectsFor(board, { memberId: id })), localKey: isolationOpener(violation.message),
-      detail: `the isolation invariant refuses dispatch: ${violation.message}` })
+    this.notices.record(board.missionId, guardTerminalNotice(board, 'workspace', { subjects: violation.memberIds.flatMap(id => noticeSubjectsFor(board, { memberId: id })), localKey: isolationOpener(violation.message),
+      detail: `the isolation invariant refuses dispatch: ${violation.message}` }))
   }
 }

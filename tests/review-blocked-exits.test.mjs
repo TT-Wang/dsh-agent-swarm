@@ -198,8 +198,8 @@ async function followExits(f, { source }, { steps, refused = [] }) {
 
 /** Publish one committed transition with no scheduling pass, as an ordinary publication or as the one after a wedged pass was named. */
 const publish = async (f, wedged) => {
-  if (wedged) f.runtime.notices.expectWedgedRelease(f.mission.id)
-  f.runtime.notices.transition(f.mission.id)
+  if (wedged) f.runtime.scheduling.expectWedgedRelease(f.mission.id)
+  f.runtime.scheduling.transition(f.mission.id)
   await new Promise(resolve => queueMicrotask(resolve))
 }
 const decisionsOn = (f, task) => f.runtime.store.list('deliveries', f.mission.id).filter(delivery => delivery.notice?.dedupKey?.startsWith(`review-blocked:${f.mission.id}:${task.id}:`))

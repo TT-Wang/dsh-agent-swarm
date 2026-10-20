@@ -9,6 +9,7 @@ import { registerAutomaticStart } from '../lib/planner.js'
 import { hasNotice, openAsks } from '../lib/arena.js'
 import { FakeWorkers, SwarmRuntime, makeRuntime, makeRuntimeStub } from './faults/harness.mjs'
 import { reviewNeed, reviewPathBlocker, reviewable, waitsLegitimately } from '../lib/board.js'
+import { reviewBlocked } from '../lib/notices.js'
 
 async function fixture(t) {
   let runtime
@@ -204,10 +205,9 @@ test('a reminder queued before review admission is retained in the ledger but ne
     f.runtime.store.put('tasks', other)
   })
   // Each review-blocked decision comes from the one emitter, per source and review need, with the blocker the runtime derives.
-  const mission = f.runtime.mission(f.mission.id)
   for (const task of [source, other]) {
     const board = f.runtime.boardOf(task.missionId), need = reviewNeed(board, task)
-    f.runtime.notices.notifyReviewBlocked(mission, task, need.id, reviewPathBlocker(board, task, need) ?? `no live independent review admits ${task.id}`)
+    f.runtime.notices.record(f.mission.id, reviewBlocked(board, task, need.id, reviewPathBlocker(board, task, need) ?? `no live independent review admits ${task.id}`))
   }
   const decisionOf = task => f.rows().find(row => row.notice?.dedupKey?.startsWith(`review-blocked:${f.mission.id}:${task.id}:`))
   await f.runtime.notices.flushOutbox(f.mission.id)
@@ -326,7 +326,7 @@ test('a delivered summary does not revive a resolved review request because unre
   t.mock.timers.tick(120000)
   f.runtime.notices.wakeBudget = 1
   f.runtime.store.transaction(() => f.runtime.notices.notify(f.mission.id, 'An observed fact', ['mission:' + f.mission.id], { noticeClass: 'progress', trigger: 'test/progress' }))
-  f.runtime.notices.notifyReviewBlocked(f.runtime.mission(f.mission.id), source, reviewNeed(f.runtime.boardOf(f.mission.id), source).id, 'Please admit the review')
+  f.runtime.notices.record(f.mission.id, reviewBlocked(f.runtime.boardOf(f.mission.id), source, reviewNeed(f.runtime.boardOf(f.mission.id), source).id, 'Please admit the review'))
   await f.runtime.notices.flushOutbox(f.mission.id)
   const summary = f.rows().find(row => row.notice?.aggregatedFacts?.some(part => part.subjects.includes(`${source.id}@1`)))
   assert.ok(summary.deliveredAt)

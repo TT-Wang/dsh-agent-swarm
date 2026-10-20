@@ -44,15 +44,15 @@ async function fixture(t) {
 }
 
 test('M2-1: a repeated pass-timeout naming is recorded once, through the ledger', () => {
-  const mission = { id: 'mission', status: 'active' }, records = [], deliveries = []
+  const mission = { id: 'mission', status: 'active' }, records = [], deliveries = [], bounds = { stallPassTimeoutMs: 1000 }
   // The stub store writes only ledger rows: a naming that wrote the mission row would throw.
   const rt = makeRuntimeStub({ store: { get: () => structuredClone(mission), list: table => table === 'deliveries' ? deliveries : [], event: (_m, _t, _a, data) => records.push(data), revision: () => 0,
     put: (table, row) => { assert.equal(table, 'deliveries'); deliveries.push(row) } },
-    bounds: { stallPassTimeoutMs: 1000 }, fingerprint: () => 'same', commit: (_id, fn) => fn(),
-    boardOf: missionId => ({ missionId, mission, tasks: [], members: [], graph: taskGraphIndex([]) }) })
-  // The runtime's own telling, over this store; the publication is outside this test.
-  const notices = new Notices(rt, new RefusalRegistry(rt), () => ({ passLive: false, wedged: false }))
-  const scheduling = new Scheduling(rt, { tell: notices.tell.bind(notices), expectWedgedRelease() {}, transition() {} })
+    bounds, fingerprint: () => 'same', commit: (_id, fn) => fn(),
+    boardOf: missionId => ({ missionId, mission, tasks: [], members: [], graph: taskGraphIndex([]), clock: () => Date.now(), bounds }) })
+  // The runtime's own telling, over this store; the publication the naming queues judges nothing here.
+  const notices = new Notices(rt, new RefusalRegistry(rt))
+  const scheduling = new Scheduling(rt, { record: notices.record.bind(notices), ensureWitness() {} })
   // Two bodies wedge in turn on one naming fact. The first naming's row is the
   // record: the second body is marked named and writes neither row nor event.
   const named = []
@@ -113,8 +113,8 @@ test('stop recovery owns its member until quiescence, including before native st
   const stopping = { id: 'old-task', status: 'blocked', epoch: 3, resumeAfterStop: { epoch: 3, memberId: member.id } }
   const ready = { id: 'new-task', missionId: 'm', title: 'New task', epoch: 0, status: 'pending', dependencies: [], acceptance: [], scope: ['**'], objective: 'New work' }
   let starts = 0
-  const board = { missionId: 'm', tasks: [stopping, ready], members: [member], graph: taskGraphIndex([stopping, ready]), view: { startable: () => true }, records: { list: () => [] }, clock: Date.now }
-  const rt = makeRuntimeStub({ store: { list: () => [stopping, ready] }, boardOf: () => board, mission: () => ({ status: 'active' }), startWorker: async () => { starts++ }, workers: new FakeWorkers({ autoIdle: true }) })
+  const board = { missionId: 'm', mission: { id: 'm', status: 'active' }, tasks: [stopping, ready], members: [member], graph: taskGraphIndex([stopping, ready]), view: { startable: () => true }, records: { list: () => [] }, clock: Date.now }
+  const rt = makeRuntimeStub({ boardOf: () => board, startWorker: async () => { starts++ }, workers: new FakeWorkers({ autoIdle: true }) })
   const scheduling = new Scheduling(rt)
   assert.equal(await scheduling.dispatch({ status: 'active' }, 'm'), true)
   assert.equal(starts, 0)
