@@ -77,7 +77,7 @@ test('afterStart skips a busy handle, unless the member is parked, and a member 
   assert.deepEqual(afterStart(f.board(), f.reached()), { kind: 'skip' }, 'a member that owes a stop')
 })
 
-test('afterStart closes out an open attempt whose turn ended, and skips one whose turn has not ended or whose owner is parked', async t => {
+test('afterStart closes out an open attempt whose turn ended, and skips one whose turn has not ended, whose owner is parked or whose owner owes a stop', async t => {
   const f = await fixture(t)
   f.workers.idle.add(f.author.id)
   const row = taskOf(f.runtime, f.work.id), attempt = { id: 'attempt-open', epoch: row.epoch + 1, ownerId: f.author.id, leaseUntil: f.clock.now() + 60_000 }
@@ -88,6 +88,10 @@ test('afterStart closes out an open attempt whose turn ended, and skips one whos
   const ended = afterStart(f.board(), f.reached())
   assert.deepEqual([ended.kind, ended.open?.attempt.id], ['close-out', 'attempt-open'])
   assert.deepEqual(afterStart(f.board(), f.reached({ phase: 'parked' })), { kind: 'skip' }, 'a parked owner is not an abandoned turn')
+  // The member comes to owe a stop for other work (during its worker start, say) while it holds that ended turn: the stop comes first.
+  const owed = f.propose({ title: 'Owed' })
+  f.put({ ...taskOf(f.runtime, owed.id), status: 'blocked', epoch: 1, resumeAfterStop: { epoch: 1, memberId: f.author.id } })
+  assert.deepEqual(afterStart(f.board(), f.reached()), { kind: 'skip' }, 'a member that owes a stop is skipped, though its open attempt\'s turn ended')
 })
 
 test('preparationFailure re-pends a transient failure under its limit with its backoff and tells nobody; the failure at the limit, and a deterministic one, block the row and owe the notice that names the resume', async t => {
