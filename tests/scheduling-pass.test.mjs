@@ -1189,6 +1189,34 @@ test('S1: the watchdog, passWedged and livePass read one bound predicate, so the
   }
 })
 
+test('R17-G5: a body named and settled in one synchronous turn is published once, with the wedged branch its naming owes; a body closed unnamed is published without it', async t => {
+  // The naming queues its publication (`expectWedgedRelease`), and the close
+  // that follows in the same turn joins it. When it runs no body is open, so
+  // only the naming's marker can give it the wedged branch: the dispatch
+  // question the wedged body never reached is still asked.
+  const clock = new FakeClock()
+  const f = await setup({ clock })
+  t.after(f.cleanup)
+  await f.runtime.settle(f.mission.id)
+  const scheduling = f.runtime.scheduling, judged = [], ensureWitness = f.runtime.notices.ensureWitness
+  f.runtime.notices.ensureWitness = function (missionId, options) { judged.push(options); return ensureWitness.call(this, missionId, options) }
+  const body = operationId => {
+    const pass = { id: scheduling.passKey(f.mission.id), operationId, missionId: f.mission.id, startedAt: clock.now() - f.runtime.bounds.stallPassTimeoutMs,
+      revisionBefore: f.runtime.store.revision(), fingerprintBefore: f.runtime.fingerprint(f.mission.id) }
+    scheduling.passes.set(f.mission.id, pass)
+    return pass
+  }
+  const published = () => new Promise(resolve => queueMicrotask(resolve))
+  scheduling.closePass(f.mission.id, body('operation_unnamed'))
+  await published()
+  const named = body('operation_named')
+  scheduling.checkSchedulingPasses()
+  assert.ok(named.escalatedAt !== undefined, 'the watchdog named the body past its bound')
+  scheduling.closePass(f.mission.id, named)
+  await published()
+  assert.deepEqual(judged, [{}, { wedged: true }], 'one publication per turn: the unnamed close off-pass, the named one with the wedged branch')
+})
+
 test('S1/R16-D: a long pass inside its declared live-work bound is progress and is never named; past that bound it is named with its live work preserved', async () => {
   // Inside `stallPassReleaseBoundMs` (= stallPassTimeoutMs + stallPassLiveGraceMs,
   // both declared) a live lease is progress: the pass stays live and no stall is
