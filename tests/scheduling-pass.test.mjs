@@ -1156,7 +1156,7 @@ test('S1: a chain of early-stopped bodies covers one rotation, and the body that
   } finally { await f.cleanup() }
 })
 
-test('S1: the watchdog, passWedged and livePass read one bound predicate, so they agree at exactly the bound', async () => {
+test('S1: the watchdog and the verdict of a body (wedged, live) read one bound predicate, so they agree at exactly the bound', async () => {
   // Before, the watchdog named a body once its age reached the bound while
   // passWedged reported it wedged only past the bound. At age == bound a body
   // was named while passWedged still read false, so the writer-lock wrappers

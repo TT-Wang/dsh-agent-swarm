@@ -27,7 +27,7 @@
  * each pair has a test below that exercises the PAIR, not one side:
  *  - bounded release x off-pass wedged classification x the notice dedup key
  *    (R16-D1, R16-D2);
- *  - the naming x `livePass`/`kick` (R16-D3: a control-path kick neither
+ *  - the naming x the verdict's `live` (`wedgeVerdict`) and `kick` (R16-D3: a control-path kick neither
  *    supersedes nor duplicates a wedged body);
  *  - attempt bound x F1 operation silence and x the lease renewal that
  *    legitimately keeps a producing attempt alive (R16-D4, R16-D6);
