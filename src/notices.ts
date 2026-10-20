@@ -13,7 +13,7 @@ import { TERMINAL_STATES, holdsAttempt, missionSubject, stopPending, subjectsOfT
 import { WriterBusyError, id, type SwarmStore } from './store.ts'
 import type { EventKind } from './events.ts'
 import { awaited, formatSpan, type Kernel } from './kernel.ts'
-import { completionError, dependentsOf, eligible, fingerprintBoard, heldByParkedMember, interpret, isolationIssues, missionFingerprint, newestReviewBlock, noticeSubjectsFor, overdueStop, reviewNeed, reviewPathBlocker, reviewPathStalled, stallRoots, startBlocker, unreviewedSources, waitsLegitimately, type Board, type Interpretation, type SchedulingPass } from './board.ts'
+import { completionError, dependentsOf, eligible, fingerprintBoard, heldByParkedMember, interpret, isolationIssues, missionFingerprint, newestReviewBlock, noticeSubjectsFor, overdueStop, passState, reviewNeed, reviewPathBlocker, reviewPathStalled, stallRoots, startBlocker, unreviewedSources, waitsLegitimately, type Board, type Interpretation, type SchedulingPass } from './board.ts'
 import type { Delivery, Escalation, Member, Mission, NoticeClass, Task, WorkerActivity } from './types.ts'
 
 /**
@@ -1126,18 +1126,22 @@ export class Notices {
    *    that need (`openReviewBlock`);
    *  - parked: a task a parked member still holds at the epoch it names;
    *  - dispatch-question: its task while still pending at that epoch;
-   *  - scheduling-pass: the work it named that is unfinished at that epoch: a
-   *    body is named once (one on a held fact is left to this row), so no later
-   *    fact speaks for the rest;
+   *  - scheduling-pass: while the mission publishes its pass as wedged
+   *    (`passState` of the board, which carries the body), the mission root it
+   *    named and the work it named that is unfinished at that epoch; nothing
+   *    once no body is wedged (the body settled or runs again, or a restart
+   *    owns none), since a reminder about a wedge that ended is noise. A body
+   *    is named once (one on a held fact is left to this row), so the row
+   *    speaks for a later body on its fact while that body is wedged;
    *  - fallthrough: every subject while no live path advances any of them: a
    *    batch asserts its claim of every subject, and once one changes, the
    *    transition publisher tells the rest as a fresh fact.
-   * A subject that is the mission root is outstanding while the claim names it.
+   * Only a scheduling-pass naming names the mission root: every other family
+   * names the tasks it is about.
    */
   private outstanding(board: Board, delivery: Delivery, family: typeof SUBJECT_FAMILIES[number]): string[] {
     const subjects = delivery.subjects ?? noticeRow(delivery)?.subjects ?? []
     const claimed = (claim: (task: Task) => boolean): string[] => subjects.filter(subject => {
-      if (subject === missionSubject(board.mission)) return true
       const task = unfinished(subject, board.tasks)
       return task !== undefined && claim(task)
     })
@@ -1146,7 +1150,7 @@ export class Notices {
       case 'review-blocked': return this.openReviewBlock(board, delivery)
       case 'parked': return claimed(task => heldByParkedMember(board.members, task))
       case 'dispatch-question': return claimed(task => task.status === 'pending')
-      case 'scheduling-pass': return claimed(() => true)
+      case 'scheduling-pass': return passState(board).wedged ? subjects.filter(subject => subject === missionSubject(board.mission) || unfinished(subject, board.tasks) !== undefined) : []
       case 'fallthrough': { const open = claimed(task => !waitsLegitimately(board, task)); return open.length === subjects.length ? open : [] }
     }
   }

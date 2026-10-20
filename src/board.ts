@@ -485,6 +485,8 @@ export function liveWork(board: Pick<Board, 'tasks' | 'clock'>): Task[] {
  * The scheduling pass state a committed transition is published with
  * (`passState`): a live pass that is not wedged owns the publication, and a
  * wedged one is published with the wedged branch (`Scheduling.transition`).
+ * A wedged pass's naming is outstanding while the mission publishes its pass
+ * as wedged (`Notices.outstanding`).
  */
 export interface PassState { passLive: boolean; wedged: boolean }
 

@@ -161,7 +161,7 @@ test('completed mission facts still reach the owner after automatic completion o
   assert.ok(f.rt.store.get('deliveries', notice.id).consumedAt)
 })
 
-test('a wedged pass\'s naming handed to a busy owner is read once the body has settled, and tells the later bodies that wedge on the same fact', async t => {
+test('a wedged pass\'s naming handed to a busy owner is withdrawn unread once its body has settled, and a later body that wedges on the same fact is told by that row\'s reminder while it is wedged', async t => {
   const entered = deferred(), release = deferred(); t.after(() => release.resolve())
   const f = await fixture(t, async (_request, n) => {
     if (n === 1) { entered.resolve(); await release.promise; return text('Finished ordinary work') }
@@ -177,22 +177,26 @@ test('a wedged pass\'s naming handed to a busy owner is read once the body has s
     return pass
   }
   const namings = () => rt.store.list('deliveries', mid).filter(row => row.to === 'owner' && row.notice?.trigger === 'scheduling-pass')
-  const read = () => f.requests.filter(request => JSON.stringify(request).includes('did not return within')).length
+  const read = needle => f.requests.filter(request => JSON.stringify(request).includes(needle)).length
   // The owner is inside a model request when the first body wedges.
   f.agent.send(input('ordinary-work', 'Ordinary independent owner work'), 'next-turn', true)
   await entered.promise
   const first = wedge('operation_host_1')
   await rt.notices.flushOutbox(mid)
-  assert.ok(namings()[0]?.deliveredAt !== undefined && f.agent.inbox.nextStep.some(message => message.source.kind === 'swarm'), 'the naming waits in the owner\'s inbox for its step to end')
-  // The hung call returns at its own bound while that request is still streaming.
+  const [naming] = namings()
+  assert.ok(naming?.deliveredAt !== undefined && f.agent.inbox.nextStep.some(message => message.source.kind === 'swarm'), 'the naming waits in the owner\'s inbox for its step to end')
+  // The hung call returns at its own bound while that request is still streaming: the wedge the naming names has ended.
   scheduling.closePass(mid, first)
   release.resolve(); await f.agent.whenIdle()
-  assert.deepEqual([read(), namings()[0].consumedAt !== undefined], [1, true], 'the owner reads it at its next step, though no body is wedged any more')
-  // The same call hangs again for later bodies: the naming fact the owner holds.
-  for (const operationId of ['operation_host_2', 'operation_host_3']) {
-    const pass = wedge(operationId)
-    await rt.notices.flushOutbox(mid); await f.agent.whenIdle()
-    assert.deepEqual([pass.escalatedAt !== undefined, namings().length, read()], [true, 1, 1], 'a body on the held fact is marked named by the row the owner has read')
-    scheduling.closePass(mid, pass)
-  }
+  assert.deepEqual([read('did not return within'), rt.store.get('deliveries', naming.id).consumedAt], [0, undefined], 'the owner\'s next step does not read it: it is withdrawn from the inbox unread')
+  // The same call hangs again for a later body: the naming fact the ledger holds, so the body writes no row.
+  const second = wedge('operation_host_2')
+  await rt.notices.flushOutbox(mid); await f.agent.whenIdle()
+  assert.deepEqual([second.escalatedAt !== undefined, namings().length, read('did not return within')], [true, 1, 0], 'a body on the held fact is marked named by its row, which the outbox delivered once and does not send again')
+  // The row's reminder tells it while that body is wedged, with the naming it reminds of.
+  rt.notices.obligationFollowupMs = 0
+  rt.notices.absenceNet(mid)
+  await rt.notices.flushOutbox(mid); await f.agent.whenIdle()
+  assert.deepEqual([read(`original delivery ${naming.id}`), read('did not return within')], [1, 1], 'the owner reads the reminder, which carries the naming')
+  scheduling.closePass(mid, second)
 })
