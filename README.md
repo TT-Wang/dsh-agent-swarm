@@ -127,7 +127,7 @@ node "$DSH_HARNESS_ROOT/apps/cli/lib/bin.js" --profile web
 
 Open the authenticated launch URL printed by Harness, choose a model in a conversation, and enter `/agent-swarm` followed by your goal. The command appears in native autocomplete.
 
-On both supported hosts Agent Swarm lives in the native right sidebar. The sidebar starts collapsed; send `/agent-swarm` with your goal to open it automatically, or use the persistent Agent Swarm button at the bottom of the left navigation to open it again. The right sidebar belongs to one conversation: after opening a worker's conversation, open its read-only swarm view with the same button. The UI supports English, Chinese, light and dark themes.
+On every supported host Agent Swarm lives in the native right sidebar. The sidebar starts collapsed; send `/agent-swarm` with your goal to open it automatically, or use the persistent Agent Swarm button at the bottom of the left navigation to open it again. The right sidebar belongs to one conversation: after opening a worker's conversation, open its read-only swarm view with the same button. The UI supports English, Chinese, light and dark themes.
 
 For bundle installation, upgrades, startup recovery and configuration, see the [operations guide](docs/operations.md).
 

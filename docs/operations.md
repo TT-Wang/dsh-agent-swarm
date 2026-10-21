@@ -87,7 +87,7 @@ New automatic plans treat task assignees as preferences. If a preferred member i
 
 The plugin uses the first available surface:
 
-1. **Native Harness right sidebar**, on both supported releases: the **Agent Swarm** button at the bottom of the left navigation opens it; the command and conversation card reveal the same tab. The right sidebar belongs to one conversation, so a worker's conversation opens its own read-only view from the same button.
+1. **Native Harness right sidebar**, on every supported release: the **Agent Swarm** button at the bottom of the left navigation opens it; the command and conversation card reveal the same tab. The right sidebar belongs to one conversation, so a worker's conversation opens its own read-only view from the same button.
 2. **Better Sidebar**, when a profile installs it: choose **Agent Swarm** in the **+** tab menu.
 
 Hiding a surface stops its display updates, not workers. Worker activity shows host-observed operations and signal freshness; it does not stream model tokens or guarantee useful progress. On disconnection, retained activity is marked as last-observed and its timer freezes. Missing fresh activity stops busy animations without declaring a worker failed.
