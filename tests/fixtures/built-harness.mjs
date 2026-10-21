@@ -66,6 +66,20 @@ export function loaderPlugin(namespace) {
 }
 
 /**
+ * The package that mounts the DeepSeek API-key route (provider
+ * `deepseek-official`) on this host. From 0.1.7-rc.2 it is
+ * dsh-llm-deepseek-api-key, and dsh-llm-deepseek is only the protocol library
+ * (0.2.1 exports no plugin from it); a host without the api-key package mounts
+ * the route from dsh-llm-deepseek. Both take the same config.
+ */
+export async function deepseekApiKeyRoute(root) {
+  const catalog = await harnessCatalog(root)
+  const name = ['@deepseek-ai/dsh-llm-deepseek-api-key', '@deepseek-ai/dsh-llm-deepseek'].find(candidate => catalog.has(candidate))
+  assert(name, 'Harness ships no DeepSeek API-key route')
+  return name
+}
+
+/**
  * The rows `bash` runs on, each mounted only when the host's catalog has its
  * package. From 0.2.1 tool-bash takes its cwd from the session's
  * `workingDirectory` service (dsh-working-directory), which reads through an
@@ -154,7 +168,7 @@ export async function bootHarness({ harnessRoot, artifactRoot, runRoot, workspac
     id: row[0], name: await harnessEntry(harnessRoot, row[1]), ...(row[2] ? { config: row[2] } : {}),
   } : row))
   entries.push(deepseekConfig ? {
-    id: 'deepseek-llm', name: await harnessEntry(harnessRoot, '@deepseek-ai/dsh-llm-deepseek'),
+    id: 'deepseek-llm', name: await harnessEntry(harnessRoot, await deepseekApiKeyRoute(harnessRoot)),
     config: deepseekConfig,
   } : {
     id: 'scripted-llm', name: new URL('./scripted-llm.mjs', import.meta.url).href,
