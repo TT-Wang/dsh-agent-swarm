@@ -90,10 +90,12 @@ export interface DeliveryApplication {
 }
 /**
  * R11-01: closed provider-outage classes. The adapter classifies an HTTP/class
- * condition (402/429/5xx, quota, provider-unavailable) into one of these so the
- * runtime can pause, route or re-assign without parsing provider text.
+ * condition (402/429/5xx, quota, provider-unavailable, a signed-out or refused
+ * account credential) into one of these so the runtime can pause, route or
+ * re-assign without parsing provider text. `PROVIDER_FAILURE_CODES` in
+ * `scheduler.ts` maps each Harness failure code it decides to one of them.
  */
-export type ProviderOutageClass = 'quota' | 'rate-limit' | 'unavailable'
+export type ProviderOutageClass = 'quota' | 'rate-limit' | 'unavailable' | 'credential'
 /** R11-01: one classified provider outage; `status` is the HTTP status when known. */
 export interface ProviderOutage {
   class: ProviderOutageClass
@@ -787,6 +789,29 @@ export const OWNER_ONLY_TOOLS: readonly string[] = [
 ]
 
 /**
+ * Host tools that take a worker session out of its confinement: its member
+ * worktree and its current attempt. Declared once and read by the same two
+ * enforcement points as `OWNER_ONLY_TOOLS`: the worker projection hides each
+ * one the host registers (`src/tools.ts`), and the runtime guard refuses every
+ * one of them (`src/runtime.ts`). A name a host does not register costs nothing
+ * to deny. The 0.2.x hosts register them:
+ *  - `working_directory` moves the session's durable working directory, which
+ *    bash, file tools and the model's directory context follow, out of the
+ *    worktree (the base bundle mounts it for every session);
+ *  - `create_worktree` (the experimental worktree tool, a GUI opt-in) creates a
+ *    branch and a second checkout and moves the session's working directory
+ *    into it;
+ *  - `schedule_create`, `schedule_update`, `schedule_list` and
+ *    `schedule_delete` (the Web Standard, Creator and PTC presets) manage
+ *    reminders, and a due reminder wakes the session that set it: a resident
+ *    worker after its attempt, a non-resident one resumed outside this adapter.
+ */
+export const UNCONFINED_HOST_TOOLS: readonly string[] = [
+  'working_directory', 'create_worktree',
+  'schedule_create', 'schedule_update', 'schedule_list', 'schedule_delete',
+]
+
+/**
  * Every durable event that fences a running attempt, and therefore closes the
  * attempt interval both readers reconstruct from the log:
  *  - the replay decoder (`src/trace.ts`) opens one attempt per `task/claimed`
@@ -1074,7 +1099,7 @@ export interface WorkerCallbacks {
   verificationCleanupFailure?(info: VerificationCleanupFailure): void
   /**
    * R11-01: a classified provider outage (quota, rate limit, provider
-   * unavailable). The adapter classifies, and this is the error's one report
+   * unavailable, account credential). The adapter classifies, and this is the error's one report
    * (never also a `failure`); the runtime emits the durable event, keeps the
    * attempt alive and never spends recovery credit on the pause.
    */

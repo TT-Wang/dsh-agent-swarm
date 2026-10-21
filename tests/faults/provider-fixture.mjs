@@ -10,8 +10,8 @@
 import assert from 'node:assert/strict'
 import { mkdir, rm } from 'node:fs/promises'
 import { join } from 'node:path'
-import { bootFaultHarness, importHarness, resolveHarnessRoot, FAULT_OWNER } from './loader.mjs'
-import { toolResultBlocks } from '../fixtures/built-harness.mjs'
+import { bootFaultHarness, resolveHarnessRoot, FAULT_OWNER } from './loader.mjs'
+import { importHarness, toolResultBlocks } from '../fixtures/built-harness.mjs'
 import { makeRepo, eventually, events, budget as defaultBudget, runScenario } from './harness.mjs'
 import { requests, faults, setScript } from './scripted-provider.mjs'
 

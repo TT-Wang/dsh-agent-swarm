@@ -11,17 +11,21 @@ import SessionStore, { SessionId } from '@deepseek-ai/dsh-session'
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
 import SessionProjection from '@deepseek-ai/dsh-session-projection'
 import ToolRuntime, { defineContentToolFixture } from '@deepseek-ai/dsh-tools'
-import JsonlPersistence from '@deepseek-ai/dsh-session-persistence-jsonl'
+import * as JsonlPersistenceModule from '@deepseek-ai/dsh-session-persistence-jsonl'
 import SandboxPolicy from '@deepseek-ai/dsh-sandbox-policy'
 import Approval from '@deepseek-ai/dsh-user-approval'
 import UserQuestionService from '@deepseek-ai/dsh-user-questions'
 import { HarnessWorkers } from '../lib/harness-workers.js'
 import { RoleScoper } from '../lib/roles.js'
-import { registerTools, ENTRY_PROMPT, HISTORICAL_OWNER_PROMPT, OWNER_PROMPT, WORKER_PROMPT, SWARM_PROMPT, MEMBER_TOOLS, MANAGEMENT_TOOLS, OWNER_SESSION_TOOLS, SWARM_TOOLS } from '../lib/tools.js'
+import { registerTools, hiddenToolsFor, ENTRY_PROMPT, HISTORICAL_OWNER_PROMPT, OWNER_PROMPT, WORKER_PROMPT, SWARM_PROMPT, MEMBER_TOOLS, MANAGEMENT_TOOLS, OWNER_SESSION_TOOLS, SWARM_TOOLS } from '../lib/tools.js'
+import { UNCONFINED_HOST_TOOLS } from '../lib/types.js'
 import { runProcess } from '../lib/workspaces.js'
 import { subprocessSeam, SubprocessLocal } from './subprocess-seam.mjs'
 import { budget as sharedBudget, makeRuntime } from './faults/harness.mjs'
 import { tempDirectory } from './temp-root.mjs'
+import { loaderPlugin } from './fixtures/built-harness.mjs'
+
+const JsonlPersistence = loaderPlugin(JsonlPersistenceModule)
 
 /**
  * The provider-visible system prompt. The agent loop requires
@@ -103,6 +107,25 @@ test('the runtime guard refuses exactly the owner-only surface the role projecti
   }
   assert.equal(guard('swarm_submit'), undefined, 'a member tool stays allowed')
   assert.equal(guard('swarm_registry'), 'Use the swarm work board; alternate delegation and runtime modification bypass mission authority', 'the drifted tool is refused by name, not by luck')
+})
+
+test('the runtime guard refuses every unconfined host tool the worker projection hides', async t => {
+  // A worker must not move its session directory out of its worktree, open a
+  // second checkout, or schedule a turn for after its attempt. One declared list
+  // (`UNCONFINED_HOST_TOOLS`) feeds both enforcement points; this pins that they
+  // agree whether or not the installed host registers those tools.
+  const f = await fixture(t, () => prompt('done'))
+  await f.ctx.agents.create({ sessionId: SessionId('owner-session'), meta: { cwd: f.source }, agentOptions: { provider: 'swarm-test', model: 'scripted' } })
+  const owner = { sessionId: 'owner-session' }
+  const mission = f.runtime.create(owner, { title: 'Confine', objective: 'Keep workers in their worktree', workspace: f.source, scope: ['**'], acceptance: ['done'], budget }, { grantRoot: f.source, source: 'session' })
+  const builder = await f.runtime.addMember(owner, mission.id, { name: 'Builder', role: 'implementation' })
+  const refusal = 'Work stays in your member worktree and current attempt; moving the session directory, opening another checkout or scheduling a later turn bypasses mission authority'
+  assert.deepEqual(UNCONFINED_HOST_TOOLS.filter(name => !hiddenToolsFor('worker').includes(name)), [], 'the worker projection hides every one')
+  for (const tool of UNCONFINED_HOST_TOOLS) assert.equal(f.workers.callbacks.guard(builder.id, tool), refusal, `${tool} is refused for a worker by name`)
+  for (const role of ['entry', 'owner', 'historical-owner']) {
+    assert.deepEqual(hiddenToolsFor(role).filter(name => UNCONFINED_HOST_TOOLS.includes(name)), [], `a ${role} session keeps them: only workers are confined`)
+  }
+  assert.notEqual(f.workers.callbacks.guard(builder.id, 'bash'), refusal, 'an ordinary workspace tool is not refused by this rule')
 })
 
 test('T3d: the entry-visible surface equals the model-visible golden fixture', async () => {

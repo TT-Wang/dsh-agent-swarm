@@ -1,11 +1,229 @@
 # Validation
 
-Current **0.7.0** working-tree checks and the historical **0.6.0** baseline are recorded separately below. Supported Harness releases remain prereleases; matching a version string alone does not establish compatibility with an arbitrary checkout or profile. From round 28 exactly two releases are supported; entries before it record checks against the releases supported at the time (`0.1.2-rc.1`, `0.1.3-alpha.2`, `0.1.5-rc.1`, `0.1.6-alpha.2`), which are no longer supported.
+Current **0.7.0** working-tree checks and the historical **0.6.0** baseline are recorded separately below. Supported Harness releases remain prereleases; matching a version string alone does not establish compatibility with an arbitrary checkout or profile. Exactly three releases are supported, `0.2.1-rc.2` (the default host) and the earlier `0.1.5-rc.3` and `0.1.7-rc.1`. From round 28 until `0.2.1-rc.2` was added, only `0.1.5-rc.3` (then the default host) and `0.1.7-rc.1` were, so entries in that span record checks on those two hosts; entries before round 28 record checks against the releases supported at the time (`0.1.2-rc.1`, `0.1.3-alpha.2`, `0.1.5-rc.1`, `0.1.6-alpha.2`), which are no longer supported.
 
 | Harness release | Exact source commit |
 | --- | --- |
-| `0.1.5-rc.3` (npm `latest`, default host) | `a4c74a91e06b00fe0b0937bde982170c526cc842` |
-| `0.1.7-rc.1` (npm `next`) | `46a7f68b0922371ce7144b668b90e377d8e799f4` |
+| `0.2.1-rc.2` (npm `latest` and `next`, default host) | `687f282e8625c6b8d11ff58211a90524be2e4317` |
+| `0.1.5-rc.3` (earlier release, formerly npm `latest`) | `a4c74a91e06b00fe0b0937bde982170c526cc842` |
+| `0.1.7-rc.1` (earlier release, formerly npm `next`) | `46a7f68b0922371ce7144b668b90e377d8e799f4` |
+
+## Harness 0.2.1-rc.2: the default host, with 0.1.5-rc.3 and 0.1.7-rc.1 kept (2026-10-21)
+
+**Head**: `7bcc4ae` and this record (documentation only), branch `dsh021/adapt` on `a57052b` (main), not merged; six
+slices (A to F) and one review repair round. `src` against `a57052b`: +193 −48, net +145. By slice: A +1, B 0, C
++69, D +73, E 0, F 0, and the repair round +2 (comments). Every change holds on all three hosts, and no `src` line
+branches on a host version: where hosts differ, the code or fixture composes what the host provides (its package
+catalog, its services, its editor nodes).
+
+**Where 0.2.1-rc.2 stood at `a57052b`.** A probe at main, with only `compatibility.json` admitting 0.2.1-rc.2:
+typecheck, build, `test:replay`, `test:oracle` (12/12 identical) and the fault suite (24/24) passed. The full suite
+ran 1843 tests with 15 failures, and six files failed to load (about 107 tests never ran). `test:harness` and
+`test:pack` failed with `unknown tool "bash"`. `test:profile`, `test:bundle` and both web smokes failed because the
+0.2.x plugin manager refused the install on the plugin's peer ranges.
+
+**What each slice leaves at the head.**
+
+- **A, the supported set** (`7116157`, `2a1d1db`, `b957e3a`). `compatibility.json` gains the 0.2.1-rc.2 row (tag
+  `dsh-v0.2.1-rc.2`, `687f282e86`) and names it `defaultHost`. Its `channel` string becomes a `channels` list, since
+  npm `latest` and `next` both name 0.2.1-rc.2; nothing reads it. Every `@deepseek-ai/dsh-*` peer range,
+  `SUPPORTED_HARNESS_RELEASES` (`src/host-version.ts`) and the profile's `requires.harness` admit it, in the same
+  order, so the 0.1.7 and 0.2.1 plugin managers accept `plugin add`. No `engines.dsh` is declared: the peer ranges
+  already decide on 0.1.7 and 0.2.1, 0.1.5 only logs a mismatch, and a second list would need its own lockstep.
+  `devDependencies` pin the default host's packages. Without `DSH_HARNESS_ROOT` or `DSH_SOURCE`,
+  `scripts/harness-target.mjs` derives its sibling checkouts from `compatibility.json`, the default host's first
+  (`deepseek-harness-021rc2`, then `015rc3` and `017rc1`), so adding a release needs no script edit.
+- **B, the test compositions** (`362a165`, `3958f08`, `31b8323`, `c1c6f4c`, `5f4b923`, `e556e9a`; no `src` change).
+  Six test files mount JSONL persistence through `loaderPlugin()` (`tests/fixtures/built-harness.mjs`), the Loader's
+  own export rule: the default export where there is one (0.1.x), else the namespace (0.2.1, which publishes no
+  default). The owner-notice fixture drops `dsh-invariants`, which 0.2.x deleted; it mounted no companion that
+  registers a check, so it ran none on 0.1.x either. Both real Loader compositions (`bootHarness`,
+  `bootFaultHarness`) add `workingDirectoryRows()`: `fs-local` rooted at the workspace and `dsh-working-directory`
+  with the workspace as its default directory, each mounted only where the host's package catalog has the package
+  (`fs-local` on every host, `dsh-working-directory` on 0.2.1, whose `tool-bash` injects it).
+  `assertEveryEntryActive()`, shared by both, replaces a boot check that only asked whether an entry had a fiber:
+  every enabled entry, group children included, must be active, and a pending one is named with the services it
+  waits for. `bootHarness` mounts the DeepSeek API-key route from `dsh-llm-deepseek-api-key` where the catalog has
+  it (0.2.1) and from `dsh-llm-deepseek` otherwise. `nativeClient()` in `tests/ui.test.mjs` keeps the identities the
+  test shares with the clients it loads (react, react-dom, Cordis) and resolves the other host-shared modules, such
+  as `zod`, from the native package's own directory.
+- **C, worker confinement** (`8dacae6`, `f4a5aac`, `bfb73c3`). `UNCONFINED_HOST_TOOLS` (`src/types.ts`), beside
+  `OWNER_ONLY_TOOLS`, lists `working_directory`, `create_worktree` and `schedule_create`, `schedule_update`,
+  `schedule_list`, `schedule_delete`. `hiddenToolsFor('worker')` hides each one the host registers, and the runtime
+  guard refuses every one by name with its own reason. Each worker activation re-anchors the session's working
+  directory where it forces `sandbox/mode` and `approval/policy`: when the host provides the `workingDirectory`
+  service and its `get()` reads anything but the member worktree, the adapter appends one
+  `working-directory/change` naming the worktree, as the service's own `ensure()` records a session's first
+  directory. It does not call the service's `set()`, which also queues an inbox notice that the stranded-inbox drain
+  would wake as a model turn of its own. A worker already in its worktree, and a host without the service, get no
+  write. The owner side needed no code: `/agent-swarm`, the swarm tools and browser drafts authorize from the
+  session header's directory.
+- **D, the runtime** (`5f6bfce`, `3b493cb`, `ccbfdc1`, `8670342`). (1) `PROVIDER_FAILURE_CODES`
+  (`src/scheduler.ts`) is the one table a Harness failure code is read from; `classifyProviderOutage` reads it first,
+  then the HTTP status, then wording. `ACCOUNT_QUOTA` is the quota class. `ACCOUNT_SIGN_IN_REQUIRED` and
+  `ACCOUNT_TOKEN_INVALID` form a new `credential` outage class: one condition of the route, shared by every session
+  on it, that ends when the owner signs in. `MODEL_UNSUPPORTED` and `CLIENT_UPGRADE_REQUIRED` stay member failures,
+  since a member's route is fixed for its session and only a replacement runs the work. (2) The worker persona
+  section holds only `{{swarm_persona}}`, and a scoped prompt variable supplies the persona. No supported host scans
+  a substituted value again, and 0.1.5-rc.3's `PromptSection` has no `interpolate` field and its renderer no escape
+  syntax, so the variable is the one form all three hosts read the same way. (3) The owner delivery filter rejects
+  an opening step (`step === 1`) whose every claimed message went stale, and still empties a continuing step. The
+  0.2.x Web presets (Standard, PTC, Cordis) mount `dsh-time-context`, whose prepended pre-step listener appended a
+  reading to an emptied opening, so a stale-only owner wake cost a model call. The time context passes a rejection
+  through, and the loop ends the turn before any step on every host. Two survey items were refuted by their own
+  challenges and changed nothing: subagent-settled turns in `OwnerReplyGuard`, and agent shutdown ownership.
+- **E, web smokes and host scripts** (`2e00a95`, `7f7b244`, `00ad4be`, `93745f9`, `e09d173`; no `src` change).
+  `smokeHost()` composes from what the host ships. It disables `llm-deepseek` and, where shipped,
+  `llm-deepseek-account`. It pins the first-use default workspace inside the run root where the workspace controller
+  has `initializeDefault` (0.1.7, 0.2.1). It asserts the command chip where the editor ships `CommandChipNode`. The
+  runner acknowledges the welcome notice through the notice, then waits for the first-use session's live composer
+  before it opens the chooser menu; the command smoke polls the composer's `textContent`.
+  `patches/harness-command-input.patch` declares its targets on a `Targets: 0.1.5-rc.3 0.1.7-rc.1` preamble line
+  that `git apply` ignores, and `scripts/command-input-patch.mjs` is its one reader. The check script runs the
+  regression on a targeted release, reports a release that ships no `claim-decor.ts` NOT AFFECTED (exit 0), and
+  refuses an untargeted release that still ships it. `update-preview` refuses a root whose `compat/` packages were
+  rebuilt from another release. `hostPatch(root)` in `scripts/host.mjs` is the one root overlay of the lab and the
+  previews, with the `hmr` row disabled. `start-lab` no longer replaces `llm-deepseek`'s model list.
+- **F, documentation** (`b963f39`, `9ea9f2f`, `b44811b`; docs only). The operations guide (EN and zh-CN) gains
+  "Upgrade a Harness home to 0.2.x": what to back up, why the way back is closed, and what the plugin does after a
+  move back. `docs/known-limitations.md` carries the evidence, and records the 0.2.x behaviour an operator meets: the
+  cached prompt prefix on `toolUpdate` routes, the shared `AGENTS.md` in `$DSH_AGENTS_HOME`, Minimal-preset members
+  that compact, dsh-external#624 and #632 (open, unchanged) and the 0.2.1 host's owner-only plugin routes. The
+  remaining "both hosts" statements in both READMEs, both operations twins and known-limitations say every
+  supported host.
+
+**Review repair round** (`499bc7e` to `7bcc4ae`).
+
+- `499bc7e` (tests): the two halves of the stale-input rejection, `step === 1` and every claimed message stale,
+  were pinned by no test; rejecting at any step, or when any one message was stale, kept the suite green on
+  0.2.1-rc.2. Two tests now pin them (below).
+- `794fccd` (tests only): `tests/faults/loader.mjs` kept its own copies of `harnessCatalog`, `harnessEntry` and
+  `importHarness`, each with its own catalog cache, so one fault composition read the checkout twice. It now takes
+  them from `tests/fixtures/built-harness.mjs`, as do the fault provider and its fixture. F3A, F3B and F3C pass on
+  all three hosts.
+- `c23399e` (comments and a test name): "both supported" hosts or releases now reads "every supported", each claim
+  checked against the 0.2.1-rc.2 source first. The telemetry note in `src/trace.ts` says 0.2.x adds only an
+  optional `sourceEvent`, and the `agentPresets` note names `dsh-agent-preset-registry` for 0.2.x too.
+- `7bcc4ae` (docs): the known-limitations bullet on what the gates did and did not exercise on 0.2.1-rc.2. The
+  review listed the replay digest on 0.2.1 as unexercised; the first gate run's `test:replay` on 0.2.1-rc.2
+  reproduced it, so the bullet records it as reproduced.
+
+**User-facing changes.**
+
+- `dsh plugin add` of the plugin succeeds on 0.2.1-rc.2. The unsupported-host refusal and log name all three
+  releases, and the default checkout search tries `deepseek-harness-021rc2` first.
+- On 0.2.x a worker neither sees nor can call `working_directory`, `create_worktree` or the `schedule_*` reminder
+  tools, and every activation starts it in its member worktree, whatever its log recorded. On 0.1.x a profile that
+  mounts `dsh-schedule` registers the reminder tools in each agent's own scope, where only the guard refuses them.
+- On 0.2.x a mission and a draft bind to the directory the owner session started in; a later `cd` moves neither.
+- The DeepSeek account route (0.2.x): a signed-out account or a refused token is a `credential` outage. The route is
+  quiescent, no recovery credit is spent, no member is retired, and it ends when the owner signs in. `ACCOUNT_QUOTA`
+  is a quota outage with or without a 402. A model the account catalog refuses on the running release is the
+  member's counted failure. On every host a Harness code now decides before the HTTP status (`QUOTA` with a 429 is
+  quota, not rate-limit).
+- A member name, role or mission objective containing `{{...}}` reaches the model as written on every host. Before,
+  a malformed group failed every request of that worker on every host, `{{cwd}}` failed on 0.2.1, and `{{cwd}}` and
+  `{{model}}` were silently substituted on 0.1.x.
+- An owner wake whose only input went stale makes no model call on any host (it made one under the 0.2.x Web
+  presets). Its `turn/end` reads `blocked` instead of `completed`, and it marks no earlier pending delivery handled.
+- The lab and preview hosts boot without HMR on every host, so a build mounts only through a restart. The lab
+  offers the host's own DeepSeek model catalog (its override named a preview model that expired on 09-10 and left
+  out `deepseek-flash`, the model every host's `agent-default-model` row names). `update-preview` will not boot a
+  0.1.x-built `compat/` overlay on another release. The web smokes no longer create folders in the operator's
+  `~/Documents`.
+- Moving a Harness home to 0.2.x is one-way for its session logs; the operations guide says what to back up first.
+
+**The full-log oracle at the head against `a57052b`** (`npm run test:oracle`, one run on each host at `7bcc4ae`,
+and one on each at `b44811b`). On 0.1.5-rc.3, 0.1.7-rc.1 and 0.2.1-rc.2 alike, every event, row, delivery and
+adapter call is identical to the 12 logs recorded at `a57052b`; no commit of the batch re-recorded a log
+(`scripts/replay/oracle/` is unchanged). Slice C also ran it at its head on 0.1.5-rc.3, 12/12 identical. No log
+could move: the scenarios drive the kernel through a scripted adapter, so the re-anchor, the persona variable and
+the owner filter (`src/harness-workers.ts`) are off their path; no scenario calls a host tool the worker projection
+now hides; and the `outage` scenario hands the runtime its outage already classified (`rate-limit`, 429) and fails
+its starts with `EMFILE`, which neither the code table nor the status and wording rules name, before or after
+`5f6bfce`. The probe at `a57052b` reproduced the same 12 logs on 0.2.1-rc.2, so the oracle told the hosts apart
+neither before the batch nor after it; the host differences are covered by the Loader compositions, the fault
+suite and the browser smokes.
+
+**Regressions.** The full suite grows from 1950 tests at `a57052b` to 1972.
+
+- A: `tests/host-version.test.mjs` builds the expected refusal and log messages from the supported list and pins
+  `defaultHost` to a supported release. `tests/harness-support.test.mjs` builds the expected `harness-target`
+  refusal from `compatibility.json`, and its default-search test builds a 0.2.1-rc.2 sibling beside a 0.1.5-rc.3
+  one and expects it to win.
+- B: `assertEveryEntryActive()` is the boot check of both real Loader compositions. On 0.2.1-rc.2 with the
+  working-directory rows dropped, boot fails with `tool-bash: pending, waiting for workingDirectory`, where the old
+  check passed and the failure surfaced later as `unknown tool "bash"`.
+- C: `tests/harness-workers.test.mjs` composes a worker with the host's real tool packages, each mounted only where
+  the installed host ships it (`tests/fixtures/host-packages.mjs`, new). The worker sees none of the unconfined
+  tools, every call fails without reaching the service behind it, and its directory stays its worktree. A worker
+  whose log recorded another directory starts its next activation in its worktree: one write, no queued input, and
+  the model-visible directory context names the worktree; on a host without the service no activation writes the
+  event. `tests/roles.test.mjs` requires the guard to refuse every tool the worker projection hides, and
+  `tests/tool-output.test.mjs` pins the worker's hidden list as the management surface plus this list.
+  `tests/r17-projection.test.mjs` accepts `working-directory/change` only on a host that does not ship the package
+  owning it.
+- D: `tests/provider-outage.test.mjs`: the table decides every code it names ahead of the status and wording; a
+  start failure classified as an outage re-routes without spending credit, the credential codes included; a start
+  the account catalog refuses for the member's model is the member's counted failure. `tests/harness-workers.test.mjs`:
+  a worker turn failing with each account code is reported as the table's class or as the member's failure, and a
+  worker persona reaches the model as written whatever braces its free text carries.
+  `tests/harness-owner-notices.test.mjs` mounts the host's time context (shipped on all three hosts): an owner wake
+  whose every message went stale opens no model call. Before `ccbfdc1` it made one request on 0.2.1-rc.2.
+- E: `tests/web-smoke-runner.test.mjs` (the smoke composes the DeepSeek routes, first-use workspace and command
+  claim by what the Harness ships), `tests/command-input-patch.test.mjs` (new: the patch targets only supported
+  releases and corrects one file; a release without the file is not affected and one that still ships it untargeted
+  is refused; a patch without a `Targets` line declares nothing), `tests/harness-support.test.mjs` (`update-preview`
+  boots rebuilt host packages only on the release they were rebuilt from), `tests/host.test.mjs` (a root's host
+  boots with its own swarm state and without HMR) and `tests/host-scripts.test.mjs` (the live lab's overlay
+  disables HMR and leaves the host's model catalog alone).
+- Repair round, `tests/harness-owner-notices.test.mjs`: a continuing owner step whose claimed input all went stale
+  still hands the model its tool result, and the turn ends `completed`; an opening owner step runs genuine owner
+  input claimed beside stale swarm input. In both, the stale text reaches no request and the delivery is not
+  consumed. On 0.2.1-rc.2 each fails on its own built-lib mutant and on no other (reject at any step: expected 2
+  requests, actual 1; reject when any message is stale: expected 1, actual 0); both pass on all three hosts.
+
+**Gates at `7bcc4ae`** on each host in turn, with `node_modules` linked to that host's link farm (`nm-015rc3`,
+`nm-017rc1`, `nm-021rc2`) and `DSH_HARNESS_ROOT` at its clone:
+
+| Check | 0.1.5-rc.3 (`a4c74a91e0`) | 0.1.7-rc.1 (`46a7f68b09`) | 0.2.1-rc.2 (`687f282e86`) |
+| --- | --- | --- | --- |
+| `npm run typecheck` / `npm run build` | passed / passed | passed / passed | passed / passed |
+| `node --test tests/*.test.mjs` | 1972/1972 (206 s) | 1972/1972 (204 s) | 1972/1972 (218 s) |
+| `npm run test:harness` | passed | passed | passed |
+| `npm run test:replay` | digest unchanged | digest unchanged | digest unchanged |
+| `npm run test:oracle` | 12/12 identical | 12/12 identical | 12/12 identical |
+| `npm run test:pack` | passed (251 archive entries, 251 published files) | passed (251, 251) | passed (251, 251) |
+| `npm run test:profile` | passed | passed | passed |
+| `npm run test:bundle` | 7/7 | 7/7 | 7/7 |
+| `node scripts/faults/run.mjs` | 24/24 | 24/24 | 24/24 |
+| `npm run test:web` | passed, 13 checks | passed, 13 checks | passed, 13 checks |
+| `npm run test:command-web` | passed, 11 checks | passed, 11 checks | passed, 11 checks |
+
+The replay digest is `sha256:61a921e64088b78b957cd6aeaa563d5436d4a6eae4b0130725d1f3c74c6f971e` on every host. Each
+web smoke's `report.json` records its host's `harnessHead`. No full-suite log holds a `not ok` line. The
+`[agent-swarm] Error: [mission_operation_pending]` lines in the harness, pack and profile logs (4 to 9 a log) are
+the notice those compositions trigger on purpose, as on main. The first gate run, at `b44811b` before the repair
+round, passed the same gates on each host with 1970/1970. `scripts/check-harness-command-input.mjs` passes 5/5
+against the patch on 0.1.5-rc.3 and 0.1.7-rc.1 and reports 0.2.1-rc.2 NOT AFFECTED.
+
+Not exercised on 0.2.1-rc.2: a real-provider mission (`test:deepseek`, `test:command-deepseek`; only the API-key
+route's boot was checked, without a request), `test:load`, Better Sidebar and the attended preview, which still
+runs 0.1.7-rc.1. No scripted model declares `toolUpdate`, and the gate compositions write no job events, so the
+in-history tool update and the 0.2.x production log shape are read from the host source and the browser smokes.
+
+**Open after this batch** (not adopted here; each predates the batch or needs an owner decision).
+
+- No downgrade guard: the plugin records no host release, so a session a 0.1.x host refuses after a move back is an
+  ordinary start failure.
+- A cold worker resumed by another host path (a sidebar reopen, the 0.2.x schedule service, a UI composer) runs
+  without the worker guard, restriction or accounting; a worker whose worktree was cleaned up fails each request at
+  prompt assembly on 0.2.x.
+- The stranded-inbox drain treats any pending inbox item as input, so context a host plugin injects into a worker
+  starts a model turn of its own.
+- On the API-key route `AUTH`, `MISSING_CREDENTIAL` and `INVALID_CREDENTIAL` are still member failures.
+- `scripts/check-cancel-freeze.mjs` imports `isJsonValue` from `@deepseek-ai/dsh-session`, which no supported host
+  exports, so it stops before booting on every host.
 
 ## Kernel/Board W1 and F2: a finished attempt's recovery, one stop-owner rule (2026-10-19)
 
@@ -2740,7 +2958,7 @@ The behavioral tests import the built `lib/` output. `npm test` builds first; a 
 
 `npm run test:harness`, `npm run test:pack` and `npm run test:profile` compose a real Harness profile whose sandbox requests `workspace-write`, so they require a host that permits nested `sandbox_apply`. Inside an outer workspace-write sandbox, macOS denies it (`sandbox-exec: sandbox_apply: Operation not permitted`) and the composition fails with `SandboxUnavailableError`. `test:pack` and `test:profile` detect an unusable nested sandbox before the composition and abort with that prerequisite; set `DSH_SWARM_SKIP_SANDBOX_PREFLIGHT=1` to attempt the composition anyway. `npm run test:harness` runs the composition directly and reports the same `SandboxUnavailableError`.
 
-`npm run test:faults` needs no sandbox, but its provider-fault tier B (F3a/F3b/F3c) boots the real Harness Loader, so it needs a built supported Harness checkout: `DSH_HARNESS_ROOT` or `DSH_SOURCE`, or else the first of `~/.dsh/source/current` and the siblings `deepseek-harness-015rc3`/`deepseek-harness-017rc1` whose version is in [compatibility.json](../compatibility.json), with built `lib/` entries. Without one it fails with `The fault suite needs a built Harness checkout; set DSH_HARNESS_ROOT`. The host-only `npm run test:isolation` drives the real sandbox provider and needs the same built checkout plus a host that permits the platform sandbox; it is not part of the worker check set. The published tarball ships only `package.json` and its `files` list (built `lib/`, `cordis.patch.yml`, the profile bundle, both READMEs, the five `docs/` documents and their images, `compatibility.json`, the naming manifest, `LICENSE`, `NOTICE` and `scripts/packed-smoke.mjs`), so the full suite requires the repository checkout (see [known-limitations.md](known-limitations.md)).
+`npm run test:faults` needs no sandbox, but its provider-fault tier B (F3a/F3b/F3c) boots the real Harness Loader, so it needs a built supported Harness checkout: `DSH_HARNESS_ROOT` or `DSH_SOURCE`, or else the first of `~/.dsh/source/current` and the siblings `deepseek-harness-021rc2`/`deepseek-harness-015rc3`/`deepseek-harness-017rc1`, in that order, whose version is in [compatibility.json](../compatibility.json), with built `lib/` entries. Without one it fails with `The fault suite needs a built Harness checkout; set DSH_HARNESS_ROOT`. The host-only `npm run test:isolation` drives the real sandbox provider and needs the same built checkout plus a host that permits the platform sandbox; it is not part of the worker check set. The published tarball ships only `package.json` and its `files` list (built `lib/`, `cordis.patch.yml`, the profile bundle, both READMEs, the five `docs/` documents and their images, `compatibility.json`, the naming manifest, `LICENSE`, `NOTICE` and `scripts/packed-smoke.mjs`), so the full suite requires the repository checkout (see [known-limitations.md](known-limitations.md)).
 
 `npm run test:web` and `npm run test:command-web` launch the real Web application and are load-sensitive. Run them sequentially on an idle host, without other large suites or browsers in parallel, and re-run a timeout before treating it as a product defect.
 

@@ -1,7 +1,7 @@
 /**
  * apply() logs an error, never throws, when the Harness it runs on is not one of
- * the supported releases: 0.1.5-rc.3 has no peer-version gate and neither host
- * reads the profile's requires.harness. The version is the manifest of the
+ * the supported releases: 0.1.5-rc.3 has no peer-version gate and no host reads
+ * the profile's requires.harness. The version is the manifest of the
  * `@deepseek-ai/dsh-session` package the plugin resolves; the unsupported case
  * gives a copy of the built plugin the module-proxy layout a 0.1.6-alpha.2 host
  * installs (a package directory whose manifest names that version and whose
@@ -18,6 +18,8 @@ import { loadedHarnessVersion, reportHarnessSupport, SUPPORTED_HARNESS_RELEASES 
 
 const project = fileURLToPath(new URL('../', import.meta.url))
 const read = path => JSON.parse(readFileSync(join(project, path), 'utf8'))
+/** The start of the error an unsupported 0.1.6-alpha.2 host logs, naming every supported release. */
+const UNSUPPORTED = new RegExp(`^agent-swarm: Unsupported Harness 0\\.1\\.6-alpha\\.2; supported: ${SUPPORTED_HARNESS_RELEASES.join(', ').replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\.`)
 
 /** A logger that records every call. */
 function recorder() {
@@ -36,8 +38,10 @@ console.log(JSON.stringify(calls))`
 }
 
 test('the supported releases the plugin checks at runtime are exactly compatibility.json\'s, its peer ranges\' and the profile\'s', () => {
-  const versions = read('compatibility.json').supportedHosts.map(host => host.version)
+  const compatibility = read('compatibility.json')
+  const versions = compatibility.supportedHosts.map(host => host.version)
   assert.deepEqual(SUPPORTED_HARNESS_RELEASES, versions)
+  assert.ok(versions.includes(compatibility.defaultHost), 'the default host is a supported release')
   assert.deepEqual(read('profile/package.json').dsh.bundle.requires.harness, versions)
   for (const [name, range] of Object.entries(read('package.json').peerDependencies)) if (name.startsWith('@deepseek-ai/dsh-')) assert.equal(range, versions.join(' || '), name)
 })
@@ -62,7 +66,7 @@ test('an unsupported release is logged as an error, an unreadable one as a warni
   const unsupported = recorder()
   assert.equal(reportHarnessSupport(unsupported, () => '0.1.6-alpha.2'), 'unsupported')
   assert.deepEqual(unsupported.calls.map(([level]) => level), ['error'])
-  assert.match(unsupported.calls[0][1], /^agent-swarm: Unsupported Harness 0\.1\.6-alpha\.2; supported: 0\.1\.5-rc\.3, 0\.1\.7-rc\.1\./)
+  assert.match(unsupported.calls[0][1], UNSUPPORTED)
   const unknown = recorder()
   assert.equal(reportHarnessSupport(unknown, () => undefined), 'unknown')
   assert.deepEqual(unknown.calls.map(([level]) => level), ['warn'])
@@ -97,6 +101,6 @@ test('apply() logs an unsupported host once and goes on; on the supported Harnes
   const calls = await applyIn(plugin)
   assert.equal(calls.length, 2, JSON.stringify(calls))
   assert.equal(calls[0][0], 'error')
-  assert.match(calls[0][1], /^agent-swarm: Unsupported Harness 0\.1\.6-alpha\.2; supported: 0\.1\.5-rc\.3, 0\.1\.7-rc\.1\./)
+  assert.match(calls[0][1], UNSUPPORTED)
   assert.deepEqual(calls[1], ['threw', 'Swarm statePath and workspacesRoot must be absolute'], 'the check logs and apply() carries on to its own validation')
 })

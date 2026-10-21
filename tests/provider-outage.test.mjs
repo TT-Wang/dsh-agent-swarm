@@ -10,7 +10,7 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { join } from 'node:path'
 import { LlmError } from '@deepseek-ai/dsh-llm'
-import { classifyProviderOutage } from '../lib/scheduler.js'
+import { classifyProviderOutage, PROVIDER_FAILURE_CODES } from '../lib/scheduler.js'
 import { PROVIDER_OUTAGE_WINDOW_MS } from '../lib/types.js'
 import { FakeClock, FakeWorkers, eventually, makeRuntime } from './faults/harness.mjs'
 
@@ -58,6 +58,26 @@ test('R11-01: the adapter classifier maps HTTP status and Harness codes to the c
   assert.equal(classifyProviderOutage(new Error('assertion failed in check')), undefined)
 })
 
+test('the failure-code table decides every Harness code it names, ahead of the HTTP status and provider wording', () => {
+  for (const [code, kind] of Object.entries(PROVIDER_FAILURE_CODES)) {
+    assert.equal(classifyProviderOutage(new LlmError(`request failed (${code})`, code))?.class, kind === 'member' ? undefined : kind, code)
+  }
+  // The DeepSeek account route (0.2.x) and its own messages: none carries the
+  // wording the fallback reads, so only the code classifies them.
+  assert.deepEqual(classifyProviderOutage(new LlmError('Your DeepSeek account tokens are used up for this period.', 'ACCOUNT_QUOTA')),
+    { class: 'quota', message: 'Your DeepSeek account tokens are used up for this period.' }, 'an account quota is the quota class without a status or quota wording')
+  assert.deepEqual(classifyProviderOutage(new LlmError('Insufficient Balance', 'ACCOUNT_QUOTA', { status: 402 })), { class: 'quota', status: 402, message: 'Insufficient Balance' })
+  const signIn = 'Sign in to DeepSeek to use the account provider. The request destination must allow account authentication.'
+  assert.deepEqual(classifyProviderOutage(new LlmError(signIn, 'ACCOUNT_SIGN_IN_REQUIRED')), { class: 'credential', message: signIn }, 'a signed-out account is a route outage the owner ends by signing in')
+  assert.deepEqual(classifyProviderOutage(new LlmError('Authentication Fails', 'ACCOUNT_TOKEN_INVALID', { status: 401 })), { class: 'credential', status: 401, message: 'Authentication Fails' },
+    'a refused account token is the same condition: the host discards it and the next request needs a sign-in')
+  assert.equal(classifyProviderOutage(new LlmError('DeepSeek model "deepseek-next" is not supported by DeepSeek Harness; current version is 0.2.1-rc.2', 'MODEL_UNSUPPORTED')), undefined,
+    'a model the account catalog refuses on this release is the member\'s failure: no wait or sign-in runs it')
+  assert.equal(classifyProviderOutage(new LlmError('DeepSeek model "deepseek-next" requires DeepSeek Harness 0.3.0 or later; current version is 0.2.1-rc.2', 'CLIENT_UPGRADE_REQUIRED')), undefined)
+  assert.equal(classifyProviderOutage(new LlmError('provider unavailable for this model', 'MODEL_UNSUPPORTED')), undefined, 'a code the table decides is never re-read from its wording')
+  assert.equal(classifyProviderOutage(new LlmError('insufficient quota', 'QUOTA', { status: 429 }))?.class, 'quota', 'the code decides ahead of a status that reads otherwise')
+})
+
 test('R11-01: a classified outage is durable, keeps the running attempt, and spends no recovery credit', async t => {
   const f = await fixture(t)
   const task = f.propose()
@@ -81,23 +101,31 @@ test('R11-01: a classified outage is durable, keeps the running attempt, and spe
   assert.equal(f.runtime.store.events(f.mission.id, 500).filter(event => event.type === 'provider/outage').length, 2, 'a new class is a new durable row')
 })
 
-test('R11-01: a start failure classified as an outage re-routes without spending credit', async t => {
+// The DeepSeek account route's codes (0.2.x) take the same path as an API-key
+// quota: the failing route is the owner's to restore, never the member's fault.
+for (const [label, error, expected] of [
+  ['an API-key quota', new LlmError('insufficient quota for this account', 'QUOTA', { status: 402 }), 'quota'],
+  ['an account quota', new LlmError('Your DeepSeek account tokens are used up for this period.', 'ACCOUNT_QUOTA'), 'quota'],
+  ['a signed-out account', new LlmError('Sign in to DeepSeek to use the account provider. The request destination must allow account authentication.', 'ACCOUNT_SIGN_IN_REQUIRED'), 'credential'],
+  ['a refused account token', new LlmError('Authentication Fails', 'ACCOUNT_TOKEN_INVALID', { status: 401 }), 'credential'],
+]) test(`R11-01: a start failure classified as an outage (${label}) re-routes without spending credit`, async t => {
   const workers = new OutageWorkers()
   const f = await fixture(t, workers)
   const task = f.propose()
   workers.failFor = f.first.id
-  workers.failWith = new LlmError('insufficient quota for this account', 'QUOTA', { status: 402 })
+  workers.failWith = error
   const routed = await eventually(() => {
     const current = f.runtime.store.get('tasks', task.id)
     return current.assigneeId === f.second.id && current.status === 'running' ? current : undefined
   }, 'the outage did not re-route the task to the live member', 4000)
   assert.equal(routed.recoveryCount ?? 0, 0, 'the outage spends no recovery credit')
   const events = f.runtime.store.events(f.mission.id, 500)
-  assert.ok(events.some(event => event.type === 'provider/outage' && event.data.class === 'quota'))
+  assert.ok(events.some(event => event.type === 'provider/outage' && event.data.class === expected))
   const startFailed = events.filter(event => event.type === 'task/start-failed')
   assert.ok(startFailed.length >= 1)
   assert.equal(startFailed[0].data.quiescent, true, 'the start-failure row is marked as an outage, not a member fault')
   assert.ok(events.some(event => event.type === 'task/reassigned' && event.data.to === f.second.id))
+  assert.equal(events.filter(event => event.type === 'member/resume-failed' && event.data.memberId === f.first.id && event.data.outage === undefined).length, 0, 'no start failure is counted toward retiring the route')
   assert.notEqual(f.runtime.store.get('members', f.first.id).status, 'stopped', 'a quiescent route stays live for a later retry')
   // Recovery clears the marker durably once the route answers again. A route
   // inside its outage window is probed once per window, so move past it.
@@ -106,6 +134,22 @@ test('R11-01: a start failure classified as an outage re-routes without spending
   const recovered = await eventually(() => f.runtime.store.events(f.mission.id, 500).find(event => event.type === 'provider/recovered'), 'the recovered route was not recorded', 4000)
   assert.equal(recovered.data.memberId, f.first.id)
   assert.equal(f.runtime.store.get('members', f.first.id).providerOutage, undefined)
+})
+
+test('a start the account catalog refuses for the member\'s model is the member\'s counted failure, not an outage', async t => {
+  const workers = new OutageWorkers()
+  const f = await fixture(t, workers)
+  f.propose()
+  workers.failFor = f.first.id
+  workers.failWith = new LlmError('DeepSeek model "deepseek-next" is not supported by DeepSeek Harness; current version is 0.2.1-rc.2', 'MODEL_UNSUPPORTED')
+  const counted = await eventually(() => f.runtime.store.events(f.mission.id, 500).find(event => event.type === 'member/resume-failed' && event.data.memberId === f.first.id),
+    'the refused start was not recorded', 4000)
+  assert.deepEqual([counted.data.consecutiveFailures, counted.data.outage], [1, undefined], 'it counts toward the member\'s retirement')
+  assert.match(counted.data.error, /not supported by DeepSeek Harness/)
+  const events = f.runtime.store.events(f.mission.id, 500)
+  assert.deepEqual(events.filter(event => event.type === 'provider/outage'), [], 'no route is paused for it')
+  assert.equal(f.runtime.store.get('members', f.first.id).providerOutage, undefined)
+  assert.ok(f.runtime.store.list('deliveries', f.mission.id).some(delivery => /First could not start \(failure 1 of 3\)/.test(delivery.content)), 'the owner is told the member\'s counted failure')
 })
 
 test('R11-01: a reroute that passes over a name-first candidate inside its outage window takes the first live candidate in store order', async t => {

@@ -27,9 +27,23 @@ import { WorkerTranscript } from '../lib/types/client/WorkerTranscript.js'
 
 const testLocale = () => ({ register() { return () => {} }, bind() { return text => text } })
 
+/** Specifiers whose single identity the test shares with every client it loads: React renders, Cordis composes. */
+const SHARED_CLIENT_MODULES = ['react', 'react-dom', '@deepseek-ai/cordis']
+
+/**
+ * Load a native client bundle as the web host does: its factory takes the
+ * host module table's `require`. Beyond the identities this test shares, the
+ * table carries more of the host's modules (0.2.1 adds `zod` and
+ * `@tanstack/react-virtual`); those resolve from the native package's own
+ * directory.
+ */
 async function nativeClient(packageName) {
-  const require = createRequire(import.meta.url)
-  const runtimeDir = dirname(require.resolve(`${packageName}/package.json`))
+  const testRequire = createRequire(import.meta.url)
+  const runtimeDir = dirname(testRequire.resolve(`${packageName}/package.json`))
+  const packageRequire = createRequire(join(runtimeDir, 'package.json'))
+  const require = specifier => SHARED_CLIENT_MODULES.some(name => specifier === name || specifier.startsWith(`${name}/`))
+    ? testRequire(specifier)
+    : packageRequire(specifier)
   const styleLoader = registerHooks({ load(url, context, nextLoad) {
     if (new URL(url).pathname.endsWith('.css')) return { format: 'module', source: 'export default {}', shortCircuit: true }
     return nextLoad(url, context)

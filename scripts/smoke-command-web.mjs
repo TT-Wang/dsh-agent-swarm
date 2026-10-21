@@ -75,9 +75,15 @@ await runWebSmoke({
     assert.match(await candidate.innerText(), /自动组织智能体协作完成任务/)
     await page.screenshot({ path: join(artifacts, 'autocomplete.png'), fullPage: true })
     await candidate.click()
-    assert.equal(await composer.innerText(), '/agent-swarm ')
+    // The claim renders after the pick: textContent, not innerText, which breaks a line
+    // around a 0.2.1-rc.2 chip (an inline-flex span).
+    await until(async () => await composer.textContent() === '/agent-swarm ', 'the picked command claims the composer draft', 5000)
+    if (ctx.host.commandChips) {
+      assert.equal(await composer.locator('[data-composer-command="agent-swarm"]').count(), 1, 'the host claims the picked command as one atomic chip')
+      assert.equal(await composer.getAttribute('data-phase'), 'claimed')
+    }
     assert.match(await composer.evaluate(element => element.style.getPropertyValue('--dsh-composer-hint')), /描述你想完成的任务/)
-    checks.push('native slash catalog advertises /agent-swarm and its natural-language input hint')
+    checks.push(`native slash catalog advertises /agent-swarm; picking it claims the draft${ctx.host.commandChips ? ' as one command chip' : ''} with its natural-language input hint`)
     await writeComposerDraft(page, composer, `/agent-swarm ${goal}`)
     await composer.press('Enter')
     // The model-only planning gate preserves a measurable planning phase; there

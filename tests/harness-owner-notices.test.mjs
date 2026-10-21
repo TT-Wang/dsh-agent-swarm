@@ -11,18 +11,20 @@ import SessionStore, { SessionId } from '@deepseek-ai/dsh-session'
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
 import SessionProjection from '@deepseek-ai/dsh-session-projection'
 import ToolRuntime, { defineContentToolFixture } from '@deepseek-ai/dsh-tools'
-import JsonlPersistence from '@deepseek-ai/dsh-session-persistence-jsonl'
+import * as JsonlPersistenceModule from '@deepseek-ai/dsh-session-persistence-jsonl'
 import SandboxPolicy from '@deepseek-ai/dsh-sandbox-policy'
 import Approval from '@deepseek-ai/dsh-user-approval'
 import UserQuestionService from '@deepseek-ai/dsh-user-questions'
 import SandboxLocal from '@deepseek-ai/dsh-sandbox-local'
-import Invariants from '@deepseek-ai/dsh-invariants'
 import * as Swarm from '../lib/index.js'
 import { runProcess } from '../lib/workspaces.js'
 import { subprocessSeam, SubprocessLocal } from './subprocess-seam.mjs'
 import { tempDirectory } from './temp-root.mjs'
 import { budget } from './faults/harness.mjs'
 import { openAsks } from '../lib/arena.js'
+import { loaderPlugin } from './fixtures/built-harness.mjs'
+
+const JsonlPersistence = loaderPlugin(JsonlPersistenceModule)
 
 const deferred = () => { let resolve; const promise = new Promise(done => { resolve = done }); return { promise, resolve } }
 const text = value => ({ kind: 'text', text: value })
@@ -55,7 +57,7 @@ async function fixture(t, respond = () => text('Done'), configure, profile = {})
   await ctx.plugin(JsonlPersistence, { root: path.join(root, 'sessions'), compression: 'none', writeBatchMaxDelayMs: 1 })
   await ctx.plugin(SandboxPolicy, { mode: 'read-only', workspaceRoot: source })
   await ctx.plugin(Approval, { policy: 'never' })
-  for (const plugin of [UserQuestionService, SandboxLocal, Invariants]) await ctx.plugin(plugin)
+  for (const plugin of [UserQuestionService, SandboxLocal]) await ctx.plugin(plugin)
   await ctx.plugin(AgentLoop, { agents: [] })
   ctx.llm.registerAdapter(['swarm-test'], new Scripted())
   await configure?.(ctx)
@@ -147,6 +149,88 @@ test('consumer rechecks messages already claimed while another pre-step handler 
   f.rt.control(f.owner, f.mission.id, 'stop', 'stopped during step preparation')
   release.resolve(); await flushing; await f.agent.whenIdle()
   assert.equal(f.requests.length, 0)
+  assert.equal(f.rt.store.get('deliveries', notice.id).consumedAt, undefined)
+})
+
+test('an owner wake whose every message went stale opens no model call, even where the host adds its time context to every step', async t => {
+  // The host's time context (mounted by the 0.2.x Web presets) wraps every other
+  // pre-step listener and appends its reading to whatever decision it gets back,
+  // an emptied one included.
+  const entered = deferred(), release = deferred(); t.after(() => release.resolve())
+  const f = await fixture(t, undefined, async ctx => {
+    await ctx.plugin(loaderPlugin(await import('@deepseek-ai/dsh-time-context')), {})
+    ctx.on('agent/pre-step', async ({ messages }, next) => {
+      if (messages.some(message => message.source.kind === 'swarm')) { entered.resolve(); await release.promise }
+      return await next()
+    })
+  })
+  const notice = f.emit('STALE_UNDER_TIME_CONTEXT')
+  const flushing = f.rt.notices.flushOutbox(f.mission.id)
+  await entered.promise
+  f.rt.control(f.owner, f.mission.id, 'stop', 'stopped during step preparation')
+  release.resolve(); await flushing; await f.agent.whenIdle()
+  assert.equal(f.requests.length, 0, 'a time reading alone is no decision turn')
+  assert.equal(f.rt.store.get('deliveries', notice.id).consumedAt, undefined)
+  assert.deepEqual(f.agent.session.snapshotEvents().filter(event => event.type === 'user/message'), [], 'nothing reaches the owner history')
+  // A genuine owner turn still carries the time context: the composition is live.
+  f.agent.send(input('ordinary-work', 'Ordinary independent owner work'), 'next-turn', true)
+  await f.agent.whenIdle()
+  assert.equal(f.requests.length, 1)
+  assert.match(JSON.stringify(f.requests[0]), /Ordinary independent owner work/)
+  assert.match(JSON.stringify(f.requests[0]), /Time sampled while preparing turn/)
+})
+
+// The rejection above is for an opening step only. A continuing step still owes
+// the model its tool result, so its stale input is dropped from the batch and
+// the step runs.
+test('a continuing owner step whose claimed input all went stale still hands the model its tool result', async t => {
+  const entered = deferred(), release = deferred(); t.after(() => release.resolve())
+  let claimed, notice
+  const f = await fixture(t, async (_request, n) => n === 1 ? { kind: 'tool' } : text('Finished tool continuation'), ctx => {
+    ctx.on('agent/pre-step', async ({ messages, step }, next) => {
+      if (step > 1 && messages.some(message => message.source.kind === 'swarm')) { claimed = messages.map(message => message.source.kind); entered.resolve(); await release.promise }
+      return await next()
+    })
+  })
+  let ran = 0
+  f.ctx.tools.register(defineContentToolFixture({ name: 'native_probe', description: 'Unrelated owner work', parameters: {}, execute: async () => {
+    ran++
+    notice = f.emit('STALE_AT_CONTINUING_STEP')
+    await f.rt.notices.flushOutbox(f.mission.id)
+    return [{ type: 'text', text: 'ordinary tool result' }]
+  } }))
+  f.agent.send(input('ordinary-work', 'Ordinary independent owner work'), 'next-turn', true)
+  await entered.promise
+  f.rt.control(f.owner, f.mission.id, 'stop', 'stopped while the continuing step was prepared')
+  release.resolve(); await f.agent.whenIdle()
+  assert.deepEqual(claimed, ['swarm'], 'the continuing step claimed only the notice')
+  assert.equal(ran, 1)
+  assert.equal(f.requests.length, 2, 'the tool result still reaches the model')
+  assert.ok(f.requests.every(request => !JSON.stringify(request).includes('STALE_AT_CONTINUING_STEP')))
+  assert.equal(f.rt.store.get('deliveries', notice.id).consumedAt, undefined)
+  assert.equal(f.agent.session.snapshotEvents().filter(event => event.type === 'turn/end').at(-1).data.reason.kind, 'completed')
+})
+
+// An opening step is rejected only when every message it claimed went stale.
+test('an opening owner step runs genuine owner input claimed beside stale swarm input', async t => {
+  const entered = deferred(), release = deferred(); t.after(() => release.resolve())
+  let claimed
+  const f = await fixture(t, undefined, ctx => {
+    ctx.on('agent/pre-step', async ({ messages }, next) => {
+      if (messages.some(message => message.source.kind === 'swarm')) { claimed = messages.map(message => message.source.kind); entered.resolve(); await release.promise }
+      return await next()
+    })
+  })
+  f.agent.send(input('genuine', 'GENUINE_OWNER_REQUEST'), 'next-turn', false)
+  const notice = f.emit('STALE_BESIDE_GENUINE')
+  const flushing = f.rt.notices.flushOutbox(f.mission.id)
+  await entered.promise
+  f.rt.control(f.owner, f.mission.id, 'stop', 'stopped during step preparation')
+  release.resolve(); await flushing; await f.agent.whenIdle()
+  assert.deepEqual(claimed.sort(), ['swarm', 'user'], 'the opening step claimed both')
+  assert.equal(f.requests.length, 1, 'the genuine request still runs')
+  assert.match(JSON.stringify(f.requests[0]), /GENUINE_OWNER_REQUEST/)
+  assert.ok(f.requests.every(request => !JSON.stringify(request).includes('STALE_BESIDE_GENUINE')))
   assert.equal(f.rt.store.get('deliveries', notice.id).consumedAt, undefined)
 })
 

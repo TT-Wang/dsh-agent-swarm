@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import { execFile, spawn } from 'node:child_process'
 import { createHash } from 'node:crypto'
+import { existsSync } from 'node:fs'
 import { access, mkdtemp, mkdir, readFile, readdir, realpath, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
@@ -8,6 +9,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url'
 import { promisify } from 'node:util'
 import { resolveHarnessRoot, assertSupportedHarness } from './harness-target.mjs'
 import { observedSwarmState } from './swarm-smoke-checks.mjs'
+import { harnessCatalog, importHarness } from '../tests/fixtures/built-harness.mjs'
 
 const execute = promisify(execFile)
 const project = fileURLToPath(new URL('../', import.meta.url))
@@ -34,12 +36,59 @@ async function openAuthenticatedWeb(page, launchUrl, checks) {
 /** Current Harness has a resident Lexical contenteditable composer. */
 export function composerFor(page) { return page.locator('[data-composer-input][contenteditable="true"]').first() }
 
-async function selectWebWorkspace(page, workspace) {
-  const trigger = page.getByRole('textbox', { name: 'Choose workspace', exact: true })
+/**
+ * The Harness a smoke runs on, as far as the smoke depends on it, read from what that
+ * Harness ships rather than from its version:
+ * - `rows` disable every DeepSeek route of its base bundle, so the scripted model is the
+ *   one provider: the API-key route `llm-deepseek` on every host, and the account route
+ *   `llm-deepseek-account` where the host ships that package (0.2.1-rc.2);
+ * - `firstUse`: its workspace controller opens a default workspace on a fresh home
+ *   (`initializeDefault`: 0.1.7-rc.1, 0.2.1-rc.2). `rows` then pin its Documents directory inside
+ *   the run's root, as the Harness web e2e scaffold does; unpinned, the default workspace
+ *   is created in the operator's own Documents folder;
+ * - `commandChips`: its composer claims a picked slash command as an atomic chip
+ *   (`CommandChipNode`, `[data-composer-command]`: 0.2.1-rc.2) instead of styling the token
+ *   text (`claim-decor.ts`: 0.1.5-rc.3, 0.1.7-rc.1).
+ */
+export async function smokeHost(harnessRoot, root) {
+  const catalog = await harnessCatalog(harnessRoot)
+  const routes = ['llm-deepseek', ...catalog.has('@deepseek-ai/dsh-llm-deepseek-account') ? ['llm-deepseek-account'] : []]
+  const controller = catalog.has('@deepseek-ai/dsh-api-workspace-controller') ? await importHarness(harnessRoot, '@deepseek-ai/dsh-api-workspace-controller') : {}
+  const firstUse = typeof controller.default?.prototype?.initializeDefault === 'function'
+  const conversation = catalog.get('@deepseek-ai/dsh-client-ui-conversation')?.directory
+  return {
+    firstUse,
+    commandChips: conversation !== undefined && existsSync(join(conversation, 'src/client/input/editor/command-chip-node.tsx')),
+    rows: [
+      ...routes.map(id => ({ id, disabled: true })),
+      ...firstUse ? [{ id: 'workspace-controller', config: { documentsDirectory: join(root, 'documents') } }] : [],
+    ],
+  }
+}
+
+/**
+ * Open the runner's workspace through the native chooser, as a first-time user does,
+ * waiting on each state the host is known to reach rather than racing for one:
+ * - a fresh home shows every supported host's welcome notice once; acknowledging it
+ *   through the notice records exactly the acknowledgement that host reads;
+ * - a host with first-use initialization (`firstUse`) then opens its default workspace;
+ *   its live composer marks that session, after which the chooser lists the default
+ *   workspace and adds another from its menu. Opening the directory dialog earlier lets
+ *   the arriving session re-render it back to the home folder mid-edit (seen on
+ *   0.2.1-rc.2);
+ * - without one, the page stays without a workspace, and the chooser raises the
+ *   directory dialog itself.
+ */
+async function selectWebWorkspace(page, workspace, { firstUse }) {
   const welcome = page.getByRole('button', { name: 'Continue', exact: true })
-  await Promise.race([trigger.waitFor(), welcome.waitFor()])
-  if (await welcome.isVisible()) await welcome.click()
-  await trigger.click()
+  await welcome.click()
+  await welcome.waitFor({ state: 'detached' })
+  const chooser = page.getByRole('button', { name: 'Choose workspace', exact: true })
+  if (firstUse) {
+    await composerFor(page).waitFor({ timeout: 60_000 })
+    await chooser.click()
+    await page.getByRole('menuitem', { name: 'Add workspace…', exact: true }).click()
+  } else await chooser.click()
   const picker = page.getByRole('dialog', { name: 'Select Workspace Directory' })
   await picker.getByRole('button', { name: 'Edit path' }).click()
   const path = picker.getByRole('textbox', { name: 'Edit path' })
@@ -112,7 +161,8 @@ export async function writeComposerDraft(page, input, text) {
  * - `report`: extra report.json fields; arrays in it are serialized when the report is written.
  * - `scenario(page, ctx)`: runs once the owner workspace is open and its session's native
  *   command catalog has loaded (trackOwnerCatalog). `ctx.state` is the latest state
- *   observed on the wire and `ctx.revision` counts its updates.
+ *   observed on the wire and `ctx.revision` counts its updates; `ctx.host` is the
+ *   Harness the smoke runs on (smokeHost).
  *
  * `--serve-only` stops after the host is ready; `--keep-alive` keeps a verified host
  * until SIGINT or SIGTERM.
@@ -190,11 +240,11 @@ export async function runWebSmoke({ name, scriptedLlm, pluginConfig, prepare, ob
     ], { cwd: workspace, env, timeout: 30_000, maxBuffer: 4 * 1024 * 1024 })
     const profile = JSON.parse(await readFile(join(home, 'profiles/web/package.json'), 'utf8'))
     assert(profile.dsh.profile.bundles.includes('@dsh-external/dsh-agent-swarm'))
-    await writeFile(join(home, 'settings.yaml'), 'ui-onboarding:\n  welcomeNoticeVersion: "2026-08-13.1"\n')
+    const host = ctx.host = await smokeHost(harnessRoot, root)
     const modelFixture = await isolateWebModelFixture(root)
     const patchPath = join(root, 'smoke.patch.yml')
     await writeFile(patchPath, JSON.stringify([
-      { id: 'llm-deepseek', disabled: true },
+      ...host.rows,
       { id: 'session-title-llm', disabled: true },
       { id: 'directory-picker', disabled: true },
       { id: 'agent-default-model', config: { provider: 'deepseek-official', model: 'swarm-web-primary' } },
@@ -246,7 +296,7 @@ export async function runWebSmoke({ name, scriptedLlm, pluginConfig, prepare, ob
     })
     await openAuthenticatedWeb(page, launchUrl, checks)
     assert((await page.evaluate(() => JSON.stringify(window.__DSH_BOOT__))).includes('@dsh-external/dsh-agent-swarm'), 'actual server must publish the external browser bundle in its boot graph')
-    await selectWebWorkspace(page, workspace)
+    await selectWebWorkspace(page, workspace, host)
     await until(ownerCatalogLoaded, 'the selected workspace\'s session and its native command catalog', 60_000)
     await scenario(page, ctx)
     assert.deepEqual(pageErrors, [])

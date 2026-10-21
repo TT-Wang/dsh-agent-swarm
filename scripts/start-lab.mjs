@@ -27,7 +27,7 @@ import { fileURLToPath } from 'node:url'
 import { parseEnv } from 'node:util'
 import { assertSupportedHarness, resolveHarnessRoot } from './harness-target.mjs'
 import { importHarness } from '../tests/fixtures/built-harness.mjs'
-import { awaitLaunchUrl, hostEnv, startHost, stopHost, writeServer } from './host.mjs'
+import { awaitLaunchUrl, hostEnv, hostPatch, startHost, stopHost, writeServer } from './host.mjs'
 
 const project = fileURLToPath(new URL('../', import.meta.url))
 const args = process.argv.slice(2)
@@ -90,21 +90,9 @@ if (!alreadyLinked) {
   execFileSync(process.execPath, [cli, 'plugin', '--profile', 'web', 'add', `link:${plugin}`, '--offline', '--ignore-scripts', '--store-dir', join(root, 'pnpm-store')], { cwd: workspace, env, stdio: ['ignore', 'pipe', 'pipe'], timeout: 180_000 })
 }
 
-// Isolated state: never share the controller's swarm DB or worktrees.
-const patchBody = [
-  { id: 'directory-picker', disabled: true },
-  { id: 'dsh-external-agent-swarm', config: { statePath: join(root, 'swarm.sqlite'), workspacesRoot: join(root, 'worktrees') } },
-  { id: 'llm-deepseek', config: { models: [
-    { id: 'deepseek-v4-flash', name: 'DeepSeek-V4-Flash' },
-    { id: 'deepseek-v4-pro', name: 'DeepSeek-V4-Pro' },
-    { id: 'deepseek-v4.1-flash-expires-on-0910', name: 'DeepSeek-V4.1-Flash (preview, expires 09-10)' },
-  ] } },
-  { insert: [
-    { id: 'directory-picker-browse', name: '@deepseek-ai/dsh-host-directory-picker-browse' },
-    { id: 'ui-directory-picker-browse', name: '@deepseek-ai/dsh-client-ui-directory-picker-browse' },
-  ] },
-]
-writeFileSync(patch, JSON.stringify(patchBody, null, 2) + '\n', { mode: 0o600 })
+// Isolated state: never share the controller's swarm DB or worktrees. The lab offers the
+// host's own model catalog, which holds the model its agent-default-model row names.
+writeFileSync(patch, JSON.stringify(hostPatch(root), null, 2) + '\n', { mode: 0o600 })
 
 // A tiny git workspace keeps smoke tasks self-contained.
 if (!existsSync(join(workspace, '.git'))) {

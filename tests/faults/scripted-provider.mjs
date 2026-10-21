@@ -7,7 +7,7 @@
  * recovery.
  */
 import assert from 'node:assert/strict'
-import { importHarness } from './loader.mjs'
+import { importHarness } from '../fixtures/built-harness.mjs'
 
 export const name = 'faults-scripted-llm'
 export const inject = ['llm']

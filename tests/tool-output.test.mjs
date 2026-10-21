@@ -26,9 +26,10 @@ test('model-visible renders stay compact: observe passes the focused view throug
 })
 test('role tool sets hide only what the runtime rejects for that role, in a stable order', async () => {
   const { hiddenToolsFor, SWARM_TOOLS, MEMBER_TOOLS, MANAGEMENT_TOOLS } = await import('../lib/tools.js')
+  const { UNCONFINED_HOST_TOOLS } = await import('../lib/types.js')
   const definitions = tools()
   assert.deepEqual([...definitions.keys()], [...SWARM_TOOLS], 'registration order is the cached schema prefix')
-  assert.deepEqual(hiddenToolsFor('worker'), [...MANAGEMENT_TOOLS])
+  assert.deepEqual(hiddenToolsFor('worker'), [...MANAGEMENT_TOOLS, ...UNCONFINED_HOST_TOOLS], 'a worker also loses the host tools the guard refuses it')
   assert.deepEqual(hiddenToolsFor('owner'), [...MEMBER_TOOLS])
   assert(hiddenToolsFor('entry').includes('swarm_launch') && !hiddenToolsFor('entry').includes('swarm_stage') && !hiddenToolsFor('entry').includes('swarm_create'))
   assert.deepEqual(hiddenToolsFor('none'), [...SWARM_TOOLS])

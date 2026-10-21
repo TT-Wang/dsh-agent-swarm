@@ -18,6 +18,7 @@
  *   startHost({ root, ... })  refuse a held port, give the host a fresh
  *                             <root>/server.log, spawn it detached
  *   awaitLaunchUrl(...)       the launch URL that host prints, kept in <root>/launch.url
+ *   hostPatch(root)           the overlay start-preview and start-lab boot a root's host with
  *
  * server.log only ever holds the current boot (the previous one is renamed to
  * server-<stamp>.log), so the first launch URL in it is this host's: no offsets.
@@ -124,6 +125,27 @@ export async function awaitLaunchUrl({ root, port, child, timeoutMs }, sys = sys
     await sys.sleep(200)
   }
   return undefined
+}
+
+/**
+ * The overlay a root's host boots with: the root's own swarm store and worktrees, the in-app
+ * directory browser in place of the native picker, and no HMR. On 0.2.1-rc.2 HMR replaces a
+ * linked plugin whose files changed on disk at every profile recomposition, which each settings
+ * write starts, so a build would mount into the running host mid-session (its browser half
+ * stale). Without it a build is mounted only by a restart (start-lab, update-preview), and the
+ * host applies settings through its config editor as before. The `hmr` row is in the base bundle
+ * of every supported release; 0.1.5-rc.3 already ships it disabled.
+ */
+export function hostPatch(root) {
+  return [
+    { id: 'hmr', disabled: true },
+    { id: 'directory-picker', disabled: true },
+    { id: 'dsh-external-agent-swarm', config: { statePath: join(root, 'swarm.sqlite'), workspacesRoot: join(root, 'worktrees') } },
+    { insert: [
+      { id: 'directory-picker-browse', name: '@deepseek-ai/dsh-host-directory-picker-browse' },
+      { id: 'ui-directory-picker-browse', name: '@deepseek-ai/dsh-client-ui-directory-picker-browse' },
+    ] },
+  ]
 }
 
 /** The host's environment: its own homes, no telemetry, and never the caller's API key (the host reads its seeded credential). */

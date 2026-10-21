@@ -11,7 +11,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { execFile } from 'node:child_process'
-import { copyFileSync, existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -19,7 +19,9 @@ import { resolveHarnessRoot as resolveFaultHarness } from './faults/loader.mjs'
 import { withLocalImports } from './fixtures/local-imports.mjs'
 
 const project = fileURLToPath(new URL('../', import.meta.url))
-const UNSUPPORTED = /Unsupported Harness 0\.1\.6-alpha\.2; supported: 0\.1\.5-rc\.3, 0\.1\.7-rc\.1/
+const compatibility = JSON.parse(readFileSync(join(project, 'compatibility.json'), 'utf8'))
+/** harness-target's refusal of the 0.1.6-alpha.2 checkout below, naming every release compatibility.json supports. */
+const UNSUPPORTED = new RegExp(`Unsupported Harness 0\\.1\\.6-alpha\\.2; supported: ${compatibility.supportedHosts.map(host => host.version).join(', ').replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`)
 
 /** A scratch root holding an unsupported Harness checkout and a HOME. */
 function scene(t) {
@@ -81,8 +83,26 @@ test('update-preview refuses an unsupported Harness before building, and proceed
   assert.doesNotMatch(refused.stdout, /preflighting/, 'refused before the build and preflight')
   const allowed = await s.run([...argv, '--allow-unsupported-harness'])
   assert.equal(allowed.code, 0, allowed.stderr)
-  assert.match(allowed.stderr, /^update-preview: WARNING: Unsupported Harness 0\.1\.6-alpha\.2; supported: 0\.1\.5-rc\.3, 0\.1\.7-rc\.1/m)
+  assert.match(allowed.stderr, new RegExp(`^update-preview: WARNING: ${UNSUPPORTED.source}`, 'm'))
   assert.match(allowed.stdout, /preflighting composed profile/)
+})
+
+test('update-preview boots a preview\'s rebuilt host packages only on the release they were rebuilt from', async t => {
+  const s = scene(t)
+  const preview = join(s.root, 'preview')
+  // The 0.1.x command-input correction ships as a rebuilt ui-conversation in <preview>/compat.
+  mkdirSync(join(preview, 'compat/ui-conversation'), { recursive: true })
+  writeFileSync(join(preview, 'compat/compat-build-report.json'), '{}')
+  const argv = [join(project, 'scripts/update-preview.mjs'), '--preview', preview, '--harness', s.harness, '--allow-unsupported-harness', '--no-sync', '--skip-build', '--dry-run', '--port', '6199']
+  writeFileSync(join(preview, 'compat/ui-conversation/package.json'), JSON.stringify({ name: '@deepseek-ai/dsh-client-ui-conversation', version: '0.1.7-rc.1' }))
+  const refused = await s.run(argv)
+  assert.equal(refused.code, 1, refused.stdout)
+  assert.match(refused.stderr, /compat\/ui-conversation is rebuilt from Harness 0\.1\.7-rc\.1 and loads only on that release, not on 0\.1\.6-alpha\.2; start a new preview root/)
+  assert.doesNotMatch(refused.stdout, /preflighting/, 'refused before the build and preflight')
+  writeFileSync(join(preview, 'compat/ui-conversation/package.json'), JSON.stringify({ name: '@deepseek-ai/dsh-client-ui-conversation', version: '0.1.6-alpha.2' }))
+  const same = await s.run(argv)
+  assert.equal(same.code, 0, same.stderr)
+  assert.match(same.stdout, /preflighting composed profile/)
 })
 
 test('round mount refuses an unsupported Harness through update-preview before building anything', async t => {
@@ -139,16 +159,16 @@ test('the fault loader keeps the real cause for a supplied root it cannot use, a
   assert.equal(await resolve(undefined, {}), 'The fault suite needs a built Harness checkout; set DSH_HARNESS_ROOT (see compatibility.json)')
 })
 
-test('the default search skips an unbuilt checkout of a supported release and takes the built sibling', async t => {
+test('the default search skips an unbuilt checkout of a supported release and takes a built sibling, the default host\'s first', async t => {
   const s = scene(t)
   // harness-target resolves its siblings from its own project, so a copy puts them in the scratch root.
   const copy = join(s.root, 'project')
   mkdirSync(join(copy, 'scripts'), { recursive: true })
   copyFileSync(join(project, 'scripts/harness-target.mjs'), join(copy, 'scripts/harness-target.mjs'))
   copyFileSync(join(project, 'compatibility.json'), join(copy, 'compatibility.json'))
-  const checkout = (dir, built) => {
+  const checkout = (dir, built, version = '0.1.5-rc.3') => {
     mkdirSync(join(dir, 'apps/cli/lib'), { recursive: true })
-    writeFileSync(join(dir, 'package.json'), JSON.stringify({ version: '0.1.5-rc.3' }))
+    writeFileSync(join(dir, 'package.json'), JSON.stringify({ version }))
     if (built) writeFileSync(join(dir, 'apps/cli/lib/bin.js'), '')
     return realpathSync(dir)
   }
@@ -160,4 +180,6 @@ test('the default search skips an unbuilt checkout of a supported release and ta
   assert.equal(await resolve(), 'Set DSH_HARNESS_ROOT to a built supported Harness checkout; see compatibility.json', 'an unbuilt checkout alone is no candidate')
   const built = checkout(join(s.root, 'deepseek-harness-015rc3'), true)
   assert.equal(await resolve(), built, 'the built sibling, not the unbuilt ~/.dsh/source/current ahead of it')
+  const preferred = checkout(join(s.root, 'deepseek-harness-021rc2'), true, '0.2.1-rc.2')
+  assert.equal(await resolve(), preferred, 'the default host 0.2.1-rc.2 ahead of another built supported sibling')
 })

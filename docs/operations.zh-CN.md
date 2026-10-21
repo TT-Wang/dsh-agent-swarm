@@ -10,10 +10,11 @@
 
 | Harness 版本 | 发布提交 |
 | --- | --- |
-| [0.1.5-rc.3](https://github.com/deepseek-ai/deepseek-harness/releases/tag/dsh-v0.1.5-rc.3)（npm `latest`，默认宿主） | `a4c74a91e06b00fe0b0937bde982170c526cc842` |
-| [0.1.7-rc.1](https://github.com/deepseek-ai/deepseek-harness/releases/tag/dsh-v0.1.7-rc.1)（npm `next`） | `46a7f68b0922371ce7144b668b90e377d8e799f4` |
+| [0.2.1-rc.2](https://github.com/deepseek-ai/deepseek-harness/releases/tag/dsh-v0.2.1-rc.2)（npm `latest` 与 `next`，默认宿主） | `687f282e8625c6b8d11ff58211a90524be2e4317` |
+| [0.1.5-rc.3](https://github.com/deepseek-ai/deepseek-harness/releases/tag/dsh-v0.1.5-rc.3)（较早版本，曾为 npm `latest`） | `a4c74a91e06b00fe0b0937bde982170c526cc842` |
+| [0.1.7-rc.1](https://github.com/deepseek-ai/deepseek-harness/releases/tag/dsh-v0.1.7-rc.1)（较早版本，曾为 npm `next`） | `46a7f68b0922371ce7144b668b90e377d8e799f4` |
 
-两个版本都是预发行版。开发链接器检查记录的发布提交，不只检查包版本号。第 28 轮已停止支持 `0.1.2-rc.1`、`0.1.3-alpha.2`、`0.1.5-rc.1` 和 `0.1.6-alpha.2`，并删除了只为它们保留的代码。插件不承诺兼容其他版本、未发布提交或任意自定义 profile。Better Sidebar 集成在 0.18.0 上经过验证。
+三个版本都是预发行版。开发链接器检查记录的发布提交，不只检查包版本号。第 28 轮已停止支持 `0.1.2-rc.1`、`0.1.3-alpha.2`、`0.1.5-rc.1` 和 `0.1.6-alpha.2`，并删除了只为它们保留的代码。插件不承诺兼容其他版本、未发布提交或任意自定义 profile。Better Sidebar 集成在 0.18.0 上经过验证。
 
 运行需要：
 
@@ -68,6 +69,34 @@ node "$DSH_HARNESS_ROOT/apps/cli/lib/bin.js" --profile web
 
 同一台机器运行多个 Harness 版本时，请为每个版本使用独立的链接检出或构建副本；重新链接共享插件目录会改变所有使用该目录的宿主所加载的依赖。
 
+<a id="upgrade-a-harness-home-to-02x"></a>
+
+## 将 Harness 主目录升级到 0.2.x
+
+Harness 主目录（`DSH_HOME`）和插件状态从 0.1.5-rc.3 或 0.1.7-rc.1 迁到 0.2.1-rc.2 时，不需要额外的迁移步骤：0.2.1-rc.2 能读取已有的会话日志，宿主版本的变化也不会触及插件的存储（`swarm.sqlite`，schema 7）。但迁过去之后就回不来了，所以首次以 0.2.x 启动前：
+
+1. **停止宿主并备份主目录。** 把 `$DSH_HOME/sessions` 和插件状态一起复制：`statePath`（默认是 `~/.dsh/agent-swarm/swarm.sqlite` 及同目录的 `-wal`、`-shm` 文件；这个默认值不随 `DSH_HOME` 变化）和 `workspacesRoot`。回到 0.1.x 的唯一办法是恢复这份备份，在 0.2.x 上完成的一切都会丢弃。
+2. **检查共享的 agent 指令文件。** 0.2.x 除了 `$DSH_HOME/AGENTS.md`，还会读取共享 agents 目录（`$DSH_AGENTS_HOME`，默认 `~/.agents`）中的 `AGENTS.md`。worker 挂载其 owner 的 agent 预设，因此在 Standard、Creator 和 PTC 预设下，这个文件会进入每个 owner 和 worker 的提示词；Minimal 预设不加载指令文件。
+3. **仍有进行中任务的主目录不要迁回 0.1.x。**
+
+会话日志的升级是单向的：
+
+- 在 0.2.x 上，Standard、Creator 和 PTC 预设中的每次前台 `bash` 调用都会向发起调用的会话写入 `job/registered` 和 `job/settled`；`working_directory` 执行 cd 时写入 `working-directory/change`（worker 激活时把会话带回成员 worktree 也会写入这一事件）。0.1.5-rc.3 和 0.1.7-rc.1 遇到含有这些事件的日志，会以 `SessionFormatUnsupportedError` 拒绝读取（"unknown to this harness and not marked ignorable"），所以在 0.2.x 上执行过一次 bash 的 owner 或 worker 会话，旧版本再也打不开。
+- 0.2.x 还会把会话工具集在两次请求之间的每次变化记为一条 `developer/message`，例如 owner 晋升，或 0.1.x 的会话在 0.2.x 上恢复后遇到新增的宿主工具。0.1.7-rc.1 能打开这种日志，但它的 DeepSeek 供应商拒绝请求历史中的 developer 消息（`UNSUPPORTED_CONTENT`），该会话之后的每个请求都会失败。
+- 0.1.5-rc.3 只读取第 3 版会话格式，而 0.1.7-rc.1 或 0.2.x 创建或写过的日志都是第 4 版，会被它拒绝。所以 0.1.7-rc.1 运行过的主目录同样回不到 0.1.5-rc.3。
+
+如果主目录仍被迁回旧版本，插件不会察觉。旧宿主拒绝的每个 worker 会话都按普通启动失败处理（见[恢复与排查](#recovery-and-troubleshooting)中的“Worker 无法启动”）：不消耗恢复额度；连续失败 3 次后成员退役，工作转给另一个有能力的在线成员；在 0.2.x 上运行过的成员都会同样失败，最后主 agent 会收到通知，列出没有在线成员能启动的工作，此时可用 `swarm_add_member` 加入一个使用新会话的成员。能打开但无法发出请求的 worker 会话，会作为该成员的失败上报。旧宿主拒绝的 owner 会话无法重新打开，发给它的通知留在发件箱中。处理办法是恢复备份，或者回到 0.2.x。
+
+在 0.2.x 上运行时还有以下变化：
+
+- **Minimal 预设的成员会压缩上下文。** 0.2.x 的 Minimal 预设挂载了压缩引擎和 `/compact`，所以由 Minimal owner 创建的成员会在任务边界和宿主上下文压力下压缩，摘要请求计入该成员的用量。在 0.1.x 上，这样的成员从不压缩。
+- **工具变化可以写进历史。** 在模型声明支持工具更新的路由上（0.2.x DeepSeek 模型目录中的 `deepseek-flash`），owner 晋升时获得的管理工具以历史中的一条消息送达，不再开启新的请求序列。
+- **插件路由只对 owner 开放。** 对于主体（principal）不是 owner 的连接，0.2.1-rc.2 宿主在插件路由上返回 HTTP 403。宿主自己创建的浏览器连接和 API socket 都是 owner，浏览器面板不受影响。
+- **试用环境不再需要宿主补丁。** 在 0.2.x 上新建的试用根目录不需要重新构建的 `ui-conversation` 覆盖层，它所修补的输入编辑器缺陷在 0.2.x 上不存在。`scripts/update-preview.mjs` 拒绝启动这样的根目录：其中重新构建的宿主包来自另一个版本。因此已有的 0.1.x 试用环境要用 `scripts/start-preview.mjs` 新建根目录才能迁到 0.2.x。
+- **上游限制未变。** 阻塞在工具调用中的会话（例如用 `job_output` 等待某个作业）仍然要到下一步才读取 swarm 通知（dsh-external#624 和 dsh-external#632 尚未解决）。
+
+细节见[已知限制](known-limitations.md)：迁回旧版本见 Supported Harness versions；共享指令、工具更新和阻塞的工具调用见 Harness integration；压缩见 Resources and budgets；插件路由见 Interface and observation。
+
 ## 运行一个任务
 
 在以 Git 项目为工作目录的会话中选择模型，然后输入：
@@ -86,7 +115,7 @@ node "$DSH_HARNESS_ROOT/apps/cli/lib/bin.js" --profile web
 
 插件按顺序选择第一个可用界面：
 
-1. **Harness 原生右侧边栏**：两个受支持版本都适用。点击左侧导航底部的 **Agent Swarm** 按钮打开；命令和会话卡片会打开同一个标签页。右侧栏属于单个会话，成员会话需要用同一个按钮打开它自己的只读视图。
+1. **Harness 原生右侧边栏**：所有受支持版本都适用。点击左侧导航底部的 **Agent Swarm** 按钮打开；命令和会话卡片会打开同一个标签页。右侧栏属于单个会话，成员会话需要用同一个按钮打开它自己的只读视图。
 2. **Better Sidebar**：profile 安装了该插件时，从 **+** 标签菜单选择 **Agent Swarm**。
 
 隐藏侧栏只停止显示更新，不停止 worker。成员活动显示宿主观察到的操作和信号新鲜度，不会逐 token 流式展示模型输出，也不保证每个活跃操作都产生有效进展。断线后，保留的活动会标记为最后观测状态，计时冻结；缺少新信号时会停止忙碌动画，但不会直接认定 worker 失败。
@@ -127,7 +156,7 @@ node "$DSH_HARNESS_ROOT/apps/cli/lib/bin.js" --profile web
 
 ### 授权其他工作区
 
-任务可以使用调用会话的工作目录，或 realpath 位于 `authorizedWorkspaces` 某个授权根内的路径。修改授权根需要用户编辑 profile 或 `cordis.patch.yml`，然后重启 Harness。任何模型可调用工具都不能添加、扩大或撤销授权根。
+任务可以使用调用会话启动时所在的目录，或 realpath 位于 `authorizedWorkspaces` 某个授权根内的路径。修改授权根需要用户编辑 profile 或 `cordis.patch.yml`，然后重启 Harness。任何模型可调用工具都不能添加、扩大或撤销授权根。在 0.2.x 宿主上，`working_directory` 的 cd 只改变该会话的 shell 和文件工具在哪里运行，不改变这项授权：`/agent-swarm`、swarm 工具和浏览器草稿仍绑定到会话启动时所在的目录。
 
 解析后的工作区和匹配到的授权会持久记录。未授权路径返回 `[workspace_not_authorized]` 及修正说明。运行时在每次启动 worker、准备工作区、创建规划快照、启动草稿、交付和创建验证检出之前，都会按准入规则（调用会话自身的目录；否则取包含该工作区、仍有效且最具体的授权根）重新校验任务的工作区。因此删除某个根并重启后，系统拒绝在该目录创建新任务；现有任务会在下一次调度时被阻止继续，并记录 blocked 原因和主 agent 通知；每个发现该任务授权已撤销的插件运行时（每次 Harness 启动或插件重载）只通知主 agent 一次。宿主运行期间授权根的 `expiresAt` 到期（或工作区无法再解析）时，相关任务也会在下一次调度时以同样方式被隔离。增删嵌套的授权根不会隔离仍被其他已配置根包含的任务。在授权根恢复之前恢复的工作会再次被隔离。
 
@@ -143,6 +172,8 @@ node "$DSH_HARNESS_ROOT/apps/cli/lib/bin.js" --profile web
 - **预警与准入**：主 agent 收到阈值提醒；允许下一步前会计入在途请求的估算用量。异常大的请求仍可能跨过上限，供应商未报告的用量也无法统计。
 - **检查命令**：宿主在 `checkConcurrency` 限制下记录排队和执行时长，使用任务指定的超时或配置兜底值。
 
+<a id="recovery-and-troubleshooting"></a>
+
 ## 恢复与排查
 
 | 情况 | 系统行为与处理方式 |
@@ -150,7 +181,7 @@ node "$DSH_HARNESS_ROOT/apps/cli/lib/bin.js" --profile web
 | 任务尚未创建，规划已超时 | 保存的请求、固定快照和用量仍在。使用侧栏的**重试**或**停止**；agent/API 也可通过保存的 `requestId` 控制。重试会推进规划 epoch，旧回调不能启动已取消工作。 |
 | 任务暂停或预算耗尽 | 让主 agent 检查原因，按需调整计划或上限后再恢复。恢复不会重置已用资源或截止时间。 |
 | Worker 或宿主中断 | 持久状态和已捕获工件保留。宿主导致的停止会将任务重新置为 pending，不消耗恢复额度；attempt 租约阻止旧 worker 继续写入。反复执行失败仍受恢复上限约束。 |
-| 供应商配额、限流或可用性故障 | 已分类故障保留 attempt，不消耗恢复额度，也不会让成员退役。成员在已记录的故障窗口（5 分钟）内启动失败时，每个窗口只探测一次，不再每个 tick 重试；从该成员移出的工作优先交给不在故障窗口内的在线成员。主 agent 对成员未完成工作上的每个故障类别只收到一次通知；已分类的故障不会再作为成员失败上报。 |
+| 供应商配额、限流、可用性或账号登录故障 | 已分类故障保留 attempt，不消耗恢复额度，也不会让成员退役。故障类别为 `quota`（API key 或 DeepSeek 账号余额耗尽）、`rate-limit`、`unavailable` 和 `credential`（DeepSeek 账号已退出登录，或账号令牌被供应商拒绝；在 Harness 中重新登录即可）。成员在已记录的故障窗口（5 分钟）内启动失败时，每个窗口只探测一次，不再每个 tick 重试；从该成员移出的工作优先交给不在故障窗口内的在线成员。主 agent 对成员未完成工作上的每个故障类别只收到一次通知；已分类的故障不会再作为成员失败上报。DeepSeek 账号模型目录在当前 Harness 版本上拒绝的模型（`MODEL_UNSUPPORTED`、`CLIENT_UPGRADE_REQUIRED`）不属于服务中断：它作为该成员的失败上报，工作需要交给使用受支持模型的成员。 |
 | Worker 无法启动 | 每次启动失败都会将任务重新置为 pending，不消耗恢复额度。连续失败 3 次后该成员退役，其工作转给另一个有能力的在线成员。当已没有任何在线成员能启动某个任务时，主 agent 会收到一条通知，列出该任务、每个退役成员的连续启动失败次数和最后一次错误，以及可用的出路：用 `swarm_add_member` 加入可用成员（它会认领未固定分配的工作），用 `swarm_control`（`action: "amend"`，`changes.assigneeId`）转移固定分配的工作，或用 `swarm_cancel` 撤回。任务保持 pending，不会再自动重试。 |
 | 任务被驳回，下游持续等待 | 主 agent 可准入保留原验收标准的 replacement；replacement 验收通过后，下游依赖会解析到它。 |
 | 主 agent 离线或原生调用挂起 | 通知持久保留。主 agent 恢复可用并到达原生 inbox 边界后才能行动；运行时取消不依赖它。通知投递不保证模型立即响应。 |
@@ -169,7 +200,7 @@ node "$DSH_HARNESS_ROOT/apps/cli/lib/bin.js" --profile web
 
 实时增量数据异常时，侧栏保留最后有效视图，并退避重试完整快照；持续异常会明确显示连接故障，不会虚构进度。主 agent 可以在暂停、停止或完成后结算已有问题，无需重新启动 worker。Trace 指标明确标注所覆盖的 span 窗口及截断状态，完整持久记录另行保留。
 
-Worker 隔离依赖配置的 Harness 沙箱；共享临时目录仍可能成为成员之间的通信路径。交付阶段的 Git 子进程也保留了进程管理例外，详见[已知限制](known-limitations.md)。
+Worker 隔离依赖配置的 Harness 沙箱。每次激活 worker 时，插件还会让它的会话从自己的成员 worktree 开始（在 0.2.x 宿主上，会话工作目录会持久保存）；worker 既看不到也不能调用会移走工作目录或安排之后再次运行的宿主工具：`working_directory`、`create_worktree` 和 `schedule_*` 提醒工具。共享临时目录仍可能成为成员之间的通信路径。交付阶段的 Git 子进程也保留了进程管理例外，详见[已知限制](known-limitations.md)。
 
 <a id="companion-context-policy"></a>
 
@@ -206,6 +237,10 @@ npm run verify
 | `npm run test:web` / `npm run test:command-web` | 侧栏和 `/agent-swarm` 浏览器工作流。 |
 
 这些测试使用临时 profile 和 Git 工作区，供应商回复由脚本提供。它们验证集成行为，不代表模型规划成功率。`npm run test:deepseek` 和 `npm run test:command-deepseek` 会发起真实供应商请求，可能产生费用，不包含在 `verify` 中。已完成的运行及其边界记录在[验证文档](validation.md)。
+
+真实 Loader 组合（`test:harness`、`test:pack`、故障套件的供应商层，以及走 DeepSeek API key 路由的 `test:deepseek`、`test:command-deepseek` 和 `scripts/check-cancel-freeze.mjs`）只挂载当前宿主自带的包，启动后每个启用的行都必须处于激活状态：仍在等待某个服务的行会让启动失败，并指出它等待的服务。这些组合挂载以测试工作区为根的 `@deepseek-ai/dsh-fs-local`；宿主自带 `@deepseek-ai/dsh-working-directory`（0.2.1-rc.2）时也挂载它，`bash` 的工作目录由该服务提供。宿主自带 `@deepseek-ai/dsh-llm-deepseek-api-key`（0.2.1-rc.2）时，DeepSeek 路由取自该包，否则取自 `@deepseek-ai/dsh-llm-deepseek`。
+
+浏览器冒烟测试（`test:web`、`test:command-web`）运行 CLI Web 产品，脚本化模型是唯一的供应商：它们禁用 `llm-deepseek`，宿主自带 `llm-deepseek-account`（0.2.1-rc.2）时也禁用它。首次使用时会打开默认工作区的宿主（0.1.7-rc.1、0.2.1-rc.2）把该工作区建在本次运行的临时根目录里，而不是操作者的“文稿”（Documents）文件夹。
 
 ## 修订估算，继续原任务
 

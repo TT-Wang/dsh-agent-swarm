@@ -2,19 +2,19 @@
  * Real Harness Loader composition for the provider-fault tier (F3a/F3b/F3c).
  *
  * Adapted from `tests/fixtures/built-harness.mjs` (same boot protocol: real
- * Loader, real Include parsing, every entry must activate) but self-contained
- * and with two environment substitutions documented in `identity-sandbox.mjs`:
- * an identity `sandbox` provider and an unsandboxed `bash-local` shell,
- * because this host refuses `sandbox-exec`.
+ * Loader, real Include parsing, every entry must activate), sharing its package
+ * catalog, its activation check and the host-provided rows `bash` needs, with
+ * two environment substitutions documented in `identity-sandbox.mjs`: an
+ * identity `sandbox` provider and an unsandboxed `bash-local` shell, because
+ * this host refuses `sandbox-exec`.
  */
 import assert from 'node:assert/strict'
-import { access, mkdir, readFile, readdir, writeFile } from 'node:fs/promises'
-import { join, resolve } from 'node:path'
-import { fileURLToPath, pathToFileURL } from 'node:url'
+import { mkdir, readFile, writeFile } from 'node:fs/promises'
+import { join } from 'node:path'
+import { pathToFileURL } from 'node:url'
 import { PROJECT } from './harness.mjs'
 import { assertSupportedHarness, resolveHarnessRoot as resolveTarget } from '../../scripts/harness-target.mjs'
-
-const catalogs = new Map()
+import { assertEveryEntryActive, harnessEntry, importHarness, workingDirectoryRows } from '../fixtures/built-harness.mjs'
 
 /**
  * The release gates' own selection (scripts/harness-target.mjs), with the fault
@@ -33,37 +33,6 @@ export function resolveHarnessRoot(explicit) {
   assertSupportedHarness(root)
   return root
 }
-
-export async function harnessCatalog(root) {
-  root = resolve(root)
-  if (catalogs.has(root)) return catalogs.get(root)
-  const packages = new Map()
-  const add = async directory => {
-    let manifest
-    try { manifest = JSON.parse(await readFile(join(directory, 'package.json'), 'utf8')) } catch (error) { if (error.code === 'ENOENT') return; throw error }
-    if (manifest.name) packages.set(manifest.name, { directory, manifest })
-  }
-  for (const entry of await readdir(join(root, 'vendor'), { withFileTypes: true })) if (entry.isDirectory()) await add(join(root, 'vendor', entry.name))
-  for (const group of await readdir(join(root, 'packages'), { withFileTypes: true })) {
-    if (!group.isDirectory()) continue
-    for (const entry of await readdir(join(root, 'packages', group.name), { withFileTypes: true })) if (entry.isDirectory()) await add(join(root, 'packages', group.name, entry.name))
-  }
-  catalogs.set(root, packages)
-  return packages
-}
-
-export async function harnessEntry(root, name) {
-  const entry = (await harnessCatalog(root)).get(name)
-  assert(entry, `Harness package is absent: ${name}`)
-  const main = entry.manifest.exports?.['.']?.default ?? entry.manifest.main
-  assert.equal(typeof main, 'string', `Harness has no built entry for ${name}`)
-  const target = join(entry.directory, main)
-  await access(target)
-  assert(target.includes('/lib/'), `Harness entry must be built: ${target}`)
-  return pathToFileURL(target).href
-}
-
-export async function importHarness(root, name) { return await import(await harnessEntry(root, name)) }
 
 /** Boot the real Loader with the fault provider and the identity sandbox. */
 export async function bootFaultHarness({ runRoot, workspace, harnessRoot, swarmConfig, artifactRoot = PROJECT }) {
@@ -87,6 +56,7 @@ export async function bootFaultHarness({ runRoot, workspace, harnessRoot, swarmC
     ['approval', '@deepseek-ai/dsh-user-approval', { policy: 'never' }],
     ['shell', '@deepseek-ai/dsh-bash-local', { cwd: workspace, timeoutMs: 10_000, graceMs: 50 }],
     ['shell-env', '@deepseek-ai/dsh-shell-env', { dshHome: join(runRoot, 'dsh-home') }],
+    ...await workingDirectoryRows(harnessRoot, workspace),
     ['tool-bash', '@deepseek-ai/dsh-tool-bash', { enableRunInBackground: false }],
     ['agent-loop', '@deepseek-ai/dsh-agent-loop', { agents: [] }],
   ]
@@ -105,8 +75,7 @@ export async function bootFaultHarness({ runRoot, workspace, harnessRoot, swarmC
     ctx.loader.builtins.include = Include
     await ctx.loader.create({ name: 'cordis:include', config: { path: pathToFileURL(configPath).href } })
     await ctx.loader.await()
-    const pending = [...ctx.loader.entries()].filter(entry => entry.fiber === undefined && !entry.disabled).map(entry => entry.options.id)
-    assert.deepEqual(pending, [], 'every real Loader entry must activate')
+    assertEveryEntryActive(ctx.loader, 'every real Loader entry must activate')
     return ctx
   } catch (error) {
     await ctx.fiber.dispose()

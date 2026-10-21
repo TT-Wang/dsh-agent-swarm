@@ -29,7 +29,7 @@ import { canBorrowTask, canOwnReview, strandedReview } from './assignment.ts'
 import { executionClock, executionElapsed, exhaustedDimensions } from './resource-time.ts'
 import { TERMINAL_STATES, blockCauses, currentEvidenceIds, finishedAttempt, holdsAttempt, holdsOpenAttempt, memberTask, missionSubject, openAttempt, pendingStopOwner, quiescencePending, selectAcceptedDelivery, stopPending, subjectsOfTasks, taskEdges, taskGraphIndex, taskSubject, terminal, uncoveredCriteria, type BlockCause, type HeldTask } from './task-graph.ts'
 import { checkSyntaxDetail, declaredPlanChecks, orderedTasks, pairReviews, planAdvisories, validatePlan } from './plans.ts'
-import { OWNER_ONLY_TOOLS, type Actor, type AutoStart, BoardQuery, Budget, CheckAttribution, CreateMissionInput, CriticalPath, criterionId, Delivery, DraftPlan, Escalation, Evidence, EvidenceStatus, Member, Mission, nextWorkerName, ObserveQuery, MessageInput, PlanInput, Post, PostInput, PostKind, PROVIDER_OUTAGE_WINDOW_MS, ProposeTaskInput, ProviderOutage, providerQuiescent, PublishInput, RecoveryFallback, RequestStartInput, RuntimeConfig, Snapshot, Task, TaskAmendment, TaskRejection, TaskCeiling, ToolRun, VerificationCleanupFailure, WorkerAdapter, WorkerActivity, Workstream } from './types.ts'
+import { OWNER_ONLY_TOOLS, UNCONFINED_HOST_TOOLS, type Actor, type AutoStart, BoardQuery, Budget, CheckAttribution, CreateMissionInput, CriticalPath, criterionId, Delivery, DraftPlan, Escalation, Evidence, EvidenceStatus, Member, Mission, nextWorkerName, ObserveQuery, MessageInput, PlanInput, Post, PostInput, PostKind, PROVIDER_OUTAGE_WINDOW_MS, ProposeTaskInput, ProviderOutage, providerQuiescent, PublishInput, RecoveryFallback, RequestStartInput, RuntimeConfig, Snapshot, Task, TaskAmendment, TaskRejection, TaskCeiling, ToolRun, VerificationCleanupFailure, WorkerAdapter, WorkerActivity, Workstream } from './types.ts'
 import { requireArtifactChecks } from './artifact-policy.ts'
 
 /** Release a prelaunch caller even when an adapter ignores cancellation. Its late writes remain fenced. */
@@ -3336,6 +3336,7 @@ export class SwarmRuntime implements Kernel {
     if (mission.status !== 'active' || this.now() >= mission.deadline || mission.usedSteps > mission.budget.maxSteps || mission.usedTokens >= mission.budget.maxTokens) return 'Mission is inactive or out of budget'
     if (mission.budgetPause) return 'Budget pause is waiting for worker quiescence and a fresh resume assignment'
     if (/^(?:subagent|spawn_agent|agent_teams|cordis|plugin|workflow|ralph)(?:$|_)/.test(tool) || ['send_message', 'interrupt_agent', ...OWNER_ONLY_TOOLS].includes(tool)) return 'Use the swarm work board; alternate delegation and runtime modification bypass mission authority'
+    if (UNCONFINED_HOST_TOOLS.includes(tool)) return 'Work stays in your member worktree and current attempt; moving the session directory, opening another checkout or scheduling a later turn bypasses mission authority'
     const board = this.boardOf(member.missionId)
     const active = openAttempt(board.tasks, memberId)
     // A sandbox Git refusal is diagnostic; reads, edits, and checks remain available.
@@ -3642,7 +3643,7 @@ export class SwarmRuntime implements Kernel {
     if (latest === undefined || memberPhaseOf(latest) === 'stopped') return
     member = latest
     // R11-01: classify at the boundary. A provider outage (quota, rate limit,
-    // provider unavailable) is a quiescent route, not this member's failure:
+    // provider unavailable, account credential) is a quiescent route, not this member's failure:
     // it spends no recovery credit, does not count toward retiring the route,
     // and the work moves to another capable live member when one exists.
     const outage = classifyProviderOutage(error) ?? providerQuiescent(member, this.now())

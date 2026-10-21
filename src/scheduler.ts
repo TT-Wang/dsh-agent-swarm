@@ -19,16 +19,56 @@
  * `scripts/load/README.md` and `src/store.ts`.
  */
 import { errorChain, isQuotaExceededError } from '@deepseek-ai/dsh-llm'
-import type { ProviderOutage } from './types.ts'
+import type { ProviderOutage, ProviderOutageClass } from './types.ts'
 const ADMISSION_REASONS = ['admitted', 'queue_full', 'budget_exceeded', 'lease_conflict', 'writer_busy'] as const
 export type AdmissionReason = (typeof ADMISSION_REASONS)[number]
 
 /**
- * R11-01: classify a provider failure as a capacity/quota/availability outage.
- * The adapter classifies at the boundary where the provider error is still
- * structured (HTTP status and the Harness' stable codes), and the runtime
- * routes on the returned class, never on message text. Returns undefined for a
- * task/worker defect that should spend recovery credit normally.
+ * What a Harness LLM failure code says about the provider route: the one place
+ * a code is read. An outage class is a condition of the route itself, shared by
+ * every session on it, that waiting or the owner ends and no member can fix:
+ * the attempt is preserved, no recovery credit is spent and the member is never
+ * retired for it. `member` is a refusal of the member's own route that neither
+ * waiting nor the owner's sign-in or top-up ends, since a member's route is
+ * fixed for its session: it is the member's failure, and the owner replaces the
+ * member. A code not listed here is decided by the HTTP status, then by provider
+ * wording (`classifyProviderOutage`).
+ */
+export const PROVIDER_FAILURE_CODES = {
+  // An exhausted balance the owner tops up. The DeepSeek account route (0.2.x)
+  // rewrites QUOTA as ACCOUNT_QUOTA and keeps the request's HTTP status.
+  QUOTA: 'quota',
+  ACCOUNT_QUOTA: 'quota',
+  RATE_LIMIT: 'rate-limit',
+  SERVER: 'unavailable',
+  TIMEOUT: 'unavailable',
+  TRANSPORT: 'unavailable',
+  PROVIDER_UNAVAILABLE: 'unavailable',
+  // The DeepSeek account route (0.2.x) holds no account token (signed out), or
+  // the provider refused its token with HTTP 401 and the host discarded it, so
+  // the route's next request is ACCOUNT_SIGN_IN_REQUIRED: one condition of the
+  // route that ends when the owner signs in again.
+  ACCOUNT_SIGN_IN_REQUIRED: 'credential',
+  ACCOUNT_TOKEN_INVALID: 'credential',
+  // The DeepSeek account catalog refuses the member's model on this Harness
+  // release (0.2.x): only another model or another Harness release runs it.
+  MODEL_UNSUPPORTED: 'member',
+  CLIENT_UPGRADE_REQUIRED: 'member',
+} as const satisfies Readonly<Record<string, ProviderOutageClass | 'member'>>
+
+/** The table's own key for `code`, or undefined when the table does not decide it. */
+function decidedCode(code: string | undefined): keyof typeof PROVIDER_FAILURE_CODES | undefined {
+  return code !== undefined && Object.hasOwn(PROVIDER_FAILURE_CODES, code) ? code as keyof typeof PROVIDER_FAILURE_CODES : undefined
+}
+
+/**
+ * R11-01: classify a provider failure as an outage of the member's provider
+ * route. The adapter classifies at the boundary where the provider error is
+ * still structured, and the runtime routes on the returned class, never on
+ * message text. The Harness' stable code decides first (`PROVIDER_FAILURE_CODES`),
+ * then the HTTP status, then provider wording for an error that carries
+ * neither. Returns undefined for a task/worker defect that should spend
+ * recovery credit normally.
  */
 export function classifyProviderOutage(error: unknown): ProviderOutage | undefined {
   const record = error !== null && typeof error === 'object' ? error as { status?: unknown; statusCode?: unknown; code?: unknown; failure?: { status?: unknown } } : undefined
@@ -40,14 +80,19 @@ export function classifyProviderOutage(error: unknown): ProviderOutage | undefin
   const message = errorChain(error)
   const detail = `${code ?? ''} ${status ?? ''} ${message}`
   const bounded = message.length > 500 ? `${message.slice(0, 500)}…` : message
-  if (status === 402) return { class: 'quota', status, message: bounded }
-  if (status === 429) return { class: 'rate-limit', status, message: bounded }
-  if (status !== undefined && status >= 500) return { class: 'unavailable', status, message: bounded }
-  if (code === 'QUOTA' || isQuotaExceededError(detail)) return { class: 'quota', ...(status === undefined ? {} : { status }), message: bounded }
-  if (code === 'RATE_LIMIT' || /\brate[\s_-]*limit\b|\btoo many requests\b/i.test(detail)) return { class: 'rate-limit', ...(status === undefined ? {} : { status }), message: bounded }
-  if (code === 'SERVER' || code === 'TIMEOUT' || code === 'TRANSPORT' || code === 'PROVIDER_UNAVAILABLE'
-    || /\bprovider\b[^.]{0,40}\b(?:unavailable|unreachable|down)\b|\bservice unavailable\b|\boverloaded\b|\b(?:502|503|504)\b|socket hang up|ECONNREFUSED|ECONNRESET|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|fetch failed|upstream connect error/i.test(detail)) {
-    return { class: 'unavailable', ...(status === undefined ? {} : { status }), message: bounded }
+  const outage = (kind: ProviderOutageClass): ProviderOutage => ({ class: kind, ...(status === undefined ? {} : { status }), message: bounded })
+  const decided = decidedCode(code)
+  if (decided !== undefined) {
+    const kind = PROVIDER_FAILURE_CODES[decided]
+    return kind === 'member' ? undefined : outage(kind)
+  }
+  if (status === 402) return outage('quota')
+  if (status === 429) return outage('rate-limit')
+  if (status !== undefined && status >= 500) return outage('unavailable')
+  if (isQuotaExceededError(detail)) return outage('quota')
+  if (/\brate[\s_-]*limit\b|\btoo many requests\b/i.test(detail)) return outage('rate-limit')
+  if (/\bprovider\b[^.]{0,40}\b(?:unavailable|unreachable|down)\b|\bservice unavailable\b|\boverloaded\b|\b(?:502|503|504)\b|socket hang up|ECONNREFUSED|ECONNRESET|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|fetch failed|upstream connect error/i.test(detail)) {
+    return outage('unavailable')
   }
   return undefined
 }

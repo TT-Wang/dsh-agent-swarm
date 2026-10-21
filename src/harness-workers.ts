@@ -2,7 +2,7 @@
 import type { Context } from '@deepseek-ai/cordis'
 import { installModelSelection, type Agent, type AgentHandle, type AgentOptions, type ModelSelection } from '@deepseek-ai/dsh-agent'
 import { freezeMessage, MessageId, ReasoningEffortId, type UserMessage } from '@deepseek-ai/dsh-llm'
-import { SessionId } from '@deepseek-ai/dsh-session'
+import { SessionId, type Session } from '@deepseek-ai/dsh-session'
 import { scrubbedParentEnv } from '@deepseek-ai/dsh-subprocess'
 import type {} from '@deepseek-ai/dsh-tools'
 import type {} from '@deepseek-ai/dsh-system-prompt'
@@ -28,17 +28,57 @@ declare module '@deepseek-ai/dsh-llm' {
   }
 }
 
+declare module '@deepseek-ai/dsh-session/types' {
+  interface SessionEventMap {
+    /**
+     * A session's effective working directory: the durable state of the 0.2.x
+     * `workingDirectory` service (`@deepseek-ai/dsh-working-directory`), whose
+     * projection replays the last one. Declared here because 0.1.x hosts have
+     * no such service; this adapter writes it only where the host provides one.
+     */
+    'working-directory/change': { cwd: string }
+  }
+}
+
 /**
  * The `agentPresets` service, declared structurally: 0.1.5 provides it from
- * `@deepseek-ai/dsh-agent-presets`, 0.1.7 from `@deepseek-ai/dsh-agent-preset-registry`
- * with the same two methods this adapter uses.
+ * `@deepseek-ai/dsh-agent-presets`, 0.1.7 and 0.2.x from
+ * `@deepseek-ai/dsh-agent-preset-registry`, with the same two methods this
+ * adapter uses.
  */
 interface AgentPresets {
   composedPreset(agentCtx: Context): string | undefined
   mount(agentCtx: Context, id?: string): Promise<unknown>
 }
 
-/** The host's regenerated runtime context: `runtime-context` on 0.1.7, a system-prompt `plugin` source on 0.1.5. */
+/**
+ * The 0.2.x session working-directory service, declared structurally: 0.1.x
+ * hosts have none. `get` reads what the session's projection replays: the last
+ * recorded `working-directory/change`, else the session header's cwd.
+ */
+interface WorkingDirectory {
+  get(session: Session): string
+}
+
+/**
+ * Re-anchor a worker session's working directory to its member worktree. Where
+ * the host provides the working-directory service, the directory is durable
+ * session state that bash, file tools and the model's directory context follow,
+ * so a recorded change outlives its turn, a resume and the attempt. The anchor
+ * is written as the host's own event, the way the service's `ensure()` records a
+ * session's first directory and the way activation forces the sandbox and
+ * approval policy. Not `set()`: it also queues a notice in the worker's inbox,
+ * which this adapter holds as input and wakes as a model turn of its own
+ * (R15-A5). The next request's required directory context names the worktree.
+ * A session already there, and a host without the service, get no write.
+ */
+function anchorWorkingDirectory(ctx: Context, agent: Agent, workspace: string): void {
+  const directory = ctx.get('workingDirectory') as WorkingDirectory | undefined
+  if (directory === undefined || directory.get(agent.session) === workspace) return
+  agent.session.append('working-directory/change', { cwd: workspace })
+}
+
+/** The host's regenerated runtime context: `runtime-context` on 0.1.7 and 0.2.x, a system-prompt `plugin` source on 0.1.5. */
 export function isRuntimeContext(source: { kind: string; plugin?: unknown }): boolean {
   return source.kind === 'runtime-context' || (source.kind === 'plugin' && source.plugin === '@deepseek-ai/dsh-system-prompt')
 }
@@ -46,8 +86,11 @@ export function isRuntimeContext(source: { kind: string; plugin?: unknown }): bo
 /**
  * Keep lifecycle policy in the runtime, but apply it at the native consumer
  * boundary too: transport acknowledgement can precede consumption by a turn.
- * Returning an empty admitted batch lets Harness finish a completed turn while
- * still continuing unrelated tool-result work; cancelling the owner would not.
+ * A turn opened by stale input alone is rejected before its first step, so no
+ * model call is made for it. A continuing step whose new input went stale gets
+ * an empty admitted batch instead, which lets Harness finish a completed turn
+ * while still continuing unrelated tool-result work; cancelling the owner would
+ * not.
  */
 export function installOwnerDeliveryFilter(ctx: Context, project: (sessionId: string, deliveryId: string) => string | false | undefined): (agent: Agent) => void {
   const stale = (agent: Agent, message: UserMessage): boolean => message.source.kind === 'swarm'
@@ -55,11 +98,19 @@ export function installOwnerDeliveryFilter(ctx: Context, project: (sessionId: st
   const prune = (agent: Agent): void => {
     for (const message of [...agent.inbox.nextTurn, ...agent.inbox.nextStep]) if (stale(agent, message)) agent.inbox.remove(message.id)
   }
-  ctx.on('agent/pre-step', async ({ agent, messages }, next) => {
+  ctx.on('agent/pre-step', async ({ agent, messages, step }, next) => {
     prune(agent)
     const decision = await next()
     if (decision.kind === 'reject') return decision
     const onlyStale = messages.length > 0 && messages.every(message => stale(agent, message))
+    // A turn whose opening input all went stale has nothing to run. An emptied
+    // opening spends no model call only while no listener outside this one adds
+    // to it, and the host's time context (mounted by the 0.2.x Web presets)
+    // wraps every other listener and appends its reading to any decision it
+    // gets back. A rejection it passes through: the loop then ends the turn
+    // before any step, exactly as it ends an emptied opening, and drops the
+    // stale input it claimed.
+    if (onlyStale && step === 1) return { kind: 'reject' }
     const admitted = decision.messages.filter(message => !stale(agent, message)
       // A changed generated context is not an independent user request. Let it
       // be regenerated for the next genuine turn instead of reviving this one.
@@ -161,6 +212,19 @@ interface Composition {
 // Teardown has a host-operation bound, separate from any model/task budget.
 // A timeout reports incomplete cleanup; stop() itself never claims success early.
 const DISPOSAL_TIMEOUT_MS = 5000
+
+/**
+ * The prompt variable that carries a worker's persona. The persona is free text
+ * (the member's name and role, the mission objective, the scratch path), and
+ * every supported host interpolates section text strictly: a `{{...}}` in it
+ * names a malformed or unknown variable (0.2.x registers no `{{cwd}}` any more),
+ * and prompt assembly fails for every request of that worker. No host scans a
+ * substituted value again, so the persona section holds only this reference and
+ * the text reaches the model as written. 0.1.7 and 0.2.1 also take
+ * `interpolate: false` on a section, but 0.1.5-rc.3's PromptSection has no such
+ * field and its renderer no escape syntax.
+ */
+const PERSONA_VARIABLE = 'swarm_persona'
 
 interface Resident {
   spec: WorkerSpec
@@ -713,9 +777,13 @@ export class HarnessWorkers implements WorkerAdapter {
       // Force a fresh durable policy on each activation; peers cannot widen it.
       agent.session.append('sandbox/mode', { mode: 'workspace-write', source: 'delegation' })
       agent.session.append('approval/policy', { policy: 'never', source: 'delegation' })
+      // And start every activation in the member worktree, whatever directory the log recorded.
+      anchorWorkingDirectory(this.ctx, agent, composition.workspace)
       // Shadow the deployment persona's prefix and suffix so workers retain only
-      // their own role, including after resuming an older composition.
-      agentCtx.systemPrompt.section({ name: 'deployment:persona-prefix', order: 0, text: composition.persona })
+      // their own role, including after resuming an older composition. The
+      // persona is free text, so it reaches the section as a variable's value.
+      agentCtx.systemPrompt.variable(PERSONA_VARIABLE, () => composition.persona)
+      agentCtx.systemPrompt.section({ name: 'deployment:persona-prefix', order: 0, text: `{{${PERSONA_VARIABLE}}}` })
       agentCtx.systemPrompt.section({ name: 'deployment:persona-suffix', order: 10200, text: '' })
       // Source metadata is preserved in the host log, but provider serializers
       // need not expose it to the model. Refresh identity on every activation,
@@ -791,7 +859,7 @@ export class HarnessWorkers implements WorkerAdapter {
         return undefined
       })
       agentCtx.on('session/event', (session, event) => {
-        // Retry events are an optional public session extension in both supported versions.
+        // Retry events are an optional public session extension in every supported release.
         const type: string = event.type
         const retryData: unknown = event.data
         if (type === 'llm/retry' && isRecord(retryData) && typeof retryData.delayMs === 'number' && Number.isSafeInteger(retryData.delayMs) && retryData.delayMs >= 0 && typeof retryData.retry === 'number') {
@@ -926,8 +994,8 @@ export class HarnessWorkers implements WorkerAdapter {
     })
   }
   /**
-   * The compaction engine this member's own composition uses. Both supported
-   * web profiles disable the host-plane `compaction-basic` row and mount it in
+   * The compaction engine this member's own composition uses. Every supported
+   * web profile disables the host-plane `compaction-basic` row and mounts it in
    * each agent preset's isolated `compaction` realm, where `ctx.get` from this
    * plugin cannot see it; the realm's public handle is the `/compact` command it
    * registers for the agents on that preset. That command runs the engine's
