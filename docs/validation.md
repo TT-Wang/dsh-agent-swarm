@@ -16,6 +16,9 @@ slices (A to F) and one review repair round. `src` against `a57052b`: +193 −48
 branches on a host version: where hosts differ, the code or fixture composes what the host provides (its package
 catalog, its services, its editor nodes).
 
+**Merged** as `a8536af` (2026-10-21) on `a57052b`. Main had not moved, so the merged tree is this record's commit
+`cd641b6` and the gates below hold for it unchanged.
+
 **Where 0.2.1-rc.2 stood at `a57052b`.** A probe at main, with only `compatibility.json` admitting 0.2.1-rc.2:
 typecheck, build, `test:replay`, `test:oracle` (12/12 identical) and the fault suite (24/24) passed. The full suite
 ran 1843 tests with 15 failures, and six files failed to load (about 107 tests never ran). `test:harness` and
