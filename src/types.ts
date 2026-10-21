@@ -90,10 +90,12 @@ export interface DeliveryApplication {
 }
 /**
  * R11-01: closed provider-outage classes. The adapter classifies an HTTP/class
- * condition (402/429/5xx, quota, provider-unavailable) into one of these so the
- * runtime can pause, route or re-assign without parsing provider text.
+ * condition (402/429/5xx, quota, provider-unavailable, a signed-out or refused
+ * account credential) into one of these so the runtime can pause, route or
+ * re-assign without parsing provider text. `PROVIDER_FAILURE_CODES` in
+ * `scheduler.ts` maps each Harness failure code it decides to one of them.
  */
-export type ProviderOutageClass = 'quota' | 'rate-limit' | 'unavailable'
+export type ProviderOutageClass = 'quota' | 'rate-limit' | 'unavailable' | 'credential'
 /** R11-01: one classified provider outage; `status` is the HTTP status when known. */
 export interface ProviderOutage {
   class: ProviderOutageClass
@@ -1097,7 +1099,7 @@ export interface WorkerCallbacks {
   verificationCleanupFailure?(info: VerificationCleanupFailure): void
   /**
    * R11-01: a classified provider outage (quota, rate limit, provider
-   * unavailable). The adapter classifies, and this is the error's one report
+   * unavailable, account credential). The adapter classifies, and this is the error's one report
    * (never also a `failure`); the runtime emits the durable event, keeps the
    * attempt alive and never spends recovery credit on the pause.
    */

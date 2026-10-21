@@ -3643,7 +3643,7 @@ export class SwarmRuntime implements Kernel {
     if (latest === undefined || memberPhaseOf(latest) === 'stopped') return
     member = latest
     // R11-01: classify at the boundary. A provider outage (quota, rate limit,
-    // provider unavailable) is a quiescent route, not this member's failure:
+    // provider unavailable, account credential) is a quiescent route, not this member's failure:
     // it spends no recovery credit, does not count toward retiring the route,
     // and the work moves to another capable live member when one exists.
     const outage = classifyProviderOutage(error) ?? providerQuiescent(member, this.now())

@@ -555,6 +555,31 @@ test('a provider error the adapter classifies as an outage is reported as that o
   assert.deepEqual(f.observations.failures, [], 'the outage is not reported a second time as a member failure')
 })
 
+// The DeepSeek account route's codes (0.2.x), raised inside a worker turn: the
+// agent loop rebuilds the provider failure on every host, and its code still
+// decides whether the route or the member failed.
+for (const [error, expected] of [
+  [new LlmError('Your DeepSeek account tokens are used up for this period.', 'ACCOUNT_QUOTA'), { outage: ['quota', undefined] }],
+  [new LlmError('Sign in to DeepSeek to use the account provider. The request destination must allow account authentication.', 'ACCOUNT_SIGN_IN_REQUIRED'), { outage: ['credential', undefined] }],
+  [new LlmError('Authentication Fails', 'ACCOUNT_TOKEN_INVALID', { status: 401 }), { outage: ['credential', 401] }],
+  [new LlmError('DeepSeek model "scripted" is not supported by DeepSeek Harness; current version is 0.2.1-rc.2', 'MODEL_UNSUPPORTED'), { failure: /not supported by DeepSeek Harness/ }],
+]) test(`a worker turn that fails with ${error.code} is reported as ${expected.outage === undefined ? 'the member\'s failure' : `a ${expected.outage[0]} outage of its route`}`, async t => {
+  const f = await fixture(t, () => { throw error })
+  const outages = []
+  f.callbacks.providerOutage = (id, outage) => { outages.push({ id, outage }) }
+  await f.adapter.deliver(f.member, message(f.member))
+  await f.ctx.agents.get(SessionId(f.member.sessionId)).whenIdle()
+  assert.equal(f.requests.length, 1)
+  if (expected.outage !== undefined) {
+    assert.deepEqual(outages.map(({ id, outage }) => [id, outage.class, outage.status]), [['worker-test', ...expected.outage]])
+    assert.deepEqual(f.observations.failures, [])
+  } else {
+    assert.deepEqual(outages, [], 'no route is paused for a refusal of the member\'s own model')
+    assert.equal(f.observations.failures.length, 1)
+    assert.match(f.observations.failures[0].error, expected.failure)
+  }
+})
+
 for (const wakeDuringRejection of [false, true]) {
   test(`real swarm_wait parks the loop until fresh peer input${wakeDuringRejection ? ' even when that input races the rejected step' : ''}`, async t => {
     let missionId

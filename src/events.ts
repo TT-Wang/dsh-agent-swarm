@@ -142,7 +142,7 @@ export const EVENTS = {
   'task/proposal-refused': { description: 'A worker proposal was refused for the per-member allowance or a mission budget/ceiling reason; the owner was notified', panel: { en: 'Work proposal refused', zh: '工作提议被拒绝' } },
   // Round 11 host caps: provider-outage routing, store snapshot, per-task
   // restart and the measured check envelope (D2/D6/D8).
-  'provider/outage': { description: 'Provider outage classified (quota, rate limit or unavailable); the route is quiescent and no recovery credit is spent', panel: { en: 'Provider route paused', zh: '提供方服务中断，任务已暂停' } },
+  'provider/outage': { description: 'Provider outage classified (quota, rate limit, unavailable or credential); the route is quiescent and no recovery credit is spent', panel: { en: 'Provider route paused', zh: '提供方服务中断，任务已暂停' } },
   'provider/recovered': { description: 'A quiescent provider route answered successfully again; the outage marker is cleared', panel: { en: 'Provider route recovered', zh: '提供方服务已恢复' } },
   'task/restart-repended': { description: 'Host restart re-pended a running task without spending recovery credit; the task and epoch are named', panel: { en: 'Task re-pended after host restart', zh: '主机重启后子任务重新排队' } },
   'task/recovery-fallback': { description: 'Cross-owner recovery could not capture the previous owner\'s workspace; names the commit the replacement started from and whether the uncaptured work was preserved into it', panel: { en: 'Task recovered from an uncaptured workspace', zh: '子任务从未能捕获的工作区恢复' } },
