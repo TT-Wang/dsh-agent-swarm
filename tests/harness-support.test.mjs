@@ -11,7 +11,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { execFile } from 'node:child_process'
-import { copyFileSync, existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -19,7 +19,9 @@ import { resolveHarnessRoot as resolveFaultHarness } from './faults/loader.mjs'
 import { withLocalImports } from './fixtures/local-imports.mjs'
 
 const project = fileURLToPath(new URL('../', import.meta.url))
-const UNSUPPORTED = /Unsupported Harness 0\.1\.6-alpha\.2; supported: 0\.1\.5-rc\.3, 0\.1\.7-rc\.1/
+const compatibility = JSON.parse(readFileSync(join(project, 'compatibility.json'), 'utf8'))
+/** harness-target's refusal of the 0.1.6-alpha.2 checkout below, naming every release compatibility.json supports. */
+const UNSUPPORTED = new RegExp(`Unsupported Harness 0\\.1\\.6-alpha\\.2; supported: ${compatibility.supportedHosts.map(host => host.version).join(', ').replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`)
 
 /** A scratch root holding an unsupported Harness checkout and a HOME. */
 function scene(t) {
@@ -81,7 +83,7 @@ test('update-preview refuses an unsupported Harness before building, and proceed
   assert.doesNotMatch(refused.stdout, /preflighting/, 'refused before the build and preflight')
   const allowed = await s.run([...argv, '--allow-unsupported-harness'])
   assert.equal(allowed.code, 0, allowed.stderr)
-  assert.match(allowed.stderr, /^update-preview: WARNING: Unsupported Harness 0\.1\.6-alpha\.2; supported: 0\.1\.5-rc\.3, 0\.1\.7-rc\.1/m)
+  assert.match(allowed.stderr, new RegExp(`^update-preview: WARNING: ${UNSUPPORTED.source}`, 'm'))
   assert.match(allowed.stdout, /preflighting composed profile/)
 })
 
