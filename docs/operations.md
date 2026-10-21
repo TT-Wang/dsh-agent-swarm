@@ -10,10 +10,11 @@ The repository records these exact supported Harness releases in [compatibility.
 
 | Harness release | Release commit |
 | --- | --- |
-| [0.1.5-rc.3](https://github.com/deepseek-ai/deepseek-harness/releases/tag/dsh-v0.1.5-rc.3) (npm `latest`, default host) | `a4c74a91e06b00fe0b0937bde982170c526cc842` |
-| [0.1.7-rc.1](https://github.com/deepseek-ai/deepseek-harness/releases/tag/dsh-v0.1.7-rc.1) (npm `next`) | `46a7f68b0922371ce7144b668b90e377d8e799f4` |
+| [0.2.1-rc.2](https://github.com/deepseek-ai/deepseek-harness/releases/tag/dsh-v0.2.1-rc.2) (npm `latest` and `next`, default host) | `687f282e8625c6b8d11ff58211a90524be2e4317` |
+| [0.1.5-rc.3](https://github.com/deepseek-ai/deepseek-harness/releases/tag/dsh-v0.1.5-rc.3) (earlier release, formerly npm `latest`) | `a4c74a91e06b00fe0b0937bde982170c526cc842` |
+| [0.1.7-rc.1](https://github.com/deepseek-ai/deepseek-harness/releases/tag/dsh-v0.1.7-rc.1) (earlier release, formerly npm `next`) | `46a7f68b0922371ce7144b668b90e377d8e799f4` |
 
-Both are prereleases. The development linker checks the recorded release revision, not only the package version. `0.1.2-rc.1`, `0.1.3-alpha.2`, `0.1.5-rc.1` and `0.1.6-alpha.2` were dropped in round 28, and the code that served only them was deleted. Compatibility with other releases, unreleased commits or arbitrary custom profiles is not claimed. Better Sidebar integration was exercised against 0.18.0.
+All three are prereleases. The development linker checks the recorded release revision, not only the package version. `0.1.2-rc.1`, `0.1.3-alpha.2`, `0.1.5-rc.1` and `0.1.6-alpha.2` were dropped in round 28, and the code that served only them was deleted. Compatibility with other releases, unreleased commits or arbitrary custom profiles is not claimed. Better Sidebar integration was exercised against 0.18.0.
 
 You need:
 

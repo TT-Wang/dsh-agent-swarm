@@ -10,10 +10,11 @@
 
 | Harness 版本 | 发布提交 |
 | --- | --- |
-| [0.1.5-rc.3](https://github.com/deepseek-ai/deepseek-harness/releases/tag/dsh-v0.1.5-rc.3)（npm `latest`，默认宿主） | `a4c74a91e06b00fe0b0937bde982170c526cc842` |
-| [0.1.7-rc.1](https://github.com/deepseek-ai/deepseek-harness/releases/tag/dsh-v0.1.7-rc.1)（npm `next`） | `46a7f68b0922371ce7144b668b90e377d8e799f4` |
+| [0.2.1-rc.2](https://github.com/deepseek-ai/deepseek-harness/releases/tag/dsh-v0.2.1-rc.2)（npm `latest` 与 `next`，默认宿主） | `687f282e8625c6b8d11ff58211a90524be2e4317` |
+| [0.1.5-rc.3](https://github.com/deepseek-ai/deepseek-harness/releases/tag/dsh-v0.1.5-rc.3)（较早版本，曾为 npm `latest`） | `a4c74a91e06b00fe0b0937bde982170c526cc842` |
+| [0.1.7-rc.1](https://github.com/deepseek-ai/deepseek-harness/releases/tag/dsh-v0.1.7-rc.1)（较早版本，曾为 npm `next`） | `46a7f68b0922371ce7144b668b90e377d8e799f4` |
 
-两个版本都是预发行版。开发链接器检查记录的发布提交，不只检查包版本号。第 28 轮已停止支持 `0.1.2-rc.1`、`0.1.3-alpha.2`、`0.1.5-rc.1` 和 `0.1.6-alpha.2`，并删除了只为它们保留的代码。插件不承诺兼容其他版本、未发布提交或任意自定义 profile。Better Sidebar 集成在 0.18.0 上经过验证。
+三个版本都是预发行版。开发链接器检查记录的发布提交，不只检查包版本号。第 28 轮已停止支持 `0.1.2-rc.1`、`0.1.3-alpha.2`、`0.1.5-rc.1` 和 `0.1.6-alpha.2`，并删除了只为它们保留的代码。插件不承诺兼容其他版本、未发布提交或任意自定义 profile。Better Sidebar 集成在 0.18.0 上经过验证。
 
 运行需要：
 

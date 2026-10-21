@@ -1,6 +1,6 @@
 # Native command input correction / 原生命令输入修补
 
-`harness-command-input.patch` targets the DeepSeek Harness releases in
+`harness-command-input.patch` targets two of the DeepSeek Harness releases in
 [compatibility.json](../compatibility.json): `0.1.5-rc.3`
 (`a4c74a91e06b00fe0b0937bde982170c526cc842`) and `0.1.7-rc.1`
 (`46a7f68b0922371ce7144b668b90e377d8e799f4`). It is a host editor correction,
