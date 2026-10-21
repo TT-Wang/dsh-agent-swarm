@@ -65,6 +65,41 @@ export function loaderPlugin(namespace) {
   return namespace.default ?? namespace
 }
 
+/**
+ * The rows `bash` runs on, each mounted only when the host's catalog has its
+ * package. From 0.2.1 tool-bash takes its cwd from the session's
+ * `workingDirectory` service (dsh-working-directory), which reads through an
+ * `fs` provider; 0.1.x ships no working-directory package. A host that needs a
+ * row it does not ship leaves tool-bash pending, and the activation check
+ * names it.
+ */
+export async function workingDirectoryRows(root, workspace) {
+  const catalog = await harnessCatalog(root)
+  return [
+    ['fs', '@deepseek-ai/dsh-fs-local', { cwd: workspace }],
+    ['working-directory', '@deepseek-ai/dsh-working-directory', { defaultDirectory: workspace }],
+  ].filter(([, name]) => catalog.has(name))
+}
+
+/** cordis `FiberState` by value: a const enum, so the published build has no runtime object. */
+const FIBER_STATES = ['pending', 'loading', 'active', 'failed', 'disposed', 'unloading']
+
+/**
+ * Every enabled Loader entry, group children included, is active once the
+ * Loader has settled. A row whose required service nothing provides keeps a
+ * fiber that stays pending, so this reads each fiber's state rather than its
+ * presence, and names the services a pending entry still waits for.
+ */
+export function assertEveryEntryActive(loader, message) {
+  const inactive = [...loader.entries()].filter(entry => !entry.disabled && FIBER_STATES[entry.fiber?.state] !== 'active').map(entry => {
+    const { fiber } = entry
+    if (!fiber) return `${entry.options.id}: not mounted`
+    const waiting = Object.keys(fiber.inject).filter(service => fiber.ctx.get(service) === undefined)
+    return `${entry.options.id}: ${FIBER_STATES[fiber.state] ?? fiber.state}${waiting.length ? `, waiting for ${waiting.join(', ')}` : ''}`
+  })
+  assert.deepEqual(inactive, [], message)
+}
+
 /** An extracted npm artifact resolves peers from one already-built Harness installation. */
 export async function linkHarnessPeers(packageRoot, harnessRoot) {
   const manifest = JSON.parse(await readFile(join(packageRoot, 'package.json'), 'utf8'))
@@ -110,6 +145,7 @@ export async function bootHarness({ harnessRoot, artifactRoot, runRoot, workspac
     ['approval', '@deepseek-ai/dsh-user-approval', { policy: 'never' }],
     ['shell', '@deepseek-ai/dsh-bash-sandbox', { cwd: workspace, timeoutMs: 5000, graceMs: 50, ...shellConfig }],
     ['shell-env', '@deepseek-ai/dsh-shell-env', { dshHome: join(runRoot, 'dsh-home') }],
+    ...await workingDirectoryRows(harnessRoot, workspace),
     ['tool-bash', '@deepseek-ai/dsh-tool-bash', { enableRunInBackground: false }],
     ['agent-loop', '@deepseek-ai/dsh-agent-loop', { agents: [] }],
     ...extraRows,
@@ -150,10 +186,7 @@ export async function bootHarness({ harnessRoot, artifactRoot, runRoot, workspac
     ctx.loader.builtins.group = Group
     await ctx.loader.create({ name: 'cordis:include', config: { path: pathToFileURL(configPath).href, ...(patches ? { patches } : {}) } })
     await ctx.loader.await()
-    const pending = [...ctx.loader.entries()]
-      .filter(entry => entry.fiber === undefined && !entry.disabled)
-      .map(entry => entry.options.id)
-    assert.deepEqual(pending, [], 'all real Loader entries must activate')
+    assertEveryEntryActive(ctx.loader, 'all real Loader entries must activate')
     return ctx
   } catch (error) {
     await ctx.fiber.dispose()

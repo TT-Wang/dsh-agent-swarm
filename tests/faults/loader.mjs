@@ -2,10 +2,11 @@
  * Real Harness Loader composition for the provider-fault tier (F3a/F3b/F3c).
  *
  * Adapted from `tests/fixtures/built-harness.mjs` (same boot protocol: real
- * Loader, real Include parsing, every entry must activate) but self-contained
- * and with two environment substitutions documented in `identity-sandbox.mjs`:
- * an identity `sandbox` provider and an unsandboxed `bash-local` shell,
- * because this host refuses `sandbox-exec`.
+ * Loader, real Include parsing, every entry must activate), sharing its
+ * activation check and the host-provided rows `bash` needs, with two
+ * environment substitutions documented in `identity-sandbox.mjs`: an identity
+ * `sandbox` provider and an unsandboxed `bash-local` shell, because this host
+ * refuses `sandbox-exec`.
  */
 import assert from 'node:assert/strict'
 import { access, mkdir, readFile, readdir, writeFile } from 'node:fs/promises'
@@ -13,6 +14,7 @@ import { join, resolve } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { PROJECT } from './harness.mjs'
 import { assertSupportedHarness, resolveHarnessRoot as resolveTarget } from '../../scripts/harness-target.mjs'
+import { assertEveryEntryActive, workingDirectoryRows } from '../fixtures/built-harness.mjs'
 
 const catalogs = new Map()
 
@@ -87,6 +89,7 @@ export async function bootFaultHarness({ runRoot, workspace, harnessRoot, swarmC
     ['approval', '@deepseek-ai/dsh-user-approval', { policy: 'never' }],
     ['shell', '@deepseek-ai/dsh-bash-local', { cwd: workspace, timeoutMs: 10_000, graceMs: 50 }],
     ['shell-env', '@deepseek-ai/dsh-shell-env', { dshHome: join(runRoot, 'dsh-home') }],
+    ...await workingDirectoryRows(harnessRoot, workspace),
     ['tool-bash', '@deepseek-ai/dsh-tool-bash', { enableRunInBackground: false }],
     ['agent-loop', '@deepseek-ai/dsh-agent-loop', { agents: [] }],
   ]
@@ -105,8 +108,7 @@ export async function bootFaultHarness({ runRoot, workspace, harnessRoot, swarmC
     ctx.loader.builtins.include = Include
     await ctx.loader.create({ name: 'cordis:include', config: { path: pathToFileURL(configPath).href } })
     await ctx.loader.await()
-    const pending = [...ctx.loader.entries()].filter(entry => entry.fiber === undefined && !entry.disabled).map(entry => entry.options.id)
-    assert.deepEqual(pending, [], 'every real Loader entry must activate')
+    assertEveryEntryActive(ctx.loader, 'every real Loader entry must activate')
     return ctx
   } catch (error) {
     await ctx.fiber.dispose()
