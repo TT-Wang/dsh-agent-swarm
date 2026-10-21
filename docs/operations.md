@@ -69,6 +69,32 @@ For a direct `link:` mount, rebuild the plugin, restart the profile and refresh 
 
 If several Harness versions run on the same machine, use a separate linked checkout or built copy for each. Relinking one shared plugin directory changes the dependencies every host loads.
 
+## Upgrade a Harness home to 0.2.x
+
+A Harness home (`DSH_HOME`) and the plugin's state move from 0.1.5-rc.3 or 0.1.7-rc.1 to 0.2.1-rc.2 without a migration step: 0.2.1-rc.2 reads the existing session logs, and the host change does not touch the plugin's store (`swarm.sqlite`, schema 7). The way back is closed, so before the first 0.2.x start:
+
+1. **Stop the host and back up the home.** Copy `$DSH_HOME/sessions` together with the plugin's state: `statePath` (by default `~/.dsh/agent-swarm/swarm.sqlite` with its `-wal` and `-shm` files; this default ignores `DSH_HOME`) and `workspacesRoot`. Going back to 0.1.x means restoring that backup, which discards everything done on 0.2.x.
+2. **Review the shared agent instructions.** 0.2.x also loads `AGENTS.md` from the shared agents directory (`$DSH_AGENTS_HOME`, by default `~/.agents`), beside `$DSH_HOME/AGENTS.md`. Workers mount their owner's agent preset, so under the Standard, Creator and PTC presets that file reaches every owner and worker prompt. The Minimal preset loads no instruction files.
+3. **Do not move a home with live missions back to 0.1.x.**
+
+The upgrade is one-way for session logs:
+
+- On 0.2.x every foreground `bash` call in the Standard, Creator and PTC presets writes `job/registered` and `job/settled` into the calling session, and a `working_directory` cd writes `working-directory/change` (so does a worker activation that returns a worker session to its member worktree). 0.1.5-rc.3 and 0.1.7-rc.1 refuse a log containing these events with `SessionFormatUnsupportedError` ("unknown to this harness and not marked ignorable"), so an owner or worker session that ran one bash command on 0.2.x can no longer be opened there.
+- 0.2.x also records each change in a session's tool set between two requests as a `developer/message`: an owner's promotion, or a 0.1.x session resumed with 0.2.x's new host tools. 0.1.7-rc.1 opens such a log, but its DeepSeek provider refuses a developer message in the request history (`UNSUPPORTED_CONTENT`), so every later request of that session fails.
+- 0.1.5-rc.3 reads only session format 3. Every log that 0.1.7-rc.1 or 0.2.x created or wrote is format 4, which 0.1.5-rc.3 refuses, so a home that 0.1.7-rc.1 has run cannot go back to 0.1.5-rc.3 either.
+
+If a home goes back anyway, the plugin does not detect it. Each refused worker session is an ordinary start failure ([A worker cannot start](#recovery-and-troubleshooting)): it spends no recovery credit, three consecutive failures retire the member and move its work to another capable live member, and every member that ran on 0.2.x fails the same way, so the owner is finally told which work no live member can start; `swarm_add_member` admits a member with a new session. A worker session that opens but cannot make a request is reported as that member's failure. An owner conversation the older host refuses cannot be reopened, and its notices wait in the outbox. Restore the backup or return to 0.2.x.
+
+Running on 0.2.x also changes the following:
+
+- **Minimal-preset members compact.** The 0.2.x Minimal preset mounts compaction and `/compact`, so a member created from a Minimal owner compacts at task boundaries and under host pressure, and its summary requests are charged to it. On 0.1.x such a member never compacts.
+- **Tool changes can arrive in the history.** On a route whose model declares tool updates (`deepseek-flash` in the 0.2.x DeepSeek catalog), the management tools an owner gains at its promotion arrive as an in-history message instead of starting a new request series.
+- **Owner-only plugin routes.** The 0.2.1-rc.2 host answers HTTP 403 on the plugin's routes to any connection whose principal is not the owner. Every browser connection and API socket it creates is an owner, so the browser panel is unaffected.
+- **Previews need no host patch.** A preview root started on 0.2.x needs no rebuilt `ui-conversation` overlay; the input-editor defect it patches does not exist there. `scripts/update-preview.mjs` refuses to boot a root whose rebuilt host packages come from another release, so an existing 0.1.x preview moves to 0.2.x as a new root from `scripts/start-preview.mjs`.
+- **Unchanged upstream limits.** A session blocked in a tool call, such as `job_output` waiting on a job, still reads swarm notices only at its next step (dsh-external#624 and dsh-external#632 remain open).
+
+[Known limitations](known-limitations.md) records the details: the move back under Supported Harness versions; the shared instructions, the tool updates and the blocked tool calls under Harness integration; the compaction under Resources and budgets; and the routes under Interface and observation.
+
 ## Run a mission
 
 Choose a model in a conversation rooted in your Git project, then enter:

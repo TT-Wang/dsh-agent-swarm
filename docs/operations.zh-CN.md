@@ -69,6 +69,34 @@ node "$DSH_HARNESS_ROOT/apps/cli/lib/bin.js" --profile web
 
 同一台机器运行多个 Harness 版本时，请为每个版本使用独立的链接检出或构建副本；重新链接共享插件目录会改变所有使用该目录的宿主所加载的依赖。
 
+<a id="upgrade-a-harness-home-to-02x"></a>
+
+## 将 Harness 主目录升级到 0.2.x
+
+Harness 主目录（`DSH_HOME`）和插件状态从 0.1.5-rc.3 或 0.1.7-rc.1 迁到 0.2.1-rc.2 时，不需要额外的迁移步骤：0.2.1-rc.2 能读取已有的会话日志，宿主版本的变化也不会触及插件的存储（`swarm.sqlite`，schema 7）。但迁过去之后就回不来了，所以首次以 0.2.x 启动前：
+
+1. **停止宿主并备份主目录。** 把 `$DSH_HOME/sessions` 和插件状态一起复制：`statePath`（默认是 `~/.dsh/agent-swarm/swarm.sqlite` 及同目录的 `-wal`、`-shm` 文件；这个默认值不随 `DSH_HOME` 变化）和 `workspacesRoot`。回到 0.1.x 的唯一办法是恢复这份备份，在 0.2.x 上完成的一切都会丢弃。
+2. **检查共享的 agent 指令文件。** 0.2.x 除了 `$DSH_HOME/AGENTS.md`，还会读取共享 agents 目录（`$DSH_AGENTS_HOME`，默认 `~/.agents`）中的 `AGENTS.md`。worker 挂载其 owner 的 agent 预设，因此在 Standard、Creator 和 PTC 预设下，这个文件会进入每个 owner 和 worker 的提示词；Minimal 预设不加载指令文件。
+3. **仍有进行中任务的主目录不要迁回 0.1.x。**
+
+会话日志的升级是单向的：
+
+- 在 0.2.x 上，Standard、Creator 和 PTC 预设中的每次前台 `bash` 调用都会向发起调用的会话写入 `job/registered` 和 `job/settled`；`working_directory` 执行 cd 时写入 `working-directory/change`（worker 激活时把会话带回成员 worktree 也会写入这一事件）。0.1.5-rc.3 和 0.1.7-rc.1 遇到含有这些事件的日志，会以 `SessionFormatUnsupportedError` 拒绝读取（"unknown to this harness and not marked ignorable"），所以在 0.2.x 上执行过一次 bash 的 owner 或 worker 会话，旧版本再也打不开。
+- 0.2.x 还会把会话工具集在两次请求之间的每次变化记为一条 `developer/message`，例如 owner 晋升，或 0.1.x 的会话在 0.2.x 上恢复后遇到新增的宿主工具。0.1.7-rc.1 能打开这种日志，但它的 DeepSeek 供应商拒绝请求历史中的 developer 消息（`UNSUPPORTED_CONTENT`），该会话之后的每个请求都会失败。
+- 0.1.5-rc.3 只读取第 3 版会话格式，而 0.1.7-rc.1 或 0.2.x 创建或写过的日志都是第 4 版，会被它拒绝。所以 0.1.7-rc.1 运行过的主目录同样回不到 0.1.5-rc.3。
+
+如果主目录仍被迁回旧版本，插件不会察觉。旧宿主拒绝的每个 worker 会话都按普通启动失败处理（见[恢复与排查](#recovery-and-troubleshooting)中的“Worker 无法启动”）：不消耗恢复额度；连续失败 3 次后成员退役，工作转给另一个有能力的在线成员；在 0.2.x 上运行过的成员都会同样失败，最后主 agent 会收到通知，列出没有在线成员能启动的工作，此时可用 `swarm_add_member` 加入一个使用新会话的成员。能打开但无法发出请求的 worker 会话，会作为该成员的失败上报。旧宿主拒绝的 owner 会话无法重新打开，发给它的通知留在发件箱中。处理办法是恢复备份，或者回到 0.2.x。
+
+在 0.2.x 上运行时还有以下变化：
+
+- **Minimal 预设的成员会压缩上下文。** 0.2.x 的 Minimal 预设挂载了压缩引擎和 `/compact`，所以由 Minimal owner 创建的成员会在任务边界和宿主上下文压力下压缩，摘要请求计入该成员的用量。在 0.1.x 上，这样的成员从不压缩。
+- **工具变化可以写进历史。** 在模型声明支持工具更新的路由上（0.2.x DeepSeek 模型目录中的 `deepseek-flash`），owner 晋升时获得的管理工具以历史中的一条消息送达，不再开启新的请求序列。
+- **插件路由只对 owner 开放。** 对于主体（principal）不是 owner 的连接，0.2.1-rc.2 宿主在插件路由上返回 HTTP 403。宿主自己创建的浏览器连接和 API socket 都是 owner，浏览器面板不受影响。
+- **试用环境不再需要宿主补丁。** 在 0.2.x 上新建的试用根目录不需要重新构建的 `ui-conversation` 覆盖层，它所修补的输入编辑器缺陷在 0.2.x 上不存在。`scripts/update-preview.mjs` 拒绝启动这样的根目录：其中重新构建的宿主包来自另一个版本。因此已有的 0.1.x 试用环境要用 `scripts/start-preview.mjs` 新建根目录才能迁到 0.2.x。
+- **上游限制未变。** 阻塞在工具调用中的会话（例如用 `job_output` 等待某个作业）仍然要到下一步才读取 swarm 通知（dsh-external#624 和 dsh-external#632 尚未解决）。
+
+细节见[已知限制](known-limitations.md)：迁回旧版本见 Supported Harness versions；共享指令、工具更新和阻塞的工具调用见 Harness integration；压缩见 Resources and budgets；插件路由见 Interface and observation。
+
 ## 运行一个任务
 
 在以 Git 项目为工作目录的会话中选择模型，然后输入：
@@ -143,6 +171,8 @@ node "$DSH_HARNESS_ROOT/apps/cli/lib/bin.js" --profile web
 - **主会话**：它的用量单独归属和记录，不计入 worker 资源池。
 - **预警与准入**：主 agent 收到阈值提醒；允许下一步前会计入在途请求的估算用量。异常大的请求仍可能跨过上限，供应商未报告的用量也无法统计。
 - **检查命令**：宿主在 `checkConcurrency` 限制下记录排队和执行时长，使用任务指定的超时或配置兜底值。
+
+<a id="recovery-and-troubleshooting"></a>
 
 ## 恢复与排查
 
