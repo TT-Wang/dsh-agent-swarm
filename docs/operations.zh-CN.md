@@ -208,6 +208,8 @@ npm run verify
 
 这些测试使用临时 profile 和 Git 工作区，供应商回复由脚本提供。它们验证集成行为，不代表模型规划成功率。`npm run test:deepseek` 和 `npm run test:command-deepseek` 会发起真实供应商请求，可能产生费用，不包含在 `verify` 中。已完成的运行及其边界记录在[验证文档](validation.md)。
 
+真实 Loader 组合（`test:harness`、`test:pack`、故障套件的供应商层，以及走 DeepSeek API key 路由的 `test:deepseek`、`test:command-deepseek` 和 `scripts/check-cancel-freeze.mjs`）只挂载当前宿主自带的包，启动后每个启用的行都必须处于激活状态：仍在等待某个服务的行会让启动失败，并指出它等待的服务。这些组合挂载以测试工作区为根的 `@deepseek-ai/dsh-fs-local`；宿主自带 `@deepseek-ai/dsh-working-directory`（0.2.1-rc.2）时也挂载它，`bash` 的工作目录由该服务提供。宿主自带 `@deepseek-ai/dsh-llm-deepseek-api-key`（0.2.1-rc.2）时，DeepSeek 路由取自该包，否则取自 `@deepseek-ai/dsh-llm-deepseek`。
+
 ## 修订估算，继续原任务
 
 主 agent 会提前收到持久的预算提醒，覆盖总体资源和任务步数/发现数量，并注明模型在途用量估计。提醒不改变任务形态。`swarm_budget(missionId, taskId, taskBudget, reason)` 修改原任务的有限额度；省略 `taskId` 并提供 `budget` 可调整总体预算。累计消耗、任务身份和工件不变；如果只是资源等待，扩额并确认停止后会继续，用户主动暂停仍需恢复。发现数量只作复核信号。用户明确暂停和停止仍然有效。
