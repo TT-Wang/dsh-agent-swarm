@@ -165,6 +165,10 @@ test('start-lab restarts a hand-restarted lab by its port with a fresh token; ro
   const server = readJson(join(s.root, 'server.json'))
   assert.equal(server.status, 'running')
   assert.equal(server.harness, s.harness)
+  // The overlay it boots: no HMR, so a build mounts only by a restart, and the host's own model catalog.
+  const overlay = readJson(join(s.root, 'lab.patch.yml'))
+  assert.deepEqual(overlay.find(row => row.id === 'hmr'), { id: 'hmr', disabled: true })
+  assert.equal(overlay.some(row => row.id === 'llm-deepseek'), false, 'the host\'s catalog holds the model its agent-default-model row names')
 
   // Restarted by hand once more: server.json now names a pid that holds nothing.
   process.kill(started.pid, 'SIGTERM')
