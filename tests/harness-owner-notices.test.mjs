@@ -180,6 +180,60 @@ test('an owner wake whose every message went stale opens no model call, even whe
   assert.match(JSON.stringify(f.requests[0]), /Time sampled while preparing turn/)
 })
 
+// The rejection above is for an opening step only. A continuing step still owes
+// the model its tool result, so its stale input is dropped from the batch and
+// the step runs.
+test('a continuing owner step whose claimed input all went stale still hands the model its tool result', async t => {
+  const entered = deferred(), release = deferred(); t.after(() => release.resolve())
+  let claimed, notice
+  const f = await fixture(t, async (_request, n) => n === 1 ? { kind: 'tool' } : text('Finished tool continuation'), ctx => {
+    ctx.on('agent/pre-step', async ({ messages, step }, next) => {
+      if (step > 1 && messages.some(message => message.source.kind === 'swarm')) { claimed = messages.map(message => message.source.kind); entered.resolve(); await release.promise }
+      return await next()
+    })
+  })
+  let ran = 0
+  f.ctx.tools.register(defineContentToolFixture({ name: 'native_probe', description: 'Unrelated owner work', parameters: {}, execute: async () => {
+    ran++
+    notice = f.emit('STALE_AT_CONTINUING_STEP')
+    await f.rt.notices.flushOutbox(f.mission.id)
+    return [{ type: 'text', text: 'ordinary tool result' }]
+  } }))
+  f.agent.send(input('ordinary-work', 'Ordinary independent owner work'), 'next-turn', true)
+  await entered.promise
+  f.rt.control(f.owner, f.mission.id, 'stop', 'stopped while the continuing step was prepared')
+  release.resolve(); await f.agent.whenIdle()
+  assert.deepEqual(claimed, ['swarm'], 'the continuing step claimed only the notice')
+  assert.equal(ran, 1)
+  assert.equal(f.requests.length, 2, 'the tool result still reaches the model')
+  assert.ok(f.requests.every(request => !JSON.stringify(request).includes('STALE_AT_CONTINUING_STEP')))
+  assert.equal(f.rt.store.get('deliveries', notice.id).consumedAt, undefined)
+  assert.equal(f.agent.session.snapshotEvents().filter(event => event.type === 'turn/end').at(-1).data.reason.kind, 'completed')
+})
+
+// An opening step is rejected only when every message it claimed went stale.
+test('an opening owner step runs genuine owner input claimed beside stale swarm input', async t => {
+  const entered = deferred(), release = deferred(); t.after(() => release.resolve())
+  let claimed
+  const f = await fixture(t, undefined, ctx => {
+    ctx.on('agent/pre-step', async ({ messages }, next) => {
+      if (messages.some(message => message.source.kind === 'swarm')) { claimed = messages.map(message => message.source.kind); entered.resolve(); await release.promise }
+      return await next()
+    })
+  })
+  f.agent.send(input('genuine', 'GENUINE_OWNER_REQUEST'), 'next-turn', false)
+  const notice = f.emit('STALE_BESIDE_GENUINE')
+  const flushing = f.rt.notices.flushOutbox(f.mission.id)
+  await entered.promise
+  f.rt.control(f.owner, f.mission.id, 'stop', 'stopped during step preparation')
+  release.resolve(); await flushing; await f.agent.whenIdle()
+  assert.deepEqual(claimed.sort(), ['swarm', 'user'], 'the opening step claimed both')
+  assert.equal(f.requests.length, 1, 'the genuine request still runs')
+  assert.match(JSON.stringify(f.requests[0]), /GENUINE_OWNER_REQUEST/)
+  assert.ok(f.requests.every(request => !JSON.stringify(request).includes('STALE_BESIDE_GENUINE')))
+  assert.equal(f.rt.store.get('deliveries', notice.id).consumedAt, undefined)
+})
+
 test('completed mission facts still reach the owner after automatic completion overtakes transport', async t => {
   const f = await fixture(t)
   const notice = f.emit('COMPLETION_FACT_MUST_SURVIVE', { noticeClass: 'completion' })
