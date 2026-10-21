@@ -7,7 +7,7 @@ import { validatePlan } from './plans.ts'
 import { openAttempt } from './task-graph.ts'
 import type { SwarmRuntime } from './runtime.ts'
 import { TraceRecorder, eventSummary, eventVocabularyReport, errorTypeFor, readEventHistory, traceMetrics, type TraceStep } from './trace.ts'
-import { OWNER_ONLY_TOOLS, Actor, BoardQuery, Budget, CreateMissionInput, DraftPlan, ObserveQuery, PlanInput, PostInput, PostKind, ProposeTaskInput, PublishInput, Snapshot, TaskAmendment, type WorkspaceGrantSnapshot } from './types.ts'
+import { OWNER_ONLY_TOOLS, UNCONFINED_HOST_TOOLS, Actor, BoardQuery, Budget, CreateMissionInput, DraftPlan, ObserveQuery, PlanInput, PostInput, PostKind, ProposeTaskInput, PublishInput, Snapshot, TaskAmendment, type WorkspaceGrantSnapshot } from './types.ts'
 
 const string = { type: 'string' } as const
 const strings = { type: 'array', items: string } as const
@@ -32,13 +32,17 @@ export const MANAGEMENT_TOOLS: readonly string[] = OWNER_ONLY_TOOLS
 /** Meaningful only once a session owns an automatic request or a mission. */
 export const OWNER_SESSION_TOOLS = ['swarm_launch', 'swarm_budget', 'swarm_control', 'swarm_cancel', 'swarm_registry', 'swarm_restore'] as const
 export type SwarmRole = 'entry' | 'owner' | 'historical-owner' | 'worker' | 'none'
-/** Global tool names hidden from a session in the given role. */
+/**
+ * Global tool names hidden from a session in the given role. A worker also
+ * loses the host tools that would take it out of its worktree or past its
+ * attempt (`UNCONFINED_HOST_TOOLS`, which the runtime guard refuses as well).
+ */
 export function hiddenToolsFor(role: SwarmRole): string[] {
   switch (role) {
     case 'entry': return [...MEMBER_TOOLS, ...OWNER_SESSION_TOOLS]
     case 'owner':
     case 'historical-owner': return [...MEMBER_TOOLS]
-    case 'worker': return [...MANAGEMENT_TOOLS]
+    case 'worker': return [...MANAGEMENT_TOOLS, ...UNCONFINED_HOST_TOOLS]
     case 'none': return [...SWARM_TOOLS]
   }
 }

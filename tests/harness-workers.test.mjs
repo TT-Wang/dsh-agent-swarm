@@ -20,12 +20,31 @@ import UserQuestionService from '@deepseek-ai/dsh-user-questions'
 import AgentDefaultModel from '@deepseek-ai/dsh-agent-default-model'
 import { HarnessWorkers, isRuntimeContext } from '../lib/harness-workers.js'
 import { registerTools } from '../lib/tools.js'
+import { UNCONFINED_HOST_TOOLS } from '../lib/types.js'
 import { runProcess } from '../lib/workspaces.js'
 import { subprocessSeam, SubprocessLocal } from './subprocess-seam.mjs'
 import { eventually, makeRuntime } from './faults/harness.mjs'
-import { loaderPlugin } from './fixtures/built-harness.mjs'
+import { loaderPlugin, toolResultBlocks } from './fixtures/built-harness.mjs'
+import { hostPackage } from './fixtures/host-packages.mjs'
 
 const JsonlPersistence = loaderPlugin(JsonlPersistenceModule)
+
+/**
+ * The session working-directory service as the host's base bundle composes it,
+ * where the installed host ships it (0.2.x): an `fs` provider and the service,
+ * both defaulting to the source checkout. Resolves the service, or undefined on
+ * a host without one (0.1.x).
+ */
+async function mountWorkingDirectory(ctx, source) {
+  const service = await hostPackage('@deepseek-ai/dsh-working-directory')
+  if (service === undefined) return undefined
+  await ctx.plugin(loaderPlugin(await import('@deepseek-ai/dsh-fs-local')), { cwd: source })
+  await ctx.plugin(loaderPlugin(service), { defaultDirectory: source })
+  return ctx.workingDirectory
+}
+
+/** Every `working-directory/change` a session log recorded, oldest first. */
+const recordedDirectories = session => session.snapshotEvents().filter(event => event.type === 'working-directory/change').map(event => event.data.cwd)
 
 /**
  * The provider-visible system prompt. The agent loop requires
@@ -125,6 +144,8 @@ async function fixture(t, responder = () => ({ kind: 'text', text: 'done' }), co
   await ctx.plugin(UserQuestionService)
   const agentLoop = await ctx.plugin(AgentLoop, { agents: [] })
   if (config.defaults !== undefined) await ctx.plugin(AgentDefaultModel, config.defaults)
+  // Host plugins every session composes, mounted before the first agent exists.
+  await config.hostPlugins?.({ ctx, root, source })
   ctx.llm.registerAdapter(['swarm-test', 'other-provider'], new Scripted())
   const owner = await ctx.agents.create({ sessionId: SessionId('owner-session'), meta: { cwd: source }, agentOptions: config.ownerOptions ?? { provider: 'swarm-test', model: 'scripted' } })
   await config.configureOwner?.({ ctx, owner })
@@ -950,3 +971,68 @@ test('worker persona shadows both legacy and prefix/suffix deployment personas',
   assert.match(systemTextOf(f.requests[0]), /Your role: implementer/)
   assert.equal(systemTextOf(f.requests[0]).match(/Your role: implementer/g).length, 1)
 })
+
+test('a worker neither sees nor runs the host tools that would move it out of its worktree or past its attempt', async t => {
+  // Each tool is composed from the package the installed host ships, the way
+  // its bundles mount it; a host that ships none registers none, and the worker
+  // still tries every name. The services behind the tools are doubles that fail
+  // the run if any call reaches them.
+  const reached = []
+  const unreachable = service => new Proxy({}, { get: (_target, method) => async () => { reached.push(`${service}.${String(method)}`); throw new Error(`${service}.${String(method)} reached`) } })
+  const registered = []
+  let directory
+  const attempts = [
+    ['working_directory', source => ({ cd: source })],
+    ['create_worktree', () => ({ name: 'escape' })],
+    ['schedule_create', () => ({ title: 'Later', prompt: 'Continue after the attempt.', after_seconds: 3600 })],
+    ['schedule_update', () => ({ id: 'reminder', after_seconds: 60 })],
+    ['schedule_list', () => ({})],
+    ['schedule_delete', () => ({ id: 'reminder' })],
+  ]
+  assert.deepEqual(attempts.map(([name]) => name).sort(), [...UNCONFINED_HOST_TOOLS].sort(), 'the worker tries every unconfined host tool')
+  let source
+  const f = await fixture(t, (_options, count) => count <= attempts.length
+    ? { kind: 'tool', name: attempts[count - 1][0], arguments: attempts[count - 1][1](source) }
+    : { kind: 'text', text: 'done' }, { start: false, hostPlugins: async ({ ctx, source: checkout }) => {
+    source = checkout
+    directory = await mountWorkingDirectory(ctx, checkout)
+    const directoryTool = await hostPackage('@deepseek-ai/dsh-tool-working-directory')
+    if (directory !== undefined && directoryTool !== undefined) {
+      await ctx.plugin(loaderPlugin(directoryTool))
+      registered.push('working_directory')
+    }
+    const worktreeTool = await hostPackage('@deepseek-ai/dsh-experimental-tool-worktree')
+    if (worktreeTool !== undefined) {
+      ctx.provide('worktrees', unreachable('worktrees'))
+      await ctx.plugin(loaderPlugin(worktreeTool))
+      registered.push('create_worktree')
+    }
+    const scheduleTools = await hostPackage('@deepseek-ai/dsh-tool-schedule')
+    if (scheduleTools !== undefined) {
+      ctx.provide('schedule', unreachable('schedule'))
+      await ctx.plugin(loaderPlugin(scheduleTools))
+      registered.push('schedule_create', 'schedule_list', 'schedule_update', 'schedule_delete')
+    }
+  } })
+  const ownerTools = new Set(f.ctx.tools.schemas(f.owner.agent).map(schema => schema.name))
+  assert.deepEqual(UNCONFINED_HOST_TOOLS.filter(name => ownerTools.has(name)).sort(), registered.sort(), 'an ordinary session sees exactly the unconfined tools this host registered')
+  await f.adapter.start(f.spec)
+  const worker = f.ctx.agents.get(SessionId(f.member.sessionId))
+  assert.deepEqual(f.ctx.tools.schemas(worker).map(schema => schema.name).filter(name => UNCONFINED_HOST_TOOLS.includes(name)), [], 'the worker sees none of them')
+  await f.adapter.deliver(f.member, message(f.member))
+  await worker.whenIdle()
+  assert.equal(f.requests.length, attempts.length + 1, 'every attempt came back to the model as a tool result')
+  for (const request of f.requests) {
+    assert.deepEqual((request.tools ?? []).map(tool => tool.name).filter(name => UNCONFINED_HOST_TOOLS.includes(name)), [], 'no worker request offers one')
+  }
+  const results = worker.session.snapshotEvents().filter(event => event.type === 'tool/result')
+  assert.equal(results.length, attempts.length)
+  assert.ok(results.every(event => toolResultBlocks([event.data.message]).every(block => block.isError)), 'every call failed without running')
+  assert.deepEqual(reached, [], 'no call reached the service behind the tool')
+  if (directory !== undefined) {
+    assert.equal(directory.get(worker.session), f.member.workspace, 'the session directory is still the member worktree')
+    assert.deepEqual(recordedDirectories(worker.session), [], 'and nothing was recorded')
+  }
+  assert.deepEqual(f.observations.failures, [])
+})
+
