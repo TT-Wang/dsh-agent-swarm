@@ -90,6 +90,15 @@ test:replay` (digest `sha256:61a921e64088b78b957cd6aeaa563d5436d4a6eae4b0130725d
 number of `mission_operation_pending` lines from its composition run, 5 to 20 a run on both `9aa4a59` and the head.
 Not run: 0.1.7-rc.1.
 
+**Merged** as `b1ea9aa` (2026-10-21) on `979b33a` (batch 17 and the validation backfill). Two conflicts kept both
+sides: `src/task-graph.ts` holds batch 17's `turnEnded` beside W1's `finishedAttempt`, and `src/scheduling.ts`
+imports both. The oracle's `prep` scenario, which batch 17 added, was re-recorded: its seven `prepareTask` trace
+entries gain the fifth argument, `null`; the other eleven scenarios are identical.
+
+Gates at `b1ea9aa` on 0.1.5-rc.3 and 0.1.7-rc.1: typecheck, build, full suite 1950/1950, `test:harness`,
+`test:replay`, `test:oracle` 12/12 identical, pack, profile, bundle, faults 24/24, `smoke-web` 13/13,
+`smoke-command-web` 11/11.
+
 ## Batch 17: decide-then-act S12, S13, S14, S15 (2026-10-20)
 
 **Head**: this record on `b7f53a3`, branch `batch17/kernel` on `f8cee82`, not merged; written in the batch's first
