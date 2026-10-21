@@ -126,7 +126,7 @@ These infrastructure settings do not replace the primary agent's task-specific b
 
 ### Authorize another workspace
 
-A mission may use the calling session's working directory or a realpath inside a root in `authorizedWorkspaces`. A human edits the profile or `cordis.patch.yml` and restarts Harness to change these roots. No model-callable tool can add, widen or revoke them.
+A mission may use the directory the calling session started in or a realpath inside a root in `authorizedWorkspaces`. A human edits the profile or `cordis.patch.yml` and restarts Harness to change these roots. No model-callable tool can add, widen or revoke them. On 0.2.x hosts a `working_directory` cd changes where that session's shells and file tools run, not this authorization: `/agent-swarm`, the swarm tools and browser drafts still bind to the directory the session started in.
 
 The resolved workspace and matched grant are recorded durably. An unauthorized path returns `[workspace_not_authorized]` with the required correction. The runtime re-checks a mission's workspace with the admission rule (the calling session's own directory, else the most specific active configured root that contains it) before every worker start, workspace preparation, planning snapshot, draft launch, delivery and verification checkout. Removing a root and restarting therefore prevents new missions there and fences an existing mission at its next scheduling pass, with a blocked reason and an owner notice; the owner is woken once per plugin runtime (each Harness start or plugin reload) that finds the mission revoked. A root whose `expiresAt` passes while Harness runs, or a workspace that stops resolving, fences its missions the same way at the next pass. Adding or removing a nested root never fences a mission that another configured root still contains. Work resumed before the root is restored is fenced again.
 
@@ -168,7 +168,7 @@ Snapshot selection follows the current Git index: a file removed from the index 
 
 An invalid live update retains the last valid view and retries a full snapshot with backoff. Continued invalid data stays visibly disconnected rather than displaying invented progress. Owners can settle existing questions after pause, stop or completion without resuming workers. Trace metrics describe a bounded span window and expose its truncation explicitly; full durable records remain available separately.
 
-Worker confinement follows the configured Harness sandbox. Shared temporary directories remain a possible cross-member channel. Delivery Git subprocesses also retain the process-management exceptions described in [known limitations](known-limitations.md).
+Worker confinement follows the configured Harness sandbox. Each worker activation also starts the worker's session in its member worktree (on 0.2.x hosts, where a session's working directory is durable), and workers neither see nor may call the host tools that would move it or schedule a later turn: `working_directory`, `create_worktree` and the `schedule_*` reminder tools. Shared temporary directories remain a possible cross-member channel. Delivery Git subprocesses also retain the process-management exceptions described in [known limitations](known-limitations.md).
 
 ## Companion context policy
 

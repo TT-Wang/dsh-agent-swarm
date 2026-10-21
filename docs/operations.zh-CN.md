@@ -128,7 +128,7 @@ node "$DSH_HARNESS_ROOT/apps/cli/lib/bin.js" --profile web
 
 ### 授权其他工作区
 
-任务可以使用调用会话的工作目录，或 realpath 位于 `authorizedWorkspaces` 某个授权根内的路径。修改授权根需要用户编辑 profile 或 `cordis.patch.yml`，然后重启 Harness。任何模型可调用工具都不能添加、扩大或撤销授权根。
+任务可以使用调用会话启动时所在的目录，或 realpath 位于 `authorizedWorkspaces` 某个授权根内的路径。修改授权根需要用户编辑 profile 或 `cordis.patch.yml`，然后重启 Harness。任何模型可调用工具都不能添加、扩大或撤销授权根。在 0.2.x 宿主上，`working_directory` 的 cd 只改变该会话的 shell 和文件工具在哪里运行，不改变这项授权：`/agent-swarm`、swarm 工具和浏览器草稿仍绑定到会话启动时所在的目录。
 
 解析后的工作区和匹配到的授权会持久记录。未授权路径返回 `[workspace_not_authorized]` 及修正说明。运行时在每次启动 worker、准备工作区、创建规划快照、启动草稿、交付和创建验证检出之前，都会按准入规则（调用会话自身的目录；否则取包含该工作区、仍有效且最具体的授权根）重新校验任务的工作区。因此删除某个根并重启后，系统拒绝在该目录创建新任务；现有任务会在下一次调度时被阻止继续，并记录 blocked 原因和主 agent 通知；每个发现该任务授权已撤销的插件运行时（每次 Harness 启动或插件重载）只通知主 agent 一次。宿主运行期间授权根的 `expiresAt` 到期（或工作区无法再解析）时，相关任务也会在下一次调度时以同样方式被隔离。增删嵌套的授权根不会隔离仍被其他已配置根包含的任务。在授权根恢复之前恢复的工作会再次被隔离。
 
@@ -170,7 +170,7 @@ node "$DSH_HARNESS_ROOT/apps/cli/lib/bin.js" --profile web
 
 实时增量数据异常时，侧栏保留最后有效视图，并退避重试完整快照；持续异常会明确显示连接故障，不会虚构进度。主 agent 可以在暂停、停止或完成后结算已有问题，无需重新启动 worker。Trace 指标明确标注所覆盖的 span 窗口及截断状态，完整持久记录另行保留。
 
-Worker 隔离依赖配置的 Harness 沙箱；共享临时目录仍可能成为成员之间的通信路径。交付阶段的 Git 子进程也保留了进程管理例外，详见[已知限制](known-limitations.md)。
+Worker 隔离依赖配置的 Harness 沙箱。每次激活 worker 时，插件还会让它的会话从自己的成员 worktree 开始（在 0.2.x 宿主上，会话工作目录会持久保存）；worker 既看不到也不能调用会移走工作目录或安排之后再次运行的宿主工具：`working_directory`、`create_worktree` 和 `schedule_*` 提醒工具。共享临时目录仍可能成为成员之间的通信路径。交付阶段的 Git 子进程也保留了进程管理例外，详见[已知限制](known-limitations.md)。
 
 <a id="companion-context-policy"></a>
 
