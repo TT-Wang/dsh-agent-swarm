@@ -16,7 +16,6 @@ import SandboxPolicy from '@deepseek-ai/dsh-sandbox-policy'
 import Approval from '@deepseek-ai/dsh-user-approval'
 import UserQuestionService from '@deepseek-ai/dsh-user-questions'
 import SandboxLocal from '@deepseek-ai/dsh-sandbox-local'
-import Invariants from '@deepseek-ai/dsh-invariants'
 import * as Swarm from '../lib/index.js'
 import { runProcess } from '../lib/workspaces.js'
 import { subprocessSeam, SubprocessLocal } from './subprocess-seam.mjs'
@@ -58,7 +57,7 @@ async function fixture(t, respond = () => text('Done'), configure, profile = {})
   await ctx.plugin(JsonlPersistence, { root: path.join(root, 'sessions'), compression: 'none', writeBatchMaxDelayMs: 1 })
   await ctx.plugin(SandboxPolicy, { mode: 'read-only', workspaceRoot: source })
   await ctx.plugin(Approval, { policy: 'never' })
-  for (const plugin of [UserQuestionService, SandboxLocal, Invariants]) await ctx.plugin(plugin)
+  for (const plugin of [UserQuestionService, SandboxLocal]) await ctx.plugin(plugin)
   await ctx.plugin(AgentLoop, { agents: [] })
   ctx.llm.registerAdapter(['swarm-test'], new Scripted())
   await configure?.(ctx)
