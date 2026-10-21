@@ -152,6 +152,34 @@ test('consumer rechecks messages already claimed while another pre-step handler 
   assert.equal(f.rt.store.get('deliveries', notice.id).consumedAt, undefined)
 })
 
+test('an owner wake whose every message went stale opens no model call, even where the host adds its time context to every step', async t => {
+  // The host's time context (mounted by the 0.2.x Web presets) wraps every other
+  // pre-step listener and appends its reading to whatever decision it gets back,
+  // an emptied one included.
+  const entered = deferred(), release = deferred(); t.after(() => release.resolve())
+  const f = await fixture(t, undefined, async ctx => {
+    await ctx.plugin(loaderPlugin(await import('@deepseek-ai/dsh-time-context')), {})
+    ctx.on('agent/pre-step', async ({ messages }, next) => {
+      if (messages.some(message => message.source.kind === 'swarm')) { entered.resolve(); await release.promise }
+      return await next()
+    })
+  })
+  const notice = f.emit('STALE_UNDER_TIME_CONTEXT')
+  const flushing = f.rt.notices.flushOutbox(f.mission.id)
+  await entered.promise
+  f.rt.control(f.owner, f.mission.id, 'stop', 'stopped during step preparation')
+  release.resolve(); await flushing; await f.agent.whenIdle()
+  assert.equal(f.requests.length, 0, 'a time reading alone is no decision turn')
+  assert.equal(f.rt.store.get('deliveries', notice.id).consumedAt, undefined)
+  assert.deepEqual(f.agent.session.snapshotEvents().filter(event => event.type === 'user/message'), [], 'nothing reaches the owner history')
+  // A genuine owner turn still carries the time context: the composition is live.
+  f.agent.send(input('ordinary-work', 'Ordinary independent owner work'), 'next-turn', true)
+  await f.agent.whenIdle()
+  assert.equal(f.requests.length, 1)
+  assert.match(JSON.stringify(f.requests[0]), /Ordinary independent owner work/)
+  assert.match(JSON.stringify(f.requests[0]), /Time sampled while preparing turn/)
+})
+
 test('completed mission facts still reach the owner after automatic completion overtakes transport', async t => {
   const f = await fixture(t)
   const notice = f.emit('COMPLETION_FACT_MUST_SURVIVE', { noticeClass: 'completion' })

@@ -77,7 +77,7 @@ function anchorWorkingDirectory(ctx: Context, agent: Agent, workspace: string): 
   agent.session.append('working-directory/change', { cwd: workspace })
 }
 
-/** The host's regenerated runtime context: `runtime-context` on 0.1.7, a system-prompt `plugin` source on 0.1.5. */
+/** The host's regenerated runtime context: `runtime-context` on 0.1.7 and 0.2.x, a system-prompt `plugin` source on 0.1.5. */
 export function isRuntimeContext(source: { kind: string; plugin?: unknown }): boolean {
   return source.kind === 'runtime-context' || (source.kind === 'plugin' && source.plugin === '@deepseek-ai/dsh-system-prompt')
 }
@@ -85,8 +85,11 @@ export function isRuntimeContext(source: { kind: string; plugin?: unknown }): bo
 /**
  * Keep lifecycle policy in the runtime, but apply it at the native consumer
  * boundary too: transport acknowledgement can precede consumption by a turn.
- * Returning an empty admitted batch lets Harness finish a completed turn while
- * still continuing unrelated tool-result work; cancelling the owner would not.
+ * A turn opened by stale input alone is rejected before its first step, so no
+ * model call is made for it. A continuing step whose new input went stale gets
+ * an empty admitted batch instead, which lets Harness finish a completed turn
+ * while still continuing unrelated tool-result work; cancelling the owner would
+ * not.
  */
 export function installOwnerDeliveryFilter(ctx: Context, project: (sessionId: string, deliveryId: string) => string | false | undefined): (agent: Agent) => void {
   const stale = (agent: Agent, message: UserMessage): boolean => message.source.kind === 'swarm'
@@ -94,11 +97,19 @@ export function installOwnerDeliveryFilter(ctx: Context, project: (sessionId: st
   const prune = (agent: Agent): void => {
     for (const message of [...agent.inbox.nextTurn, ...agent.inbox.nextStep]) if (stale(agent, message)) agent.inbox.remove(message.id)
   }
-  ctx.on('agent/pre-step', async ({ agent, messages }, next) => {
+  ctx.on('agent/pre-step', async ({ agent, messages, step }, next) => {
     prune(agent)
     const decision = await next()
     if (decision.kind === 'reject') return decision
     const onlyStale = messages.length > 0 && messages.every(message => stale(agent, message))
+    // A turn whose opening input all went stale has nothing to run. An emptied
+    // opening spends no model call only while no listener outside this one adds
+    // to it, and the host's time context (mounted by the 0.2.x Web presets)
+    // wraps every other listener and appends its reading to any decision it
+    // gets back. A rejection it passes through: the loop then ends the turn
+    // before any step, exactly as it ends an emptied opening, and drops the
+    // stale input it claimed.
+    if (onlyStale && step === 1) return { kind: 'reject' }
     const admitted = decision.messages.filter(message => !stale(agent, message)
       // A changed generated context is not an independent user request. Let it
       // be regenerated for the next genuine turn instead of reviving this one.
