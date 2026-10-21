@@ -166,12 +166,13 @@ interface TraceStore {
 /**
  * R17-G10: the host telemetry sink (`session-telemetry`), declared structurally.
  *
- * The host package `@deepseek-ai/dsh-session-telemetry` (the same contract on
- * 0.1.5-rc.3 and 0.1.7-rc.1) defines `SessionTelemetryRecord` and
- * `SessionTelemetrySink` and registers the sink as the `sessionTelemetry`
- * service; the record shape below is that contract verbatim
- * (`channel`/`time`/`severity`/`attributes`/`body`, with `emit` a non-blocking
- * enqueue). It is declared here instead of imported so this package keeps no
+ * The host package `@deepseek-ai/dsh-session-telemetry`, on every supported
+ * release, defines `SessionTelemetryRecord` and `SessionTelemetrySink` and
+ * registers the sink as the `sessionTelemetry` service; the record shape below
+ * is that contract verbatim (`channel`/`time`/`severity`/`attributes`/`body`,
+ * with `emit` a non-blocking enqueue). 0.2.x adds only an optional
+ * `sourceEvent`, which the host's own ledger records carry and an ops record
+ * omits. It is declared here instead of imported so this package keeps no
  * runtime or build dependency on a host package it does not declare
  * (package.json is outside this branch's scope, and the deployed plugin
  * installs only its declared peers); the binding is made through the cordis

@@ -42,8 +42,9 @@ declare module '@deepseek-ai/dsh-session/types' {
 
 /**
  * The `agentPresets` service, declared structurally: 0.1.5 provides it from
- * `@deepseek-ai/dsh-agent-presets`, 0.1.7 from `@deepseek-ai/dsh-agent-preset-registry`
- * with the same two methods this adapter uses.
+ * `@deepseek-ai/dsh-agent-presets`, 0.1.7 and 0.2.x from
+ * `@deepseek-ai/dsh-agent-preset-registry`, with the same two methods this
+ * adapter uses.
  */
 interface AgentPresets {
   composedPreset(agentCtx: Context): string | undefined
@@ -858,7 +859,7 @@ export class HarnessWorkers implements WorkerAdapter {
         return undefined
       })
       agentCtx.on('session/event', (session, event) => {
-        // Retry events are an optional public session extension in both supported versions.
+        // Retry events are an optional public session extension in every supported release.
         const type: string = event.type
         const retryData: unknown = event.data
         if (type === 'llm/retry' && isRecord(retryData) && typeof retryData.delayMs === 'number' && Number.isSafeInteger(retryData.delayMs) && retryData.delayMs >= 0 && typeof retryData.retry === 'number') {
@@ -993,8 +994,8 @@ export class HarnessWorkers implements WorkerAdapter {
     })
   }
   /**
-   * The compaction engine this member's own composition uses. Both supported
-   * web profiles disable the host-plane `compaction-basic` row and mount it in
+   * The compaction engine this member's own composition uses. Every supported
+   * web profile disables the host-plane `compaction-basic` row and mounts it in
    * each agent preset's isolated `compaction` realm, where `ctx.get` from this
    * plugin cannot see it; the realm's public handle is the `/compact` command it
    * registers for the agents on that preset. That command runs the engine's

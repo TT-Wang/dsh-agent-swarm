@@ -70,8 +70,8 @@ async function appendStoredEvents(persistence, id, events) {
   finally { await handle.close() }
 }
 
-test('the owner filter recognizes regenerated runtime context on both supported hosts', () => {
-  assert.equal(isRuntimeContext({ kind: 'runtime-context', form: 'snapshot', sections: [] }), true, '0.1.7 names its own producer kind')
+test('the owner filter recognizes regenerated runtime context on every supported host', () => {
+  assert.equal(isRuntimeContext({ kind: 'runtime-context', form: 'snapshot', sections: [] }), true, '0.1.7 and 0.2.x name their own producer kind')
   assert.equal(isRuntimeContext({ kind: 'plugin', plugin: '@deepseek-ai/dsh-system-prompt' }), true, '0.1.5 attributes it to the system-prompt plugin')
   assert.equal(isRuntimeContext({ kind: 'plugin', plugin: '@deepseek-ai/dsh-other' }), false)
   assert.equal(isRuntimeContext({ kind: 'user' }), false)
@@ -203,8 +203,8 @@ test('cancelled native startup cannot publish a late worker and can be retried a
 })
 
 test('a native dispose that rejected has still released the worker, so the member starts again and unload completes', async t => {
-  // Both supported hosts memoize a handle's dispose and run registry, scope and
-  // ownership cleanup to quiescence before it rejects: a settled dispose is a
+  // Every supported host memoizes a handle's dispose and runs registry, scope
+  // and ownership cleanup to quiescence before it rejects: a settled dispose is a
   // released handle, never one to retry (review M-15).
   const f = await fixture(t, undefined, { start: false })
   // The worker's session write handle (a fresh create, or a resume's open) closes, then reports EIO.

@@ -2,8 +2,8 @@
  * Real Harness Loader composition: boundary compaction reaches the member's own
  * compaction realm.
  *
- * Both supported web profiles disable the host-plane `compaction-basic` row and
- * mount it, with `/compact`, inside an agent preset's `cordis:group` that
+ * Every supported web profile disables the host-plane `compaction-basic` row and
+ * mounts it, with `/compact`, inside an agent preset's `cordis:group` that
  * isolates the `compaction` service. This composition mounts that same realm
  * (the preset's rows and `isolate` map) beside the host-plane `commands` and
  * `tokenMeter` services, so the plugin cannot see the engine through

@@ -371,7 +371,7 @@ export function registerWebApi(ctx: Context, runtime: SwarmRuntime, options: Web
       return { ok: false, error: { code: 'internal-error', message: 'Swarm request failed unexpectedly; the original error was logged on the host.', details: { issues: [] } } }
     }
   }
-  // One route shape on both supported hosts. A plugin-owned channel
+  // One route shape on every supported host. A plugin-owned channel
   // (`rpc.handle('/agent-swarm', …)`) is unusable on 0.1.5: `rpc.handle`
   // registers the route under the CONNECTION plugin's own fiber, which injects
   // `credentials` alone, so Cordis refuses its `webServer` access and the route

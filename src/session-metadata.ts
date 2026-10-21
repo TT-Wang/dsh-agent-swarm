@@ -1,4 +1,4 @@
-/** The public persistence metadata contract both supported Harness releases share. */
+/** The public persistence metadata contract every supported Harness release shares. */
 import type { SessionHeader, SessionId } from '@deepseek-ai/dsh-session'
 
 interface MetadataReader {
