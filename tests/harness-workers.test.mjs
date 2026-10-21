@@ -45,6 +45,8 @@ async function mountWorkingDirectory(ctx, source) {
 
 /** Every `working-directory/change` a session log recorded, oldest first. */
 const recordedDirectories = session => session.snapshotEvents().filter(event => event.type === 'working-directory/change').map(event => event.data.cwd)
+/** The provider-visible text of one request. */
+const requestText = request => (request.messages ?? []).flatMap(message => message.content.filter(block => block.type === 'text').map(block => block.text)).join('\n')
 
 /**
  * The provider-visible system prompt. The agent loop requires
@@ -1036,3 +1038,46 @@ test('a worker neither sees nor runs the host tools that would move it out of it
   assert.deepEqual(f.observations.failures, [])
 })
 
+test('a worker whose log recorded a working-directory change starts its next activation in its worktree', async t => {
+  // Where the host provides the working-directory service the directory is
+  // durable session state: its projection replays the last recorded change on
+  // every resume. A host without the service never sees the event, so no
+  // activation may write it there.
+  let directory
+  const f = await fixture(t, undefined, { hostPlugins: async ({ ctx, source }) => { directory = await mountWorkingDirectory(ctx, source) } })
+  const id = SessionId(f.member.sessionId)
+  assert.deepEqual(recordedDirectories(f.ctx.agents.get(id).session), [], 'a fresh worker already starts in its worktree, so nothing is written')
+  await f.adapter.dispose()
+  const elsewhere = f.mission.workspace
+  if (directory !== undefined) {
+    // A cd the worker made before its tools were hidden, or in a turn the
+    // adapter did not set up: the public persistence API appends it to the log.
+    const stored = await readStoredSession(f.ctx.sessionPersistence, id)
+    const staged = Session.fromRestore(id, stored.events, stored.meta, stored.inheritedEventCount)
+    staged.append('working-directory/change', { cwd: elsewhere })
+    await appendStoredEvents(f.ctx.sessionPersistence, id, staged.snapshotEvents(stored.events.length))
+  }
+  const resumed = new HarnessWorkers(f.ctx, f.options)
+  resumed.bind(f.callbacks)
+  try {
+    await resumed.start(f.spec)
+    const worker = f.ctx.agents.get(id)
+    if (directory === undefined) {
+      assert.deepEqual(recordedDirectories(worker.session), [], 'a resumed activation writes no event this host cannot read')
+      return
+    }
+    assert.equal(directory.get(worker.session), f.member.workspace, 'the activation re-anchored the session directory')
+    assert.deepEqual(recordedDirectories(worker.session), [elsewhere, f.member.workspace], 'as one durable change after the recorded one')
+    assert.equal(worker.inbox.hasPending, false, 'the anchor queues no notice, so the worker holds no input of its own making')
+    assert.equal(resumed.isIdle(f.member.id), true, 'and the drain step has nothing to wake')
+    await resumed.deliver(f.member, message(f.member))
+    await worker.whenIdle()
+    const text = requestText(f.requests.at(-1))
+    assert.ok(text.includes(`Current working directory: ${JSON.stringify(f.member.workspace)}.`), 'the model is told it works in its worktree')
+    assert.ok(!text.includes(`Current working directory: ${JSON.stringify(elsewhere)}.`), 'and never in the recorded directory')
+    await resumed.stop(f.member.id)
+    await resumed.start(f.spec)
+    assert.deepEqual(recordedDirectories(f.ctx.agents.get(id).session), [elsewhere, f.member.workspace], 'a session already in its worktree is not written again')
+    assert.deepEqual(f.observations.failures, [])
+  } finally { await resumed.dispose() }
+})

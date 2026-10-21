@@ -47,6 +47,7 @@ import { SwarmStore } from '../lib/store.js'
 import { FakeWorkers, NO_GRANTS, SwarmRuntime, budget as sharedBudget, eventually, makeRuntime } from './faults/harness.mjs'
 import { guardActions, guardBoard, guardProgressActions } from './guard-model.mjs'
 import { tempDirectory } from './temp-root.mjs'
+import { hostShips } from './fixtures/host-packages.mjs'
 
 const ROOT = dirname(dirname(fileURLToPath(import.meta.url)))
 /** The pre-change tree has no built projection module; every test says so explicitly. */
@@ -108,12 +109,22 @@ test('no session event: the plugin appends nothing to the owner log, and the der
   // not marked ignorable. So the check is source-level and exhaustive over every
   // writer in src/: each append names a literal type from that vocabulary (a
   // worker activation writes the host's own sandbox and approval policy events).
+  // One host event is written only behind the host service that owns it: the
+  // activation re-anchors a worker's working directory where the host provides
+  // the `workingDirectory` service. A host that ships the owning package must
+  // know the type like any other; a host without it never reaches the write,
+  // which tests/harness-workers.test.mjs asserts on the activations it runs.
+  const SERVICE_EVENTS = new Map([['working-directory/change', '@deepseek-ai/dsh-working-directory']])
+  const unreachable = new Set([...SERVICE_EVENTS].filter(([, owner]) => !hostShips(owner)).map(([type]) => type))
   const { readdir } = await import('node:fs/promises')
   const sources = await Promise.all((await readdir(join(ROOT, 'src'))).filter(name => name.endsWith('.ts'))
     .map(async name => [name, await readFile(join(ROOT, 'src', name), 'utf8')]))
   const unreadable = sources.flatMap(([name, source]) => [...source.matchAll(/\bsession\.append\(\s*([^,)]*)|\.append\(\s*(['"]swarm\/[^,)]*)/g)]
     .map(([, type, swarm]) => (type ?? swarm).trim())
-    .filter(type => !KNOWN_SESSION_EVENT_TYPES.has(/^(['"])([^'"]*)\1$/.exec(type)?.[2]))
+    .filter(type => {
+      const literal = /^(['"])([^'"]*)\1$/.exec(type)?.[2]
+      return !KNOWN_SESSION_EVENT_TYPES.has(literal) && !unreachable.has(literal)
+    })
     .map(type => `${name}: ${type}`))
   assert.deepEqual(unreadable, [], 'no src module appends a session event type outside the host vocabulary: the host format cannot carry a plugin-owned type')
 })

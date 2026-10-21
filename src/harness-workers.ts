@@ -2,7 +2,7 @@
 import type { Context } from '@deepseek-ai/cordis'
 import { installModelSelection, type Agent, type AgentHandle, type AgentOptions, type ModelSelection } from '@deepseek-ai/dsh-agent'
 import { freezeMessage, MessageId, ReasoningEffortId, type UserMessage } from '@deepseek-ai/dsh-llm'
-import { SessionId } from '@deepseek-ai/dsh-session'
+import { SessionId, type Session } from '@deepseek-ai/dsh-session'
 import { scrubbedParentEnv } from '@deepseek-ai/dsh-subprocess'
 import type {} from '@deepseek-ai/dsh-tools'
 import type {} from '@deepseek-ai/dsh-system-prompt'
@@ -28,6 +28,18 @@ declare module '@deepseek-ai/dsh-llm' {
   }
 }
 
+declare module '@deepseek-ai/dsh-session/types' {
+  interface SessionEventMap {
+    /**
+     * A session's effective working directory: the durable state of the 0.2.x
+     * `workingDirectory` service (`@deepseek-ai/dsh-working-directory`), whose
+     * projection replays the last one. Declared here because 0.1.x hosts have
+     * no such service; this adapter writes it only where the host provides one.
+     */
+    'working-directory/change': { cwd: string }
+  }
+}
+
 /**
  * The `agentPresets` service, declared structurally: 0.1.5 provides it from
  * `@deepseek-ai/dsh-agent-presets`, 0.1.7 from `@deepseek-ai/dsh-agent-preset-registry`
@@ -36,6 +48,33 @@ declare module '@deepseek-ai/dsh-llm' {
 interface AgentPresets {
   composedPreset(agentCtx: Context): string | undefined
   mount(agentCtx: Context, id?: string): Promise<unknown>
+}
+
+/**
+ * The 0.2.x session working-directory service, declared structurally: 0.1.x
+ * hosts have none. `get` reads what the session's projection replays: the last
+ * recorded `working-directory/change`, else the session header's cwd.
+ */
+interface WorkingDirectory {
+  get(session: Session): string
+}
+
+/**
+ * Re-anchor a worker session's working directory to its member worktree. Where
+ * the host provides the working-directory service, the directory is durable
+ * session state that bash, file tools and the model's directory context follow,
+ * so a recorded change outlives its turn, a resume and the attempt. The anchor
+ * is written as the host's own event, the way the service's `ensure()` records a
+ * session's first directory and the way activation forces the sandbox and
+ * approval policy. Not `set()`: it also queues a notice in the worker's inbox,
+ * which this adapter holds as input and wakes as a model turn of its own
+ * (R15-A5). The next request's required directory context names the worktree.
+ * A session already there, and a host without the service, get no write.
+ */
+function anchorWorkingDirectory(ctx: Context, agent: Agent, workspace: string): void {
+  const directory = ctx.get('workingDirectory') as WorkingDirectory | undefined
+  if (directory === undefined || directory.get(agent.session) === workspace) return
+  agent.session.append('working-directory/change', { cwd: workspace })
 }
 
 /** The host's regenerated runtime context: `runtime-context` on 0.1.7, a system-prompt `plugin` source on 0.1.5. */
@@ -713,6 +752,8 @@ export class HarnessWorkers implements WorkerAdapter {
       // Force a fresh durable policy on each activation; peers cannot widen it.
       agent.session.append('sandbox/mode', { mode: 'workspace-write', source: 'delegation' })
       agent.session.append('approval/policy', { policy: 'never', source: 'delegation' })
+      // And start every activation in the member worktree, whatever directory the log recorded.
+      anchorWorkingDirectory(this.ctx, agent, composition.workspace)
       // Shadow the deployment persona's prefix and suffix so workers retain only
       // their own role, including after resuming an older composition.
       agentCtx.systemPrompt.section({ name: 'deployment:persona-prefix', order: 0, text: composition.persona })
