@@ -55,6 +55,16 @@ export async function importHarness(root, name) {
   return import(await harnessEntry(root, name))
 }
 
+/**
+ * The plugin the Loader mounts from a module namespace: its default export
+ * when it has one, else the namespace itself (cordis-plugin-loader
+ * `unwrapExports`). 0.1.x exports JSONL persistence as a default class; 0.2.1
+ * publishes it as a namespace with `name`, `Config` and `apply`.
+ */
+export function loaderPlugin(namespace) {
+  return namespace.default ?? namespace
+}
+
 /** An extracted npm artifact resolves peers from one already-built Harness installation. */
 export async function linkHarnessPeers(packageRoot, harnessRoot) {
   const manifest = JSON.parse(await readFile(join(packageRoot, 'package.json'), 'utf8'))
