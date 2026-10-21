@@ -8,15 +8,20 @@ import { execFileSync } from 'node:child_process'
 
 const project = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 /**
- * An explicit root is taken as given; a default candidate only when it is a
- * supported release and built (its CLI entry exists), so an unbuilt checkout
- * never shadows a built sibling.
+ * An explicit root is taken as given. Otherwise the candidates are the
+ * installed source `~/.dsh/source/current`, then one sibling checkout per
+ * release compatibility.json supports, named for its version without dots and
+ * hyphens (0.2.1-rc.2 is `deepseek-harness-021rc2`), the default host's first.
+ * A candidate is taken only when it is a supported release and built (its CLI
+ * entry exists), so an unbuilt checkout never shadows a built sibling.
  */
 export function resolveHarnessRoot(explicit) {
   const supplied = explicit ?? process.env.DSH_HARNESS_ROOT ?? process.env.DSH_SOURCE
   if (supplied) return realpathSync(resolve(supplied))
-  const supported = new Set(JSON.parse(readFileSync(join(project, 'compatibility.json'), 'utf8')).supportedHosts.map(host => host.version))
-  for (const candidate of [join(homedir(), '.dsh/source/current'), join(project, '../deepseek-harness-015rc3'), join(project, '../deepseek-harness-017rc1')]) {
+  const { defaultHost, supportedHosts } = JSON.parse(readFileSync(join(project, 'compatibility.json'), 'utf8'))
+  const supported = new Set(supportedHosts.map(host => host.version))
+  const siblings = [...supported].sort((a, b) => Number(b === defaultHost) - Number(a === defaultHost)).map(version => join(project, `../deepseek-harness-${version.replace(/[.-]/g, '')}`))
+  for (const candidate of [join(homedir(), '.dsh/source/current'), ...siblings]) {
     const manifest = join(candidate, 'package.json')
     if (existsSync(manifest) && existsSync(join(candidate, 'apps/cli/lib/bin.js')) && supported.has(JSON.parse(readFileSync(manifest, 'utf8')).version)) return realpathSync(candidate)
   }
