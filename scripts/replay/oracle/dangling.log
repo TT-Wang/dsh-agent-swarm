@@ -5,13 +5,11 @@ event 2 {"actor":"owner","data":{"id":"stream#1","missionId":"mission#1","object
 event 3 {"actor":"owner","data":{"id":"member#1","maxOutputTokens":5000,"missionId":"mission#1","name":"Author","phase":"active","role":"implementation","sessionId":"swarm-session#1","subscriptions":[],"workspace":"/isolated/member#1"},"missionId":"mission#1","type":"member/added"}
 event 4 {"actor":"owner","data":{"id":"member#2","maxOutputTokens":5000,"missionId":"mission#1","name":"Reviewer","phase":"active","role":"verification","sessionId":"swarm-session#2","subscriptions":[],"workspace":"/isolated/member#2"},"missionId":"mission#1","type":"member/added"}
 event 5 {"actor":"owner","data":{"acceptance":["fault recovery is proven from durable state"],"assigneeId":"member#1","ceilingProvenance":{"maxFindings":{"source":"default","value":50},"maxSteps":{"source":"default","value":150}},"checks":["test -d ."],"covers":["c1"],"createdAt":"t+0","dependencies":[],"epoch":0,"evidenceIds":[],"experiment":false,"id":"task#1","kind":"implementation","maxFindings":50,"maxSteps":150,"missionId":"mission#1","objective":"Implement the scoped change","outputs":[],"plannedAssigneeId":"member#1","priorOwnerIds":[],"priority":50,"proposedBy":"owner","revision":1,"scope":["**"],"status":"pending","title":"Withdrawn template","workstreamId":"stream#1"},"missionId":"mission#1","type":"task/proposed"}
-event 6 {"actor":"runtime","data":{"attemptId":null,"cause":"owner-cancel","taskId":"task#1"},"missionId":"mission#1","type":"attempt/fenced"}
-event 7 {"actor":"owner","data":{"previousStatus":"pending","reason":"leave the board idle","taskId":"task#1"},"missionId":"mission#1","type":"task/cancelled"}
-event 8 {"actor":"runtime","data":{"fingerprint":"47491cfc091a8abf7a02827fe989b61d","noticeKey":"board-stall:mission#1:task_dangling@0:1fe68d0c20a81cec","reason":"Mission still has unfinished or blocked required work: task_dangling (pending)","unschedulable":["task_dangling"]},"missionId":"mission#1","type":"mission/stalled"}
-event 9 {"actor":"owner","data":{"action":"amend","changes":{"dependencies":[]},"epoch":1,"previous":{"dependencies":["task_missing"]},"reason":"the prerequisite does not exist","status":"pending","taskId":"task_dangling"},"missionId":"mission#1","type":"task/amended"}
-event 10 {"actor":"member#1","data":{"attempt":{"epoch":2,"id":"attempt#1","leaseUntil":"t+60000","ownerId":"member#1"},"taskId":"task_dangling"},"missionId":"mission#1","type":"task/claimed"}
-event 11 {"actor":"runtime","data":{"attemptId":null,"cause":"owner-cancel","taskId":"task_dangling_review"},"missionId":"mission#1","type":"attempt/fenced"}
-event 12 {"actor":"owner","data":{"previousStatus":"pending","reason":"its source does not exist","taskId":"task_dangling_review"},"missionId":"mission#1","type":"task/cancelled"}
+event 6 {"actor":"owner","data":{"previousStatus":"pending","reason":"leave the board idle","taskId":"task#1"},"missionId":"mission#1","type":"task/cancelled"}
+event 7 {"actor":"runtime","data":{"fingerprint":"47491cfc091a8abf7a02827fe989b61d","noticeKey":"board-stall:mission#1:task_dangling@0:1fe68d0c20a81cec","reason":"Mission still has unfinished or blocked required work: task_dangling (pending)","unschedulable":["task_dangling"]},"missionId":"mission#1","type":"mission/stalled"}
+event 8 {"actor":"owner","data":{"action":"amend","changes":{"dependencies":[]},"epoch":1,"previous":{"dependencies":["task_missing"]},"reason":"the prerequisite does not exist","status":"pending","taskId":"task_dangling"},"missionId":"mission#1","type":"task/amended"}
+event 9 {"actor":"member#1","data":{"attempt":{"epoch":2,"id":"attempt#1","leaseUntil":"t+60000","ownerId":"member#1"},"taskId":"task_dangling"},"missionId":"mission#1","type":"task/claimed"}
+event 10 {"actor":"owner","data":{"previousStatus":"pending","reason":"its source does not exist","taskId":"task_dangling_review"},"missionId":"mission#1","type":"task/cancelled"}
 missions 0 {"acceptance":["fault recovery is proven from durable state"],"budget":{"maxDurationMs":600000,"maxExperiments":0,"maxSteps":500,"maxTasks":30,"maxTokens":500000,"maxWorkers":3},"createdAt":"t+0","deadline":"t+600000","executionTime":{"since":"t+0","usedMs":0},"id":"mission#1","objective":"Prove the injected fault fired and recovery holds","ownerSessionId":"fault-owner","scope":["**"],"status":"active","title":"Fault injection","updatedAt":"t+0","usedSteps":0,"usedTokens":0,"workspace":"<dir>","workspaceAuthorizationSource":"session","workspaceGrantRoot":"<dir>"}
 members 0 {"id":"member#1","maxOutputTokens":5000,"missionId":"mission#1","name":"Author","phase":"active","role":"implementation","sessionId":"swarm-session#1","status":"working","subscriptions":[],"workspace":"/isolated/member#1"}
 members 1 {"id":"member#2","maxOutputTokens":5000,"missionId":"mission#1","name":"Reviewer","phase":"active","role":"verification","sessionId":"swarm-session#2","status":"idle","subscriptions":[],"workspace":"/isolated/member#2"}
@@ -45,7 +43,7 @@ trace 18 ["isIdle","member#1",{"returned":false}]
 trace 19 ["start",{"member":"member#2","mission":"mission#1","ownerSessionId":"fault-owner"},"<signal>"]
 trace 20 ["isIdle","member#2",{"returned":false}]
 trace 21 ["deliver","owner","msg#1"]
-trace 22 ["prepareTask","member#1","task_dangling@2",[],null]
+trace 22 ["prepareTask","member#1","task_dangling@2",[],null,null]
 trace 23 ["isIdle","member#1",{"returned":false}]
 trace 24 ["drainStrandedInbox","member#1",{}]
 trace 25 ["drainStrandedInbox","member#2",{}]

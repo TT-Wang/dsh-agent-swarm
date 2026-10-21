@@ -46,7 +46,7 @@ export function stopOutcome(causes: ReadonlySet<BlockCause>, reason: StopReason)
  * while it ran (they are its fields, `Attempt`), and remember its owner
  * durably, so the union below can never forget a member who already touched
  * the work. Only the two operations that end an attempt, `endAttempt` and
- * `Attempts.fenceRow`, call it.
+ * `Attempts.fenceForStop`, call it.
  */
 function dropAttempt(task: Task): void {
   const owner = task.attempt?.ownerId
@@ -58,8 +58,9 @@ function dropAttempt(task: Task): void {
  * End the row's attempt when no handle owes a stop for it: the epoch bump
  * fences its lease and every write it could still present. A host restart
  * re-pending running work (the old process is gone), a rework re-opening a
- * rejected task or its review (their handles finished with the submission and
- * the verdict), and a worker start that failed end an attempt this way. An
+ * rejected task or its review, an owner's resume of a review holding its
+ * deferred or rejecting verdict (each handle finished with its submission or
+ * its verdict), and a worker start that failed end an attempt this way. An
  * attempt a handle may still be running is fenced instead (`Attempts.fenceForStop`).
  */
 export function endAttempt(task: Task): void {
@@ -228,11 +229,17 @@ export class Attempts {
     this.k.commit(mission.id, () => this.k.store.put('tasks', task))
   }
   /**
-   * The one write that fences an attempt a handle may still be running,
-   * whatever decided to stop it, with the handle that owes the stop named by
-   * the caller (`memberId`). Every site fences through `fenceForStop`, which
-   * reads that handle from the row; only the owner's task control names it
-   * itself (`SwarmRuntime.controlTask`).
+   * The one write that fences the attempt a row holds, whatever decided to
+   * end it: lease expiry, an idle close-out, a handoff, a task ceiling, the
+   * legacy stop-owner recovery, an owner's structural amendment of running
+   * work and each control decision (an owner cancel, a mission pause or stop,
+   * a challenged prerequisite, a retired review, a revoked workspace).
+   *
+   * The handle that owes the stop is the one holding the row's open attempt,
+   * if any. An attempt that ended in a submission or a verdict owes none:
+   * submitted work may retain an author who now owns another task, and a
+   * deferred review a reviewer who now runs other work. A stop already owed
+   * keeps its own.
    *
    * Stopping work in flight is four things that only mean anything together:
    * the end of the attempt (`endAttempt`: the epoch bump that invalidates the
@@ -243,6 +250,13 @@ export class Attempts {
    * clearing a different subset of the markers, and only the control paths
    * wrote the closer, so a budget-resume marker could outlive the attempt it
    * named.
+   *
+   * The closer records a fence, so it is written exactly when this fenced an
+   * open attempt or carried a stop already owed. Ending a finished attempt, or
+   * a row that holds none, writes no closer, as at every other end of a
+   * finished attempt (a rework, an owner resume: `endAttempt`): the
+   * submission's or the verdict's own event closed that attempt
+   * (`ATTEMPT_FENCING_EVENTS`), and no stop follows.
    *
    * The caller keeps what is its own: its authorization check, its closer
    * event, its extra fields (a checkpoint, a recovery count, an assignee, an
@@ -258,31 +272,22 @@ export class Attempts {
    * Call inside a mission transaction: the closer event and the caller's task
    * write are one durable transition.
    */
-  fenceRow(task: Task, options: { status: Task['status']; reason: StopReason; memberId: string | undefined; cause: string }): { previousStatus: Task['status']; attempt: Task['attempt']; stopOwner: string | undefined } {
+  fenceForStop(task: Task, options: { status: Task['status']; reason?: StopReason; cause: string }): { previousStatus: Task['status']; attempt: Task['attempt']; stopOwner: string | undefined } {
     const previousStatus = task.status
     const attempt = task.attempt
+    const owner = holdsOpenAttempt(task) ? task.attempt.ownerId : undefined
+    const reason = options.reason ?? 'handoff'
     const priorStop = stopPending(task) ? task.resumeAfterStop : undefined
     task.status = options.status
     if (priorStop === undefined) {
       endAttempt(task)
-      if (options.memberId !== undefined) task.resumeAfterStop = { epoch: task.epoch, memberId: options.memberId, reason: options.reason, at: this.k.now() }
+      if (owner !== undefined) task.resumeAfterStop = { epoch: task.epoch, memberId: owner, reason, at: this.k.now() }
     } else {
       dropAttempt(task)
-      if (options.reason === 'invalidated' && priorStop.reason !== 'invalidated') task.resumeAfterStop = { ...priorStop, reason: options.reason }
+      if (reason === 'invalidated' && priorStop.reason !== 'invalidated') task.resumeAfterStop = { ...priorStop, reason }
     }
-    this.k.store.event(task.missionId, 'attempt/fenced', 'runtime', { taskId: task.id, attemptId: attempt?.id ?? null, cause: options.cause })
-    return { previousStatus, attempt, stopOwner: priorStop?.memberId ?? options.memberId }
-  }
-  /**
-   * The fence every site uses: lease expiry, an idle close-out, a handoff, a
-   * task ceiling, the legacy stop-owner recovery and each control decision (an
-   * owner cancel, a mission pause or stop, a challenged prerequisite, a retired
-   * review, a revoked workspace). Submitted work may retain an author who now
-   * owns another task, so the handle that owes the stop is the one holding the
-   * row's open attempt, if any; a stop already owed keeps its own.
-   */
-  fenceForStop(task: Task, options: { status: Task['status']; reason?: StopReason; cause: string }): ReturnType<Attempts['fenceRow']> {
-    return this.fenceRow(task, { status: options.status, reason: options.reason ?? 'handoff', memberId: holdsOpenAttempt(task) ? task.attempt.ownerId : undefined, cause: options.cause })
+    if (owner !== undefined || priorStop !== undefined) this.k.store.event(task.missionId, 'attempt/fenced', 'runtime', { taskId: task.id, attemptId: attempt?.id ?? null, cause: options.cause })
+    return { previousStatus, attempt, stopOwner: priorStop?.memberId ?? owner }
   }
   /**
    * The live operation an attempt currently holds, with the member row that

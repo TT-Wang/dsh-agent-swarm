@@ -123,7 +123,7 @@ class EnvelopeWorkers extends FakeWorkers {
   // Never idle (FakeWorkers' default): the fixture claims its tasks explicitly, so the tick must not race the test.
   constructor(workspaces) { super(); this.workspaces = workspaces; this.verifications = [] }
   async prepareWorkspace(mission, memberId) { return await this.workspaces.prepareWorkspace(mission, memberId) }
-  async prepareTask(member, task, dependencies, reviewSource) { await this.workspaces.prepareTask(member, task, dependencies, reviewSource) }
+  async prepareTask(member, task, dependencies, reviewSource, finished) { await this.workspaces.prepareTask(member, task, dependencies, reviewSource, finished) }
   async captureArtifact(member, task) {
     await writeFile(path.join(member.workspace, 'src', 'answer.txt'), `answer ${task.id}\n`)
     return await this.workspaces.captureArtifact(member, task)

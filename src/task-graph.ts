@@ -5,7 +5,7 @@
  * effective task, a prerequisite never met). An id a caller supplies is refused
  * where it enters (`SwarmRuntime.task`, the admission graph check), never here.
  */
-import { criterionId, type Attempt, type EvidenceStatus, type Mission, type Task } from './types.ts'
+import { criterionId, type Attempt, type EvidenceStatus, type FinishedAttempt, type Mission, type Task } from './types.ts'
 
 const oldest = (tasks: readonly Task[]): Task | undefined => [...tasks].sort((a, b) => a.createdAt - b.createdAt || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))[0]
 
@@ -364,6 +364,22 @@ export function openAttempt(tasks: readonly Task[], memberId: string): HeldTask 
  */
 export function turnEnded(open: HeldTask): boolean {
   return open.attempt.idleSignal !== undefined
+}
+
+/**
+ * W1: the newest attempt on `task` that ended in a submission or a verdict and
+ * was then ended, which the task's next attempt is recovered from
+ * (`WorkerAdapter.prepareTask`): the round a rework archived last (a source's
+ * rejected commit, a rejecting review's artifact) or the verdict an owner
+ * resume re-opened a review from (`resumedFrom`), whichever is at the later
+ * epoch. Undefined when no attempt on it ended so.
+ */
+export function finishedAttempt(task: Task): FinishedAttempt | undefined {
+  const round = task.rejections?.at(-1)
+  const capture = round === undefined ? undefined : task.kind === 'verification' ? round.reviewArtifact?.commit : round.commit
+  const reworked = round === undefined ? undefined : { epoch: round.epoch, ...(capture === undefined ? {} : { capture }) }
+  const resumed = task.resumedFrom
+  return resumed !== undefined && (reworked === undefined || resumed.epoch > reworked.epoch) ? resumed : reworked
 }
 
 /** A fenced handle must finish stopping before that member can own new work. */

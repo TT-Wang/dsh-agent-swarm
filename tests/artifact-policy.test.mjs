@@ -219,7 +219,6 @@ test('out-of-scope review report is refused before the source verdict changes', 
 test('captured review report survives deferred checks and reassignment without locking recovery', async t => {
   const f = await fixture(t)
   f.runtime.kick = () => {}
-  f.workers.checkpointTask = (...args) => f.workspaces.checkpointTask(...args)
   const task = await f.runtime.claim(f.a, f.mission.id, f.propose({ checks: ['test -s report.md'] }).id)
   await writeFile(path.join(f.author.workspace, 'report.md'), 'Source remains immutable')
   await f.readEvidence(f.author, f.a, task, 'report.md')
@@ -243,16 +242,21 @@ test('captured review report survives deferred checks and reassignment without l
   f.runtime.updateBudget(f.owner, f.mission.id, { ...f.runtime.mission(f.mission.id).budget, maxWorkers: 3 }, 'Replacement reviewer availability')
   const nextReviewer = await f.runtime.addMember(f.owner, f.mission.id, { role: 'independent replacement reviewer' })
   f.runtime.controlTask(f.owner, f.mission.id, review.id, 'resume', { assigneeId: nextReviewer.id }, 'Host repaired; reviewer unavailable')
-  // The stop barrier checkpoints the reviewer's workspace with real git before it
-  // re-pends the review; wait for the barrier itself, however long git takes,
-  // instead of reading a status the barrier has not decided yet.
-  await f.runtime.settle(f.mission.id)
-  assert.equal(f.runtime.task(f.mission.id, review.id).resumeAfterStop, undefined, 'the stop barrier settled')
+  // The first reviewer's attempt ended with its deferred verdict, so the resume
+  // owes it no stop (F2): the review re-pends at once, and the next reviewer's
+  // preparation recovers the review from the capture the deferral recorded (W1),
+  // not from that reviewer's worktree, which it may still be writing.
+  assert.equal(f.runtime.task(f.mission.id, review.id).resumeAfterStop, undefined, 'the resume owes no stop')
+  assert.deepEqual(f.workers.stopped, [], 'the first reviewer is not stopped')
   assert.equal(f.runtime.task(f.mission.id, review.id).status, 'pending', 'saved review record is not a rejected deliverable exhaustion gate')
   const nextActor = { sessionId: nextReviewer.sessionId }
   const resumed = await f.runtime.claim(nextActor, f.mission.id, review.id)
   assert.equal(await deferralRef(), blocked.reviewArtifact.commit, 'recovering the review leaves the deferral epoch\'s artifact ref at the commit its verdict recorded')
   assert.equal(await readFile(path.join(nextReviewer.workspace, 'reviews/verdict.md'), 'utf8'), 'Preserved first reviewer record')
+  // W1: the review is recovered from the capture its deferral recorded, not
+  // from the first reviewer's worktree as it stood after the verdict.
+  await assert.rejects(readFile(path.join(nextReviewer.workspace, 'after-verdict.md')), { code: 'ENOENT' }, 'what the first reviewer wrote after its verdict is not carried')
+  assert.equal(await f.command(nextReviewer.workspace, ['git', 'rev-parse', 'HEAD']), blocked.reviewArtifact.commit, 'the next reviewer starts from the deferral\'s review artifact')
   await writeFile(path.join(nextReviewer.workspace, 'reviews/verdict.md'), 'Replacement reviewer verified the exact original source')
   const accepted = await f.runtime.verify(nextActor, f.mission.id, { taskId: resumed.id, attemptId: resumed.attempt.id, verdict: 'accept', reason: 'Host checks now pass', deliverables: ['reviews/verdict.md'] })
   assert.equal(accepted.status, 'accepted'); assert.equal(accepted.reviewedCommit, source.artifact.commit)

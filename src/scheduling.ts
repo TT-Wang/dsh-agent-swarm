@@ -11,7 +11,7 @@
  * board where it decides, after each of its awaits, and acts on the verdict.
  */
 import { id } from './store.ts'
-import { TERMINAL_STATES, holdsOpenAttempt, openAttempt, pendingStopOwner, subjectsOfTasks, taskSubject, terminal, turnEnded, type HeldTask } from './task-graph.ts'
+import { finishedAttempt, holdsOpenAttempt, openAttempt, pendingStopOwner, quiescencePending, subjectsOfTasks, taskSubject, terminal, TERMINAL_STATES, turnEnded, type HeldTask } from './task-graph.ts'
 import { asksHandle, eligible, isolationViolation, noticeSubjectsFor, overdueStop, passState, pastBound, startBlocker, stillDispatchable, takesWork, unschedulable, wedgeVerdict, type Board, type PassVerdict, type SchedulingPass } from './board.ts'
 import { factKey, guardTerminalNotice, silenceNotice, type Notice, type Notices, type SilentAttempt } from './notices.ts'
 import { AdmissionRefusedError } from './scheduler.ts'
@@ -353,7 +353,7 @@ export class Scheduling {
             // member it prepares before the report commits.
             if (pass !== undefined) pass.preparing = member.id
             const { graph } = this.k.boardOf(missionId)
-            try { await awaited(pass, this.k.workers.prepareTask(member, { ...task, epoch: task.epoch + 1 }, graph.effectiveDependencies(task), graph.reviewSource(task)), this.k.now) }
+            try { await awaited(pass, this.k.workers.prepareTask(member, { ...task, epoch: task.epoch + 1 }, graph.effectiveDependencies(task), graph.reviewSource(task), finishedAttempt(task)), this.k.now) }
             finally { if (pass !== undefined) delete pass.preparing }
             const prepared = this.activeBoard(missionId)
             if (prepared === undefined) return false
