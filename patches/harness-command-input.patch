@@ -1,3 +1,18 @@
+Host editor correction for dsh-external#637: the claim-token transform loops.
+
+Targets: 0.1.5-rc.3 0.1.7-rc.1
+
+ui-conversation's claim-decor.ts splits the styled `/command ` token with
+splitText. The overflow keeps the token style, Lexical merges the identically
+styled siblings again, and the transform never settles. Clear the overflow
+style right after the split.
+
+Upstream fixed the loop in 92b23cb792 (dsh-v0.2.1-alpha.2) and then replaced
+claim-decor.ts with atomic command chips in 98d93db18f (dsh-v0.2.1-alpha.4).
+A release without that file, such as 0.2.1-rc.2, is not affected and needs no
+rebuilt ui-conversation. `git apply` ignores this preamble; the Targets line is
+read by scripts/check-harness-command-input.mjs, see patches/README.md.
+
 diff --git a/packages/client/ui-conversation/src/client/input/editor/claim-decor.ts b/packages/client/ui-conversation/src/client/input/editor/claim-decor.ts
 --- a/packages/client/ui-conversation/src/client/input/editor/claim-decor.ts
 +++ b/packages/client/ui-conversation/src/client/input/editor/claim-decor.ts

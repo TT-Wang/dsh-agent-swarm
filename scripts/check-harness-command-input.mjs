@@ -1,11 +1,22 @@
-/** Unpaid regression for the native command-token patch, using the target's Lexical. */
+/**
+ * Headless regression for the native command-token patch, using the target's Lexical.
+ *
+ * patches/harness-command-input.patch declares the releases it targets on its
+ * `Targets:` line and names the file it corrects in its diff header. A targeted
+ * release is checked against the patch. A release that ships no such file is
+ * reported not affected (0.2.1-rc.2 replaced claim-decor.ts with command chips)
+ * and exits 0. A release that still ships the file without being targeted fails:
+ * the defect there is unchecked.
+ */
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
+import { existsSync } from 'node:fs'
 import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { createRequire, stripTypeScriptTypes } from 'node:module'
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
-import { fileURLToPath, pathToFileURL } from 'node:url'
+import { pathToFileURL } from 'node:url'
+import { commandInputPatch } from './command-input-patch.mjs'
 
 if (process.argv.length !== 3 || process.argv[2].startsWith('-')) {
   console.error('Usage: node scripts/check-harness-command-input.mjs /path/to/deepseek-harness')
@@ -13,19 +24,26 @@ if (process.argv.length !== 3 || process.argv[2].startsWith('-')) {
 }
 
 const harness = resolve(process.argv[2])
+const { version } = JSON.parse(await readFile(join(harness, 'package.json'), 'utf8'))
+const patch = await commandInputPatch()
+if (!patch.targets.includes(version)) {
+  if (patch.files.every(file => !existsSync(join(harness, file)))) {
+    console.log(`NOT AFFECTED: Harness ${version} ships no ${patch.files.join(', ')}, the code this patch corrects; the patch targets ${patch.targets.join(', ')}.`)
+    process.exit(0)
+  }
+  console.error(`Harness ${version} still ships ${patch.files.join(', ')}, but the patch targets only ${patch.targets.join(', ')}; check the defect on ${version} before adding it to the patch's Targets line`)
+  process.exit(1)
+}
 const packageRoot = join(harness, 'packages/client/ui-conversation')
-const packageJson = JSON.parse(await readFile(join(packageRoot, 'package.json'), 'utf8'))
-const supported = JSON.parse(await readFile(new URL('../compatibility.json', import.meta.url), 'utf8')).supportedHosts.map(host => host.version)
-assert(supported.includes(packageJson.version), `this patch targets the supported Harness releases (${supported.join(', ')}), not ${packageJson.version}`)
+const sourcePath = 'src/client/input/editor/claim-decor.ts'
+assert.deepEqual(patch.files, [join('packages/client/ui-conversation', sourcePath)], 'the probe reproduces the defect in the one file the patch corrects')
 const require = createRequire(join(packageRoot, 'package.json'))
 // Use the same ESM Lexical instance for the source module and test editor.
 const lexicalUrl = pathToFileURL(require.resolve('lexical').replace(/\.js$/, '.mjs')).href
 const headlessUrl = pathToFileURL(require.resolve('@lexical/headless').replace(/\.js$/, '.mjs')).href
 const { $createParagraphNode, $createTextNode, $getRoot, $getSelection } = await import(lexicalUrl)
 const { createHeadlessEditor } = await import(headlessUrl)
-const sourcePath = 'src/client/input/editor/claim-decor.ts'
 const original = await readFile(join(packageRoot, sourcePath), 'utf8')
-const patch = fileURLToPath(new URL('../patches/harness-command-input.patch', import.meta.url))
 const temporary = await mkdtemp(join(tmpdir(), 'dsh-command-input-regression-'))
 
 try {
@@ -34,7 +52,7 @@ try {
   await writeFile(copiedSource, original)
   // Apply the actual shipped patch to a disposable source copy. A missing or
   // mismatched patch fails here; the probe never edits the Harness checkout.
-  execFileSync('git', ['apply', '--no-index', '-p4', patch], { cwd: temporary, stdio: 'pipe' })
+  execFileSync('git', ['apply', '--no-index', '-p4', patch.path], { cwd: temporary, stdio: 'pipe' })
   const patched = await readFile(copiedSource, 'utf8')
   assert.notEqual(patched, original, 'patch must change the copied source')
   const load = source => {

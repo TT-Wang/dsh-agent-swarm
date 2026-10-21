@@ -27,7 +27,9 @@
  *                     launched from, else the one recorded in
  *                     <preview>/server.json; required when neither exists).
  *                     A checkout whose release is not in compatibility.json is
- *                     refused with harness-target's message
+ *                     refused with harness-target's message, and so is any
+ *                     release other than the one a host package rebuilt in
+ *                     <preview>/compat/<name> comes from (its manifest version)
  *   --allow-unsupported-harness
  *                     update a preview pinned to an unsupported Harness anyway,
  *                     with a warning on stderr and in restart.log. A preview
@@ -108,6 +110,16 @@ try { assertSupportedHarness(harnessRoot) } catch (error) {
   const warning = `WARNING: ${error.message} (${harnessRoot}); continuing only because --allow-unsupported-harness was passed. This plugin is neither supported nor tested on that Harness.`
   process.stderr.write(`update-preview: ${warning}\n`)
   log(warning)
+}
+// A preview keeps the host packages it rebuilt in <preview>/compat/<name>, such as the
+// ui-conversation carrying patches/harness-command-input.patch on 0.1.x hosts. Each is a
+// build of the one release its manifest names and loads only on that release; a release
+// the patch does not target needs none.
+const hostRelease = JSON.parse(readFileSync(join(harnessRoot, 'package.json'), 'utf8')).version
+const compat = join(preview, 'compat')
+for (const manifest of existsSync(compat) ? readdirSync(compat).map(name => join(compat, name, 'package.json')).filter(path => existsSync(path)) : []) {
+  const built = JSON.parse(readFileSync(manifest, 'utf8')).version
+  if (built !== hostRelease) fail(`${dirname(manifest)} is rebuilt from Harness ${built} and loads only on that release, not on ${hostRelease}; start a new preview root for ${hostRelease} with scripts/start-preview.mjs`)
 }
 
 /** Exactly the paths the published tarball carries, so the snapshot mirrors a release. */

@@ -87,6 +87,24 @@ test('update-preview refuses an unsupported Harness before building, and proceed
   assert.match(allowed.stdout, /preflighting composed profile/)
 })
 
+test('update-preview boots a preview\'s rebuilt host packages only on the release they were rebuilt from', async t => {
+  const s = scene(t)
+  const preview = join(s.root, 'preview')
+  // The 0.1.x command-input correction ships as a rebuilt ui-conversation in <preview>/compat.
+  mkdirSync(join(preview, 'compat/ui-conversation'), { recursive: true })
+  writeFileSync(join(preview, 'compat/compat-build-report.json'), '{}')
+  const argv = [join(project, 'scripts/update-preview.mjs'), '--preview', preview, '--harness', s.harness, '--allow-unsupported-harness', '--no-sync', '--skip-build', '--dry-run', '--port', '6199']
+  writeFileSync(join(preview, 'compat/ui-conversation/package.json'), JSON.stringify({ name: '@deepseek-ai/dsh-client-ui-conversation', version: '0.1.7-rc.1' }))
+  const refused = await s.run(argv)
+  assert.equal(refused.code, 1, refused.stdout)
+  assert.match(refused.stderr, /compat\/ui-conversation is rebuilt from Harness 0\.1\.7-rc\.1 and loads only on that release, not on 0\.1\.6-alpha\.2; start a new preview root/)
+  assert.doesNotMatch(refused.stdout, /preflighting/, 'refused before the build and preflight')
+  writeFileSync(join(preview, 'compat/ui-conversation/package.json'), JSON.stringify({ name: '@deepseek-ai/dsh-client-ui-conversation', version: '0.1.6-alpha.2' }))
+  const same = await s.run(argv)
+  assert.equal(same.code, 0, same.stderr)
+  assert.match(same.stdout, /preflighting composed profile/)
+})
+
 test('round mount refuses an unsupported Harness through update-preview before building anything', async t => {
   const s = scene(t)
   const lab = join(s.root, 'lab')
