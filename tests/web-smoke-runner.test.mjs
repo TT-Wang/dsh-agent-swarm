@@ -12,7 +12,7 @@ import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { withLocalImports } from './fixtures/local-imports.mjs'
-import { trackOwnerCatalog } from '../scripts/web-smoke-browser.mjs'
+import { smokeHost, trackOwnerCatalog } from '../scripts/web-smoke-browser.mjs'
 
 const project = fileURLToPath(new URL('../', import.meta.url))
 
@@ -23,6 +23,7 @@ async function scene(t) {
   const harness = join(root, 'harness')
   mkdirSync(join(harness, 'apps/cli/lib'), { recursive: true })
   mkdirSync(join(harness, 'apps/web/dist'), { recursive: true })
+  for (const catalog of ['vendor', 'packages']) mkdirSync(join(harness, catalog)) // a checkout that ships no package
   copyFileSync(fileURLToPath(new URL('./fixtures/fake-host.mjs', import.meta.url)), join(harness, 'apps/cli/lib/bin.js'))
   writeFileSync(join(harness, 'apps/web/dist/index.html'), '')
   writeFileSync(join(harness, 'package.json'), JSON.stringify({ version: '0.0.0-fake' }))
@@ -32,7 +33,8 @@ async function scene(t) {
   for (const entry of ['scripts/smoke-web.mjs', 'scripts/smoke-command-web.mjs']) {
     for (const [path, source] of Object.entries(await withLocalImports(project, entry))) { mkdirSync(dirname(join(copy, path)), { recursive: true }); writeFileSync(join(copy, path), source) }
   }
-  for (const entry of ['package.json', 'lib', 'tests']) symlinkSync(join(project, entry), join(copy, entry))
+  // The runner copies the scripted model fixture from the project's tests (isolateWebModelFixture).
+  for (const entry of ['package.json', 'lib', 'tests/fixtures/web-scripted-llm.mjs']) symlinkSync(join(project, entry), join(copy, entry))
   writeFileSync(join(copy, 'compatibility.json'), JSON.stringify({ supportedHosts: [{ version: '0.0.0-fake', commit: git('rev-parse', 'HEAD') }] }))
   const artifacts = join(root, 'artifacts')
   return {
@@ -122,4 +124,39 @@ test('the web scenarios start only once the selected workspace\'s session has it
   assert.equal(ready(), false, 'a failed catalog load is not ready')
   await page.respond('commands/list', { agentId: 'session-selected' }, catalog)
   assert.equal(ready(), true)
+})
+
+/** A Harness checkout whose catalog is exactly `packages`: { name: { relative path: source } }. */
+function fakeCatalog(root, packages) {
+  mkdirSync(join(root, 'vendor'), { recursive: true })
+  for (const [name, files] of Object.entries(packages)) {
+    const directory = join(root, 'packages/group', name.split('/').pop())
+    mkdirSync(directory, { recursive: true })
+    writeFileSync(join(directory, 'package.json'), JSON.stringify({ name, exports: { '.': { default: './lib/index.js' } } }))
+    for (const [path, source] of Object.entries(files)) { mkdirSync(dirname(join(directory, path)), { recursive: true }); writeFileSync(join(directory, path), source) }
+  }
+  return root
+}
+
+test('the smoke composes the DeepSeek routes, first-use workspace and command claim of the Harness it runs, by what that Harness ships', async t => {
+  const root = mkdtempSync(join(tmpdir(), 'smoke-host-'))
+  t.after(() => rmSync(root, { recursive: true, force: true }))
+  const run = join(root, 'run')
+  // 0.1.5-rc.3: no account route, no first-use initialization, a styled command token.
+  const earlier = await smokeHost(fakeCatalog(join(root, 'earlier'), {
+    '@deepseek-ai/dsh-api-workspace-controller': { 'lib/index.js': 'export default class WorkspaceController {}\n' },
+    '@deepseek-ai/dsh-client-ui-conversation': { 'src/client/input/editor/claim-decor.ts': '' },
+  }), run)
+  assert.deepEqual(earlier, { firstUse: false, commandChips: false, rows: [{ id: 'llm-deepseek', disabled: true }] })
+  // 0.2.1-rc.2: the account route, a default workspace on first use (pinned inside the run), command chips.
+  const current = await smokeHost(fakeCatalog(join(root, 'current'), {
+    '@deepseek-ai/dsh-llm-deepseek-account': {},
+    '@deepseek-ai/dsh-api-workspace-controller': { 'lib/index.js': 'export default class WorkspaceController { initializeDefault() {} }\n' },
+    '@deepseek-ai/dsh-client-ui-conversation': { 'src/client/input/editor/command-chip-node.tsx': '' },
+  }), run)
+  assert.deepEqual(current, { firstUse: true, commandChips: true, rows: [
+    { id: 'llm-deepseek', disabled: true },
+    { id: 'llm-deepseek-account', disabled: true },
+    { id: 'workspace-controller', config: { documentsDirectory: join(run, 'documents') } },
+  ] })
 })
