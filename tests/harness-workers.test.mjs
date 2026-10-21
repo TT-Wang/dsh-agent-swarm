@@ -170,7 +170,7 @@ async function fixture(t, responder = () => ({ kind: 'text', text: 'done' }), co
     failure: (id, error) => { observations.failures.push({ id, error }) },
   }
   adapter.bind(callbacks)
-  const mission = { id: 'mission-test', workspace: source, objective: 'Test durable collaboration' }
+  const mission = { id: 'mission-test', workspace: source, objective: 'Test durable collaboration', ...config.mission }
   const member = { id: 'worker-test', missionId: mission.id, sessionId: 'worker-session', name: 'worker', role: 'implementer', workspace: await adapter.prepareWorkspace(mission, 'worker-test'), ...config.member }
   const spec = { mission, member, ownerSessionId: 'owner-session' }
   if (config.start !== false) await adapter.start(spec)
@@ -984,6 +984,22 @@ for (const nativeOwnerDisposal of [false, true]) test(`${nativeOwnerDisposal ? '
     assert.equal(worker.inbox.hasPending, false)
     assert.deepEqual(f.observations.failures, [])
   } finally { await resumed.dispose() }
+})
+
+test('a worker persona reaches the model as written, whatever braces its free text carries', async t => {
+  // The member's name and role and the mission objective are free text. On
+  // 0.1.x the agent loop registers {{cwd}} and {{model}}, so a strict section
+  // would have substituted them; on 0.2.x {{cwd}} is gone and would fail every
+  // request. A malformed group fails on every host.
+  const objective = 'Render {{cwd}} and {{model}} placeholders, keep {{Not A Name}} and a lone {{ brace'
+  const f = await fixture(t, undefined, { mission: { objective }, member: { name: 'Templater {{name}}', role: 'implementer of {{role}} {{}}' } })
+  await f.adapter.deliver(f.member, message(f.member))
+  await f.ctx.agents.get(SessionId(f.member.sessionId)).whenIdle()
+  assert.deepEqual(f.observations.failures, [], 'prompt assembly does not fail on the text')
+  assert.equal(f.requests.length, 1)
+  const system = systemTextOf(f.requests[0])
+  assert.ok(system.includes(`Mission: ${objective}`), 'the objective is not interpolated')
+  assert.ok(system.includes('You are Templater {{name}}, a member of an agent swarm. Your role: implementer of {{role}} {{}}.'), 'nor are the name and the role')
 })
 
 test('worker persona shadows both legacy and prefix/suffix deployment personas', async t => {

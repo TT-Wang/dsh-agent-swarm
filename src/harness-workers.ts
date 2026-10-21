@@ -201,6 +201,19 @@ interface Composition {
 // A timeout reports incomplete cleanup; stop() itself never claims success early.
 const DISPOSAL_TIMEOUT_MS = 5000
 
+/**
+ * The prompt variable that carries a worker's persona. The persona is free text
+ * (the member's name and role, the mission objective, the scratch path), and
+ * every supported host interpolates section text strictly: a `{{...}}` in it
+ * names a malformed or unknown variable (0.2.x registers no `{{cwd}}` any more),
+ * and prompt assembly fails for every request of that worker. No host scans a
+ * substituted value again, so the persona section holds only this reference and
+ * the text reaches the model as written. 0.1.7 and 0.2.1 also take
+ * `interpolate: false` on a section, but 0.1.5-rc.3's PromptSection has no such
+ * field and its renderer no escape syntax.
+ */
+const PERSONA_VARIABLE = 'swarm_persona'
+
 interface Resident {
   spec: WorkerSpec
   abort: AbortController
@@ -755,8 +768,10 @@ export class HarnessWorkers implements WorkerAdapter {
       // And start every activation in the member worktree, whatever directory the log recorded.
       anchorWorkingDirectory(this.ctx, agent, composition.workspace)
       // Shadow the deployment persona's prefix and suffix so workers retain only
-      // their own role, including after resuming an older composition.
-      agentCtx.systemPrompt.section({ name: 'deployment:persona-prefix', order: 0, text: composition.persona })
+      // their own role, including after resuming an older composition. The
+      // persona is free text, so it reaches the section as a variable's value.
+      agentCtx.systemPrompt.variable(PERSONA_VARIABLE, () => composition.persona)
+      agentCtx.systemPrompt.section({ name: 'deployment:persona-prefix', order: 0, text: `{{${PERSONA_VARIABLE}}}` })
       agentCtx.systemPrompt.section({ name: 'deployment:persona-suffix', order: 10200, text: '' })
       // Source metadata is preserved in the host log, but provider serializers
       // need not expose it to the model. Refresh identity on every activation,

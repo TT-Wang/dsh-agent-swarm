@@ -17,7 +17,7 @@ async function fixture(t, create) {
     session: { snapshotEvents: () => [], append() {} }, cancel() { calls.cancelled++ }, async whenIdle() {}, send() { calls.sent++ } }
   const handle = { agent, async dispose() { calls.disposed++ } }
   const effects = []
-  const agentCtx = { agent, on: on(nativeHooks), effect(execute) { effects.push(execute()) }, systemPrompt: { section() {} }, tools: { schemas: () => [], restrict() {}, guard(fn) { guard = fn } } }
+  const agentCtx = { agent, on: on(nativeHooks), effect(execute) { effects.push(execute()) }, systemPrompt: { section() {}, variable() {} }, tools: { schemas: () => [], restrict() {}, guard(fn) { guard = fn } } }
   const ctx = { on: on(hooks), logger: { warn() {}, error() {} }, sessions: { async flush() {}, get: () => agent.session },
     get(name) { if (name === 'sessionPersistence') return { async stat() {} }; if (name === 'sandboxPolicy' || name === 'approval') return {}; if (name === 'sessions') return this.sessions },
     agents: { withoutInitiator: fn => fn(), async create(options) { calls.create++; await options.setup(agentCtx, agent); return create ? await create({ options, handle }) : handle } } }
