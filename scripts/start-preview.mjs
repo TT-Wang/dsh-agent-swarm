@@ -7,7 +7,7 @@ import { fileURLToPath } from 'node:url'
 import { parseEnv } from 'node:util'
 import { resolveHarnessRoot, assertSupportedHarness } from './harness-target.mjs'
 import { importHarness, linkHarnessPeers } from '../tests/fixtures/built-harness.mjs'
-import { awaitLaunchUrl, hostEnv, startHost, writeServer } from './host.mjs'
+import { awaitLaunchUrl, hostEnv, hostPatch, startHost, writeServer } from './host.mjs'
 
 const project = fileURLToPath(new URL('../', import.meta.url))
 const args = process.argv.slice(2)
@@ -52,11 +52,7 @@ for (const command of [['init', '--quiet'], ['config', 'user.name', 'Swarm Previ
 const cli = join(harnessRoot, 'apps/cli/lib/bin.js')
 execFileSync(process.execPath, [cli, 'plugin', '--profile', 'web', 'add', `link:${plugin}`, '--offline', '--ignore-scripts', '--store-dir', join(preview, 'pnpm-store')], { cwd: workspace, env, stdio: ['ignore', 'pipe', 'pipe'], timeout: 90_000 })
 const patch = join(preview, 'preview.patch.yml')
-writeFileSync(patch, JSON.stringify([
-  { id: 'directory-picker', disabled: true },
-  { id: 'dsh-external-agent-swarm', config: { statePath: join(preview, 'swarm.sqlite'), workspacesRoot: join(preview, 'worktrees') } },
-  { insert: [{ id: 'directory-picker-browse', name: '@deepseek-ai/dsh-host-directory-picker-browse' }, { id: 'ui-directory-picker-browse', name: '@deepseek-ai/dsh-client-ui-directory-picker-browse' }] },
-], null, 2) + '\n', { mode: 0o600 })
+writeFileSync(patch, JSON.stringify(hostPatch(preview), null, 2) + '\n', { mode: 0o600 })
 const logPath = join(preview, 'server.log')
 const child = startHost({ root: preview, port, cli, patch, cwd: workspace, env })
 const manifest = JSON.parse(readFileSync(join(plugin, 'package.json'), 'utf8'))

@@ -9,7 +9,7 @@ import assert from 'node:assert/strict'
 import { appendFileSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { awaitLaunchUrl, findHost, hostHarness, startHost, stopHost } from '../scripts/host.mjs'
+import { awaitLaunchUrl, findHost, hostHarness, hostPatch, startHost, stopHost } from '../scripts/host.mjs'
 
 function tempRoot(t) {
   const root = mkdtempSync(join(tmpdir(), 'host-'))
@@ -180,4 +180,11 @@ test('awaitLaunchUrl gives up at once when the host has exited, and after the ti
   assert.equal(await awaitLaunchUrl({ root, port: 6101, child: { exitCode: null, signalCode: null }, timeoutMs: 1_000 }, sys), undefined)
   assert.equal(polls, 6, 'a 1000 ms timeout polls every 200 ms')
   assert.deepEqual(readdirSync(root), ['server.log'], 'no launch.url is written without a token for this port')
+})
+
+test('a root\'s host boots with its own swarm state and without HMR, so a build is mounted only by a restart', () => {
+  const rows = hostPatch(ROOT)
+  // 0.2.1-rc.2 HMR swaps a linked plugin whose files changed at any profile recomposition.
+  assert.deepEqual(rows.find(row => row.id === 'hmr'), { id: 'hmr', disabled: true })
+  assert.deepEqual(rows.find(row => row.id === 'dsh-external-agent-swarm').config, { statePath: join(ROOT, 'swarm.sqlite'), workspacesRoot: join(ROOT, 'worktrees') })
 })
