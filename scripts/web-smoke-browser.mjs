@@ -43,12 +43,12 @@ export function composerFor(page) { return page.locator('[data-composer-input][c
  *   one provider: the API-key route `llm-deepseek` on every host, and the account route
  *   `llm-deepseek-account` where the host ships that package (0.2.1-rc.2);
  * - `firstUse`: its workspace controller opens a default workspace on a fresh home
- *   (`initializeDefault`, from 0.1.7-rc.1). `rows` then pin its Documents directory inside
+ *   (`initializeDefault`: 0.1.7-rc.1, 0.2.1-rc.2). `rows` then pin its Documents directory inside
  *   the run's root, as the Harness web e2e scaffold does; unpinned, the default workspace
  *   is created in the operator's own Documents folder;
  * - `commandChips`: its composer claims a picked slash command as an atomic chip
- *   (`CommandChipNode`, `[data-composer-command]`, from 0.2.1-rc.1) instead of styling the
- *   token text.
+ *   (`CommandChipNode`, `[data-composer-command]`: 0.2.1-rc.2) instead of styling the token
+ *   text (`claim-decor.ts`: 0.1.5-rc.3, 0.1.7-rc.1).
  */
 export async function smokeHost(harnessRoot, root) {
   const catalog = await harnessCatalog(harnessRoot)
