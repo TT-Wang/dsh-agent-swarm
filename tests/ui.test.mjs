@@ -84,9 +84,8 @@ test('board separates queued, blocked and cancelled work and clamps budget', () 
 test('UI reads native private metadata and rejects incompatible historical payloads', () => {
   const snapshot = uiSnapshot()
   assert.deepEqual(snapshotFromResult({ swarmSnapshot: snapshot }, []), snapshot)
-  assert.deepEqual(snapshotFromResult(undefined, [{ type: 'tool-result', content: [{ type: 'text', text: JSON.stringify({ snapshot }) }] }]), snapshot)
+  assert.deepEqual(snapshotFromResult(undefined, [{ type: 'text', text: JSON.stringify({ snapshot }) }]), snapshot)
   assert.equal(snapshotFromResult({ swarmSnapshot: { mission: { id: 'broken' } } }, []), undefined)
-  assert.equal(snapshotFromResult(undefined, [{ type: 'tool-result', isError: true, content: [{ type: 'text', text: JSON.stringify(snapshot) }] }]), undefined)
 })
 
 test('board keeps borrowable work ready when its preference stops and validates assignment policy', () => {
@@ -109,14 +108,13 @@ test('native conversation fold presents only successful explicit swarm observati
   assert.deepEqual(swarmCardDefinition.match(start.event), { id: 'call-1', role: 'start' })
   assert.equal(swarmCardDefinition.match({ ...start.event, data: { ...start.event.data, name: 'other_tool' } }), null)
   const context = { state: {}, start, id: 'call-1', key: 'key' }
-  const result = { event: { type: 'tool/result', data: { meta: { swarmSnapshot: snapshot }, message: { source: { kind: 'tool', callId: 'call-1' }, content: [] } } } }
+  const result = { event: { type: 'tool/result', data: { meta: { swarmSnapshot: snapshot }, message: { role: 'tool', source: { kind: 'tool', callId: 'call-1' }, toolCallId: 'call-1', content: [] } } } }
   context.state = swarmCardDefinition.update(context, result)
   assert.equal(swarmCardDefinition.buildViewNode(context).data.mission.id, snapshot.mission.id)
   assert.deepEqual(swarmCardDefinition.update({ ...context, state: {} }, { event: { ...result.event, data: { ...result.event.data, error: { name: 'Error' } } } }), {})
-  // A failed tool result: 0.1.7 flags the tool-role message, 0.1.5 its nested tool-result block.
+  // A failed call's tool-role message carries isError itself.
   const failedResult = message => ({ event: { ...result.event, data: { ...result.event.data, message: { ...result.event.data.message, ...message } } } })
-  assert.deepEqual(swarmCardDefinition.update({ ...context, state: {} }, failedResult({ role: 'tool', toolCallId: 'call-1', isError: true })), {})
-  assert.deepEqual(swarmCardDefinition.update({ ...context, state: {} }, failedResult({ content: [{ type: 'tool-result', toolCallId: 'call-1', isError: true, content: [] }] })), {})
+  assert.deepEqual(swarmCardDefinition.update({ ...context, state: {} }, failedResult({ isError: true })), {})
 })
 
 test('current native Conversation assembler rebuilds swarm cards from durable tool events', async () => {
@@ -374,11 +372,11 @@ test('cold worker history paginates native events, renders inert tool results, a
     return new Promise(resolve => pending.push(resolve))
   })
   history.open('worker-a', 'Builder')
-  pending[0]({ events: [{ event: { seq: 8, type: 'tool/result', data: { message: { content: [{ type: 'tool-result', isError: true, content: [{ type: 'text', text: '<script>untrusted()</script> command output' }] }] } } } }], hasMore: true })
+  pending[0]({ events: [{ event: { seq: 8, type: 'tool/result', data: { message: { role: 'tool', isError: true, content: [{ type: 'text', text: '<script>untrusted()</script> command output' }] } } } }], hasMore: true })
   await new Promise(resolve => setImmediate(resolve))
   const html = renderToStaticMarkup(React.createElement(WorkerTranscript, { history }))
   assert.match(html, /Read-only worker transcript/)
-  assert.match(html, /Tool error/, 'native nested tool-result failure is labelled correctly')
+  assert.match(html, /Tool error/, 'a failed tool-role message is labelled correctly')
   assert.match(html, /&lt;script&gt;untrusted\(\)&lt;\/script&gt;/)
   assert.doesNotMatch(html, /<script>/)
   const older = history.load()
