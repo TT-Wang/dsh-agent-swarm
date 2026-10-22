@@ -14,12 +14,15 @@ const budget = { ...sharedBudget, maxTokens: 1000, maxSteps: 10, maxWorkers: 4, 
 /**
  * The external execution boundary with a route catalog: `efforts` holds the
  * reasoning efforts each `provider/model` declares (none: the model declares no
- * reasoning), `unrouted` the routes the host does not resolve. A member with no
- * route of its own runs the owner's, `owner/default` here.
+ * reasoning), `unrouted` the routes the host does not resolve, `refused` the
+ * routes whose provider refuses the model, with the host's code (checked before
+ * the effort, as the host prepares a call). A member with no route of its own
+ * runs the owner's, `owner/default` here.
  */
 class GovernanceWorkers extends FakeWorkers {
   efforts = new Map([['deepseek-official/flash', ['off', 'high']], ['owner/default', ['off', 'high']]])
   unrouted = new Set()
+  refused = new Map()
   routeQuestions = []
   captureStarted = false
   artifact = { commit: 'abc123', baseCommit: 'base', workspace: '/isolated', changedPaths: ['src/a.ts'] }
@@ -29,6 +32,8 @@ class GovernanceWorkers extends FakeWorkers {
     return members.map(member => {
       const provider = member.provider ?? 'owner', model = member.model ?? 'default'
       if (this.unrouted.has(`${provider}/${model}`)) return { verdict: 'unavailable', provider, model }
+      const code = this.refused.get(`${provider}/${model}`)
+      if (code !== undefined) return { verdict: 'model-refused', provider, model, code }
       const efforts = this.efforts.get(`${provider}/${model}`) ?? []
       return member.reasoningEffort === undefined || efforts.includes(member.reasoningEffort) ? { verdict: 'accepted' }
         : { verdict: 'effort-unsupported', provider, model, effort: member.reasoningEffort, efforts }
@@ -119,6 +124,47 @@ test('W8: a launch names every member whose route refuses it, in one refusal bef
   const snapshot = await f.runtime.startPlan(f.owner, 'start_w8', plan(['off', 'high']))
   assert.equal(snapshot.mission.status, 'active')
   assert.deepEqual(snapshot.members.map(member => member.reasoningEffort), ['off', 'high'])
+})
+
+test('W8: a model its provider refuses on this Harness release is refused at admission on the same rule, naming the member\'s model field', async t => {
+  const f = await setup(t)
+  const members = () => f.runtime.snapshot(f.owner, f.mission.id).members
+  f.workers.refused.set('deepseek-account/deepseek-next', 'CLIENT_UPGRADE_REQUIRED')
+  await assert.rejects(f.addMember({ name: 'Builder', role: 'implementation', provider: 'deepseek-account', model: 'deepseek-next', reasoningEffort: 'high' }), error => {
+    assert.equal(error.name, 'AdmissionError')
+    assert.equal(error.code, 'member_model_unsupported')
+    assert.equal(error.category, 'validation_error')
+    assert.equal(error.message, '[member_model_unsupported] member.model: provider "deepseek-account" model "deepseek-next" is refused by its provider on this Harness release (CLIENT_UPGRADE_REQUIRED). Choose a `provider` and `model` this release runs, or omit both to run the owner conversation\'s route, and add the member again.')
+    assert.deepEqual(error.diagnostics.map(diagnostic => [diagnostic.code, diagnostic.location]), [['member_model_unsupported', 'member.model']])
+    return true
+  })
+  // An inherited model the provider refuses names the owner conversation, and offers no way back to it.
+  f.workers.refused.set('owner/default', 'MODEL_UNSUPPORTED')
+  await assert.rejects(f.addMember({ name: 'Scout', role: 'research' }), error => {
+    assert.equal(error.message, '[member_model_unsupported] member.model: provider "owner" model "default", inherited from the owner conversation, is refused by its provider on this Harness release (MODEL_UNSUPPORTED). Choose a `provider` and `model` this release runs, and add the member again.')
+    return true
+  })
+  assert.deepEqual(members(), [], 'no member row is written')
+  assert.deepEqual(f.workers.started, [], 'no worker is started')
+  // A plan whose members are refused for different reasons is one refusal naming each at its own field.
+  const draft = f.runtime.createDraft(f.owner, {
+    title: 'Launch', objective: 'Fix governance', workspace: f.dir, scope: ['src/'], acceptance: ['works'], budget,
+    members: [
+      { key: 'fixer', role: 'implementation', provider: 'deepseek-account', model: 'deepseek-next', maxOutputTokens: 1000 },
+      { key: 'checker', role: 'verification', provider: 'deepseek-official', model: 'flash', reasoningEffort: 'low', maxOutputTokens: 1000 },
+    ],
+    workstreams: [{ key: 'w', title: 'Main', objective: 'Fix governance' }],
+    tasks: [{ key: 't', workstreamKey: 'w', title: 'Fix', objective: 'Fix governance', kind: 'implementation', scope: ['src/'], outputs: [], covers: ['c1'], checks: ['test'], assigneeKey: 'fixer', maxRecoveryAttempts: 1, checkTimeoutMs: 60000 }],
+  }, { grantRoot: f.dir, source: 'session' })
+  const before = f.runtime.list(f.owner.sessionId).length
+  await assert.rejects(f.runtime.launchDraft(f.owner, draft.id, draft.revision), error => {
+    assert.equal(error.code, 'plan_invalid')
+    assert.deepEqual(error.diagnostics.map(diagnostic => [diagnostic.code, diagnostic.location]), [['member_model_unsupported', 'members[fixer].model'], ['member_reasoning_effort_unsupported', 'members[checker].reasoningEffort']])
+    assert.match(error.message, /^\[member_model_unsupported\] members\[fixer\]\.model: provider "deepseek-account" model "deepseek-next" is refused by its provider on this Harness release \(CLIENT_UPGRADE_REQUIRED\)\./)
+    return true
+  })
+  assert.equal(f.runtime.list(f.owner.sessionId).length, before, 'no mission is created')
+  assert.deepEqual(f.workers.started, [])
 })
 
 test('W8 at a step: a refusal by the member\'s own route retires it once, releases its work and tells the owner the exits', async t => {

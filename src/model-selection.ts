@@ -8,6 +8,7 @@ import type {} from '@deepseek-ai/dsh-session-projection'
 import type {} from '@deepseek-ai/dsh-agent-default-model'
 import type { MemberRoute, MemberRouteInput } from './types.js'
 import { PolicyError } from './policy-error.js'
+import { memberRouteRefusal } from './scheduler.js'
 
 function sameSelection(left: ModelSelection, right: ModelSelection): boolean {
   return left.provider === right.provider && left.model === right.model && left.reasoningEffort === right.reasoningEffort
@@ -67,13 +68,18 @@ export function workerRoute(inherited: ModelSelection | undefined, member: Membe
 
 /**
  * Each member's route as its worker will run it (`workerRoute` under the owner
- * session's current selection), checked by the host's own call-config
- * validation, which refuses an effort the route's model does not declare before
- * any provider request (`llm.resolveCallConfig`). A refused effort is answered
- * with the efforts that model declares (`llm.resolveModelInfo`); any other
- * resolution failure is an unavailable route. The host's text can carry host
- * paths or internal route codes (SURFACE-R3-01), so it is logged and never
- * returned. A worker that runs no route of its own has nothing to resolve.
+ * session's current selection), prepared as its model step prepares it: the
+ * agent loop calls `llm.prepareCall` before every request, and so does
+ * admission, so the route's adapter admits the model (the DeepSeek account
+ * catalog refuses one this Harness release does not run) and the host
+ * validates the effort, both before any provider request. The prepared call is
+ * never dispatched. A refusal is read by the table that reads a step's refusal
+ * (`memberRouteRefusal`, src/scheduler.ts), so admission and a step refuse on
+ * one rule: a refused effort is answered with the efforts that model declares
+ * (`llm.resolveModelInfo`), another `member`-class code is the route refusing
+ * its model, and any other failure is an unavailable route. The host's text can
+ * carry host paths or internal route codes (SURFACE-R3-01), so it is logged and
+ * never returned. A worker that runs no route of its own has nothing to resolve.
  */
 export async function memberRoutes(ctx: Context, ownerSessionId: string, members: readonly MemberRouteInput[], signal?: AbortSignal): Promise<MemberRoute[]> {
   const owner = ctx.agents.get(SessionId(ownerSessionId))
@@ -89,18 +95,21 @@ export async function memberRoutes(ctx: Context, ownerSessionId: string, members
 async function resolvedRoute(ctx: Context, route: ModelSelection, signal?: AbortSignal): Promise<MemberRoute> {
   const { provider, model, reasoningEffort } = route
   try {
-    await ctx.llm.resolveCallConfig(route, signal)
+    await ctx.llm.prepareCall(route, signal)
     return { verdict: 'accepted' }
   } catch (error) {
     signal?.throwIfAborted()
-    // The Harness LLM error code, read structurally like every provider code (src/scheduler.ts).
-    const code = error !== null && typeof error === 'object' ? (error as { code?: unknown }).code : undefined
-    if (reasoningEffort !== undefined && code === 'UNSUPPORTED_REASONING_EFFORT') {
+    const refusal = memberRouteRefusal(error)
+    if (refusal?.code === 'UNSUPPORTED_REASONING_EFFORT' && reasoningEffort !== undefined) {
       const declared = (await ctx.llm.resolveModelInfo(provider, model, signal)).reasoning?.efforts ?? []
       return { verdict: 'effort-unsupported', provider, model, effort: reasoningEffort, efforts: declared.map(effort => effort.id) }
     }
     const detail = error instanceof Error ? `${error.name}: ${error.message}` : String(error)
-    try { ctx.logger.warn('agent-swarm: model route %s/%s failed to resolve: %s', provider, model, detail) } catch { /* Logging must never mask the answer. */ }
-    return { verdict: 'unavailable', provider, model }
+    try { ctx.logger.warn('agent-swarm: model route %s/%s refused at admission: %s', provider, model, detail) } catch { /* Logging must never mask the answer. */ }
+    // A route that names no effort runs its model's default, which the host
+    // requires to be one the model declares, so its effort is never refused.
+    return refusal === undefined || refusal.code === 'UNSUPPORTED_REASONING_EFFORT'
+      ? { verdict: 'unavailable', provider, model }
+      : { verdict: 'model-refused', provider, model, code: refusal.code }
   }
 }

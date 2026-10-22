@@ -21,7 +21,7 @@ import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
 import SessionProjection from '@deepseek-ai/dsh-session-projection'
 import ToolRuntime from '@deepseek-ai/dsh-tools'
 import UserQuestionService from '@deepseek-ai/dsh-user-questions'
-import LlmRuntime, { LlmAdapter } from '@deepseek-ai/dsh-llm'
+import LlmRuntime, { LlmAdapter, LlmError } from '@deepseek-ai/dsh-llm'
 import { registerWebApi } from '../lib/web-api.js'
 import { PolicyError } from '../lib/policy-error.js'
 import { AdmissionError } from '../lib/admission.js'
@@ -67,11 +67,17 @@ async function fixture(t) {
   class Catalog extends LlmAdapter {
     routeError
     reasoning
+    // The adapter's own admission of a model, run when a call is prepared, as the DeepSeek account catalog's is.
+    refusal
     providerInfo(id) { return { id, name: 'Public provider' } }
     async listModels(provider) { return [{ provider, id: 'model-one', name: 'Model One' }] }
     async resolveModel(provider, model) {
       if (this.routeError) throw this.routeError
       return { provider, id: model, name: model, ...(this.reasoning === undefined ? {} : { reasoning: this.reasoning }) }
+    }
+    async prepareCall(provider, model, signal) {
+      if (this.refusal) throw this.refusal
+      return await super.prepareCall(provider, model, signal)
     }
   }
   const catalog = new Catalog()
@@ -271,6 +277,14 @@ test('a route the host refuses reaches the browser as the admission refusal, nev
   assert.match(gateway.result.error.message, /^\[member_route_unavailable\] member: provider "public-provider" model "model-one" does not resolve on this host\./)
   assert.doesNotMatch(gateway.text, /llm-gw|corp\.internal|R-417|secret/)
   delete f.catalog.routeError
+  // A model the provider refuses on this Harness release is refused at admission, as its first step would be, with the code alone.
+  f.catalog.refusal = new LlmError('DeepSeek model "model-one" requires DeepSeek Harness 9.0.0 or later; current version is 0.2.1-rc.2 at /opt/host/secret', 'CLIENT_UPGRADE_REQUIRED')
+  const upgrade = await add({ name: 'Builder', provider: 'public-provider', model: 'model-one', reasoningEffort: 'high' })
+  assert.equal(upgrade.result.error.code, 'bad-request')
+  assert.equal(upgrade.result.error.message, '[member_model_unsupported] member.model: provider "public-provider" model "model-one" is refused by its provider on this Harness release (CLIENT_UPGRADE_REQUIRED). Choose a `provider` and `model` this release runs, or omit both to run the owner conversation\'s route, and add the member again.')
+  assert.deepEqual(upgrade.result.error.details, { issues: [], policyCode: 'member_model_unsupported', category: 'validation_error' })
+  assert.doesNotMatch(upgrade.text, /9\.0\.0|\/opt\/host|secret/)
+  delete f.catalog.refusal
   assert.deepEqual(f.runtime.snapshot(owner, mission.id).members, [], 'no refused admission leaves a member behind')
   assert.deepEqual(f.workers.started, [])
   // The repaired admission runs on the effort the owner chose.

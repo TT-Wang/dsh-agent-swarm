@@ -30,11 +30,14 @@ export type AdmissionReason = (typeof ADMISSION_REASONS)[number]
  * the attempt is preserved, no recovery credit is spent and the member is never
  * retired for it. `member` is a refusal of the member's own route that neither
  * waiting nor the owner's sign-in or top-up ends, since a member's route is
- * fixed for its session (`memberRouteRefusal`): a model step it refuses
- * retires the member at once and releases its work, and the owner admits a
- * replacement (a worker start, which makes no model request, counts it like any
- * other start failure). A code not listed here is decided by the HTTP status,
- * then by provider wording (`classifyProviderOutage`).
+ * fixed for its session (`memberRouteRefusal`). Admission prepares each
+ * member's route as a model step prepares it and refuses a route this table
+ * reads as `member` (`memberRoutes`, src/model-selection.ts), so at a step it
+ * is a route that changed after admission: the step retires the member at once
+ * and releases its work, and the owner admits a replacement (a worker start,
+ * which makes no model request, counts it like any other start failure). A code
+ * not listed here is decided by the HTTP status, then by provider wording
+ * (`classifyProviderOutage`).
  */
 export const PROVIDER_FAILURE_CODES = {
   // An exhausted balance the owner tops up. The DeepSeek account route
@@ -53,12 +56,11 @@ export const PROVIDER_FAILURE_CODES = {
   ACCOUNT_SIGN_IN_REQUIRED: 'credential',
   ACCOUNT_TOKEN_INVALID: 'credential',
   // The DeepSeek account catalog refuses the member's model on this Harness
-  // release: only another model or another Harness release runs it.
+  // release (the adapter's own admission in `prepareCall`): only another model
+  // or another Harness release runs it.
   MODEL_UNSUPPORTED: 'member',
   CLIENT_UPGRADE_REQUIRED: 'member',
-  // The route's model does not take the member's reasoning effort. Admission
-  // refuses an effort the route does not declare (`admitMemberRoutes`,
-  // src/runtime.ts), so at a step this is a route that changed after it.
+  // The route's model does not take the member's reasoning effort.
   UNSUPPORTED_REASONING_EFFORT: 'member',
 } as const satisfies Readonly<Record<string, ProviderOutageClass | 'member'>>
 

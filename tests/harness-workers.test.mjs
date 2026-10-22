@@ -109,6 +109,9 @@ async function fixture(t, responder = () => ({ kind: 'text', text: 'done' }), co
   const requests = []
   class Scripted extends LlmAdapter {
     async resolveModel(provider, model) { return { provider, id: model, name: model, ...config.modelInfo?.(model) } }
+    // An adapter's own admission of a model, run when a call is prepared and
+    // not by `resolveModel`, as the DeepSeek account catalog's is.
+    async prepareCall(provider, model, signal) { config.admit?.(model); return await super.prepareCall(provider, model, signal) }
     async *stream(options) {
       requests.push(options)
       const action = await responder(options, requests.length)
@@ -425,6 +428,38 @@ test('explicit worker reasoning effort reaches real requests and survives owner-
     assert.equal(f.requests[1].model, 'reasoning-model')
     assert.deepEqual(f.observations.failures, [])
   } finally { await resumed.dispose() }
+})
+
+test('admission prepares each member route as its model step does, so the adapter\'s own refusal of a model decides it too, before any request', async t => {
+  const refusals = new Map([
+    ['retired-model', new LlmError('DeepSeek model "retired-model" is not supported by DeepSeek Harness; current version is 0.2.1-rc.2', 'MODEL_UNSUPPORTED')],
+    ['next-model', new LlmError('DeepSeek model "next-model" requires DeepSeek Harness 0.3.0 or later; current version is 0.2.1-rc.2', 'CLIENT_UPGRADE_REQUIRED')],
+  ])
+  const f = await fixture(t, undefined, { start: false, modelInfo: reasoningModel, admit: model => { const refusal = refusals.get(model); if (refusal !== undefined) throw refusal } })
+  // The host's standalone call-config query skips the adapter's admission; the call a step prepares runs it.
+  await f.ctx.llm.resolveCallConfig({ provider: 'other-provider', model: 'retired-model' })
+  await assert.rejects(f.ctx.llm.prepareCall({ provider: 'other-provider', model: 'retired-model' }), { code: 'MODEL_UNSUPPORTED' })
+  const routes = await f.adapter.memberRoutes('owner-session', [
+    { provider: 'other-provider', model: 'retired-model' },
+    // The adapter admits the model before the host validates the effort.
+    { provider: 'other-provider', model: 'next-model', reasoningEffort: 'low' },
+    { provider: 'other-provider', model: 'reasoning-model', reasoningEffort: 'low' },
+    { provider: 'other-provider', model: 'plain-model', reasoningEffort: 'high' },
+    { provider: 'other-provider', model: 'reasoning-model', reasoningEffort: 'high' },
+    { provider: 'unregistered', model: 'reasoning-model' },
+    {},
+  ])
+  assert.deepEqual(routes, [
+    { verdict: 'model-refused', provider: 'other-provider', model: 'retired-model', code: 'MODEL_UNSUPPORTED' },
+    { verdict: 'model-refused', provider: 'other-provider', model: 'next-model', code: 'CLIENT_UPGRADE_REQUIRED' },
+    { verdict: 'effort-unsupported', provider: 'other-provider', model: 'reasoning-model', effort: 'low', efforts: ['off', 'high'] },
+    { verdict: 'effort-unsupported', provider: 'other-provider', model: 'plain-model', effort: 'high', efforts: [] },
+    { verdict: 'accepted' },
+    { verdict: 'unavailable', provider: 'unregistered', model: 'reasoning-model' },
+    { verdict: 'accepted' },
+  ])
+  assert.equal(f.requests.length, 0, 'admission sends no provider request')
+  assert.equal(f.ctx.agents.get(SessionId(f.member.sessionId)), undefined, 'admission opens no worker session')
 })
 
 test('workers inherit a native model and effort switch before the owner sends another request', async t => {

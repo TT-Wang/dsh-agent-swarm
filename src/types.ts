@@ -115,15 +115,20 @@ export interface MemberRouteRefusal { code: string; message: string }
 export type MemberRouteInput = Pick<PlanMember, 'provider' | 'model' | 'reasoningEffort'>
 /**
  * The host's answer for one member's route, resolved as its worker will run it
- * (`memberRoutes`, src/model-selection.ts): accepted; refused for its reasoning
- * effort, with the efforts the route declares (none when its model declares no
- * reasoning); or unavailable, a route the host does not resolve at all.
- * `provider` and `model` are the route the worker would run, inherited ones
- * included; the host's own text is never carried.
+ * and prepared as its model step prepares it (`memberRoutes`,
+ * src/model-selection.ts). Accepted; refused for its reasoning effort, with the
+ * efforts the route declares (none when its model declares no reasoning);
+ * model-refused, the route refusing its model with a `member`-class code
+ * (`MemberRouteRefusal`) other than the effort's, as the DeepSeek account
+ * catalog does with MODEL_UNSUPPORTED and CLIENT_UPGRADE_REQUIRED; or
+ * unavailable, a route the host does not resolve at all. `provider` and `model`
+ * are the route the worker would run, inherited ones included; the host's own
+ * text is never carried.
  */
 export type MemberRoute =
   | { verdict: 'accepted' }
   | { verdict: 'effort-unsupported'; provider: string; model: string; effort: string; efforts: string[] }
+  | { verdict: 'model-refused'; provider: string; model: string; code: string }
   | { verdict: 'unavailable'; provider: string; model: string }
 /** R11-01: how long a classified provider outage keeps a member's route quiescent. */
 export const PROVIDER_OUTAGE_WINDOW_MS = 5 * 60_000
@@ -1166,9 +1171,10 @@ export interface WorkerAdapter {
   /**
    * Resolve each member's model route as its worker will run it, the owner
    * session's current selection under the member's own route fields, and ask
-   * the host whether that route takes its reasoning effort, without a model
-   * request. One answer per member, in input order; no worker, worktree or
-   * session is touched. Admission decides on the answers.
+   * the host whether that route takes its model and reasoning effort, the
+   * question its model step asks, without a model request. One answer per
+   * member, in input order; no worker, worktree or session is touched.
+   * Admission decides on the answers.
    */
   memberRoutes(ownerSessionId: string, members: readonly MemberRouteInput[], signal?: AbortSignal): Promise<MemberRoute[]>
   /**

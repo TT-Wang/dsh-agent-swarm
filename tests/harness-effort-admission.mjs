@@ -6,7 +6,7 @@
  * Only the model boundary is scripted. Its route `swarm-smoke` / `reasoning`
  * declares the efforts "off" and "high" (`reasoning` in
  * tests/fixtures/scripted-llm.mjs); the host's own LLM service decides every
- * refusal, at admission (`llm.resolveCallConfig`) and at a step (`prepareCall`).
+ * refusal, in the same call at admission and at a step (`llm.prepareCall`).
  * The owner's model calls the swarm tools through its real tool loop.
  *  1. `swarm_launch` with a member effort the route does not take is refused
  *     before any effect, naming the members and the efforts it accepts; the
