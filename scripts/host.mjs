@@ -133,8 +133,8 @@ export async function awaitLaunchUrl({ root, port, child, timeoutMs }, sys = sys
  * linked plugin whose files changed on disk at every profile recomposition, which each settings
  * write starts, so a build would mount into the running host mid-session (its browser half
  * stale). Without it a build is mounted only by a restart (start-lab, update-preview), and the
- * host applies settings through its config editor as before. The `hmr` row is in the base bundle
- * of every supported release; 0.1.5-rc.3 already ships it disabled.
+ * host applies settings through its config editor as before. The `hmr` row is in the supported
+ * release's base bundle.
  */
 export function hostPatch(root) {
   return [
