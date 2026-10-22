@@ -12,12 +12,12 @@ The repository records the one supported Harness release in [compatibility.json]
 | --- | --- |
 | [0.2.1-rc.2](https://github.com/deepseek-ai/deepseek-harness/releases/tag/dsh-v0.2.1-rc.2) (npm `latest` and `next`) | `687f282e8625c6b8d11ff58211a90524be2e4317` |
 
-It is a prerelease. The development linker checks the recorded release revision, not only the package version. `0.1.5-rc.3` and `0.1.7-rc.1` were dropped on 2026-10-22; `a28b116` is the last revision that supports them, and a Harness home that stays on them stays on a plugin revision up to it. `0.1.2-rc.1`, `0.1.3-alpha.2`, `0.1.5-rc.1` and `0.1.6-alpha.2` were dropped in round 28, and the code that served only them was deleted. Compatibility with other releases, unreleased commits or arbitrary custom profiles is not claimed. Better Sidebar integration was exercised against 0.18.0.
+It is a prerelease. The development linker checks the recorded release revision, not only the package version. Compatibility with other releases, unreleased commits or arbitrary custom profiles is not claimed. `0.1.5-rc.3` and `0.1.7-rc.1` were dropped on 2026-10-22, and `a28b116` is the last plugin revision that runs on them; a Harness home used with them moves to 0.2.1-rc.2 once, as [Move a 0.1.x Harness home to 0.2.1-rc.2](#move-a-01x-harness-home-to-021-rc2) describes. Better Sidebar integration was last exercised with Better Sidebar 0.18.0 on an earlier Harness release, not on 0.2.1-rc.2.
 
 You need:
 
 - Node.js `^22.19.0 || >=24.0.0`, Git, and macOS or Linux. Checks and syntax probes use `/bin/sh`; delivery requires POSIX link semantics. Windows execution is unsupported.
-- A checkout of a supported Harness release, with its dependencies installed and its CLI and Web application built.
+- A checkout of Harness 0.2.1-rc.2 at that commit, with its dependencies installed and its CLI and Web application built.
 - A working model/provider configuration in Harness. **Harness manages API keys and credentials**; the plugin uses the primary conversation's model by default. Configure credentials in the host rather than copying a key into this plugin.
 - A local Git project. Distributed workers and non-Git workspaces are not implemented.
 
@@ -65,33 +65,27 @@ Open the authenticated launch URL printed by Harness. Its login exchange sets th
 
 For a direct `link:` mount, rebuild the plugin, restart the profile and refresh the browser. A declarative `file:` mount packages the payload: after rebuilding, rerun its `plugin --profile web add "file:$PWD/profile"` command from the plugin checkout root (or run `dsh plugin --profile web install` with the matching CLI), then restart the profile and refresh the browser.
 
-If several Harness versions run on the same machine, use a separate linked checkout or built copy for each. Relinking one shared plugin directory changes the dependencies every host loads.
+If several Harness checkouts run on the same machine, use a separate linked plugin checkout or built copy for each. Relinking one shared plugin directory changes the dependencies every host using it loads.
 
-## Upgrade a Harness home to 0.2.x
+## Move a 0.1.x Harness home to 0.2.1-rc.2
 
-A Harness home (`DSH_HOME`) and the plugin's state move from 0.1.5-rc.3 or 0.1.7-rc.1 to 0.2.1-rc.2 without a migration step: 0.2.1-rc.2 reads the existing session logs, and the host change does not touch the plugin's store (`swarm.sqlite`, schema 7). The way back is closed, so before the first 0.2.x start:
+The plugin runs only on 0.2.1-rc.2. A Harness home (`DSH_HOME`) and plugin state that ran on 0.1.5-rc.3 or 0.1.7-rc.1 move to it once, without a migration step: 0.2.1-rc.2 reads the existing session logs, and the host change does not touch the plugin's store (`swarm.sqlite`, schema 7). The move is one-way, so before the first start on 0.2.1-rc.2:
 
-1. **Stop the host and back up the home.** Copy `$DSH_HOME/sessions` together with the plugin's state: `statePath` (by default `~/.dsh/agent-swarm/swarm.sqlite` with its `-wal` and `-shm` files; this default ignores `DSH_HOME`) and `workspacesRoot`. Going back to 0.1.x means restoring that backup, which discards everything done on 0.2.x, and running a plugin revision that still supports 0.1.x (up to `a28b116`): 0.1.7-rc.1 refuses to install the current plugin and skips a mounted one, and 0.1.5-rc.3 has no such gate: the current plugin logs that the host is unsupported and is not expected to work there.
-2. **Review the shared agent instructions.** 0.2.x also loads `AGENTS.md` from the shared agents directory (`$DSH_AGENTS_HOME`, by default `~/.agents`), beside `$DSH_HOME/AGENTS.md`. Workers mount their owner's agent preset, so under the Standard, Creator and PTC presets that file reaches every owner and worker prompt. The Minimal preset loads no instruction files.
+1. **Stop the host and back up the home.** Copy `$DSH_HOME/sessions` together with the plugin's state: `statePath` (by default `~/.dsh/agent-swarm/swarm.sqlite` with its `-wal` and `-shm` files; this default ignores `DSH_HOME`) and `workspacesRoot`. Going back to 0.1.x means restoring that backup, which discards everything done on 0.2.1-rc.2, and running a plugin revision up to `a28b116`: 0.1.7-rc.1 refuses to install the current plugin and skips a mounted one, and 0.1.5-rc.3 has no such gate: the current plugin logs that the host is unsupported and is not expected to work there.
+2. **Review the shared agent instructions.** 0.2.1-rc.2 also loads `AGENTS.md` from the shared agents directory (`$DSH_AGENTS_HOME`, by default `~/.agents`), beside `$DSH_HOME/AGENTS.md`. Workers mount their owner's agent preset, so under the Standard, Creator and PTC presets that file reaches every owner and worker prompt. The Minimal preset loads no instruction files.
 3. **Do not move a home with live missions back to 0.1.x.**
 
-The upgrade is one-way for session logs:
+The move is one-way for session logs:
 
-- On 0.2.x every foreground `bash` call in the Standard, Creator and PTC presets writes `job/registered` and `job/settled` into the calling session, and a `working_directory` cd writes `working-directory/change` (so does a worker activation that returns a worker session to its member worktree). 0.1.5-rc.3 and 0.1.7-rc.1 refuse a log containing these events with `SessionFormatUnsupportedError` ("unknown to this harness and not marked ignorable"), so an owner or worker session that ran one bash command on 0.2.x can no longer be opened there.
-- 0.2.x also records each change in a session's tool set between two requests as a `developer/message`: an owner's promotion, or a 0.1.x session resumed with 0.2.x's new host tools. 0.1.7-rc.1 opens such a log, but its DeepSeek provider refuses a developer message in the request history (`UNSUPPORTED_CONTENT`), so every later request of that session fails.
-- 0.1.5-rc.3 reads only session format 3. Every log that 0.1.7-rc.1 or 0.2.x created or wrote is format 4, which 0.1.5-rc.3 refuses, so a home that 0.1.7-rc.1 has run cannot go back to 0.1.5-rc.3 either.
+- Every foreground `bash` call in the Standard, Creator and PTC presets writes `job/registered` and `job/settled` into the calling session, and a `working_directory` cd writes `working-directory/change` (so does a worker activation that returns a worker session to its member worktree). 0.1.5-rc.3 and 0.1.7-rc.1 refuse a log containing these events with `SessionFormatUnsupportedError` ("unknown to this harness and not marked ignorable"), so an owner or worker session that ran one bash command on 0.2.1-rc.2 can no longer be opened there.
+- 0.2.1-rc.2 records each change in a session's tool set between two requests as a `developer/message`: an owner's promotion, or a session from 0.1.x resumed with the host tools 0.2.1-rc.2 adds. 0.1.7-rc.1 opens such a log, but its DeepSeek provider refuses a developer message in the request history (`UNSUPPORTED_CONTENT`), so every later request of that session fails.
+- 0.1.5-rc.3 reads only session format 3 and refuses every log that 0.1.7-rc.1 or 0.2.1-rc.2 created or wrote, which is format 4.
 
-If a home goes back anyway, the plugin does not detect it. Each refused worker session is an ordinary start failure ([A worker cannot start](#recovery-and-troubleshooting)): it spends no recovery credit, three consecutive failures retire the member and move its work to another capable live member, and every member that ran on 0.2.x fails the same way, so the owner is finally told which work no live member can start; `swarm_add_member` admits a member with a new session. A worker session that opens but cannot make a request is reported as that member's failure. An owner conversation the older host refuses cannot be reopened, and its notices wait in the outbox. Restore the backup or return to 0.2.x.
+If a home goes back anyway, the plugin does not detect it. Each refused worker session is an ordinary start failure ([A worker cannot start](#recovery-and-troubleshooting)): it spends no recovery credit, three consecutive failures retire the member and move its work to another capable live member, and every member that ran on 0.2.1-rc.2 fails the same way, so the owner is finally told which work no live member can start; `swarm_add_member` admits a member with a new session. A worker session that opens but cannot make a request is reported as that member's failure. An owner conversation a 0.1.x host refuses cannot be reopened, and its notices wait in the outbox. Restore the backup or return to 0.2.1-rc.2.
 
-Running on 0.2.x also changes the following:
+A preview root created on 0.1.x does not move with its home. `scripts/update-preview.mjs` keeps a snapshot's linked `node_modules` and refuses to boot the snapshot on any release but the one whose Harness SDK it links, so a preview runs the current plugin only as a new root from `scripts/start-preview.mjs` on 0.2.1-rc.2.
 
-- **Minimal-preset members compact.** The 0.2.x Minimal preset mounts compaction and `/compact`, so a member created from a Minimal owner compacts at task boundaries and under host pressure, and its summary requests are charged to it. On 0.1.x such a member never compacts.
-- **Tool changes can arrive in the history.** On a route whose model declares tool updates (`deepseek-flash` in the 0.2.x DeepSeek catalog), the management tools an owner gains at its promotion arrive as an in-history message instead of starting a new request series.
-- **Owner-only plugin routes.** The 0.2.1-rc.2 host answers HTTP 403 on the plugin's routes to any connection whose principal is not the owner. Every browser connection and API socket it creates is an owner, so the browser panel is unaffected.
-- **Previews need no host patch.** A preview root started on 0.2.x needs no rebuilt `ui-conversation` overlay; the input-editor defect it patches does not exist there. `scripts/update-preview.mjs` keeps a snapshot's linked `node_modules` and refuses to boot the snapshot on any release but the one whose Harness SDK it links, so an existing 0.1.x preview moves to 0.2.x as a new root from `scripts/start-preview.mjs`. It can no longer be updated in place from the current plugin either: `update-preview` refuses its 0.1.x release, and with `--allow-unsupported-harness` a 0.1.7-rc.1 host skips the updated plugin, whose peer ranges name only 0.2.1-rc.2.
-- **Unchanged upstream limits.** A session blocked in a tool call, such as `job_output` waiting on a job, still reads swarm notices only at its next step (dsh-external#624 and dsh-external#632 remain open).
-
-[Known limitations](known-limitations.md) records the details: the move back under Supported Harness versions; the shared instructions, the tool updates and the blocked tool calls under Harness integration; the compaction under Resources and budgets; and the routes under Interface and observation.
+[Known limitations](known-limitations.md#supported-harness-versions) records the move back in detail.
 
 ## Run a mission
 
@@ -107,11 +101,13 @@ Before planning, the plugin captures tracked edits and non-ignored new files in 
 
 New automatic plans treat task assignees as preferences. If a preferred member is busy or unavailable, eligible idle members can take work that has never started; an active or recovering task keeps its existing lifecycle. The primary can set `assignmentMode: pinned` when a task requires a specific member or model. Pinned work keeps its required route through automatic startup recovery; the primary agent can explicitly amend its assignee after reviewing the requirement. Manual drafts and old task rows keep their previous binding when the field is absent. Choosing an assignee in the manual editor pins it; clearing the assignee clears its mode. No extra user configuration or planning turn is required, and step/token budgets remain the primary agent's decision.
 
+Each member runs the model the primary conversation has selected, under the member's own `provider`, `model` and `reasoningEffort` where the plan sets them. Before a launch or `swarm_add_member` creates anything, the plugin prepares each member's route through Harness as the member's model step would. A route that does not resolve, a model this Harness release does not run, or a reasoning effort the model does not take refuses the plan; the refusal names each refused member, with the efforts its route accepts when the effort is refused, and the primary agent repairs the plan and relaunches. Nothing is downgraded. A route that changes after admission retires its member at the member's next model step ([Recovery and troubleshooting](#recovery-and-troubleshooting)).
+
 ### Open the sidebar
 
 The plugin uses the first available surface:
 
-1. **Native Harness right sidebar**, on every supported release: the **Agent Swarm** button at the bottom of the left navigation opens it; the command and conversation card reveal the same tab. The right sidebar belongs to one conversation, so a worker's conversation opens its own read-only view from the same button.
+1. **Native Harness right sidebar**: the **Agent Swarm** button at the bottom of the left navigation opens it; the command and conversation card reveal the same tab. The right sidebar belongs to one conversation, so a worker's conversation opens its own read-only view from the same button.
 2. **Better Sidebar**, when a profile installs it: choose **Agent Swarm** in the **+** tab menu.
 
 Hiding a surface stops its display updates, not workers. Worker activity shows host-observed operations and signal freshness; it does not stream model tokens or guarantee useful progress. On disconnection, retained activity is marked as last-observed and its timer freezes. Missing fresh activity stops busy animations without declaring a worker failed.
@@ -150,7 +146,7 @@ These infrastructure settings do not replace the primary agent's task-specific b
 
 ### Authorize another workspace
 
-A mission may use the directory the calling session started in or a realpath inside a root in `authorizedWorkspaces`. A human edits the profile or `cordis.patch.yml` and restarts Harness to change these roots. No model-callable tool can add, widen or revoke them. On 0.2.x hosts a `working_directory` cd changes where that session's shells and file tools run, not this authorization: `/agent-swarm`, the swarm tools and browser drafts still bind to the directory the session started in.
+A mission may use the directory the calling session started in or a realpath inside a root in `authorizedWorkspaces`. A human edits the profile or `cordis.patch.yml` and restarts Harness to change these roots. No model-callable tool can add, widen or revoke them. A `working_directory` cd changes where that session's shells and file tools run, not this authorization: `/agent-swarm`, the swarm tools and browser drafts still bind to the directory the session started in.
 
 The resolved workspace and matched grant are recorded durably. An unauthorized path returns `[workspace_not_authorized]` with the required correction. The runtime re-checks a mission's workspace with the admission rule (the calling session's own directory, else the most specific active configured root that contains it) before every worker start, workspace preparation, planning snapshot, draft launch, delivery and verification checkout. Removing a root and restarting therefore prevents new missions there and fences an existing mission at its next scheduling pass, with a blocked reason and an owner notice; the owner is woken once per plugin runtime (each Harness start or plugin reload) that finds the mission revoked. A root whose `expiresAt` passes while Harness runs, or a workspace that stops resolving, fences its missions the same way at the next pass. Adding or removing a nested root never fences a mission that another configured root still contains. Work resumed before the root is restored is fenced again.
 
@@ -193,7 +189,7 @@ Snapshot selection follows the current Git index: a file removed from the index 
 
 An invalid live update retains the last valid view and retries a full snapshot with backoff. Continued invalid data stays visibly disconnected rather than displaying invented progress. Owners can settle existing questions after pause, stop or completion without resuming workers. Trace metrics describe a bounded span window and expose its truncation explicitly; full durable records remain available separately.
 
-Worker confinement follows the configured Harness sandbox. Each worker activation also starts the worker's session in its member worktree (on 0.2.x hosts, where a session's working directory is durable), and workers neither see nor may call the host tools that would move it or schedule a later turn: `working_directory`, `create_worktree` and the `schedule_*` reminder tools. Shared temporary directories remain a possible cross-member channel. Delivery Git subprocesses also retain the process-management exceptions described in [known limitations](known-limitations.md).
+Worker confinement follows the configured Harness sandbox. Each worker activation also starts the worker's session in its member worktree, since a session's working directory outlives a turn, and workers neither see nor may call the host tools that would move it or schedule a later turn: `working_directory`, `create_worktree` and the `schedule_*` reminder tools. Shared temporary directories remain a possible cross-member channel. Delivery Git subprocesses also retain the process-management exceptions described in [known limitations](known-limitations.md).
 
 ## Companion context policy
 
@@ -203,7 +199,7 @@ Mount the swarm and slice layers in the same profile using each project's instal
 
 ## Development and verification
 
-After linking a supported Harness checkout:
+After linking a Harness 0.2.1-rc.2 checkout:
 
 ```sh
 npm run verify
