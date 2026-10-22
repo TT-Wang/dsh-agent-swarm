@@ -53,10 +53,11 @@ async function commandBench(t, start = async () => ({ kind: 'success', text: 'æ­
   }
   ctx.provide('locale', { bind: () => text => text })
   ctx.provide('inputTriggers', { registerSource(source) { sources.set(source.name, source); return () => sources.delete(source.name) } })
-  // 0.1.7's command catalog reads through a retained, open session binding; 0.1.5 ignores these two.
+  // The command catalog reads through a retained, open session binding.
   const binding = { session: { getSnapshot: () => ({ openState: 'open' }) } }
+  // The main conversation view retains the session on screen.
   ctx.provide('sessions', {
-    subagentAddress: () => undefined, list: { getSnapshot: () => ({ current }) },
+    subagentAddress: () => undefined, list: { getSnapshot: () => ({ ids: [current], byId: { [current]: { retainedBy: { mainView: 1 } } } }) },
     binding: () => binding, using: async (_sessionId, _retain, use) => await use({ binding }),
   })
   ctx.provide('remote', { commands, $on() { return () => {} } })

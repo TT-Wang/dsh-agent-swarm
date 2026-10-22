@@ -1,39 +1,28 @@
 import type { Context } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-api-session-controller/client'
 import type {} from '@deepseek-ai/dsh-client-ui-workspace/client'
+import type { SessionId } from '@deepseek-ai/dsh-session/types'
 
-/** The session list, restricted to what identifies the conversation on screen across supported hosts. */
-interface SessionListView {
-  /** 0.1.5: the persisted selection every session-scoped surface keys off. */
-  current?: string
-  /** 0.1.7: local reference counts; the main conversation view retains its session as 'mainView'. */
-  byId?: Record<string, { retainedBy?: Partial<Record<string, number>> } | undefined>
-  ids?: readonly string[]
+/**
+ * The session whose conversation is on screen. Client sessions can have several
+ * live instances, so the list names no current one; the main conversation view
+ * retains its session under the 'mainView' reference source instead.
+ */
+export function currentSessionId(sessions: Context['sessions'] | undefined): string | undefined {
+  const list = sessions?.list.getSnapshot()
+  return list?.ids.find(id => (list.byId[id]?.retainedBy.mainView ?? 0) > 0)
 }
 
 /**
- * The session whose conversation is on screen. 0.1.7 has no `list.current`
- * (client sessions can have several live instances) and the main view instead
- * retains its session under the 'mainView' source, so that count stands in.
+ * Workers are independent Harness sessions created with withoutInitiator, not
+ * catalog children. A listed one opens through the workspace UI service; false
+ * leaves the caller to read its persisted history instead.
  */
-export function currentSessionId(sessions: Context['sessions'] | undefined): string | undefined {
-  const list = (sessions?.list?.getSnapshot?.() ?? {}) as SessionListView
-  if (typeof list.current === 'string') return list.current
-  for (const id of list.ids ?? Object.keys(list.byId ?? {})) {
-    if ((list.byId?.[id]?.retainedBy?.['mainView'] ?? 0) > 0) return id
-  }
-  return undefined
-}
-
-/** Workers are independent Harness sessions created with withoutInitiator, not catalog children. */
 export function openWorker(ctx: Pick<Context, 'sessions' | 'get'>, workerSessionId: string): boolean {
-  const sessions = ctx.sessions as Context['sessions'] & { open?: (id: string) => void }
-  const list = sessions.list.getSnapshot() as SessionListView
-  if (!list.byId?.[workerSessionId]) return false
-  // 0.1.5 navigates through the sessions face; 0.1.7 through the workspace UI service.
-  if (typeof sessions.open === 'function') { sessions.open(workerSessionId); return true }
-  const workspace = ctx.get('uiWorkspace') as { openSession?: (target: string) => void } | undefined
-  if (typeof workspace?.openSession !== 'function') return false
-  workspace.openSession(workerSessionId)
+  const id = workerSessionId as SessionId
+  if (!ctx.sessions.list.getSnapshot().byId[id]) return false
+  const workspace = ctx.get('uiWorkspace')
+  if (workspace === undefined) return false
+  workspace.openSession(id)
   return true
 }

@@ -125,7 +125,7 @@ function panelHarness(monitor) {
     useSyncExternalStore(_subscribe, getSnapshot) { return getSnapshot() },
   }
   const fixed = value => ({ subscribe: () => () => {}, getSnapshot: () => value })
-  const props = { sessions: { list: fixed({ current: 'owner' }) }, modelDirectories: { directoryFor() {} }, monitor,
+  const props = { sessions: { list: fixed({ ids: ['owner'], byId: { owner: { retainedBy: { mainView: 1 } } } }) }, modelDirectories: { directoryFor() {} }, monitor,
     history: { ...fixed({}), close() {} }, onOpenWorker() {} }
   const render = () => {
     let rounds = 0

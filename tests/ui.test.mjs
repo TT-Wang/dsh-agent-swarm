@@ -244,30 +244,23 @@ test('live monitor fences switched-session responses and aborts all work on disp
 })
 
 test('worker navigation opens its independent native session and rejects missing list entries', async () => {
-  const opened = []
-  const list = { getSnapshot: () => ({ byId: { worker: { id: 'worker' } } }) }
-  // 0.1.5: the sessions face navigates.
-  const legacy = { sessions: { list, open: sessionId => opened.push(sessionId) }, get: () => undefined }
-  assert.equal(openWorker(legacy, 'worker'), true)
-  assert.deepEqual(opened, ['worker'])
-  assert.equal(openWorker(legacy, 'missing'), false, 'missing live row delegates to read-only native history')
-  assert.equal(opened.length, 1)
-  // 0.1.7: no sessions.open; navigation belongs to the workspace UI service.
   const navigated = []
-  const modern = { sessions: { list }, get: name => name === 'uiWorkspace' ? { openSession: target => navigated.push(target) } : undefined }
-  assert.equal(openWorker(modern, 'worker'), true)
+  const list = { getSnapshot: () => ({ ids: ['worker'], byId: { worker: { id: 'worker', retainedBy: {} } } }) }
+  const ctx = { sessions: { list }, get: name => name === 'uiWorkspace' ? { openSession: target => navigated.push(target) } : undefined }
+  assert.equal(openWorker(ctx, 'worker'), true, 'a listed worker opens through the workspace UI service')
   assert.deepEqual(navigated, ['worker'])
+  assert.equal(openWorker(ctx, 'missing'), false, 'missing live row delegates to read-only native history')
+  assert.equal(navigated.length, 1)
   assert.equal(openWorker({ sessions: { list }, get: () => undefined }, 'worker'), false, 'no navigation service: fall back to persisted history')
 })
 
-test('session selection supports 0.1.5 current and the retained 0.1.7 main view', () => {
+test('the session on screen is the one the main conversation view retains', () => {
   const background = { retainedBy: { worker: 1, mainView: 0 } }
   const displayed = { retainedBy: { mainView: 1 } }
   const sessions = snapshot => ({ list: { getSnapshot: () => snapshot } })
-  assert.equal(currentSessionId(sessions({ current: 'legacy', byId: { displayed } })), 'legacy')
   assert.equal(currentSessionId(sessions({ ids: ['background', 'displayed'], byId: { background, displayed } })), 'displayed')
-  assert.equal(currentSessionId(sessions({ byId: { background, displayed } })), 'displayed')
   assert.equal(currentSessionId(sessions({ ids: ['background'], byId: { background } })), undefined)
+  assert.equal(currentSessionId(sessions({ ids: [], byId: {} })), undefined)
   assert.equal(currentSessionId(undefined), undefined)
 })
 
@@ -652,7 +645,7 @@ test('right sidebar adapter: passive tab registration, its body seat, and explic
 
 test('right sidebar adapter: an explicit refused reveal stays native until its session surface exists', async t => {
   t.mock.timers.enable({ apis: ['setInterval'] })
-  // The 0.1.5 host answers a write with no mounted session surface by throwing
+  // The host answers a write with no mounted session surface by throwing
   // (`sidebarRight: no session surface is mounted`). Only explicit intent creates
   // a retry request; registration and ordinary session signals remain passive.
   // Native ownership covers a pending request so it cannot open a second surface.
@@ -663,7 +656,7 @@ test('right sidebar adapter: an explicit refused reveal stays native until its s
     inject(name, factory) { const release = factory(); return () => release?.() },
     register(options) { return () => {} },
   }
-  const sessions = { listeners: [], subscribe(listener) { this.listeners.push(listener); return () => {} }, getSnapshot: () => ({ current: 's1' }) }
+  const sessions = { listeners: [], subscribe(listener) { this.listeners.push(listener); return () => {} }, getSnapshot: () => ({ ids: ['s1'], byId: { s1: { retainedBy: { mainView: 1 } } } }) }
   const ctx = {
     inject(names, factory) {
       const available = { slots, sidebarRightTabs: registry, sidebarRight: ctx.get('sidebarRight'), layout: ctx.get('layout') }

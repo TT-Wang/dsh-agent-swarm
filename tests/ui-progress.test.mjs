@@ -23,7 +23,7 @@ function withActivity(kind = 'model') {
   return snapshot
 }
 function panelProps(state) {
-  const sessionState = { current: 'owner', byId: { owner: { id: 'owner', displayTitle: 'Owner conversation' } } }
+  const sessionState = { ids: ['owner'], byId: { owner: { id: 'owner', displayTitle: 'Owner conversation', retainedBy: { mainView: 1 } } } }
   const subscribe = () => () => {}
   return {
     sessions: { list: { getSnapshot: () => sessionState, subscribe } },

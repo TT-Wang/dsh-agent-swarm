@@ -17,7 +17,7 @@ function renderStart(start, overrides = {}) {
   const data = { snapshots: [], drafts: [], starts: [start], writable: true, ...overrides.data }
   const monitor = { ...store({ ownerSessionId: 'owner-a', loading: false, connection: overrides.connection ?? 'connected', data }), select() {} }
   return renderToStaticMarkup(React.createElement(ActivityPanel, {
-    sessions: { list: store({ current: 'owner-a' }) }, modelDirectories: { directoryFor() {} }, monitor,
+    sessions: { list: store({ ids: ['owner-a'], byId: { 'owner-a': { retainedBy: { mainView: 1 } } } }) }, modelDirectories: { directoryFor() {} }, monitor,
     history: { ...store({ entries: [], loading: false, hasMore: false }), close() {} }, sessionId: 'owner-a', onOpenWorker() {},
   }))
 }
