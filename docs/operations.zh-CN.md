@@ -238,7 +238,7 @@ npm run verify
 
 真实 Loader 组合（`test:harness`、`test:pack`、故障套件的供应商层，以及走 DeepSeek API key 路由的 `test:deepseek`、`test:command-deepseek` 和 `scripts/check-cancel-freeze.mjs`）挂载当前宿主已构建的包；检出缺少某个包时，组合失败并给出该包的名字。启动后每个启用的行都必须处于激活状态：仍在等待某个服务的行会让启动失败，并指出它等待的服务。这些组合挂载以测试工作区为根的 `@deepseek-ai/dsh-fs-local` 和 `@deepseek-ai/dsh-working-directory`，`bash` 的工作目录由 working-directory 服务提供。DeepSeek 路由取自 `@deepseek-ai/dsh-llm-deepseek-api-key`。
 
-浏览器冒烟测试（`test:web`、`test:command-web`）运行 CLI Web 产品，脚本化模型是唯一的供应商：它们禁用 `llm-deepseek`，宿主自带 `llm-deepseek-account`（0.2.1-rc.2）时也禁用它。首次使用时会打开默认工作区的宿主（0.1.7-rc.1、0.2.1-rc.2）把该工作区建在本次运行的临时根目录里，而不是操作者的“文稿”（Documents）文件夹。
+浏览器冒烟测试（`test:web`、`test:command-web`）运行 CLI Web 产品，脚本化模型是唯一的供应商：它们禁用 `llm-deepseek` 和 `llm-deepseek-account`。宿主首次使用时打开的默认工作区建在本次运行的临时根目录里，而不是操作者的“文稿”（Documents）文件夹。
 
 ## 修订估算，继续原任务
 

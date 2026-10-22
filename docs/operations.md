@@ -228,7 +228,7 @@ These suites use temporary profiles and Git workspaces with scripted provider re
 
 The real Loader compositions (`test:harness`, `test:pack`, the fault suite's provider tier, and `test:deepseek`, `test:command-deepseek` and `scripts/check-cancel-freeze.mjs` on the DeepSeek API-key route) mount the running host's built packages; a package the checkout lacks fails the composition with its name, and every enabled row must be active after boot: a row still waiting for a service fails the boot and names that service. They mount `@deepseek-ai/dsh-fs-local` and `@deepseek-ai/dsh-working-directory` rooted at the test workspace; the working-directory service gives `bash` its directory. The DeepSeek route comes from `@deepseek-ai/dsh-llm-deepseek-api-key`.
 
-The browser smokes (`test:web`, `test:command-web`) run the CLI web product with the scripted model as its only provider: they disable `llm-deepseek` and, where the host ships it (0.2.1-rc.2), `llm-deepseek-account`. A host that opens a default workspace on first use (0.1.7-rc.1, 0.2.1-rc.2) creates it inside the run's temporary root, not in the operator's Documents folder.
+The browser smokes (`test:web`, `test:command-web`) run the CLI web product with the scripted model as its only provider: they disable `llm-deepseek` and `llm-deepseek-account`. The default workspace the host opens on first use is created inside the run's temporary root, not in the operator's Documents folder.
 
 ## Revise estimates and recover the same work
 
