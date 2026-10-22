@@ -47,9 +47,11 @@ test('the supported releases the plugin checks at runtime are exactly compatibil
   const manifest = read('package.json')
   for (const [name, range] of Object.entries(manifest.peerDependencies)) if (name.startsWith('@deepseek-ai/dsh-')) assert.equal(range, versions.join(' || '), name)
   for (const [name, range] of Object.entries(manifest.devDependencies)) if (name.startsWith('@deepseek-ai/dsh-')) assert.equal(range, compatibility.defaultHost, `${name} is developed against the default host`)
-  // The peer ranges are the one declaration both npm and the host's gate read. A
-  // declared engines.dsh decides alone on 0.2.x and the gate then ignores the peers,
-  // so a second list would let the host and npm follow different ranges.
+  // No engines.dsh: it would change no verdict, and only a plugin index would read
+  // it. A 0.2.x gate lets a declared engines.dsh decide alone and ignores the peers,
+  // but with one supported release it would name the release the peers name; 0.1.7
+  // reads only the peers. The 0.2.1 plugin market reads only engines.dsh, and this
+  // plugin is distributed from its source checkout, not through an index.
   assert.equal(Object.hasOwn(manifest.engines ?? {}, 'dsh'), false, 'package.json declares no engines.dsh')
 })
 

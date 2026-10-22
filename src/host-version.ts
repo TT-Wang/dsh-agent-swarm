@@ -38,8 +38,9 @@ interface VersionLogger { error(message: string): void, warn(message: string): v
  * peer-version gate (0.1.7-rc.1, 0.2.x) refuses to install, and skips at boot,
  * a plugin whose dsh-* peer ranges exclude it, unless its owner exempted this
  * exact plugin version on that release. A host without one (0.1.6-alpha.2,
- * 0.1.5-rc.3 and earlier) loads the plugin, and no host reads the profile's
- * requires.harness, so there this is the only runtime notice.
+ * 0.1.5-rc.3 and earlier) applies the plugin anyway, where it is not expected
+ * to work, and no host reads the profile's requires.harness, so there this is
+ * the only runtime notice.
  * @param read - the version source; undefined from it means unreadable.
  * @returns what was found, for the caller and the tests.
  */
