@@ -7,7 +7,7 @@ import { scrubbedParentEnv } from '@deepseek-ai/dsh-subprocess'
 import type {} from '@deepseek-ai/dsh-tools'
 import { PERSONA_PREFIX_SECTION, PERSONA_SUFFIX_SECTION } from '@deepseek-ai/dsh-system-prompt'
 import type {} from '@deepseek-ai/dsh-session-persistence'
-import type {} from '@deepseek-ai/dsh-sandbox'
+import type { SandboxProvider } from '@deepseek-ai/dsh-sandbox'
 import type {} from '@deepseek-ai/dsh-sandbox-policy'
 import type {} from '@deepseek-ai/dsh-user-approval'
 import { readFile, mkdir, rm } from 'node:fs/promises'
@@ -167,12 +167,6 @@ interface HarnessWorkerOptions {
    */
   checkConcurrency?: number
 }
-/** The confinement surface a declared verification check must pass through. */
-interface VerificationSandbox {
-  /** 0.1.5 returns the confinement synchronously; 0.1.7 resolves it (the backend probe became async). Both are accepted. */
-  confine(argv: readonly string[], policy: { mode: 'workspace-write'; workspaceRoot: string }): ConfinedCheck | Promise<ConfinedCheck>
-}
-interface ConfinedCheck { argv: string[]; enforcement: 'full' | 'partial' }
 /**
  * F-29: run a declared check only under FULL host enforcement. A partial
  * backend (Windows ACL, an older Landlock ABI) does not govern every promised
@@ -182,7 +176,7 @@ interface ConfinedCheck { argv: string[]; enforcement: 'full' | 'partial' }
  * refusal as that command's infrastructure row (exit 125), so the review is
  * deferred for the host to repair, never rejected as an assertion failure.
  */
-export async function confinedCheckArgv(sandbox: VerificationSandbox, argv: string[], cwd: string): Promise<string[]> {
+export async function confinedCheckArgv(sandbox: Pick<SandboxProvider, 'confine'>, argv: string[], cwd: string): Promise<string[]> {
   const confined = await sandbox.confine(argv, { mode: 'workspace-write', workspaceRoot: cwd })
   if (confined.enforcement !== 'full') throw new Error(`Artifact verification requires full sandbox enforcement: the host provider reports ${JSON.stringify(confined.enforcement)} enforcement for workspace-write, so a declared check could write outside the verification checkout. Refusing to run it.`)
   return confined.argv
