@@ -188,7 +188,7 @@ export function registerWebApi(ctx: Context, runtime: SwarmRuntime, options: Web
       writable, ownerLive: writable && ctx.agents.get(SessionId(actor.sessionId)) !== undefined, revision: runtime.store.revision(),
     } }
   }
-  // The routes below call this directly; 0.1.7's ConnectionRpcHandler adds a peer argument no route needs.
+  // The exact routes below call this directly: only an owner Peer reaches them, so no Peer is passed.
   const handler = async (endpoint: string, payload: unknown, signal: AbortSignal): Promise<ConnectionRpcResult<unknown>> => {
     try {
       signal.throwIfAborted()
@@ -371,16 +371,15 @@ export function registerWebApi(ctx: Context, runtime: SwarmRuntime, options: Web
       return { ok: false, error: { code: 'internal-error', message: 'Swarm request failed unexpectedly; the original error was logged on the host.', details: { issues: [] } } }
     }
   }
-  // One route shape on every supported host. A plugin-owned channel
-  // (`rpc.handle('/agent-swarm', …)`) is unusable on 0.1.5: `rpc.handle`
-  // registers the route under the CONNECTION plugin's own fiber, which injects
-  // `credentials` alone, so Cordis refuses its `webServer` access and the route
-  // is never registered — silently, because the failure lands in a child fiber.
-  // The shared `/api` interceptor is not an option either — that channel admits
-  // exactly one interceptor and another plugin holds it. What is left is what the
-  // host itself documents for plugin endpoints: one exact route per endpoint on
-  // the shared channel, consulted before the interceptor, inheriting its Host,
-  // Origin and browser-authentication fence. The client posts the standard
+  // One exact route per endpoint on the shared `/api` channel. Connection
+  // consults the exact routes before the channel's interceptor; they inherit its
+  // Host, Origin and browser-authentication fence, and only an owner Peer
+  // reaches them (any other principal is answered 403 before the route runs).
+  // The shared interceptor is not an option: the channel admits exactly one,
+  // and the API gateway holds it for the generated Remote endpoints. A
+  // plugin-owned channel (`rpc.handle('/agent-swarm', …)`) would hand this
+  // handler every authenticated Peer whatever its principal, so the owner rule
+  // would become this plugin's to enforce. The client posts the standard
   // envelope to `/api/agent-swarm/<endpoint>`.
   const releases: Array<() => Promise<void>> = []
   ctx.effect(() => async () => {

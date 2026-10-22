@@ -751,23 +751,20 @@ export interface Delivery {
  * The host's shared browser-transport channel and this plugin's endpoint prefix
  * inside it.
  *
- * Every supported release mounts the connection plugin's `/api` route and offers
- * `ctx.connection.rpc.intercept('/api', …)` for plugin endpoints. A plugin-owned
- * channel (`rpc.handle('/agent-swarm', …)`) is unusable on 0.1.5: the connection
- * service resolves `webServer` on its own context, which
- * injects `credentials` alone, and Cordis refuses that property access
- * (`cannot get property "webServer" without inject`), so the channel route is
- * never registered. The client posts to `<channel>/<endpoint>`, so both halves
- * agree on `SWARM_RPC_CHANNEL` plus `SWARM_RPC_PREFIX` in front of the endpoint.
+ * The connection plugin owns the sole `/api` route of the Web carrier, and the
+ * plugin's endpoints are exact routes under it (`registerWebApi`, which says why
+ * neither the channel's interceptor nor a plugin-owned channel serves them). The
+ * client posts to `<channel>/<endpoint>`, so both halves agree on
+ * `SWARM_RPC_CHANNEL` plus `SWARM_RPC_PREFIX` in front of the endpoint.
  */
 export const SWARM_RPC_CHANNEL = '/api'
 export const SWARM_RPC_PREFIX = 'agent-swarm/'
 
 /**
  * Every endpoint the panel may call, and therefore every exact route the host is
- * asked for. 0.1.5 admits one interceptor per shared channel, so the plugin
- * registers one route per endpoint instead; the list, the handler's dispatch and
- * the naming manifest are pinned together by tests.
+ * asked for: the shared channel admits one interceptor, which the API gateway
+ * holds, so the plugin registers one route per endpoint instead. The list, the
+ * handler's dispatch and the naming manifest are pinned together by tests.
  */
 export const SWARM_WEB_ENDPOINTS: readonly string[] = [
   'state', 'watch', 'models', 'control', 'cancel', 'delivery', 'apply-delivery', 'worker-history',
