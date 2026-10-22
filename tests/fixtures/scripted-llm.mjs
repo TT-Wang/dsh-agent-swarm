@@ -4,6 +4,13 @@ import { importHarness } from './built-harness.mjs'
 export const name = 'swarm-smoke-scripted-llm'
 export const inject = ['llm']
 export const requests = []
+/**
+ * The reasoning each model id declares (`{ efforts, defaultEffort }`, as an
+ * adapter's `resolveModel` returns it); a model absent here declares none. The
+ * host reads it at every call it prepares, so a scenario that changes it
+ * changes the route under a live session.
+ */
+export const reasoning = new Map()
 let responder
 let nextCall = 0
 
@@ -17,13 +24,17 @@ export function setResponder(next) {
 export async function apply(ctx, config) {
   const { LlmAdapter, ToolCallId } = await importHarness(config.harnessRoot, '@deepseek-ai/dsh-llm')
   class ScriptedAdapter extends LlmAdapter {
-    async resolveModel(provider, model) { return { provider, id: model, name: model } }
+    async resolveModel(provider, model) {
+      const declared = reasoning.get(model)
+      return { provider, id: model, name: model, ...(declared === undefined ? {} : { reasoning: structuredClone(declared) }) }
+    }
 
     async * stream(options) {
       assert(responder, 'scripted model requires a scenario')
       requests.push({
         sessionId: options.sessionId,
         purpose: options.purpose,
+        reasoningEffort: options.reasoningEffort,
         messages: structuredClone(options.messages),
         system: options.system,
         tools: structuredClone(options.tools),
