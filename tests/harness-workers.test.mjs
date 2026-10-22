@@ -987,10 +987,10 @@ for (const nativeOwnerDisposal of [false, true]) test(`${nativeOwnerDisposal ? '
 })
 
 test('a worker persona reaches the model as written, whatever braces its free text carries', async t => {
-  // The member's name and role and the mission objective are free text. On
-  // 0.1.x the agent loop registers {{cwd}} and {{model}}, so a strict section
-  // would have substituted them; on 0.2.x {{cwd}} is gone and would fail every
-  // request. A malformed group fails on every host.
+  // The member's name and role and the mission objective are free text. In a
+  // section the host interpolates, {{cwd}} and {{model}} name no registered
+  // variable and a malformed group is refused, so either would fail every
+  // request of the worker.
   const objective = 'Render {{cwd}} and {{model}} placeholders, keep {{Not A Name}} and a lone {{ brace'
   const f = await fixture(t, undefined, { mission: { objective }, member: { name: 'Templater {{name}}', role: 'implementer of {{role}} {{}}' } })
   await f.adapter.deliver(f.member, message(f.member))
