@@ -201,7 +201,7 @@ test('cancelled native startup cannot publish a late worker and can be retried a
 })
 
 test('a native dispose that rejected has still released the worker, so the member starts again and unload completes', async t => {
-  // Every supported host memoizes a handle's dispose and runs registry, scope
+  // The host memoizes a handle's dispose and runs registry, scope
   // and ownership cleanup to quiescence before it rejects: a settled dispose is a
   // released handle, never one to retry (review M-15).
   const f = await fixture(t, undefined, { start: false })
@@ -553,9 +553,9 @@ test('a provider error the adapter classifies as an outage is reported as that o
   assert.deepEqual(f.observations.failures, [], 'the outage is not reported a second time as a member failure')
 })
 
-// The DeepSeek account route's codes (0.2.x), raised inside a worker turn: the
-// agent loop rebuilds the provider failure on every host, and its code still
-// decides whether the route or the member failed.
+// The DeepSeek account route's codes, raised inside a worker turn: the agent
+// loop rebuilds the provider failure, and its code still decides whether the
+// route or the member failed.
 for (const [error, expected] of [
   [new LlmError('Your DeepSeek account tokens are used up for this period.', 'ACCOUNT_QUOTA'), { outage: ['quota', undefined] }],
   [new LlmError('Sign in to DeepSeek to use the account provider. The request destination must allow account authentication.', 'ACCOUNT_SIGN_IN_REQUIRED'), { outage: ['credential', undefined] }],

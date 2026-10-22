@@ -62,7 +62,7 @@ test('the failure-code table decides every Harness code it names, ahead of the H
   for (const [code, kind] of Object.entries(PROVIDER_FAILURE_CODES)) {
     assert.equal(classifyProviderOutage(new LlmError(`request failed (${code})`, code))?.class, kind === 'member' ? undefined : kind, code)
   }
-  // The DeepSeek account route (0.2.x) and its own messages: none carries the
+  // The DeepSeek account route and its own messages: none carries the
   // wording the fallback reads, so only the code classifies them.
   assert.deepEqual(classifyProviderOutage(new LlmError('Your DeepSeek account tokens are used up for this period.', 'ACCOUNT_QUOTA')),
     { class: 'quota', message: 'Your DeepSeek account tokens are used up for this period.' }, 'an account quota is the quota class without a status or quota wording')
@@ -101,7 +101,7 @@ test('R11-01: a classified outage is durable, keeps the running attempt, and spe
   assert.equal(f.runtime.store.events(f.mission.id, 500).filter(event => event.type === 'provider/outage').length, 2, 'a new class is a new durable row')
 })
 
-// The DeepSeek account route's codes (0.2.x) take the same path as an API-key
+// The DeepSeek account route's codes take the same path as an API-key
 // quota: the failing route is the owner's to restore, never the member's fault.
 for (const [label, error, expected] of [
   ['an API-key quota', new LlmError('insufficient quota for this account', 'QUOTA', { status: 402 }), 'quota'],

@@ -33,9 +33,8 @@ const SHARED_CLIENT_MODULES = ['react', 'react-dom', '@deepseek-ai/cordis']
 /**
  * Load a native client bundle as the web host does: its factory takes the
  * host module table's `require`. Beyond the identities this test shares, the
- * table carries more of the host's modules (0.2.1 adds `zod` and
- * `@tanstack/react-virtual`); those resolve from the native package's own
- * directory.
+ * table carries more of the host's modules (`zod`, `@tanstack/react-virtual`);
+ * those resolve from the native package's own directory.
  */
 async function nativeClient(packageName) {
   const testRequire = createRequire(import.meta.url)
