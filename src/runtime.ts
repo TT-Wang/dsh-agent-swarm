@@ -3822,8 +3822,7 @@ export class SwarmRuntime implements Kernel {
         const owed = this.refusals.stopOwed(mission.id, member.id)
         if (owed !== undefined) throw owed
         try {
-          const selected = options.admission ? { ...latest, provider: member.provider, model: member.model, reasoningEffort: member.reasoningEffort } : latest
-          const native = Promise.resolve(this.workers.start({ mission: current!, member: selected, ownerSessionId: current!.ownerSessionId }, controller.signal))
+          const native = Promise.resolve(this.workers.start({ mission: current!, member: latest, ownerSessionId: current!.ownerSessionId }, controller.signal))
           const entry = this.workerStarts.get(member.id)!
           entry.nativePending = true
           void native.then(() => { entry.nativePending = false }, () => { entry.nativePending = false })
@@ -3838,8 +3837,9 @@ export class SwarmRuntime implements Kernel {
         } catch (error) {
           failed = true
           controller.abort(error)
-          // The admission caller owns its option fallback/rollback. Shared
-          // recovery/dispatch waiters record one actual native failure only.
+          // An admission caller records its own failure (`addMember` stops the
+          // new member, a launch fails its draft). Shared recovery/dispatch
+          // waiters record one actual native failure only.
           if (!options.admission && !options.signal?.aborted && this.workerStarts.get(member.id)?.controller === controller) this.onStartFailure(mission, member, error)
           throw error
         }
