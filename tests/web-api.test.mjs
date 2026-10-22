@@ -57,11 +57,7 @@ async function fixture(t, { grants = NO_GRANTS } = {}) {
     modifyRecord: async (_key, mutate) => (credentialRecord = await mutate(credentialRecord)),
     deleteRecord: async () => { credentialRecord = undefined },
   })
-  // 0.1.5's connection registers its RPC route on the context the service was provided from,
-  // and that context must itself inject webServer; compose it inside such a scope.
-  await new Promise((resolve, reject) => ctx.inject(['webServer'], scope => {
-    scope.plugin(Connection, { trustedHosts: ['lan.example'], maxRequestBodyBytes: 1048576 }).then(() => resolve(), reject)
-  }))
+  await ctx.plugin(Connection, { trustedHosts: ['lan.example'], maxRequestBodyBytes: 1048576 })
   await ctx.plugin(SessionStore)
   await ctx.plugin(SessionProjection)
   await ctx.plugin(JsonlPersistence, { root: path.join(directory, 'sessions'), compression: 'none', writeBatchMaxDelayMs: 1 })
@@ -103,7 +99,7 @@ async function fixture(t, { grants = NO_GRANTS } = {}) {
   } })
   await ownerFiber
   ctx.sessions.create(SessionId('other-owner'), { meta: { cwd: workspace } })
-  const bridge = ctx.plugin({ name: 'test-swarm-web', inject: ['connection', 'webServer', 'sessions', 'sessionPersistence', 'agents', 'llm'], apply(scope) { registerWebApi(scope, runtime, { defaultBudget: budget, maxPayloadBytes: 8192 }) } })
+  const bridge = ctx.plugin({ name: 'test-swarm-web', inject: ['connection', 'sessions', 'sessionPersistence', 'agents', 'llm'], apply(scope) { registerWebApi(scope, runtime, { defaultBudget: budget, maxPayloadBytes: 8192 }) } })
   await bridge
   const port = ctx.webServer.port
   const authority = `127.0.0.1:${port}`

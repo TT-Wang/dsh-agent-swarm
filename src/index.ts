@@ -177,6 +177,6 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
   const ownerReplies = new OwnerReplyGuard(ctx, runtime, { maxNudges: config.maxOwnerReplyNudges })
   ctx.effect(() => () => ownerReplies.dispose(), 'swarm.owner-reply-guard')
   ctx.inject(['commands'], commands => registerAutomaticStart(commands, runtime))
-  ctx.inject(['connection', 'webServer'], browser => registerWebApi(browser, runtime, { defaultBudget: config.defaultBudget, maxPayloadBytes: 1048576 }))
+  ctx.inject(['connection'], browser => registerWebApi(browser, runtime, { defaultBudget: config.defaultBudget, maxPayloadBytes: 1048576 }))
   await runtime.start()
 }
