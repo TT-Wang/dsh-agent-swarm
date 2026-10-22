@@ -45,33 +45,16 @@ export async function importHarness(root, name) {
 }
 
 /**
- * The package that mounts the DeepSeek API-key route (provider
- * `deepseek-official`) on this host. From 0.1.7-rc.2 it is
- * dsh-llm-deepseek-api-key, and dsh-llm-deepseek is only the protocol library
- * (0.2.1 exports no plugin from it); a host without the api-key package mounts
- * the route from dsh-llm-deepseek. Both take the same config.
+ * The rows `bash` runs on, rooted at the workspace: tool-bash takes its cwd
+ * from the session's `workingDirectory` service (dsh-working-directory), which
+ * reads through an `fs` provider. Without them tool-bash stays pending, and
+ * the activation check names the service it waits for.
  */
-export async function deepseekApiKeyRoute(root) {
-  const catalog = await harnessCatalog(root)
-  const name = ['@deepseek-ai/dsh-llm-deepseek-api-key', '@deepseek-ai/dsh-llm-deepseek'].find(candidate => catalog.has(candidate))
-  assert(name, 'Harness ships no DeepSeek API-key route')
-  return name
-}
-
-/**
- * The rows `bash` runs on, each mounted only when the host's catalog has its
- * package. From 0.2.1 tool-bash takes its cwd from the session's
- * `workingDirectory` service (dsh-working-directory), which reads through an
- * `fs` provider; 0.1.x ships no working-directory package. A host that needs a
- * row it does not ship leaves tool-bash pending, and the activation check
- * names it.
- */
-export async function workingDirectoryRows(root, workspace) {
-  const catalog = await harnessCatalog(root)
+export function workingDirectoryRows(workspace) {
   return [
     ['fs', '@deepseek-ai/dsh-fs-local', { cwd: workspace }],
     ['working-directory', '@deepseek-ai/dsh-working-directory', { defaultDirectory: workspace }],
-  ].filter(([, name]) => catalog.has(name))
+  ]
 }
 
 /** cordis `FiberState` by value: a const enum, so the published build has no runtime object. */
@@ -138,7 +121,7 @@ export async function bootHarness({ harnessRoot, artifactRoot, runRoot, workspac
     ['approval', '@deepseek-ai/dsh-user-approval', { policy: 'never' }],
     ['shell', '@deepseek-ai/dsh-bash-sandbox', { cwd: workspace, timeoutMs: 5000, graceMs: 50, ...shellConfig }],
     ['shell-env', '@deepseek-ai/dsh-shell-env', { dshHome: join(runRoot, 'dsh-home') }],
-    ...await workingDirectoryRows(harnessRoot, workspace),
+    ...workingDirectoryRows(workspace),
     ['tool-bash', '@deepseek-ai/dsh-tool-bash', { enableRunInBackground: false }],
     ['agent-loop', '@deepseek-ai/dsh-agent-loop', { agents: [] }],
     ...extraRows,
@@ -146,8 +129,9 @@ export async function bootHarness({ harnessRoot, artifactRoot, runRoot, workspac
   const entries = await Promise.all(plugins.map(async row => Array.isArray(row) ? {
     id: row[0], name: await harnessEntry(harnessRoot, row[1]), ...(row[2] ? { config: row[2] } : {}),
   } : row))
+  // `deepseekConfig` mounts the DeepSeek API-key route (provider `deepseek-official`).
   entries.push(deepseekConfig ? {
-    id: 'deepseek-llm', name: await harnessEntry(harnessRoot, await deepseekApiKeyRoute(harnessRoot)),
+    id: 'deepseek-llm', name: await harnessEntry(harnessRoot, '@deepseek-ai/dsh-llm-deepseek-api-key'),
     config: deepseekConfig,
   } : {
     id: 'scripted-llm', name: new URL('./scripted-llm.mjs', import.meta.url).href,
