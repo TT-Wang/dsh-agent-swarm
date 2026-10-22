@@ -5,7 +5,7 @@ import { scopeSubset, validScope, withinScope } from './scope.ts'
 // Declared outputs are checked against the same toolchain names the workspace
 // engine excludes from capture; both sides must never drift apart.
 import { DEFAULT_VERIFICATION_DEPENDENCY_DIRS, SWARM_SCRATCH_DIRNAME } from './workspaces.ts'
-import { criterionId, type TaskCeiling, type TaskCeilingDimension, type TaskCeilingProvenance } from './types.ts'
+import { criterionId, type MemberRoute, type MemberRouteInput, type TaskCeiling, type TaskCeilingDimension, type TaskCeilingProvenance } from './types.ts'
 import { PolicyError, type PolicyErrorCategory } from './policy-error.ts'
 import { taskEdges } from './task-graph.ts'
 
@@ -178,6 +178,26 @@ export interface AdmissionDiagnostic {
 
 export function formatDiagnostic(diagnostic: AdmissionDiagnostic): string {
   return `[${diagnostic.code}] ${diagnostic.location}: ${diagnostic.message}`
+}
+
+/** One member admission's route fields and where a refusal names it: `members[<key>]` in a plan, `member` for a member added on its own. */
+export interface MemberRouteEntry { location: string; member: MemberRouteInput }
+
+/**
+ * W8, the route rule: a member is admitted only on a route the host resolves
+ * and whose model takes the member's reasoning effort, as the adapter answered
+ * for the route its worker will run (`MemberRoute`). The diagnostic of a refused
+ * route, or undefined for an accepted one; nothing is downgraded or retried.
+ * It is built from the route and its efforts alone, so the host's own text
+ * never reaches it. `retry` is the caller's own next step after the repair.
+ */
+export function memberRouteDiagnostic({ location, member }: MemberRouteEntry, route: MemberRoute, retry: string): AdmissionDiagnostic | undefined {
+  if (route.verdict === 'accepted') return undefined
+  const named = `provider ${JSON.stringify(route.provider)} model ${JSON.stringify(route.model)}`
+  if (route.verdict === 'unavailable') return { code: 'member_route_unavailable', location, message: `${named} does not resolve on this host. Choose a \`provider\` and \`model\` it routes, or omit both to run the owner conversation's route, and ${retry}.` }
+  const effort = `${JSON.stringify(route.effort)}${member.reasoningEffort === undefined ? ', inherited from the owner conversation' : ''}`
+  const declared = route.efforts.length === 0 ? 'its model declares no reasoning effort' : `it accepts ${route.efforts.map(id => JSON.stringify(id)).join(', ')}`
+  return { code: 'member_reasoning_effort_unsupported', location: `${location}.reasoningEffort`, message: `${named} does not accept reasoning effort ${effort}; ${declared}. Set \`reasoningEffort\` to one it accepts, or omit it and name the member's own \`provider\` and \`model\` to run that route's default, and ${retry}.` }
 }
 
 export interface TaskCeilingInput {

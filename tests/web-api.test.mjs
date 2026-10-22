@@ -24,6 +24,7 @@ import { loadWorkspaceGrants } from '../lib/authorization.js'
 import { PolicyError } from '../lib/policy-error.js'
 import { errorTypeFor } from '../lib/trace.js'
 import { AdmissionError, TaskGraphAdmissionError } from '../lib/admission.js'
+import { memberRoutes } from '../lib/model-selection.js'
 import { FakeWorkers, NO_GRANTS, budget as defaultBudget, makeRuntime } from './faults/harness.mjs'
 
 const budget = { ...defaultBudget, maxTokens: 100000, maxSteps: 100, maxTasks: 10, maxExperiments: 2 }
@@ -86,6 +87,8 @@ async function fixture(t, { grants = NO_GRANTS } = {}) {
   }
   const catalog = new Catalog()
   ctx.llm.registerAdapter(['public-provider'], catalog)
+  // Admission asks the routes of this composition, as the Harness adapter does in the plugin.
+  workers.memberRoutes = (ownerSessionId, members, signal) => memberRoutes(ctx, ownerSessionId, members, signal)
   runtime = made.runtime
   const ownerId = 'web-owner'
   const ownerFiber = ctx.plugin({ name: 'test-web-owner', inject: ['agents'], async apply(scope) {
@@ -375,7 +378,7 @@ test('model validation rejects unknown routes before saving but accepts routable
   const withModel = (provider, model) => ({ ...f.input, members: [{ ...f.input.members[0], provider, model }] })
   const unknown = await f.rpc('create-draft', { sessionId: f.ownerId, input: withModel('unknown-provider', 'model-one') })
   assert.equal(unknown.result.ok, false)
-  assert.match(unknown.result.error.message, /Unknown model provider/)
+  assert.match(unknown.result.error.message, /^\[member_route_unavailable\] members\[builder\]: provider "unknown-provider" model "model-one" does not resolve on this host\./)
   const invalid = await f.rpc('create-draft', { sessionId: f.ownerId, input: withModel('public-provider', 'unroutable') })
   assert.equal(invalid.result.ok, false)
   assert.deepEqual(f.runtime.drafts({ sessionId: f.ownerId }), [])
@@ -406,7 +409,8 @@ test('launch revalidates current model routing before side effects and activates
   f.catalog.unavailable = true
   const invalid = await f.rpc('launch-draft', { sessionId: f.ownerId, draftId: draft.id, revision: draft.revision })
   assert.equal(invalid.result.ok, false)
-  assert.match(invalid.result.error.message, /Model route is unavailable/)
+  // The draft's member names no route: the launch admits the owner's, which it inherits.
+  assert.match(invalid.result.error.message, /^\[member_route_unavailable\] members\[builder\]: provider "public-provider" model "model-one" does not resolve on this host\./)
   assert.deepEqual(f.workers.workspaces, [], 'no workspace is prepared before route admission')
   assert.deepEqual(f.workers.starts, [], 'no worker is started before route admission')
   f.catalog.unavailable = false

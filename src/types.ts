@@ -104,6 +104,20 @@ export interface ProviderOutage {
 }
 /** The last classified outage observed for a member, used to avoid spending recovery credit. */
 export interface MemberProviderOutage extends ProviderOutage { at: number }
+/** The route fields one member admission names; each one it omits is inherited from the owner's conversation. */
+export type MemberRouteInput = Pick<PlanMember, 'provider' | 'model' | 'reasoningEffort'>
+/**
+ * The host's answer for one member's route, resolved as its worker will run it
+ * (`memberRoutes`, src/model-selection.ts): accepted; refused for its reasoning
+ * effort, with the efforts the route declares (none when its model declares no
+ * reasoning); or unavailable, a route the host does not resolve at all.
+ * `provider` and `model` are the route the worker would run, inherited ones
+ * included; the host's own text is never carried.
+ */
+export type MemberRoute =
+  | { verdict: 'accepted' }
+  | { verdict: 'effort-unsupported'; provider: string; model: string; effort: string; efforts: string[] }
+  | { verdict: 'unavailable'; provider: string; model: string }
 /** R11-01: how long a classified provider outage keeps a member's route quiescent. */
 export const PROVIDER_OUTAGE_WINDOW_MS = 5 * 60_000
 /**
@@ -1136,6 +1150,14 @@ export interface WorkerAdapter {
    * `checks`; a command that parses has no entry, so callers pair by `index`.
    */
   checkSyntaxPreflight(checks: readonly string[], cwd: string, signal?: AbortSignal): Promise<CheckSyntaxIssue[]>
+  /**
+   * Resolve each member's model route as its worker will run it, the owner
+   * session's current selection under the member's own route fields, and ask
+   * the host whether that route takes its reasoning effort, without a model
+   * request. One answer per member, in input order; no worker, worktree or
+   * session is touched. Admission decides on the answers.
+   */
+  memberRoutes(ownerSessionId: string, members: readonly MemberRouteInput[], signal?: AbortSignal): Promise<MemberRoute[]>
   /**
    * Whether the member's handle could take an assignment now. A question:
    * asking it changes nothing, so a decision may ask it any number of times. An

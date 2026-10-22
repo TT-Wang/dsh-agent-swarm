@@ -25,6 +25,7 @@ import LlmRuntime, { LlmAdapter } from '@deepseek-ai/dsh-llm'
 import { registerWebApi } from '../lib/web-api.js'
 import { PolicyError } from '../lib/policy-error.js'
 import { AdmissionError } from '../lib/admission.js'
+import { memberRoutes } from '../lib/model-selection.js'
 import { FakeWorkers, budget as sharedBudget, makeRuntime, makeWorkspaces } from './faults/harness.mjs'
 
 const budget = { ...sharedBudget, maxTokens: 100000, maxSteps: 100, maxTasks: 10, maxExperiments: 2 }
@@ -75,6 +76,8 @@ async function fixture(t) {
   }
   const catalog = new Catalog()
   ctx.llm.registerAdapter(['public-provider'], catalog)
+  // Admission asks the routes of this composition, as the Harness adapter does in the plugin.
+  workers.memberRoutes = (ownerSessionId, members, signal) => memberRoutes(ctx, ownerSessionId, members, signal)
   runtime = made.runtime
   const ownerId = 'web-owner'
   const ownerFiber = ctx.plugin({ name: 'test-web-owner', inject: ['agents'], async apply(scope) {
@@ -147,7 +150,8 @@ test('wrapped runtime and LLM failures return sanitized internal errors, never r
     input: { ...routeRuntime.input, members: [{ ...routeRuntime.input.members[0], provider: 'public-provider', model: 'model-one' }] } })
   assert.equal(route.result.ok, false)
   assert.doesNotMatch(route.text, leaks)
-  assert.match(route.result.error.message, /Model route is unavailable: public-provider\/model-one/)
+  assert.match(route.result.error.message, /^\[member_route_unavailable\] members\[builder\]: provider "public-provider" model "model-one" does not resolve on this host\./)
+  assert.deepEqual(route.result.error.details, { issues: [], policyCode: 'member_route_unavailable', category: 'validation_error' })
 })
 
 test('a staged plan whose task scope holds a non-string entry returns every diagnostic, not a TypeError', async t => {
@@ -212,14 +216,13 @@ test('the cancel RPC withdraws one task for the owner and refuses other sessions
 
 test('T2 W8/F7 owner-actionable refusals stay actionable over the RPCs', async t => {
   const f = await fixture(t)
-  // Byte-for-byte messages agreed with the governance task (member_9e7abaca).
-  const w8 = 'Member Builder cannot start: provider "public-provider" model "model-one" does not support reasoning effort "high". Clearing reasoningEffort and retrying also failed: Error: route rejected. Admit a replacement member without reasoningEffort, or with an effort this provider/model supports.'
-  f.runtime.addMember = () => { throw new PolicyError('member_reasoning_effort_unsupported', 'tool_error', w8) }
+  const w8 = '[member_reasoning_effort_unsupported] member.reasoningEffort: provider "public-provider" model "model-one" does not accept reasoning effort "low"; it accepts "high". Set `reasoningEffort` to one it accepts, or omit it and name the member\'s own `provider` and `model` to run that route\'s default, and add the member again.'
+  f.runtime.addMember = () => { throw new AdmissionError('member_reasoning_effort_unsupported', 'validation_error', w8, 'member.reasoningEffort') }
   const member = await f.rpc('add-member', { sessionId: f.ownerId, missionId: 'mission-x', input: { name: 'Builder', role: 'implementation' } })
   assert.equal(member.result.ok, false)
   assert.equal(member.result.error.code, 'bad-request')
   assert.equal(member.result.error.message, w8, 'the W8 refusal is not sanitized')
-  assert.deepEqual(member.result.error.details, { issues: [], policyCode: 'member_reasoning_effort_unsupported', category: 'tool_error' })
+  assert.deepEqual(member.result.error.details, { issues: [], policyCode: 'member_reasoning_effort_unsupported', category: 'validation_error' })
   // F7 from the real runtime: a deterministic retry of a withdrawn record is a typed refusal.
   const owner = { sessionId: f.ownerId }
   const mission = f.runtime.create(owner, f.input, { grantRoot: f.input.workspace, source: 'session' })
@@ -247,41 +250,33 @@ test('T2 W8/F7 owner-actionable refusals stay actionable over the RPCs', async t
   }
 })
 
-test('a rejected reasoning effort reaches the browser in the canonical shape, never as the adapter text', async t => {
+test('a route the host refuses reaches the browser as the admission refusal, never as the adapter text', async t => {
   const f = await fixture(t)
-  f.catalog.reasoning = { efforts: [{ id: 'high', name: 'High' }] }
+  f.catalog.reasoning = { efforts: [{ id: 'off', name: 'Off' }, { id: 'high', name: 'High' }], defaultEffort: 'off' }
   const owner = { sessionId: f.ownerId }
   const mission = f.runtime.create(owner, f.input, { grantRoot: f.input.workspace, source: 'session' })
-  // The effort start is rejected with the adapter's code; the retry without it fails too.
-  const rejectWith = message => {
-    f.workers.onStart = async spec => {
-      if (spec.member.reasoningEffort === undefined) throw new Error('route rejected')
-      throw Object.assign(new Error(message), { code: 'UNSUPPORTED_REASONING_EFFORT' })
-    }
-  }
-  const add = name => f.rpc('add-member', { sessionId: f.ownerId, missionId: mission.id,
-    input: { name, role: 'implementation', provider: 'public-provider', model: 'model-one', reasoningEffort: 'high' } })
-  const refusal = name => `Member ${name} cannot start: provider "public-provider" model "model-one" does not support reasoning effort "high". Clearing reasoningEffort did not help; admit a replacement member without reasoningEffort, or with an effort this provider/model supports.`
-  // The canonical Harness rejection keeps the bytes it always rendered.
-  rejectWith('provider "public-provider" model "model-one" does not support reasoning effort "high"')
-  const canonical = await add('Builder')
-  assert.equal(canonical.result.error.code, 'bad-request')
-  assert.equal(canonical.result.error.message, refusal('Builder'))
-  assert.deepEqual(canonical.result.error.details, { issues: [], policyCode: 'member_reasoning_effort_unsupported', category: 'tool_error' })
-  // A gateway rejection that names an internal host and route code is not echoed.
-  const raw = 'upstream llm-gw.corp.internal:8443 refused route R-417 for reasoning_effort=high'
-  rejectWith(raw)
-  const gateway = await add('Checker')
+  const add = input => f.rpc('add-member', { sessionId: f.ownerId, missionId: mission.id, input: { role: 'implementation', ...input } })
+  // The host's own resolver refuses the effort; admission names the efforts the route declares, before any effect.
+  const effort = await add({ name: 'Builder', provider: 'public-provider', model: 'model-one', reasoningEffort: 'low' })
+  assert.equal(effort.result.error.code, 'bad-request')
+  assert.equal(effort.result.error.message, '[member_reasoning_effort_unsupported] member.reasoningEffort: provider "public-provider" model "model-one" does not accept reasoning effort "low"; it accepts "off", "high". Set `reasoningEffort` to one it accepts, or omit it and name the member\'s own `provider` and `model` to run that route\'s default, and add the member again.')
+  assert.deepEqual(effort.result.error.details, { issues: [], policyCode: 'member_reasoning_effort_unsupported', category: 'validation_error' })
+  // A member that inherits the owner's route is admitted on that route's efforts.
+  const inherited = await add({ name: 'Scout', reasoningEffort: 'medium' })
+  assert.match(inherited.result.error.message, /^\[member_reasoning_effort_unsupported\] member\.reasoningEffort: provider "public-provider" model "model-one" does not accept reasoning effort "medium"; it accepts "off", "high"\./)
+  // A gateway failure that names an internal host and route code is never echoed.
+  f.catalog.routeError = new Error('upstream llm-gw.corp.internal:8443 refused route R-417 at /opt/host/secret')
+  const gateway = await add({ name: 'Checker', provider: 'public-provider', model: 'model-one', reasoningEffort: 'high' })
   assert.equal(gateway.result.error.code, 'bad-request')
-  assert.equal(gateway.result.error.message, refusal('Checker'))
-  assert.doesNotMatch(gateway.text, /llm-gw|corp\.internal|R-417/)
-  // A member that inherits the owner's route names no provider or model of its own.
-  const inherited = await f.rpc('add-member', { sessionId: f.ownerId, missionId: mission.id, input: { name: 'Scout', role: 'research', reasoningEffort: 'high' } })
-  assert.equal(inherited.result.error.message, 'Member Scout cannot start: provider (inherited) model (inherited) does not support reasoning effort "high". Clearing reasoningEffort did not help; admit a replacement member without reasoningEffort, or with an effort this provider/model supports.')
-  assert.doesNotMatch(inherited.text, /llm-gw|corp\.internal|R-417/)
-  // The raw rejection is kept only in the durable record.
-  const rejected = f.runtime.store.events(mission.id, 100).filter(event => event.type === 'member/effort-rejected')
-  assert.deepEqual(rejected.map(event => event.data.error), ['provider "public-provider" model "model-one" does not support reasoning effort "high"', raw, raw])
+  assert.match(gateway.result.error.message, /^\[member_route_unavailable\] member: provider "public-provider" model "model-one" does not resolve on this host\./)
+  assert.doesNotMatch(gateway.text, /llm-gw|corp\.internal|R-417|secret/)
+  delete f.catalog.routeError
+  assert.deepEqual(f.runtime.snapshot(owner, mission.id).members, [], 'no refused admission leaves a member behind')
+  assert.deepEqual(f.workers.started, [])
+  // The repaired admission runs on the effort the owner chose.
+  const admitted = await add({ name: 'Builder', provider: 'public-provider', model: 'model-one', reasoningEffort: 'high' })
+  assert.equal(admitted.result.ok, true, admitted.text)
+  assert.equal(admitted.result.value.member.reasoningEffort, 'high')
 })
 
 test('a refusal text on a plain Error grants no visibility: only the typed refusal reaches the browser', async t => {

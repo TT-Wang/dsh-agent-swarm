@@ -1,5 +1,5 @@
 /**
- * T2 governance regressions: W8 member route validation, the owner's authority
+ * T2 governance regressions: W8 member route admission, the owner's authority
  * to withdraw submitted work (D9), the cancel-during-submit message (F6),
  * deterministic-id re-admission of a cancelled task (F7) and the budget-warning
  * suggested limit (F11). Only the external execution adapter is replaced; store,
@@ -11,21 +11,28 @@ import { FakeWorkers, budget as sharedBudget, eventually, makeRuntime } from './
 
 const budget = { ...sharedBudget, maxTokens: 1000, maxSteps: 10, maxWorkers: 4, maxTasks: 12, maxExperiments: 2 }
 
-/** A provider whose supported efforts are declared by `unsupported` and `rejectAll`. */
+/**
+ * The external execution boundary with a route catalog: `efforts` holds the
+ * reasoning efforts each `provider/model` declares (none: the model declares no
+ * reasoning), `unrouted` the routes the host does not resolve. A member with no
+ * route of its own runs the owner's, `owner/default` here.
+ */
 class GovernanceWorkers extends FakeWorkers {
-  unsupported = new Set()
-  rejectAll = false
+  efforts = new Map([['deepseek-official/flash', ['off', 'high']], ['owner/default', ['off', 'high']]])
+  unrouted = new Set()
+  routeQuestions = []
   captureStarted = false
   artifact = { commit: 'abc123', baseCommit: 'base', workspace: '/isolated', changedPaths: ['src/a.ts'] }
   checks = [{ command: 'test', exitCode: 0, output: 'ok' }]
-  async start(spec) {
-    const effort = spec.member.reasoningEffort
-    if (effort !== undefined && this.unsupported.has(effort)) {
-      const error = new Error(`provider "${spec.member.provider ?? 'inherited'}" model "${spec.member.model ?? 'inherited'}" does not support reasoning effort "${effort}"`)
-      error.code = 'UNSUPPORTED_REASONING_EFFORT'
-      throw error
-    }
-    if (this.rejectAll) throw new Error(`provider "${spec.member.provider ?? 'inherited'}" model "${spec.member.model ?? 'inherited'}" is unavailable`)
+  memberRoutes(ownerSessionId, members) {
+    this.routeQuestions.push({ ownerSessionId, members: structuredClone(members) })
+    return members.map(member => {
+      const provider = member.provider ?? 'owner', model = member.model ?? 'default'
+      if (this.unrouted.has(`${provider}/${model}`)) return { verdict: 'unavailable', provider, model }
+      const efforts = this.efforts.get(`${provider}/${model}`) ?? []
+      return member.reasoningEffort === undefined || efforts.includes(member.reasoningEffort) ? { verdict: 'accepted' }
+        : { verdict: 'effort-unsupported', provider, model, effort: member.reasoningEffort, efforts }
+    })
   }
   async captureArtifact() { this.captureStarted = true; if (this.captureGate) await this.captureGate; return this.artifact }
 }
@@ -40,42 +47,78 @@ async function setup(t, options = {}) {
   const propose = (actor, extra = {}, admittedId) => runtime.propose(actor, mission.id, {
     outputs: [], workstreamId: stream.id, title: 'Fix', objective: 'Fix governance', kind: 'implementation', scope: ['src/'], acceptance: ['works'], checks: ['test'], ...extra }, admittedId)
   const events = type => runtime.snapshot(owner, mission.id).events.filter(event => event.type === type)
-  return { runtime, workers, mission, stream, owner, addMember, propose, events }
+  const ownerNotices = () => runtime.store.list('deliveries', mission.id).filter(delivery => delivery.to === 'owner').map(delivery => delivery.content)
+  return { dir, runtime, workers, mission, stream, owner, addMember, propose, events, ownerNotices }
 }
 
-test('W8: an unsupported reasoning effort is downgraded with a durable warning and the member still runs', async t => {
+test('W8: an effort the route does not accept is refused at admission, before any effect, naming the efforts it accepts', async t => {
   const f = await setup(t)
-  f.workers.unsupported.add('medium')
-  const member = await f.addMember({ name: 'Builder', role: 'implementation', provider: 'deepseek-official', model: 'flash', reasoningEffort: 'medium' })
-  assert.equal(member.reasoningEffort, undefined, 'the rejected effort is cleared on the admitted member')
-  const downgraded = f.events('member/effort-downgraded')
-  assert.equal(downgraded.length, 1)
-  assert.equal(downgraded[0].data.memberId, member.id)
-  assert.equal(downgraded[0].data.requested, 'medium')
-  assert.equal(downgraded[0].data.rejected, 'medium')
-  assert.match(downgraded[0].data.reason, /does not support reasoning effort "medium"/)
-  const stored = f.runtime.snapshot(f.owner, f.mission.id).members.find(item => item.id === member.id)
-  assert.equal(stored.status, 'idle', 'the downgraded member is admitted and usable')
-  assert.equal(stored.reasoningEffort, undefined)
-  assert.equal(f.events('member/failed').length, 0)
+  const members = () => f.runtime.snapshot(f.owner, f.mission.id).members
+  await assert.rejects(f.addMember({ name: 'Builder', role: 'implementation', provider: 'deepseek-official', model: 'flash', reasoningEffort: 'low' }), error => {
+    assert.equal(error.name, 'AdmissionError')
+    assert.equal(error.code, 'member_reasoning_effort_unsupported')
+    assert.equal(error.category, 'validation_error')
+    assert.equal(error.message, '[member_reasoning_effort_unsupported] member.reasoningEffort: provider "deepseek-official" model "flash" does not accept reasoning effort "low"; it accepts "off", "high". Set `reasoningEffort` to one it accepts, or omit it and name the member\'s own `provider` and `model` to run that route\'s default, and add the member again.')
+    assert.deepEqual(error.diagnostics.map(diagnostic => [diagnostic.code, diagnostic.location]), [['member_reasoning_effort_unsupported', 'member.reasoningEffort']])
+    return true
+  })
+  assert.deepEqual(members(), [], 'no member row is written')
+  assert.deepEqual(f.events('member/added'), [])
+  assert.deepEqual(f.workers.started, [], 'no worker is started')
+  assert.deepEqual(f.workers.routeQuestions, [{ ownerSessionId: f.owner.sessionId, members: [{ provider: 'deepseek-official', model: 'flash', reasoningEffort: 'low' }] }], 'the adapter is asked about the route fields alone')
+  // A member that inherits the owner's route is admitted on that route's efforts too.
+  await assert.rejects(f.addMember({ role: 'research', reasoningEffort: 'medium' }), /provider "owner" model "default" does not accept reasoning effort "medium"; it accepts "off", "high"/)
+  // A route the host does not resolve is refused the same way, naming only the route.
+  f.workers.unrouted.add('gateway/missing')
+  await assert.rejects(f.addMember({ name: 'Scout', role: 'research', provider: 'gateway', model: 'missing' }), error => {
+    assert.equal(error.code, 'member_route_unavailable')
+    assert.equal(error.message, '[member_route_unavailable] member: provider "gateway" model "missing" does not resolve on this host. Choose a `provider` and `model` it routes, or omit both to run the owner conversation\'s route, and add the member again.')
+    return true
+  })
+  assert.deepEqual(members(), [])
+  // The repaired admission runs on the effort the owner chose: nothing is downgraded.
+  const member = await f.addMember({ name: 'Builder', role: 'implementation', provider: 'deepseek-official', model: 'flash', reasoningEffort: 'high' })
+  assert.equal(member.reasoningEffort, 'high')
+  assert.deepEqual(f.workers.started, [member.id])
 })
 
-test('W8: a route that still rejects the cleared effort refuses admission with a typed error', async t => {
+test('W8: a launch names every member whose route refuses it, in one refusal before any effect, on every launch path', async t => {
   const f = await setup(t)
-  f.workers.unsupported.add('medium')
-  f.workers.rejectAll = true
-  await assert.rejects(
-    f.addMember({ name: 'Builder', role: 'implementation', provider: 'deepseek-official', model: 'flash', reasoningEffort: 'medium' }),
-    error => {
-      assert.match(error.message, /^Member Builder cannot start: provider .+ does not support reasoning effort "medium"/)
-      assert.match(error.message, /admit a replacement member without reasoningEffort/i)
-      return true
-    })
-  const rejected = f.events('member/effort-rejected')
-  assert.equal(rejected.length, 1)
-  assert.equal(rejected[0].data.requested, 'medium')
-  const stored = f.runtime.snapshot(f.owner, f.mission.id).members.find(item => item.name === 'Builder')
-  assert.equal(stored.status, 'stopped', 'a member that cannot start is not left live')
+  const plan = efforts => ({
+    title: 'Launch', objective: 'Fix governance', workspace: f.dir, scope: ['src/'], acceptance: ['works'], budget,
+    members: [
+      { key: 'fixer', role: 'implementation', provider: 'deepseek-official', model: 'flash', reasoningEffort: efforts[0], maxOutputTokens: 1000 },
+      { key: 'checker', role: 'verification', reasoningEffort: efforts[1], maxOutputTokens: 1000 },
+    ],
+    workstreams: [{ key: 'w', title: 'Main', objective: 'Fix governance' }],
+    tasks: [{ key: 't', workstreamKey: 'w', title: 'Fix', objective: 'Fix governance', kind: 'implementation', scope: ['src/'], outputs: [], covers: ['c1'], checks: ['test'], assigneeKey: 'fixer', maxRecoveryAttempts: 1, checkTimeoutMs: 60000 }],
+  })
+  const draft = f.runtime.createDraft(f.owner, plan(['low', 'medium']), { grantRoot: f.dir, source: 'session' })
+  const missions = () => f.runtime.list(f.owner.sessionId).length
+  const before = missions()
+  await assert.rejects(f.runtime.launchDraft(f.owner, draft.id, draft.revision), error => {
+    assert.equal(error.code, 'member_reasoning_effort_unsupported')
+    assert.deepEqual(error.diagnostics.map(diagnostic => diagnostic.location), ['members[fixer].reasoningEffort', 'members[checker].reasoningEffort'])
+    assert.deepEqual(error.message.split('\n').map(line => line.slice(0, line.indexOf(':'))), ['[member_reasoning_effort_unsupported] members[fixer].reasoningEffort', '[member_reasoning_effort_unsupported] members[checker].reasoningEffort'])
+    assert.match(error.message, /members\[checker\]\.reasoningEffort: provider "owner" model "default" does not accept reasoning effort "medium"; it accepts "off", "high"\./)
+    assert.match(error.message, /and relaunch the complete plan\.$/)
+    return true
+  })
+  assert.equal(missions(), before, 'no mission is created')
+  assert.deepEqual(f.workers.started, [], 'no worker is started')
+  // The automatic path (swarm_launch) refuses the same plan at the same boundary.
+  f.runtime.store.transaction(() => f.runtime.store.put('starts', { id: 'start_w8', ownerSessionId: f.owner.sessionId, commandId: 'start_w8', goal: 'Fix governance',
+    workspace: f.dir, workspaceGrantRoot: f.dir, workspaceAuthorizationSource: 'session', status: 'planning', createdAt: Date.now(), updatedAt: Date.now() }))
+  await assert.rejects(f.runtime.startPlan(f.owner, 'start_w8', plan(['low', 'high'])), error => {
+    assert.deepEqual(error.diagnostics.map(diagnostic => diagnostic.location), ['members[fixer].reasoningEffort'])
+    return true
+  })
+  assert.equal(missions(), before)
+  assert.deepEqual(f.workers.started, [])
+  // One retry with the repaired efforts launches, on exactly those efforts.
+  const snapshot = await f.runtime.startPlan(f.owner, 'start_w8', plan(['off', 'high']))
+  assert.equal(snapshot.mission.status, 'active')
+  assert.deepEqual(snapshot.members.map(member => member.reasoningEffort), ['off', 'high'])
 })
 
 test('a mission duration beyond the clock range is one validation_error at create and at budget update', async t => {

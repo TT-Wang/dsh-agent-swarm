@@ -16,11 +16,11 @@ import { randomUUID } from 'node:crypto'
 import path from 'node:path'
 import { SWARM_SCRATCH_DIRNAME, Workspaces, writePrivateJson } from './workspaces.js'
 import { inspectDelivery, applyDelivery } from './delivery.js'
-import { ownerModelSelection, workerModelSelection } from './model-selection.js'
+import { memberRoutes, ownerModelSelection, workerRoute } from './model-selection.js'
 import { persistedSessionHeader } from './session-metadata.js'
 import { hiddenToolsFor, WORKER_PROMPT } from './tools.js'
 import { classifyProviderOutage } from './scheduler.js'
-import type { Artifact, CheckEnvelope, CheckSyntaxIssue, Delivery, FinishedAttempt, Member, Mission, Task, UsageBuckets, WorkerAdapter, WorkerCallbacks, WorkerSpec, WorkerActivity } from './types.js'
+import type { Artifact, CheckEnvelope, CheckSyntaxIssue, Delivery, FinishedAttempt, Member, MemberRoute, MemberRouteInput, Mission, Task, UsageBuckets, WorkerAdapter, WorkerCallbacks, WorkerSpec, WorkerActivity } from './types.js'
 
 declare module '@deepseek-ai/dsh-llm' {
   interface MessageSourceMap {
@@ -704,9 +704,7 @@ export class HarnessWorkers implements WorkerAdapter {
     const owner = this.ctx.agents.get(SessionId(spec.ownerSessionId))
     if (owner === undefined) throw new Error('First worker creation requires its owner session to seed a durable composition')
     const preset = (this.ctx.get('agentPresets') as AgentPresets | undefined)?.composedPreset(owner.ctx)
-    const inherited = await ownerModelSelection(this.ctx, owner, signal)
-    const selection = inherited === undefined && spec.member.provider === undefined && spec.member.model === undefined && spec.member.reasoningEffort === undefined
-      ? undefined : workerModelSelection(inherited, spec.member)
+    const selection = workerRoute(await ownerModelSelection(this.ctx, owner, signal), spec.member)
     const value: Composition = {
       version: 1, sessionId: spec.member.sessionId, missionId: spec.mission.id, memberId: spec.member.id, workspace: spec.member.workspace,
       ...(preset === undefined ? {} : { preset }),
@@ -945,6 +943,10 @@ export class HarnessWorkers implements WorkerAdapter {
     if (resident === undefined || this.fenced(resident)) return
     resident.compactionRequested = true
     this.compactIfRequested(resident)
+  }
+  /** Admission's question about each member's route, answered as `composition` will create the worker. */
+  async memberRoutes(ownerSessionId: string, members: readonly MemberRouteInput[], signal?: AbortSignal): Promise<MemberRoute[]> {
+    return await memberRoutes(this.ctx, ownerSessionId, members, signal)
   }
   /**
    * WS-1: the durable member identity changed (a staged-plan repair rotated its
