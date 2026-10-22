@@ -791,7 +791,7 @@ export const OWNER_ONLY_TOOLS: readonly string[] = [
  * enforcement points as `OWNER_ONLY_TOOLS`: the worker projection hides each
  * one the host registers (`src/tools.ts`), and the runtime guard refuses every
  * one of them (`src/runtime.ts`). A name a host does not register costs nothing
- * to deny. The 0.2.x hosts register them:
+ * to deny. Harness registers them where a profile mounts them:
  *  - `working_directory` moves the session's durable working directory, which
  *    bash, file tools and the model's directory context follow, out of the
  *    worktree (the base bundle mounts it for every session);

@@ -35,7 +35,7 @@ export type AdmissionReason = (typeof ADMISSION_REASONS)[number]
  * wording (`classifyProviderOutage`).
  */
 export const PROVIDER_FAILURE_CODES = {
-  // An exhausted balance the owner tops up. The DeepSeek account route (0.2.x)
+  // An exhausted balance the owner tops up. The DeepSeek account route
   // rewrites QUOTA as ACCOUNT_QUOTA and keeps the request's HTTP status.
   QUOTA: 'quota',
   ACCOUNT_QUOTA: 'quota',
@@ -44,14 +44,14 @@ export const PROVIDER_FAILURE_CODES = {
   TIMEOUT: 'unavailable',
   TRANSPORT: 'unavailable',
   PROVIDER_UNAVAILABLE: 'unavailable',
-  // The DeepSeek account route (0.2.x) holds no account token (signed out), or
+  // The DeepSeek account route holds no account token (signed out), or
   // the provider refused its token with HTTP 401 and the host discarded it, so
   // the route's next request is ACCOUNT_SIGN_IN_REQUIRED: one condition of the
   // route that ends when the owner signs in again.
   ACCOUNT_SIGN_IN_REQUIRED: 'credential',
   ACCOUNT_TOKEN_INVALID: 'credential',
   // The DeepSeek account catalog refuses the member's model on this Harness
-  // release (0.2.x): only another model or another Harness release runs it.
+  // release: only another model or another Harness release runs it.
   MODEL_UNSUPPORTED: 'member',
   CLIENT_UPGRADE_REQUIRED: 'member',
 } as const satisfies Readonly<Record<string, ProviderOutageClass | 'member'>>
