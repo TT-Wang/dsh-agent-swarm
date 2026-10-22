@@ -31,20 +31,21 @@ declare module '@deepseek-ai/dsh-llm' {
 declare module '@deepseek-ai/dsh-session/types' {
   interface SessionEventMap {
     /**
-     * A session's effective working directory: the durable state of the 0.2.x
+     * A session's effective working directory: the durable state of the
      * `workingDirectory` service (`@deepseek-ai/dsh-working-directory`), whose
-     * projection replays the last one. Declared here because 0.1.x hosts have
-     * no such service; this adapter writes it only where the host provides one.
+     * projection replays the last one. The service's package declares the
+     * event; this plugin reads the service as an optional one, takes no
+     * dependency on the package, and so declares the one event it writes.
      */
     'working-directory/change': { cwd: string }
   }
 }
 
 /**
- * The `agentPresets` service, declared structurally: 0.1.5 provides it from
- * `@deepseek-ai/dsh-agent-presets`, 0.1.7 and 0.2.x from
- * `@deepseek-ai/dsh-agent-preset-registry`, with the same two methods this
- * adapter uses.
+ * The `agentPresets` service of `@deepseek-ai/dsh-agent-preset-registry`,
+ * declared structurally with the two methods this adapter uses. Only the Web
+ * bundle mounts the registry, so the service is optional and the plugin takes
+ * no dependency on its package.
  */
 interface AgentPresets {
   composedPreset(agentCtx: Context): string | undefined
@@ -52,25 +53,35 @@ interface AgentPresets {
 }
 
 /**
- * The 0.2.x session working-directory service, declared structurally: 0.1.x
- * hosts have none. `get` reads what the session's projection replays: the last
- * recorded `working-directory/change`, else the session header's cwd.
+ * The session working-directory service, declared structurally (see the
+ * `working-directory/change` declaration above). `get` reads what the
+ * session's projection replays: the last recorded `working-directory/change`,
+ * else the session header's cwd, else the service's default directory.
  */
 interface WorkingDirectory {
   get(session: Session): string
 }
 
 /**
- * Re-anchor a worker session's working directory to its member worktree. Where
- * the host provides the working-directory service, the directory is durable
- * session state that bash, file tools and the model's directory context follow,
- * so a recorded change outlives its turn, a resume and the attempt. The anchor
- * is written as the host's own event, the way the service's `ensure()` records a
- * session's first directory and the way activation forces the sandbox and
- * approval policy. Not `set()`: it also queues a notice in the worker's inbox,
- * which this adapter holds as input and wakes as a model turn of its own
- * (R15-A5). The next request's required directory context names the worktree.
- * A session already there, and a host without the service, get no write.
+ * Re-anchor a worker session's working directory to its member worktree. The
+ * directory is durable session state of the working-directory service that
+ * bash, file tools and the model's directory context follow, so a recorded
+ * change outlives its turn, a resume and the attempt. The anchor is written as
+ * the service's own event, the way its `ensure()` records a session's first
+ * directory and the way activation forces the sandbox and approval policy. Not
+ * `set()`: it also queues a notice in the worker's inbox, which this adapter
+ * holds as input and wakes as a model turn of its own (R15-A5). The next
+ * request's required directory context names the worktree. A session already
+ * there gets no write.
+ *
+ * The service stays optional, read at each activation. Every shipped profile
+ * mounts it (`dsh-base`, under the acp, web, headless and sdk profiles, and
+ * `dsh-sdk-minimal`). Every host tool that reads or moves a session's
+ * directory (bash, pwsh, the file and search tools, `working_directory`,
+ * subagents) injects it, and `run_code` refuses an agent's call without it. A
+ * composition without it therefore records no directory and has no tool that
+ * could leave the worktree, so there is nothing to re-anchor, while an inject
+ * would hold the whole swarm runtime pending there.
  */
 function anchorWorkingDirectory(ctx: Context, agent: Agent, workspace: string): void {
   const directory = ctx.get('workingDirectory') as WorkingDirectory | undefined
@@ -109,7 +120,7 @@ export function installOwnerDeliveryFilter(ctx: Context, project: (sessionId: st
     const onlyStale = messages.length > 0 && messages.every(message => stale(agent, message))
     // A turn whose opening input all went stale has nothing to run. An emptied
     // opening spends no model call only while no listener outside this one adds
-    // to it, and the host's time context (mounted by the 0.2.x Web presets)
+    // to it, and the host's time context (mounted by the Web presets)
     // wraps every other listener and appends its reading to any decision it
     // gets back. A rejection it passes through: the loop then ends the turn
     // before any step, exactly as it ends an emptied opening, and drops the
@@ -847,7 +858,7 @@ export class HarnessWorkers implements WorkerAdapter {
         return undefined
       })
       agentCtx.on('session/event', (session, event) => {
-        // Retry events are an optional public session extension in every supported release.
+        // Retry events belong to the optional `@deepseek-ai/dsh-llm-retry` package, hence the structural read.
         const type: string = event.type
         const retryData: unknown = event.data
         if (type === 'llm/retry' && isRecord(retryData) && typeof retryData.delayMs === 'number' && Number.isSafeInteger(retryData.delayMs) && retryData.delayMs >= 0 && typeof retryData.retry === 'number') {
@@ -982,12 +993,13 @@ export class HarnessWorkers implements WorkerAdapter {
     })
   }
   /**
-   * The compaction engine this member's own composition uses. Every supported
-   * web profile disables the host-plane `compaction-basic` row and mounts it in
-   * each agent preset's isolated `compaction` realm, where `ctx.get` from this
-   * plugin cannot see it; the realm's public handle is the `/compact` command it
-   * registers for the agents on that preset. That command runs the engine's
-   * idle-only `compactNow` and reports an expected failure as an error result.
+   * The compaction engine this member's own composition uses. The Web bundle
+   * disables the host-plane `compaction-basic` row and each of its agent
+   * presets mounts the engine in its isolated `compaction` realm, where
+   * `ctx.get` from this plugin cannot see it; the realm's public handle is the
+   * `/compact` command it registers for the agents on that preset. That
+   * command runs the engine's idle-only `compactNow` and reports an expected
+   * failure as an error result.
    * A composition that mounts the engine on the host plane without the command
    * is reached through the service. Resolves to a refusal text, or undefined.
    */
