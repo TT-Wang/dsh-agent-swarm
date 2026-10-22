@@ -104,6 +104,13 @@ export interface ProviderOutage {
 }
 /** The last classified outage observed for a member, used to avoid spending recovery credit. */
 export interface MemberProviderOutage extends ProviderOutage { at: number }
+/**
+ * A model step the member's own route refused (`PROVIDER_FAILURE_CODES` class
+ * `member` in `scheduler.ts`): the Harness failure code and the host's text. A
+ * member's route is fixed for its session, so no wait, retry or recovery of
+ * that member runs it again.
+ */
+export interface MemberRouteRefusal { code: string; message: string }
 /** The route fields one member admission names; each one it omits is inherited from the owner's conversation. */
 export type MemberRouteInput = Pick<PlanMember, 'provider' | 'model' | 'reasoningEffort'>
 /**
@@ -1115,6 +1122,12 @@ export interface WorkerCallbacks {
    * attempt alive and never spends recovery credit on the pause.
    */
   providerOutage(memberId: string, outage: ProviderOutage): void
+  /**
+   * A model step the member's own route refused (`MemberRouteRefusal`). The
+   * adapter classifies, and this is the error's one report (never also a
+   * `failure`); the runtime retires the member and releases its work.
+   */
+  routeRefused(memberId: string, refusal: MemberRouteRefusal): void
 }
 /** One declared check `/bin/sh` could not parse: its position in the probed list and the parser's own diagnostic. */
 export interface CheckSyntaxIssue { index: number; message: string }

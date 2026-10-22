@@ -19,7 +19,7 @@ import { inspectDelivery, applyDelivery } from './delivery.js'
 import { memberRoutes, ownerModelSelection, workerRoute } from './model-selection.js'
 import { persistedSessionHeader } from './session-metadata.js'
 import { hiddenToolsFor, WORKER_PROMPT } from './tools.js'
-import { classifyProviderOutage } from './scheduler.js'
+import { classifyProviderOutage, memberRouteRefusal } from './scheduler.js'
 import type { Artifact, CheckEnvelope, CheckSyntaxIssue, Delivery, FinishedAttempt, Member, MemberRoute, MemberRouteInput, Mission, Task, UsageBuckets, WorkerAdapter, WorkerCallbacks, WorkerSpec, WorkerActivity } from './types.js'
 
 declare module '@deepseek-ai/dsh-llm' {
@@ -551,10 +551,15 @@ export class HarnessWorkers implements WorkerAdapter {
     if (this.closing) return
     // R11-01: classify at the boundary where the provider error is still
     // structured. A classified outage is the route's, not the member's failure,
-    // so it is reported as that outage alone; anything else is the failure.
+    // so it is reported as that outage alone; a refusal of the member's own
+    // route is reported as that refusal alone; anything else is the failure.
     const outage = classifyProviderOutage(error)
-    try { if (outage === undefined) this.observer().failure(memberId, errorText(error)); else this.observer().providerOutage(memberId, outage) }
-    catch (callbackError) { this.ctx.logger.error(`Swarm failure observer failed: ${errorText(callbackError)}`) }
+    const refusal = outage === undefined ? memberRouteRefusal(error) : undefined
+    try {
+      if (outage !== undefined) this.observer().providerOutage(memberId, outage)
+      else if (refusal !== undefined) this.observer().routeRefused(memberId, refusal)
+      else this.observer().failure(memberId, errorText(error))
+    } catch (callbackError) { this.ctx.logger.error(`Swarm failure observer failed: ${errorText(callbackError)}`) }
   }
   private observe(resident: Resident, operation: () => Promise<void>): void {
     if (this.closing) return

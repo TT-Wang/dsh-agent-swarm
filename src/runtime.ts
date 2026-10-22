@@ -8,7 +8,7 @@ export { WorkspaceRevokedError } from './authorization.ts'
 import { recordedClaim, type WorkspaceClaim } from './authorization.ts'
 import { WorkspaceAdmission, deniedGitWrite, gitWriteDeniedMessage, TEMP_RENDEZVOUS_WINDOW_MS } from './workspace-admission.ts'
 import { Notices, NOTICE_TEMPLATES, REJECTION_DECISION_TRIGGER, assignmentCurrent, guardTerminalNotice, integrationGap, renderNotice, reviewBlocked } from './notices.ts'
-import { RefusalRegistry, requireStrings, requireText, sameChecks, unsupportedEffort, validatedBudget } from './refusals.ts'
+import { RefusalRegistry, requireStrings, requireText, sameChecks, validatedBudget } from './refusals.ts'
 import { Scheduling } from './scheduling.ts'
 import { progressed, type Kernel } from './kernel.ts'
 import { ADMISSION_REFUSED, AUTOMATIC_REVIEW_PREFIX, bounds, capable, completionError, fingerprintBoard, inFlightEstimate, missionFingerprint, noticeSubjectsFor, readBoard, readinessBlocker, readMission, ready, rerouteTarget, reviewable, reviewNeed, reviewPathBlocker, reviewPathStalled, stillChosen, unreviewedSources, unschedulable, type AdapterView, type Board, type Bounds, type ReviewNeed, type SchedulingPass } from './board.ts'
@@ -29,7 +29,7 @@ import { canBorrowTask, canOwnReview, strandedReview } from './assignment.ts'
 import { executionClock, executionElapsed, exhaustedDimensions } from './resource-time.ts'
 import { TERMINAL_STATES, blockCauses, currentEvidenceIds, finishedAttempt, holdsAttempt, holdsOpenAttempt, memberTask, missionSubject, openAttempt, pendingStopOwner, quiescencePending, selectAcceptedDelivery, stopPending, subjectsOfTasks, taskEdges, taskGraphIndex, taskSubject, terminal, uncoveredCriteria, type BlockCause, type HeldTask } from './task-graph.ts'
 import { checkSyntaxDetail, declaredPlanChecks, orderedTasks, pairReviews, planAdvisories, validatePlan } from './plans.ts'
-import { OWNER_ONLY_TOOLS, UNCONFINED_HOST_TOOLS, type Actor, type AutoStart, BoardQuery, Budget, CheckAttribution, CreateMissionInput, CriticalPath, criterionId, Delivery, DraftPlan, Escalation, Evidence, EvidenceStatus, Member, Mission, nextWorkerName, ObserveQuery, MessageInput, PlanInput, Post, PostInput, PostKind, PROVIDER_OUTAGE_WINDOW_MS, ProposeTaskInput, ProviderOutage, providerQuiescent, PublishInput, RecoveryFallback, RequestStartInput, RuntimeConfig, Snapshot, Task, TaskAmendment, TaskRejection, TaskCeiling, ToolRun, VerificationCleanupFailure, WorkerAdapter, WorkerActivity, Workstream } from './types.ts'
+import { OWNER_ONLY_TOOLS, UNCONFINED_HOST_TOOLS, type Actor, type AutoStart, BoardQuery, Budget, CheckAttribution, CreateMissionInput, CriticalPath, criterionId, Delivery, DraftPlan, Escalation, Evidence, EvidenceStatus, Member, Mission, nextWorkerName, ObserveQuery, MessageInput, PlanInput, Post, PostInput, PostKind, PROVIDER_OUTAGE_WINDOW_MS, MemberRouteRefusal, ProposeTaskInput, ProviderOutage, providerQuiescent, PublishInput, RecoveryFallback, RequestStartInput, RuntimeConfig, Snapshot, Task, TaskAmendment, TaskRejection, TaskCeiling, ToolRun, VerificationCleanupFailure, WorkerAdapter, WorkerActivity, Workstream } from './types.ts'
 import { requireArtifactChecks } from './artifact-policy.ts'
 
 /** Release a prelaunch caller even when an adapter ignores cancellation. Its late writes remain fenced. */
@@ -283,6 +283,7 @@ export class SwarmRuntime implements Kernel {
       guard: (memberId, tool) => this.guard(memberId, tool),
       failure: (memberId, error) => this.onFailure(memberId, error),
       providerOutage: (memberId, outage) => this.onProviderOutage(memberId, outage),
+      routeRefused: (memberId, refusal) => this.onRouteRefused(memberId, refusal),
       recoveryFallback: info => this.onRecoveryFallback(info),
       verificationCleanupFailure: info => this.onVerificationCleanupFailure(info),
     })
@@ -3528,19 +3529,59 @@ export class SwarmRuntime implements Kernel {
     if (this.closed || this.shuttingDown) return
     const member = this.store.get('members', memberId)
     if (!member) return
-    // W8: a rejected reasoning effort also surfaces asynchronously on the first
-    // worker request. Keep the durable event shape, but wake the owner with the
-    // supported exit instead of the raw provider text.
-    const rejection = unsupportedEffort(error)
-    const message = rejection !== undefined && member.reasoningEffort !== undefined
-      ? `${member.name} cannot run: ${rejection.message}. Its route is fixed for this session; admit a replacement member without reasoningEffort (or with an effort this provider/model supports) and reassign its work.`
-      : `${member.name} failed: ${error}`
     this.commit(member.missionId, () => {
       this.store.event(member.missionId, 'member/failure', memberId, { error })
       // R15-A1: it names the member's unfinished work, else the mission root. The fact
       // is the member on that work; the provider's text (per-request data) is the body.
-      this.notices.notify(member.missionId, message, noticeSubjectsFor(this.boardOf(member.missionId), { memberId: member.id }), { trigger: 'member/failure', reason: member.id })
+      this.notices.notify(member.missionId, `${member.name} failed: ${error}`, noticeSubjectsFor(this.boardOf(member.missionId), { memberId: member.id }), { trigger: 'member/failure', reason: member.id })
     })
+  }
+  /**
+   * W8 at a step: the member's own route refused it (`MemberRouteRefusal`: a
+   * model, or a reasoning effort, the route no longer takes). Admission refuses
+   * a route the host does not take (`admitMemberRoutes`), so this is a route
+   * that changed after the member was admitted. A member's route is fixed for
+   * its session, so no wait, retry or recovery of it can run again: the member
+   * is retired at the first refusal, which is therefore reported once. Each
+   * attempt it holds is fenced and, once its handle has stopped and its
+   * workspace is checkpointed, re-pended with its recovery allowance intact;
+   * unpinned work is released to capable live members, and pinned work waits
+   * for the owner to move it. The owner is told once, with the exits. The
+   * host's text stays in the durable event; the notice names the route the
+   * member row holds.
+   */
+  private onRouteRefused(memberId: string, refusal: MemberRouteRefusal): void {
+    if (this.closed || this.shuttingDown) return
+    const member = this.store.get('members', memberId)
+    if (member === undefined || memberPhaseOf(member) === 'stopped') return
+    const missionId = member.missionId
+    const mission = this.store.get('missions', missionId)
+    if (mission === undefined || terminal(mission)) return
+    const fenced: Task[] = [], pinned: Task[] = [], released: Task[] = []
+    // R15-A1: the fact is the member on the work it held, read before it is released.
+    const subjects = noticeSubjectsFor(this.boardOf(missionId), { memberId })
+    member.phase = 'stopped'
+    delete member.activity
+    this.commit(missionId, () => {
+      this.store.put('members', member)
+      this.store.event(missionId, 'member/route-refused', 'runtime', { memberId, code: refusal.code, error: refusal.message })
+      for (const task of this.store.list('tasks', missionId)) {
+        const holds = holdsOpenAttempt(task) && task.attempt.ownerId === memberId
+        if (!holds && !(task.status === 'pending' && task.assigneeId === memberId)) continue
+        if (task.assignmentMode === 'pinned') pinned.push(task)
+        else { delete task.assigneeId; released.push(task) }
+        if (holds) { this.attempts.fenceForStop(task, { status: 'blocked', reason: 'handoff', cause: 'member-route-refused' }); fenced.push(task) }
+        this.store.put('tasks', task)
+      }
+      const route = [member.provider === undefined ? undefined : `provider ${JSON.stringify(member.provider)}`, member.model === undefined ? undefined : `model ${JSON.stringify(member.model)}`,
+        member.reasoningEffort === undefined ? undefined : `reasoning effort ${JSON.stringify(member.reasoningEffort)}`].filter(Boolean).join(' ') || 'the route inherited from the owner conversation'
+      const named = (tasks: Task[]) => tasks.map(task => `${task.id} (${task.title})`).join(', ')
+      this.notices.notify(missionId, `[member_route_refused] ${member.name} (${member.id}) was stopped: its route (${route}) refused a model step with ${refusal.code}, and a member's route is fixed for its session, so it cannot run again. ${released.length ? `Its unpinned work returns to the board for a capable live member: ${named(released)}. ` : ''}${pinned.length ? `Its pinned work waits for a new assignee: ${named(pinned)}; move it with \`swarm_control\` using \`taskId\`, \`action: "amend"\` and \`changes.assigneeId\`. ` : ''}Admit a replacement with \`swarm_add_member\` on a route that takes it: admission names the \`reasoningEffort\` values a route accepts.`,
+        subjects, { trigger: 'member/route-refused', reason: memberId })
+    })
+    for (const task of fenced) this.attempts.resumeStoppedAttempt(missionId, task)
+    if (fenced.length === 0) this.defer(() => this.workers.stop(memberId))
+    this.kick(missionId)
   }
   /**
    * H-3: a cross-owner recovery could not capture the previous owner's workspace

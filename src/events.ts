@@ -117,6 +117,7 @@ export const EVENTS = {
   // (`admitMemberRoutes`, src/runtime.ts) and nothing starts on it.
   'member/effort-downgraded': { description: 'Provider rejected the requested reasoning effort; the member runs without it', panel: { en: 'Worker reasoning effort downgraded', zh: '成员的推理强度已降级' }, historical: true },
   'member/effort-rejected': { description: 'Provider rejected the effort retry; admission failed and the member was stopped', panel: { omit: 'paired with member/failed (Worker could not start)' }, historical: true },
+  'member/route-refused': { description: 'The member\'s own route refused a model step (a model or reasoning effort it no longer takes); the member was retired and its work released', panel: { en: 'Worker stopped: its model route refused it', zh: '成员已停止：其模型路由拒绝执行' } },
   'task/check-changed': { description: 'A replaced or re-submitted task declared a different check than the stored record', panel: { en: 'A declared check changed', zh: '声明的检查已变更' } },
   'task/closeout-ready': { description: 'Idle close-out re-pended the task after a checkpoint instead of abandoning it', panel: { en: 'Task ready to close out', zh: '子任务可以收尾' } },
   'task/closeout-exhausted': { description: 'Idle close-out reached the recovery limit and left the task blocked', panel: { en: 'Task close-out limit reached', zh: '子任务收尾次数已达上限' } },

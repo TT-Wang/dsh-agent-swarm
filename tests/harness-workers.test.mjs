@@ -157,7 +157,7 @@ async function fixture(t, responder = () => ({ kind: 'text', text: 'done' }), co
     await workerOwnerScope
   }
   adapter = new HarnessWorkers(adapterContext, options)
-  const observations = { idle: [], steps: [], usage: [], tools: [], failures: [], activities: [] }
+  const observations = { idle: [], steps: [], usage: [], tools: [], failures: [], refusals: [], activities: [] }
   const callbacks = {
     idle: id => { observations.idle.push(id) },
     activity: (id, activity) => { observations.activities.push({ id, activity }) },
@@ -166,6 +166,7 @@ async function fixture(t, responder = () => ({ kind: 'text', text: 'done' }), co
     toolRun: async (id, run) => { observations.tools.push({ id, run }) },
     guard: () => undefined,
     failure: (id, error) => { observations.failures.push({ id, error }) },
+    routeRefused: (id, refusal) => { observations.refusals.push({ id, refusal }) },
   }
   adapter.bind(callbacks)
   const mission = { id: 'mission-test', workspace: source, objective: 'Test durable collaboration', ...config.mission }
@@ -553,28 +554,31 @@ test('a provider error the adapter classifies as an outage is reported as that o
   assert.deepEqual(f.observations.failures, [], 'the outage is not reported a second time as a member failure')
 })
 
-// The DeepSeek account route's codes, raised inside a worker turn: the agent
-// loop rebuilds the provider failure, and its code still decides whether the
-// route or the member failed.
+// The DeepSeek account route's codes, and the host's refusal of a reasoning
+// effort, raised inside a worker turn: the agent loop rebuilds the provider
+// failure, and its code still decides whether the route is out, the member's
+// own route refused it, or the member failed.
 for (const [error, expected] of [
   [new LlmError('Your DeepSeek account tokens are used up for this period.', 'ACCOUNT_QUOTA'), { outage: ['quota', undefined] }],
   [new LlmError('Sign in to DeepSeek to use the account provider. The request destination must allow account authentication.', 'ACCOUNT_SIGN_IN_REQUIRED'), { outage: ['credential', undefined] }],
   [new LlmError('Authentication Fails', 'ACCOUNT_TOKEN_INVALID', { status: 401 }), { outage: ['credential', 401] }],
-  [new LlmError('DeepSeek model "scripted" is not supported by DeepSeek Harness; current version is 0.2.1-rc.2', 'MODEL_UNSUPPORTED'), { failure: /not supported by DeepSeek Harness/ }],
-]) test(`a worker turn that fails with ${error.code} is reported as ${expected.outage === undefined ? 'the member\'s failure' : `a ${expected.outage[0]} outage of its route`}`, async t => {
+  [new LlmError('DeepSeek model "scripted" is not supported by DeepSeek Harness; current version is 0.2.1-rc.2', 'MODEL_UNSUPPORTED'), { refusal: /not supported by DeepSeek Harness/ }],
+  [new LlmError('provider "swarm-test" model "scripted" does not support reasoning effort "low"', 'UNSUPPORTED_REASONING_EFFORT'), { refusal: /does not support reasoning effort "low"/ }],
+]) test(`a worker turn that fails with ${error.code} is reported as ${expected.outage === undefined ? 'a refusal of the member\'s own route' : `a ${expected.outage[0]} outage of its route`}`, async t => {
   const f = await fixture(t, () => { throw error })
   const outages = []
   f.callbacks.providerOutage = (id, outage) => { outages.push({ id, outage }) }
   await f.adapter.deliver(f.member, message(f.member))
   await f.ctx.agents.get(SessionId(f.member.sessionId)).whenIdle()
   assert.equal(f.requests.length, 1)
+  assert.deepEqual(f.observations.failures, [], 'a classified failure is reported once, as its class')
   if (expected.outage !== undefined) {
     assert.deepEqual(outages.map(({ id, outage }) => [id, outage.class, outage.status]), [['worker-test', ...expected.outage]])
-    assert.deepEqual(f.observations.failures, [])
+    assert.deepEqual(f.observations.refusals, [])
   } else {
-    assert.deepEqual(outages, [], 'no route is paused for a refusal of the member\'s own model')
-    assert.equal(f.observations.failures.length, 1)
-    assert.match(f.observations.failures[0].error, expected.failure)
+    assert.deepEqual(outages, [], 'no route is paused for a refusal of the member\'s own route')
+    assert.deepEqual(f.observations.refusals.map(({ id, refusal }) => [id, refusal.code]), [['worker-test', error.code]])
+    assert.match(f.observations.refusals[0].refusal.message, expected.refusal)
   }
 })
 

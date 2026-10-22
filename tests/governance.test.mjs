@@ -1,5 +1,5 @@
 /**
- * T2 governance regressions: W8 member route admission, the owner's authority
+ * T2 governance regressions: W8 member route admission and step refusal, the owner's authority
  * to withdraw submitted work (D9), the cancel-during-submit message (F6),
  * deterministic-id re-admission of a cancelled task (F7) and the budget-warning
  * suggested limit (F11). Only the external execution adapter is replaced; store,
@@ -119,6 +119,43 @@ test('W8: a launch names every member whose route refuses it, in one refusal bef
   const snapshot = await f.runtime.startPlan(f.owner, 'start_w8', plan(['off', 'high']))
   assert.equal(snapshot.mission.status, 'active')
   assert.deepEqual(snapshot.members.map(member => member.reasoningEffort), ['off', 'high'])
+})
+
+test('W8 at a step: a refusal by the member\'s own route retires it once, releases its work and tells the owner the exits', async t => {
+  const f = await setup(t)
+  const ada = await f.addMember({ name: 'Ada', role: 'implementation', provider: 'deepseek-official', model: 'flash', reasoningEffort: 'high' })
+  const alan = await f.addMember({ name: 'Alan', role: 'implementation' })
+  const running = f.propose(f.owner, { title: 'Running', assigneeId: ada.id })
+  const claimed = await f.runtime.claim({ sessionId: ada.sessionId }, f.mission.id, running.id)
+  const pinned = f.propose(f.owner, { title: 'Pinned', assigneeId: ada.id, assignmentMode: 'pinned' })
+  // The route changed after admission: the host now refuses Ada's effort at her next step.
+  const refusal = { code: 'UNSUPPORTED_REASONING_EFFORT', message: 'provider "deepseek-official" model "flash" does not support reasoning effort "high"' }
+  f.workers.callbacks.routeRefused(ada.id, refusal)
+  const member = id => f.runtime.snapshot(f.owner, f.mission.id).members.find(item => item.id === id)
+  const task = id => f.runtime.snapshot(f.owner, f.mission.id).tasks.find(item => item.id === id)
+  assert.equal(member(ada.id).status, 'stopped', 'the member is retired at the first refusal')
+  assert.deepEqual(f.events('member/route-refused').map(event => event.data), [{ memberId: ada.id, code: refusal.code, error: refusal.message }])
+  assert.equal(task(running.id).attempt, undefined, 'the attempt it held is fenced')
+  // Once the handle has stopped, the unpinned work is pending for any capable live member, its allowance intact.
+  const released = await eventually(() => { const current = task(running.id); return current.status === 'pending' ? current : undefined }, 'the fenced task is re-pended')
+  assert.equal(released.assigneeId, undefined)
+  assert.equal(released.recoveryCount ?? 0, 0, 'no recovery credit is spent on the route')
+  assert.ok(f.workers.stopped.includes(ada.id), 'the handle is stopped')
+  assert.equal(task(pinned.id).assigneeId, ada.id, 'pinned work waits for the owner')
+  const notices = f.ownerNotices().filter(content => content.startsWith('[member_route_refused]'))
+  assert.equal(notices.length, 1)
+  assert.match(notices[0], new RegExp(`^\\[member_route_refused\\] Ada \\(${ada.id}\\) was stopped: its route \\(provider "deepseek-official" model "flash" reasoning effort "high"\\) refused a model step with UNSUPPORTED_REASONING_EFFORT`))
+  assert.ok(notices[0].includes(`Its unpinned work returns to the board for a capable live member: ${running.id} (Running).`))
+  assert.ok(notices[0].includes(`Its pinned work waits for a new assignee: ${pinned.id} (Pinned)`))
+  assert.match(notices[0], /Admit a replacement with `swarm_add_member`/)
+  assert.doesNotMatch(notices[0], /does not support/, 'the host\'s text stays in the durable event')
+  // A later refusal of the retired member is not reported again, and the old attempt is gone.
+  f.workers.callbacks.routeRefused(ada.id, refusal)
+  assert.equal(f.events('member/route-refused').length, 1)
+  await assert.rejects(f.runtime.submit({ sessionId: ada.sessionId }, f.mission.id, { taskId: running.id, attemptId: claimed.attempt.id, output: 'late' }))
+  // The released work runs on another member.
+  const next = await f.runtime.claim({ sessionId: alan.sessionId }, f.mission.id, running.id)
+  assert.equal(next.attempt.ownerId, alan.id)
 })
 
 test('a mission duration beyond the clock range is one validation_error at create and at budget update', async t => {
