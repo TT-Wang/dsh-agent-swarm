@@ -778,10 +778,11 @@ export class HarnessWorkers implements WorkerAdapter {
       // Shadow the deployment persona's prefix and suffix so workers retain only
       // their own role, including after resuming an older composition. The
       // persona is free text (the member's name and role, the mission objective,
-      // the scratch path), and the host interpolates section text strictly: a
-      // `{{...}}` in it would name a malformed or unknown variable and fail
-      // prompt assembly for every request of this worker. Its section is
-      // literal, so the text reaches the model as written.
+      // the scratch path). In a section the host interpolates, a malformed or
+      // unknown reference in it (`{{Not A Name}}`, `{{cwd}}`) would fail prompt
+      // assembly for every request of this worker, and a registered one
+      // (`{{model}}`, `{{provider}}`) would be silently substituted. Its section
+      // is literal, so the text reaches the model as written.
       agentCtx.systemPrompt.section({ name: PERSONA_PREFIX_SECTION, order: agentCtx.systemPrompt.getSectionOrder('DEPLOYMENT_PERSONA_PREFIX'), text: composition.persona, interpolate: false })
       agentCtx.systemPrompt.section({ name: PERSONA_SUFFIX_SECTION, order: agentCtx.systemPrompt.getSectionOrder('DEPLOYMENT_PERSONA_SUFFIX'), text: '' })
       // Source metadata is preserved in the host log, but provider serializers
