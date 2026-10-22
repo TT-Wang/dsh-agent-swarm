@@ -381,6 +381,8 @@ test('cold worker history paginates native events, renders inert tool results, a
   const toolMessage = isError => ({ event: { seq: 9, type: 'tool/result', data: { message: { role: 'tool', toolCallId: 'call-9', isError, content: [{ type: 'text', text: 'output' }] } } } })
   assert.deepEqual(transcriptEntry(toolMessage(true)), { role: 'Tool error', text: 'output' }, 'a tool-role failure is labelled correctly')
   assert.deepEqual(transcriptEntry(toolMessage(false)), { role: 'Tool result', text: 'output' })
+  const withImage = { event: { seq: 10, type: 'user/message', data: { role: 'user', content: [{ type: 'text', text: 'See the screenshot' }, { type: 'image', attachment: { id: 'attachment-1' } }] } } }
+  assert.deepEqual(transcriptEntry(withImage), { role: 'Input', text: 'See the screenshot\n[image]' }, 'each block of the flat content list is read in order')
   history.open('worker-b', 'Reviewer')
   history.close()
   pending[2]({ events: [{ event: { seq: 1, type: 'user/message', data: { content: 'late' } } }], hasMore: false })
