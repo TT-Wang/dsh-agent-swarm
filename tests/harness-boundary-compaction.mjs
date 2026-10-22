@@ -22,7 +22,7 @@ import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { promisify } from 'node:util'
-import { bootHarness, harnessEntry, importHarness, toolResultBlocks } from './fixtures/built-harness.mjs'
+import { bootHarness, harnessEntry, importHarness } from './fixtures/built-harness.mjs'
 import { requests, setResponder } from './fixtures/scripted-llm.mjs'
 
 const execute = promisify(execFile)
@@ -82,7 +82,7 @@ setResponder(options => {
       return { kind: 'tool', name: 'swarm_observe', args: { missionId: source.missionId }, usage }
     }
     if (script.stage === 'done') return { kind: 'text', text: 'Unit finished; waiting for new work.', usage }
-    const view = toolResultBlocks(options.messages).map(block => { try { return JSON.parse(texts(block).join('\n')).result } catch { return undefined } })
+    const view = options.messages.filter(message => message.role === 'tool').map(result => { try { return JSON.parse(texts(result).join('\n')).result } catch { return undefined } })
       .findLast(result => result?.current?.task !== undefined)
     const task = view?.current?.task
     assert(task?.status === 'running', 'the assignment must lead to a model-visible observation of the running task')
@@ -119,7 +119,7 @@ async function ownerCall(name, args) {
   ownerHandle.agent.followup(createUserMessage({ content: [{ type: 'text', text: `SMOKE_OWNER ${++commandCounter} ${JSON.stringify({ name, args })}` }], source: { kind: 'user' } }))
   await ownerHandle.agent.whenIdle()
   if (failures.length) throw failures[0]
-  const result = ownerHandle.agent.session.snapshotEvents().slice(firstSeq).filter(event => event.type === 'tool/result').flatMap(event => toolResultBlocks([event.data.message]))[0]
+  const result = ownerHandle.agent.session.snapshotEvents().slice(firstSeq).filter(event => event.type === 'tool/result').map(event => event.data.message)[0]
   assert(result && !result.isError, `${name} failed: ${result && texts(result).join('\n')}`)
   return JSON.parse(texts(result).join('\n')).result
 }

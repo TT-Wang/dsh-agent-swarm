@@ -7,7 +7,7 @@ import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { parseEnv, promisify } from 'node:util'
-import { bootHarness, importHarness, toolResultBlocks } from '../tests/fixtures/built-harness.mjs'
+import { bootHarness, importHarness } from '../tests/fixtures/built-harness.mjs'
 
 const execute = promisify(execFile)
 const project = fileURLToPath(new URL('../', import.meta.url))
@@ -89,11 +89,10 @@ try {
     })
     if (event.type === 'assistant/message' && event.data.usage) usage.push({ sessionId, ...event.data.usage })
     if (event.type === 'tool/result') {
-      for (const block of toolResultBlocks([event.data.message])) {
-        const call = calls.find(call => call.sessionId === sessionId && call.callId === block.toolCallId)
-        toolResults.push({ sessionId, name: call?.name, callId: block.toolCallId, isError: Boolean(block.isError) })
-        if (block.isError) toolErrors.push({ sessionId, name: call?.name, detail: redact(JSON.stringify(block)).slice(0, 1200) })
-      }
+      const { message } = event.data
+      const call = calls.find(call => call.sessionId === sessionId && call.callId === message.toolCallId)
+      toolResults.push({ sessionId, name: call?.name, callId: message.toolCallId, isError: Boolean(message.isError) })
+      if (message.isError) toolErrors.push({ sessionId, name: call?.name, detail: redact(JSON.stringify(message)).slice(0, 1200) })
     }
     if (event.type.includes('error') || event.type.includes('failed')) modelErrors.push({ sessionId, type: event.type, detail: redact(JSON.stringify(event.data)).slice(0, 800) })
   })

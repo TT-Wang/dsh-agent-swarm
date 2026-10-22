@@ -24,7 +24,7 @@ import { UNCONFINED_HOST_TOOLS } from '../lib/types.js'
 import { runProcess } from '../lib/workspaces.js'
 import { subprocessSeam, SubprocessLocal } from './subprocess-seam.mjs'
 import { eventually, makeRuntime } from './faults/harness.mjs'
-import { loaderPlugin, toolResultBlocks } from './fixtures/built-harness.mjs'
+import { loaderPlugin } from './fixtures/built-harness.mjs'
 import { hostPackage } from './fixtures/host-packages.mjs'
 
 const JsonlPersistence = loaderPlugin(JsonlPersistenceModule)
@@ -1070,7 +1070,7 @@ test('a worker neither sees nor runs the host tools that would move it out of it
   }
   const results = worker.session.snapshotEvents().filter(event => event.type === 'tool/result')
   assert.equal(results.length, attempts.length)
-  assert.ok(results.every(event => toolResultBlocks([event.data.message]).every(block => block.isError)), 'every call failed without running')
+  assert.ok(results.every(event => event.data.message.isError === true), 'every call failed without running')
   assert.deepEqual(reached, [], 'no call reached the service behind the tool')
   if (directory !== undefined) {
     assert.equal(directory.get(worker.session), f.member.workspace, 'the session directory is still the member worktree')

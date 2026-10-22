@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { access, appendFile } from 'node:fs/promises'
-import { importHarness, toolResultBlocks } from './built-harness.mjs'
+import { importHarness } from './built-harness.mjs'
 
 export const name = 'swarm-web-scripted-llm'
 export const inject = ['llm']
@@ -67,8 +67,9 @@ export async function apply(ctx, config) {
   let nextCall = 0
   const trace = entry => appendFile(config.tracePath, JSON.stringify(entry) + '\n')
   const texts = message => message.content.filter(block => block.type === 'text').map(block => block.text)
-  const blocks = toolResultBlocks
-  const resultBody = block => JSON.parse(texts(block).join('\n'))
+  /** The tool-role messages of a message list: each answers one call and carries its own error flag. */
+  const toolResults = messages => messages.filter(message => message.role === 'tool')
+  const resultBody = result => JSON.parse(texts(result).join('\n'))
   const tool = (name, args) => ({ kind: 'tool', name, args })
   const answer = text => ({ kind: 'text', text })
   async function released(signal, path = config.releasePath) {
@@ -90,7 +91,7 @@ export async function apply(ctx, config) {
 
   /** The user asks in the composer; the owner stages the draft once, then acknowledges. */
   async function stagingOwner(options) {
-    const lastResult = blocks(options.messages).at(-1)
+    const lastResult = toolResults(options.messages).at(-1)
     if (lastResult?.isError) return toolFailure(options, lastResult)
     const ownerPrompt = options.messages.flatMap(texts).findLast(text => text.startsWith('Prepare a staged swarm for browser validation.'))
     if (!ownerPrompt) return answer('The real web model loop is connected.')
@@ -107,7 +108,7 @@ export async function apply(ctx, config) {
 
   /** /agent-swarm delivers a durable start; the owner plans it once and launches it. */
   async function commandOwner(options) {
-    const lastResult = blocks(options.messages).at(-1)
+    const lastResult = toolResults(options.messages).at(-1)
     const startMessage = options.messages.findLast(message => message.source?.kind === 'swarm-start')
     if (!startMessage) return answer('The actual web model loop is connected.')
     const requestId = startMessage.source.requestId
@@ -179,13 +180,13 @@ export async function apply(ctx, config) {
     assert.deepEqual(assignment.task.acceptance, [...acceptance, ...ownAcceptance])
     assert.equal(assignment.task.covers, undefined)
     const key = `${options.sessionId}:${assignment.task.attempt.id}`
-    const previous = blocks(options.messages).at(-1)
+    const previous = toolResults(options.messages).at(-1)
     if (previous?.isError) return toolFailure(options, previous)
     let script = scripts.get(key)
     if (!script) { script = { stage: 'work' }; scripts.set(key, script); return tool('swarm_observe', { missionId: assignment.missionId }) }
     if (script.stage === 'done') return answer('Assignment finished; awaiting further work.')
-    const observations = blocks(options.messages).map(block => {
-      try { return resultBody(block) } catch { return undefined }
+    const observations = toolResults(options.messages).map(result => {
+      try { return resultBody(result) } catch { return undefined }
     }).filter(body => body?.result?.member !== undefined || body?.result?.delta === true)
     assert(observations.length > 0, 'worker must see its focused task view through swarm_observe')
     const observation = mergeObservationWindows(observations)

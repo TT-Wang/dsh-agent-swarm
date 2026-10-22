@@ -8,7 +8,7 @@ import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { parseEnv, promisify } from 'node:util'
-import { bootHarness, harnessEntry, importHarness, toolResultBlocks } from '../tests/fixtures/built-harness.mjs'
+import { bootHarness, harnessEntry, importHarness } from '../tests/fixtures/built-harness.mjs'
 
 const execute = promisify(execFile)
 const project = fileURLToPath(new URL('../', import.meta.url))
@@ -31,7 +31,7 @@ const apiKey = process.env.DEEPSEEK_API_KEY || configured.DEEPSEEK_API_KEY
 assert(apiKey, 'DEEPSEEK_API_KEY is absent; export it or use --env with its existing Harness environment file')
 const baseURL = process.env.DEEPSEEK_BASE_URL || configured.DEEPSEEK_BASE_URL
 const redact = value => String(value).split(apiKey).join('[REDACTED]').replace(/sk-[A-Za-z0-9_-]+/g, '[REDACTED]')
-const textContent = content => Array.isArray(content) ? content.flatMap(block => block.type === 'text' ? [block.text] : block.content ? [textContent(block.content)] : []).join('\n') : ''
+const textContent = content => content.filter(block => block.type === 'text').map(block => block.text).join('\n')
 const usageTotal = usage => usage.inputTokens + usage.outputTokens + (usage.cacheReadTokens ?? 0) + (usage.cacheWriteTokens ?? 0)
 // Do not serialize arbitrary provider error fields: they may contain request headers.
 function errorDetails(error, depth = 0) {
@@ -147,10 +147,11 @@ try {
       }
     }
     if (['command/run', 'command/done', 'turn/start', 'turn/end', 'step/start', 'step/end'].includes(event.type)) lifecycle.push({ sessionId, seq: event.seq, type: event.type, data: event.data, phase: disposing ? 'cleanup' : 'execution', atMs: Date.now() - started })
-    if (event.type === 'tool/result') for (const block of toolResultBlocks([event.data.message])) {
-      const call = calls.find(item => item.sessionId === sessionId && item.callId === block.toolCallId)
-      const resultText = redact(textContent(block.content))
-      toolResults.push({ sessionId, seq: event.seq, name: call?.name, callId: block.toolCallId, isError: Boolean(block.isError), text: resultText.slice(0, 16000), textCharacters: resultText.length, reportTextTruncated: resultText.length > 16000 })
+    if (event.type === 'tool/result') {
+      const { message } = event.data
+      const call = calls.find(item => item.sessionId === sessionId && item.callId === message.toolCallId)
+      const resultText = redact(textContent(message.content))
+      toolResults.push({ sessionId, seq: event.seq, name: call?.name, callId: message.toolCallId, isError: Boolean(message.isError), text: resultText.slice(0, 16000), textCharacters: resultText.length, reportTextTruncated: resultText.length > 16000 })
     }
   })
   ctx.on('agent/error', ({ agent, error }) => modelErrors.push({ sessionId: agent.id, error: redact(error instanceof Error ? error.message : error), details: errorDetails(error), phase: disposing ? 'cleanup' : 'execution', atMs: Date.now() - started, activeStep: stepDiagnostic(agent.id) }))
