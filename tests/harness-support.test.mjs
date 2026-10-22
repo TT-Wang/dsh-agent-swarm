@@ -87,19 +87,32 @@ test('update-preview refuses an unsupported Harness before building, and proceed
   assert.match(allowed.stdout, /preflighting composed profile/)
 })
 
-test('update-preview boots a preview\'s rebuilt host packages only on the release they were rebuilt from', async t => {
+test('update-preview boots a plugin snapshot only on the release whose Harness SDK it links', async t => {
   const s = scene(t)
   const preview = join(s.root, 'preview')
-  // The 0.1.x command-input correction ships as a rebuilt ui-conversation in <preview>/compat.
-  mkdirSync(join(preview, 'compat/ui-conversation'), { recursive: true })
-  writeFileSync(join(preview, 'compat/compat-build-report.json'), '{}')
-  const argv = [join(project, 'scripts/update-preview.mjs'), '--preview', preview, '--harness', s.harness, '--allow-unsupported-harness', '--no-sync', '--skip-build', '--dry-run', '--port', '6199']
-  writeFileSync(join(preview, 'compat/ui-conversation/package.json'), JSON.stringify({ name: '@deepseek-ai/dsh-client-ui-conversation', version: '0.1.7-rc.1' }))
+  const plugin = join(preview, 'plugin')
+  mkdirSync(join(plugin, 'node_modules/@deepseek-ai'), { recursive: true })
+  writeFileSync(join(plugin, 'package.json'), JSON.stringify({ name: 'dsh-external-agent-swarm', version: '0.0.0' }))
+  const argv = [join(project, 'scripts/update-preview.mjs'), '--preview', preview, '--harness', s.harness, '--allow-unsupported-harness', '--skip-build', '--dry-run', '--port', '6199']
+  // A snapshot without its own SDK link loads the host's packages.
+  const unlinked = await s.run(argv)
+  assert.equal(unlinked.code, 0, unlinked.stderr)
+  assert.match(unlinked.stdout, /preflighting composed profile/)
+  // start-preview links the snapshot's SDK packages to the checkout it started on (linkHarnessPeers).
+  const sdk = (checkout, version) => {
+    const directory = join(checkout, 'packages/core/session')
+    mkdirSync(directory, { recursive: true })
+    writeFileSync(join(directory, 'package.json'), JSON.stringify({ name: '@deepseek-ai/dsh-session', version }))
+    return directory
+  }
+  const session = join(plugin, 'node_modules/@deepseek-ai/dsh-session')
+  symlinkSync(sdk(join(s.root, 'harness-017'), '0.1.7-rc.1'), session, 'dir')
   const refused = await s.run(argv)
   assert.equal(refused.code, 1, refused.stdout)
-  assert.match(refused.stderr, /compat\/ui-conversation is rebuilt from Harness 0\.1\.7-rc\.1 and loads only on that release, not on 0\.1\.6-alpha\.2; start a new preview root/)
-  assert.doesNotMatch(refused.stdout, /preflighting/, 'refused before the build and preflight')
-  writeFileSync(join(preview, 'compat/ui-conversation/package.json'), JSON.stringify({ name: '@deepseek-ai/dsh-client-ui-conversation', version: '0.1.6-alpha.2' }))
+  assert.match(refused.stderr, /plugin links the Harness 0\.1\.7-rc\.1 SDK, which the update keeps, so it boots only on Harness 0\.1\.7-rc\.1, not on 0\.1\.6-alpha\.2; start a new preview root for 0\.1\.6-alpha\.2/)
+  assert.doesNotMatch(refused.stdout, /skipping build|syncing|preflighting/, 'refused before the build, sync and preflight')
+  rmSync(session)
+  symlinkSync(sdk(s.harness, '0.1.6-alpha.2'), session, 'dir')
   const same = await s.run(argv)
   assert.equal(same.code, 0, same.stderr)
   assert.match(same.stdout, /preflighting composed profile/)

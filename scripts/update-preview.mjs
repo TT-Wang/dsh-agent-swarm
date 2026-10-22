@@ -28,8 +28,9 @@
  *                     <preview>/server.json; required when neither exists).
  *                     A checkout whose release is not in compatibility.json is
  *                     refused with harness-target's message, and so is any
- *                     release other than the one a host package rebuilt in
- *                     <preview>/compat/<name> comes from (its manifest version)
+ *                     release other than the one whose SDK the plugin snapshot
+ *                     links (its node_modules/@deepseek-ai/dsh-session), which
+ *                     the sync keeps
  *   --allow-unsupported-harness
  *                     update a preview pinned to an unsupported Harness anyway,
  *                     with a warning on stderr and in restart.log. A preview
@@ -111,15 +112,16 @@ try { assertSupportedHarness(harnessRoot) } catch (error) {
   process.stderr.write(`update-preview: ${warning}\n`)
   log(warning)
 }
-// A preview keeps the host packages it rebuilt in <preview>/compat/<name>, such as the
-// ui-conversation carrying patches/harness-command-input.patch on 0.1.x hosts. Each is a
-// build of the one release its manifest names and loads only on that release; a release
-// the patch does not target needs none.
+// The sync replaces only the packaged files and keeps the snapshot's node_modules, where
+// start-preview linked the Harness SDK packages of the checkout it started on
+// (linkHarnessPeers). The snapshot loads that release's packages, so it boots only on that
+// release, read from the @deepseek-ai/dsh-session it links, the package apply() reads its
+// host version from. A snapshot that links none loads the host's own.
 const hostRelease = JSON.parse(readFileSync(join(harnessRoot, 'package.json'), 'utf8')).version
-const compat = join(preview, 'compat')
-for (const manifest of existsSync(compat) ? readdirSync(compat).map(name => join(compat, name, 'package.json')).filter(path => existsSync(path)) : []) {
-  const built = JSON.parse(readFileSync(manifest, 'utf8')).version
-  if (built !== hostRelease) fail(`${dirname(manifest)} is rebuilt from Harness ${built} and loads only on that release, not on ${hostRelease}; start a new preview root for ${hostRelease} with scripts/start-preview.mjs`)
+const linkedSdk = pluginDir === undefined ? undefined : join(pluginDir, 'node_modules/@deepseek-ai/dsh-session/package.json')
+if (linkedSdk !== undefined && existsSync(linkedSdk)) {
+  const linked = JSON.parse(readFileSync(linkedSdk, 'utf8')).version
+  if (linked !== hostRelease) fail(`${pluginDir} links the Harness ${linked} SDK, which the update keeps, so it boots only on Harness ${linked}, not on ${hostRelease}; start a new preview root for ${hostRelease} with scripts/start-preview.mjs`)
 }
 
 /** Exactly the paths the published tarball carries, so the snapshot mirrors a release. */

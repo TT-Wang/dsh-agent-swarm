@@ -90,7 +90,7 @@ Harness 主目录（`DSH_HOME`）和插件状态从 0.1.5-rc.3 或 0.1.7-rc.1 �
 - **Minimal 预设的成员会压缩上下文。** 0.2.x 的 Minimal 预设挂载了压缩引擎和 `/compact`，所以由 Minimal owner 创建的成员会在任务边界和宿主上下文压力下压缩，摘要请求计入该成员的用量。在 0.1.x 上，这样的成员从不压缩。
 - **工具变化可以写进历史。** 在模型声明支持工具更新的路由上（0.2.x DeepSeek 模型目录中的 `deepseek-flash`），owner 晋升时获得的管理工具以历史中的一条消息送达，不再开启新的请求序列。
 - **插件路由只对 owner 开放。** 对于主体（principal）不是 owner 的连接，0.2.1-rc.2 宿主在插件路由上返回 HTTP 403。宿主自己创建的浏览器连接和 API socket 都是 owner，浏览器面板不受影响。
-- **试用环境不再需要宿主补丁。** 在 0.2.x 上新建的试用根目录不需要重新构建的 `ui-conversation` 覆盖层，它所修补的输入编辑器缺陷在 0.2.x 上不存在。`scripts/update-preview.mjs` 拒绝启动这样的根目录：其中重新构建的宿主包来自另一个版本。因此已有的 0.1.x 试用环境要用 `scripts/start-preview.mjs` 新建根目录才能迁到 0.2.x。它也无法再用当前插件原地更新：`update-preview` 会拒绝它的 0.1.x 版本；即使加上 `--allow-unsupported-harness`，0.1.7-rc.1 宿主也会跳过更新后的插件，因为插件的 peer 版本范围只写 0.2.1-rc.2。
+- **试用环境不再需要宿主补丁。** 在 0.2.x 上新建的试用根目录不需要重新构建的 `ui-conversation` 覆盖层，它所修补的输入编辑器缺陷在 0.2.x 上不存在。`scripts/update-preview.mjs` 保留快照中已链接的 `node_modules`，并且只在快照所链接的 Harness SDK 的那个版本上启动它，其他版本一律拒绝。因此已有的 0.1.x 试用环境要用 `scripts/start-preview.mjs` 新建根目录才能迁到 0.2.x。它也无法再用当前插件原地更新：`update-preview` 会拒绝它的 0.1.x 版本；即使加上 `--allow-unsupported-harness`，0.1.7-rc.1 宿主也会跳过更新后的插件，因为插件的 peer 版本范围只写 0.2.1-rc.2。
 - **上游限制未变。** 阻塞在工具调用中的会话（例如用 `job_output` 等待某个作业）仍然要到下一步才读取 swarm 通知（dsh-external#624 和 dsh-external#632 尚未解决）。
 
 细节见[已知限制](known-limitations.md)：迁回旧版本见 Supported Harness versions；共享指令、工具更新和阻塞的工具调用见 Harness integration；压缩见 Resources and budgets；插件路由见 Interface and observation。
