@@ -13,7 +13,7 @@ import SessionStore, { Session, SessionId } from '@deepseek-ai/dsh-session'
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
 import SessionProjection from '@deepseek-ai/dsh-session-projection'
 import ToolRuntime, { defineContentToolFixture } from '@deepseek-ai/dsh-tools'
-import * as JsonlPersistenceModule from '@deepseek-ai/dsh-session-persistence-jsonl'
+import * as JsonlPersistence from '@deepseek-ai/dsh-session-persistence-jsonl'
 import SandboxPolicy from '@deepseek-ai/dsh-sandbox-policy'
 import Approval from '@deepseek-ai/dsh-user-approval'
 import UserQuestionService from '@deepseek-ai/dsh-user-questions'
@@ -29,9 +29,6 @@ import { UNCONFINED_HOST_TOOLS } from '../lib/types.js'
 import { runProcess } from '../lib/workspaces.js'
 import { subprocessSeam, SubprocessLocal } from './subprocess-seam.mjs'
 import { eventually, makeRuntime } from './faults/harness.mjs'
-import { loaderPlugin } from './fixtures/built-harness.mjs'
-
-const JsonlPersistence = loaderPlugin(JsonlPersistenceModule)
 
 /**
  * The session working-directory service as the host's base bundle composes it:

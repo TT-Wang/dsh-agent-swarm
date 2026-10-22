@@ -8,7 +8,7 @@ import { Context } from '@deepseek-ai/cordis'
 import WebServer from '@deepseek-ai/dsh-host-webserver'
 import * as Connection from '@deepseek-ai/dsh-client-connection'
 import SessionStore, { SessionId } from '@deepseek-ai/dsh-session'
-import * as JsonlPersistenceModule from '@deepseek-ai/dsh-session-persistence-jsonl'
+import * as JsonlPersistence from '@deepseek-ai/dsh-session-persistence-jsonl'
 import SessionQueryEngine from '@deepseek-ai/dsh-session-query'
 import SessionController from '@deepseek-ai/dsh-api-session-controller'
 import AgentRegistry from '@deepseek-ai/dsh-agent'
@@ -25,9 +25,6 @@ import { PolicyError } from '../lib/policy-error.js'
 import { errorTypeFor } from '../lib/trace.js'
 import { AdmissionError, TaskGraphAdmissionError } from '../lib/admission.js'
 import { FakeWorkers, NO_GRANTS, budget as defaultBudget, makeRuntime } from './faults/harness.mjs'
-import { loaderPlugin } from './fixtures/built-harness.mjs'
-
-const JsonlPersistence = loaderPlugin(JsonlPersistenceModule)
 
 const budget = { ...defaultBudget, maxTokens: 100000, maxSteps: 100, maxTasks: 10, maxExperiments: 2 }
 /** Records the members it started and the workspaces it prepared. */

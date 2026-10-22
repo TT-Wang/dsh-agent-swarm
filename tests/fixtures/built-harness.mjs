@@ -45,16 +45,6 @@ export async function importHarness(root, name) {
 }
 
 /**
- * The plugin the Loader mounts from a module namespace: its default export
- * when it has one, else the namespace itself (cordis-plugin-loader
- * `unwrapExports`). 0.1.x exports JSONL persistence as a default class; 0.2.1
- * publishes it as a namespace with `name`, `Config` and `apply`.
- */
-export function loaderPlugin(namespace) {
-  return namespace.default ?? namespace
-}
-
-/**
  * The package that mounts the DeepSeek API-key route (provider
  * `deepseek-official`) on this host. From 0.1.7-rc.2 it is
  * dsh-llm-deepseek-api-key, and dsh-llm-deepseek is only the protocol library

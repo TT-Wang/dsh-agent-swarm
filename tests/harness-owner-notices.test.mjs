@@ -11,20 +11,18 @@ import SessionStore, { SessionId } from '@deepseek-ai/dsh-session'
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
 import SessionProjection from '@deepseek-ai/dsh-session-projection'
 import ToolRuntime, { defineContentToolFixture } from '@deepseek-ai/dsh-tools'
-import * as JsonlPersistenceModule from '@deepseek-ai/dsh-session-persistence-jsonl'
+import * as JsonlPersistence from '@deepseek-ai/dsh-session-persistence-jsonl'
 import SandboxPolicy from '@deepseek-ai/dsh-sandbox-policy'
 import Approval from '@deepseek-ai/dsh-user-approval'
 import UserQuestionService from '@deepseek-ai/dsh-user-questions'
 import SandboxLocal from '@deepseek-ai/dsh-sandbox-local'
+import * as TimeContext from '@deepseek-ai/dsh-time-context'
 import * as Swarm from '../lib/index.js'
 import { runProcess } from '../lib/workspaces.js'
 import { subprocessSeam, SubprocessLocal } from './subprocess-seam.mjs'
 import { tempDirectory } from './temp-root.mjs'
 import { budget } from './faults/harness.mjs'
 import { openAsks } from '../lib/arena.js'
-import { loaderPlugin } from './fixtures/built-harness.mjs'
-
-const JsonlPersistence = loaderPlugin(JsonlPersistenceModule)
 
 const deferred = () => { let resolve; const promise = new Promise(done => { resolve = done }); return { promise, resolve } }
 const text = value => ({ kind: 'text', text: value })
@@ -153,12 +151,12 @@ test('consumer rechecks messages already claimed while another pre-step handler 
 })
 
 test('an owner wake whose every message went stale opens no model call, even where the host adds its time context to every step', async t => {
-  // The host's time context (mounted by the 0.2.x Web presets) wraps every other
+  // The host's time context (mounted by the Web presets) wraps every other
   // pre-step listener and appends its reading to whatever decision it gets back,
   // an emptied one included.
   const entered = deferred(), release = deferred(); t.after(() => release.resolve())
   const f = await fixture(t, undefined, async ctx => {
-    await ctx.plugin(loaderPlugin(await import('@deepseek-ai/dsh-time-context')), {})
+    await ctx.plugin(TimeContext, {})
     ctx.on('agent/pre-step', async ({ messages }, next) => {
       if (messages.some(message => message.source.kind === 'swarm')) { entered.resolve(); await release.promise }
       return await next()
