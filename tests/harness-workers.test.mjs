@@ -18,6 +18,11 @@ import SandboxPolicy from '@deepseek-ai/dsh-sandbox-policy'
 import Approval from '@deepseek-ai/dsh-user-approval'
 import UserQuestionService from '@deepseek-ai/dsh-user-questions'
 import AgentDefaultModel from '@deepseek-ai/dsh-agent-default-model'
+import LocalFileSystem from '@deepseek-ai/dsh-fs-local'
+import WorkingDirectoryService from '@deepseek-ai/dsh-working-directory'
+import * as ToolWorkingDirectory from '@deepseek-ai/dsh-tool-working-directory'
+import * as ToolWorktree from '@deepseek-ai/dsh-experimental-tool-worktree'
+import * as ToolSchedule from '@deepseek-ai/dsh-tool-schedule'
 import { HarnessWorkers, isRuntimeContext } from '../lib/harness-workers.js'
 import { registerTools } from '../lib/tools.js'
 import { UNCONFINED_HOST_TOOLS } from '../lib/types.js'
@@ -25,21 +30,18 @@ import { runProcess } from '../lib/workspaces.js'
 import { subprocessSeam, SubprocessLocal } from './subprocess-seam.mjs'
 import { eventually, makeRuntime } from './faults/harness.mjs'
 import { loaderPlugin } from './fixtures/built-harness.mjs'
-import { hostPackage } from './fixtures/host-packages.mjs'
 
 const JsonlPersistence = loaderPlugin(JsonlPersistenceModule)
 
 /**
- * The session working-directory service as the host's base bundle composes it,
- * where the installed host ships it (0.2.x): an `fs` provider and the service,
- * both defaulting to the source checkout. Resolves the service, or undefined on
- * a host without one (0.1.x).
+ * The session working-directory service as the host's base bundle composes it:
+ * an `fs` provider and the service, both defaulting to the source checkout.
+ * Resolves the service.
  */
 async function mountWorkingDirectory(ctx, source) {
-  const service = await hostPackage('@deepseek-ai/dsh-working-directory')
-  if (service === undefined) return undefined
-  await ctx.plugin(loaderPlugin(await import('@deepseek-ai/dsh-fs-local')), { cwd: source })
-  await ctx.plugin(loaderPlugin(service), { defaultDirectory: source })
+  await ctx.plugin(LocalFileSystem, { cwd: source })
+  await ctx.plugin(WorkingDirectoryService, { defaultDirectory: source })
+  assert.ok(ctx.workingDirectory, 'the working-directory service is active')
   return ctx.workingDirectory
 }
 
@@ -1016,13 +1018,11 @@ test('worker persona shadows both legacy and prefix/suffix deployment personas',
 })
 
 test('a worker neither sees nor runs the host tools that would move it out of its worktree or past its attempt', async t => {
-  // Each tool is composed from the package the installed host ships, the way
-  // its bundles mount it; a host that ships none registers none, and the worker
-  // still tries every name. The services behind the tools are doubles that fail
-  // the run if any call reaches them.
+  // Each tool is composed from its host package, the way the host's bundles
+  // mount it. The services behind the tools are doubles that fail the run if
+  // any call reaches them.
   const reached = []
   const unreachable = service => new Proxy({}, { get: (_target, method) => async () => { reached.push(`${service}.${String(method)}`); throw new Error(`${service}.${String(method)} reached`) } })
-  const registered = []
   let directory
   const attempts = [
     ['working_directory', source => ({ cd: source })],
@@ -1039,26 +1039,14 @@ test('a worker neither sees nor runs the host tools that would move it out of it
     : { kind: 'text', text: 'done' }, { start: false, hostPlugins: async ({ ctx, source: checkout }) => {
     source = checkout
     directory = await mountWorkingDirectory(ctx, checkout)
-    const directoryTool = await hostPackage('@deepseek-ai/dsh-tool-working-directory')
-    if (directory !== undefined && directoryTool !== undefined) {
-      await ctx.plugin(loaderPlugin(directoryTool))
-      registered.push('working_directory')
-    }
-    const worktreeTool = await hostPackage('@deepseek-ai/dsh-experimental-tool-worktree')
-    if (worktreeTool !== undefined) {
-      ctx.provide('worktrees', unreachable('worktrees'))
-      await ctx.plugin(loaderPlugin(worktreeTool))
-      registered.push('create_worktree')
-    }
-    const scheduleTools = await hostPackage('@deepseek-ai/dsh-tool-schedule')
-    if (scheduleTools !== undefined) {
-      ctx.provide('schedule', unreachable('schedule'))
-      await ctx.plugin(loaderPlugin(scheduleTools))
-      registered.push('schedule_create', 'schedule_list', 'schedule_update', 'schedule_delete')
-    }
+    await ctx.plugin(ToolWorkingDirectory)
+    ctx.provide('worktrees', unreachable('worktrees'))
+    await ctx.plugin(ToolWorktree)
+    ctx.provide('schedule', unreachable('schedule'))
+    await ctx.plugin(ToolSchedule)
   } })
   const ownerTools = new Set(f.ctx.tools.schemas(f.owner.agent).map(schema => schema.name))
-  assert.deepEqual(UNCONFINED_HOST_TOOLS.filter(name => ownerTools.has(name)).sort(), registered.sort(), 'an ordinary session sees exactly the unconfined tools this host registered')
+  assert.deepEqual(UNCONFINED_HOST_TOOLS.filter(name => ownerTools.has(name)), UNCONFINED_HOST_TOOLS, 'an ordinary session sees every unconfined tool')
   await f.adapter.start(f.spec)
   const worker = f.ctx.agents.get(SessionId(f.member.sessionId))
   assert.deepEqual(f.ctx.tools.schemas(worker).map(schema => schema.name).filter(name => UNCONFINED_HOST_TOOLS.includes(name)), [], 'the worker sees none of them')
@@ -1072,41 +1060,31 @@ test('a worker neither sees nor runs the host tools that would move it out of it
   assert.equal(results.length, attempts.length)
   assert.ok(results.every(event => event.data.message.isError === true), 'every call failed without running')
   assert.deepEqual(reached, [], 'no call reached the service behind the tool')
-  if (directory !== undefined) {
-    assert.equal(directory.get(worker.session), f.member.workspace, 'the session directory is still the member worktree')
-    assert.deepEqual(recordedDirectories(worker.session), [], 'and nothing was recorded')
-  }
+  assert.equal(directory.get(worker.session), f.member.workspace, 'the session directory is still the member worktree')
+  assert.deepEqual(recordedDirectories(worker.session), [], 'and nothing was recorded')
   assert.deepEqual(f.observations.failures, [])
 })
 
 test('a worker whose log recorded a working-directory change starts its next activation in its worktree', async t => {
-  // Where the host provides the working-directory service the directory is
-  // durable session state: its projection replays the last recorded change on
-  // every resume. A host without the service never sees the event, so no
-  // activation may write it there.
+  // The working-directory service keeps the directory as durable session
+  // state: its projection replays the last recorded change on every resume.
   let directory
   const f = await fixture(t, undefined, { hostPlugins: async ({ ctx, source }) => { directory = await mountWorkingDirectory(ctx, source) } })
   const id = SessionId(f.member.sessionId)
   assert.deepEqual(recordedDirectories(f.ctx.agents.get(id).session), [], 'a fresh worker already starts in its worktree, so nothing is written')
   await f.adapter.dispose()
   const elsewhere = f.mission.workspace
-  if (directory !== undefined) {
-    // A cd the worker made before its tools were hidden, or in a turn the
-    // adapter did not set up: the public persistence API appends it to the log.
-    const stored = await readStoredSession(f.ctx.sessionPersistence, id)
-    const staged = Session.fromRestore(id, stored.events, stored.meta, stored.inheritedEventCount)
-    staged.append('working-directory/change', { cwd: elsewhere })
-    await appendStoredEvents(f.ctx.sessionPersistence, id, staged.snapshotEvents(stored.events.length))
-  }
+  // A cd the worker made before its tools were hidden, or in a turn the
+  // adapter did not set up: the public persistence API appends it to the log.
+  const stored = await readStoredSession(f.ctx.sessionPersistence, id)
+  const staged = Session.fromRestore(id, stored.events, stored.meta, stored.inheritedEventCount)
+  staged.append('working-directory/change', { cwd: elsewhere })
+  await appendStoredEvents(f.ctx.sessionPersistence, id, staged.snapshotEvents(stored.events.length))
   const resumed = new HarnessWorkers(f.ctx, f.options)
   resumed.bind(f.callbacks)
   try {
     await resumed.start(f.spec)
     const worker = f.ctx.agents.get(id)
-    if (directory === undefined) {
-      assert.deepEqual(recordedDirectories(worker.session), [], 'a resumed activation writes no event this host cannot read')
-      return
-    }
     assert.equal(directory.get(worker.session), f.member.workspace, 'the activation re-anchored the session directory')
     assert.deepEqual(recordedDirectories(worker.session), [elsewhere, f.member.workspace], 'as one durable change after the recorded one')
     assert.equal(worker.inbox.hasPending, false, 'the anchor queues no notice, so the worker holds no input of its own making')
@@ -1119,6 +1097,23 @@ test('a worker whose log recorded a working-directory change starts its next act
     await resumed.stop(f.member.id)
     await resumed.start(f.spec)
     assert.deepEqual(recordedDirectories(f.ctx.agents.get(id).session), [elsewhere, f.member.workspace], 'a session already in its worktree is not written again')
+    assert.deepEqual(f.observations.failures, [])
+  } finally { await resumed.dispose() }
+})
+
+test('a composition without the working-directory service gets no directory event from any activation', async t => {
+  // The adapter reads the service as an optional one: a composition that does
+  // not mount it records no directory, so there is nothing to re-anchor.
+  const f = await fixture(t)
+  const id = SessionId(f.member.sessionId)
+  assert.equal(f.ctx.get('workingDirectory'), undefined)
+  assert.deepEqual(recordedDirectories(f.ctx.agents.get(id).session), [], 'a fresh activation writes none')
+  await f.adapter.dispose()
+  const resumed = new HarnessWorkers(f.ctx, f.options)
+  resumed.bind(f.callbacks)
+  try {
+    await resumed.start(f.spec)
+    assert.deepEqual(recordedDirectories(f.ctx.agents.get(id).session), [], 'nor does a resumed one')
     assert.deepEqual(f.observations.failures, [])
   } finally { await resumed.dispose() }
 })
