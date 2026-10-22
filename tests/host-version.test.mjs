@@ -1,6 +1,7 @@
 /**
  * apply() logs an error, never throws, when the Harness it runs on is not one of
- * the supported releases: 0.1.5-rc.3 has no peer-version gate and no host reads
+ * the supported releases: a host before 0.1.7-rc.1 has no peer-version gate, an
+ * owner can exempt the plugin from the gate of a later one, and no host reads
  * the profile's requires.harness. The version is the manifest of the
  * `@deepseek-ai/dsh-session` package the plugin resolves; the unsupported case
  * gives a copy of the built plugin the module-proxy layout a 0.1.6-alpha.2 host
@@ -46,6 +47,10 @@ test('the supported releases the plugin checks at runtime are exactly compatibil
   const manifest = read('package.json')
   for (const [name, range] of Object.entries(manifest.peerDependencies)) if (name.startsWith('@deepseek-ai/dsh-')) assert.equal(range, versions.join(' || '), name)
   for (const [name, range] of Object.entries(manifest.devDependencies)) if (name.startsWith('@deepseek-ai/dsh-')) assert.equal(range, compatibility.defaultHost, `${name} is developed against the default host`)
+  // The peer ranges are the one declaration both npm and the host's gate read. A
+  // declared engines.dsh decides alone on 0.2.x and the gate then ignores the peers,
+  // so a second list would let the host and npm follow different ranges.
+  assert.equal(Object.hasOwn(manifest.engines ?? {}, 'dsh'), false, 'package.json declares no engines.dsh')
 })
 
 test('the version is read from the Harness package the plugin resolves, linked or behind a module proxy', t => {
