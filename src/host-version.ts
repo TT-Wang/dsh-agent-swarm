@@ -4,7 +4,7 @@ import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 /** The releases compatibility.json, the dsh-* peer ranges and the profile's requires.harness name (tests pin them together). */
-export const SUPPORTED_HARNESS_RELEASES: readonly string[] = ['0.1.5-rc.3', '0.1.7-rc.1', '0.2.1-rc.2']
+export const SUPPORTED_HARNESS_RELEASES: readonly string[] = ['0.2.1-rc.2']
 
 /** A Harness package every host provides and this plugin imports at runtime. */
 const PROBE = '@deepseek-ai/dsh-session'

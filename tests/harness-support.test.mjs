@@ -159,14 +159,14 @@ test('the fault loader keeps the real cause for a supplied root it cannot use, a
   assert.equal(await resolve(undefined, {}), 'The fault suite needs a built Harness checkout; set DSH_HARNESS_ROOT (see compatibility.json)')
 })
 
-test('the default search skips an unbuilt checkout of a supported release and takes a built sibling, the default host\'s first', async t => {
+test('the default search takes a built checkout of a supported release, the default host\'s first, and skips an unbuilt one or one of another release', async t => {
   const s = scene(t)
   // harness-target resolves its siblings from its own project, so a copy puts them in the scratch root.
   const copy = join(s.root, 'project')
   mkdirSync(join(copy, 'scripts'), { recursive: true })
   copyFileSync(join(project, 'scripts/harness-target.mjs'), join(copy, 'scripts/harness-target.mjs'))
   copyFileSync(join(project, 'compatibility.json'), join(copy, 'compatibility.json'))
-  const checkout = (dir, built, version = '0.1.5-rc.3') => {
+  const checkout = (dir, built, version = compatibility.defaultHost) => {
     mkdirSync(join(dir, 'apps/cli/lib'), { recursive: true })
     writeFileSync(join(dir, 'package.json'), JSON.stringify({ version }))
     if (built) writeFileSync(join(dir, 'apps/cli/lib/bin.js'), '')
@@ -177,9 +177,16 @@ test('the default search skips an unbuilt checkout of a supported release and ta
   symlinkSync(unbuilt, join(s.root, 'home/.dsh/source/current'))
   const probe = `import(${JSON.stringify(join(copy, 'scripts/harness-target.mjs'))}).then(({ resolveHarnessRoot }) => { try { console.log(resolveHarnessRoot()) } catch (error) { console.log(error.message) } })`
   const resolve = () => new Promise(done => execFile(process.execPath, ['-e', probe], { env: { PATH: process.env.PATH, HOME: join(s.root, 'home') } }, (error, stdout, stderr) => { assert.equal(error, null, stderr); done(stdout.trim()) }))
-  assert.equal(await resolve(), 'Set DSH_HARNESS_ROOT to a built supported Harness checkout; see compatibility.json', 'an unbuilt checkout alone is no candidate')
-  const built = checkout(join(s.root, 'deepseek-harness-015rc3'), true)
+  const none = 'Set DSH_HARNESS_ROOT to a built supported Harness checkout; see compatibility.json'
+  assert.equal(await resolve(), none, 'an unbuilt checkout alone is no candidate')
+  // The default host's sibling, built from a release that is no longer supported.
+  const sibling = join(s.root, `deepseek-harness-${compatibility.defaultHost.replace(/[.-]/g, '')}`)
+  checkout(sibling, true, '0.1.7-rc.1')
+  assert.equal(await resolve(), none, 'a built checkout of an unsupported release is no candidate, whatever its directory name')
+  const built = checkout(sibling, true)
   assert.equal(await resolve(), built, 'the built sibling, not the unbuilt ~/.dsh/source/current ahead of it')
-  const preferred = checkout(join(s.root, 'deepseek-harness-021rc2'), true, '0.2.1-rc.2')
-  assert.equal(await resolve(), preferred, 'the default host 0.2.1-rc.2 ahead of another built supported sibling')
+  // With a second supported release listed ahead of it, the default host's sibling still comes first.
+  writeFileSync(join(copy, 'compatibility.json'), JSON.stringify({ defaultHost: compatibility.defaultHost, supportedHosts: [{ version: '0.0.1-fake' }, ...compatibility.supportedHosts] }))
+  checkout(join(s.root, 'deepseek-harness-001fake'), true, '0.0.1-fake')
+  assert.equal(await resolve(), built, 'the default host ahead of another built supported sibling')
 })

@@ -43,7 +43,9 @@ test('the supported releases the plugin checks at runtime are exactly compatibil
   assert.deepEqual(SUPPORTED_HARNESS_RELEASES, versions)
   assert.ok(versions.includes(compatibility.defaultHost), 'the default host is a supported release')
   assert.deepEqual(read('profile/package.json').dsh.bundle.requires.harness, versions)
-  for (const [name, range] of Object.entries(read('package.json').peerDependencies)) if (name.startsWith('@deepseek-ai/dsh-')) assert.equal(range, versions.join(' || '), name)
+  const manifest = read('package.json')
+  for (const [name, range] of Object.entries(manifest.peerDependencies)) if (name.startsWith('@deepseek-ai/dsh-')) assert.equal(range, versions.join(' || '), name)
+  for (const [name, range] of Object.entries(manifest.devDependencies)) if (name.startsWith('@deepseek-ai/dsh-')) assert.equal(range, compatibility.defaultHost, `${name} is developed against the default host`)
 })
 
 test('the version is read from the Harness package the plugin resolves, linked or behind a module proxy', t => {
