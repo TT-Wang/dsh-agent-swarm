@@ -78,9 +78,13 @@ function anchorWorkingDirectory(ctx: Context, agent: Agent, workspace: string): 
   agent.session.append('working-directory/change', { cwd: workspace })
 }
 
-/** The host's regenerated runtime context: `runtime-context` on 0.1.7 and 0.2.x, a system-prompt `plugin` source on 0.1.5. */
-export function isRuntimeContext(source: { kind: string; plugin?: unknown }): boolean {
-  return source.kind === 'runtime-context' || (source.kind === 'plugin' && source.plugin === '@deepseek-ai/dsh-system-prompt')
+/**
+ * The agent loop's regenerated runtime-context snapshot. `@deepseek-ai/dsh-agent-loop`
+ * declares that message source kind, and this plugin does not depend on the
+ * package, so the kind is read structurally.
+ */
+export function isRuntimeContext(source: { kind: string }): boolean {
+  return source.kind === 'runtime-context'
 }
 
 /**

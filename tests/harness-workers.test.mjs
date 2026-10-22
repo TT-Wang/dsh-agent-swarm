@@ -70,10 +70,9 @@ async function appendStoredEvents(persistence, id, events) {
   finally { await handle.close() }
 }
 
-test('the owner filter recognizes regenerated runtime context on every supported host', () => {
-  assert.equal(isRuntimeContext({ kind: 'runtime-context', form: 'snapshot', sections: [] }), true, '0.1.7 and 0.2.x name their own producer kind')
-  assert.equal(isRuntimeContext({ kind: 'plugin', plugin: '@deepseek-ai/dsh-system-prompt' }), true, '0.1.5 attributes it to the system-prompt plugin')
-  assert.equal(isRuntimeContext({ kind: 'plugin', plugin: '@deepseek-ai/dsh-other' }), false)
+test('the owner filter recognizes the agent loop\'s regenerated runtime context', () => {
+  assert.equal(isRuntimeContext({ kind: 'runtime-context', form: 'snapshot', sections: [] }), true, 'the agent loop names its own producer kind')
+  assert.equal(isRuntimeContext({ kind: 'system-prompt', form: 'snapshot', sections: [] }), false, 'the system prompt is not runtime context')
   assert.equal(isRuntimeContext({ kind: 'user' }), false)
   assert.equal(isRuntimeContext({ kind: 'swarm', deliveryId: 'd1' }), false)
 })
