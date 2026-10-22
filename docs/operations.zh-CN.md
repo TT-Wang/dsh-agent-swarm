@@ -6,15 +6,13 @@
 
 ## 支持的环境
 
-仓库的 [compatibility.json](../compatibility.json) 记录了以下精确支持的 Harness 版本：
+仓库的 [compatibility.json](../compatibility.json) 记录了唯一支持的 Harness 版本：
 
 | Harness 版本 | 发布提交 |
 | --- | --- |
-| [0.2.1-rc.2](https://github.com/deepseek-ai/deepseek-harness/releases/tag/dsh-v0.2.1-rc.2)（npm `latest` 与 `next`，默认宿主） | `687f282e8625c6b8d11ff58211a90524be2e4317` |
-| [0.1.5-rc.3](https://github.com/deepseek-ai/deepseek-harness/releases/tag/dsh-v0.1.5-rc.3)（较早版本，曾为 npm `latest`） | `a4c74a91e06b00fe0b0937bde982170c526cc842` |
-| [0.1.7-rc.1](https://github.com/deepseek-ai/deepseek-harness/releases/tag/dsh-v0.1.7-rc.1)（较早版本，曾为 npm `next`） | `46a7f68b0922371ce7144b668b90e377d8e799f4` |
+| [0.2.1-rc.2](https://github.com/deepseek-ai/deepseek-harness/releases/tag/dsh-v0.2.1-rc.2)（npm `latest` 与 `next`） | `687f282e8625c6b8d11ff58211a90524be2e4317` |
 
-三个版本都是预发行版。开发链接器检查记录的发布提交，不只检查包版本号。第 28 轮已停止支持 `0.1.2-rc.1`、`0.1.3-alpha.2`、`0.1.5-rc.1` 和 `0.1.6-alpha.2`，并删除了只为它们保留的代码。插件不承诺兼容其他版本、未发布提交或任意自定义 profile。Better Sidebar 集成在 0.18.0 上经过验证。
+它是预发行版。开发链接器检查记录的发布提交，不只检查包版本号。`0.1.5-rc.3` 和 `0.1.7-rc.1` 已于 2026-10-22 停止支持；最后一个支持它们的版本是 `a28b116`，仍留在这两个版本上的 Harness 主目录也只能使用不晚于它的插件版本。第 28 轮已停止支持 `0.1.2-rc.1`、`0.1.3-alpha.2`、`0.1.5-rc.1` 和 `0.1.6-alpha.2`，并删除了只为它们保留的代码。插件不承诺兼容其他版本、未发布提交或任意自定义 profile。Better Sidebar 集成在 0.18.0 上经过验证。
 
 运行需要：
 
@@ -75,7 +73,7 @@ node "$DSH_HARNESS_ROOT/apps/cli/lib/bin.js" --profile web
 
 Harness 主目录（`DSH_HOME`）和插件状态从 0.1.5-rc.3 或 0.1.7-rc.1 迁到 0.2.1-rc.2 时，不需要额外的迁移步骤：0.2.1-rc.2 能读取已有的会话日志，宿主版本的变化也不会触及插件的存储（`swarm.sqlite`，schema 7）。但迁过去之后就回不来了，所以首次以 0.2.x 启动前：
 
-1. **停止宿主并备份主目录。** 把 `$DSH_HOME/sessions` 和插件状态一起复制：`statePath`（默认是 `~/.dsh/agent-swarm/swarm.sqlite` 及同目录的 `-wal`、`-shm` 文件；这个默认值不随 `DSH_HOME` 变化）和 `workspacesRoot`。回到 0.1.x 的唯一办法是恢复这份备份，在 0.2.x 上完成的一切都会丢弃。
+1. **停止宿主并备份主目录。** 把 `$DSH_HOME/sessions` 和插件状态一起复制：`statePath`（默认是 `~/.dsh/agent-swarm/swarm.sqlite` 及同目录的 `-wal`、`-shm` 文件；这个默认值不随 `DSH_HOME` 变化）和 `workspacesRoot`。回到 0.1.x 的唯一办法是恢复这份备份，在 0.2.x 上完成的一切都会丢弃；同时还要换回仍支持 0.1.x 的插件版本（不晚于 `a28b116`）：0.1.7-rc.1 会拒绝安装当前插件并跳过已挂载的插件，0.1.5-rc.3 虽会加载它，但会记录一条不受支持的错误日志。
 2. **检查共享的 agent 指令文件。** 0.2.x 除了 `$DSH_HOME/AGENTS.md`，还会读取共享 agents 目录（`$DSH_AGENTS_HOME`，默认 `~/.agents`）中的 `AGENTS.md`。worker 挂载其 owner 的 agent 预设，因此在 Standard、Creator 和 PTC 预设下，这个文件会进入每个 owner 和 worker 的提示词；Minimal 预设不加载指令文件。
 3. **仍有进行中任务的主目录不要迁回 0.1.x。**
 
@@ -92,7 +90,7 @@ Harness 主目录（`DSH_HOME`）和插件状态从 0.1.5-rc.3 或 0.1.7-rc.1 �
 - **Minimal 预设的成员会压缩上下文。** 0.2.x 的 Minimal 预设挂载了压缩引擎和 `/compact`，所以由 Minimal owner 创建的成员会在任务边界和宿主上下文压力下压缩，摘要请求计入该成员的用量。在 0.1.x 上，这样的成员从不压缩。
 - **工具变化可以写进历史。** 在模型声明支持工具更新的路由上（0.2.x DeepSeek 模型目录中的 `deepseek-flash`），owner 晋升时获得的管理工具以历史中的一条消息送达，不再开启新的请求序列。
 - **插件路由只对 owner 开放。** 对于主体（principal）不是 owner 的连接，0.2.1-rc.2 宿主在插件路由上返回 HTTP 403。宿主自己创建的浏览器连接和 API socket 都是 owner，浏览器面板不受影响。
-- **试用环境不再需要宿主补丁。** 在 0.2.x 上新建的试用根目录不需要重新构建的 `ui-conversation` 覆盖层，它所修补的输入编辑器缺陷在 0.2.x 上不存在。`scripts/update-preview.mjs` 拒绝启动这样的根目录：其中重新构建的宿主包来自另一个版本。因此已有的 0.1.x 试用环境要用 `scripts/start-preview.mjs` 新建根目录才能迁到 0.2.x。
+- **试用环境不再需要宿主补丁。** 在 0.2.x 上新建的试用根目录不需要重新构建的 `ui-conversation` 覆盖层，它所修补的输入编辑器缺陷在 0.2.x 上不存在。`scripts/update-preview.mjs` 拒绝启动这样的根目录：其中重新构建的宿主包来自另一个版本。因此已有的 0.1.x 试用环境要用 `scripts/start-preview.mjs` 新建根目录才能迁到 0.2.x。它也无法再用当前插件原地更新：`update-preview` 会拒绝它的 0.1.x 版本；即使加上 `--allow-unsupported-harness`，0.1.7-rc.1 宿主也会跳过更新后的插件，因为插件的 peer 版本范围只写 0.2.1-rc.2。
 - **上游限制未变。** 阻塞在工具调用中的会话（例如用 `job_output` 等待某个作业）仍然要到下一步才读取 swarm 通知（dsh-external#624 和 dsh-external#632 尚未解决）。
 
 细节见[已知限制](known-limitations.md)：迁回旧版本见 Supported Harness versions；共享指令、工具更新和阻塞的工具调用见 Harness integration；压缩见 Resources and budgets；插件路由见 Interface and observation。

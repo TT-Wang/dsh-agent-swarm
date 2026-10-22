@@ -6,15 +6,13 @@ This guide covers installing Agent Swarm, choosing its storage, running missions
 
 ## Supported environment
 
-The repository records these exact supported Harness releases in [compatibility.json](../compatibility.json):
+The repository records the one supported Harness release in [compatibility.json](../compatibility.json):
 
 | Harness release | Release commit |
 | --- | --- |
-| [0.2.1-rc.2](https://github.com/deepseek-ai/deepseek-harness/releases/tag/dsh-v0.2.1-rc.2) (npm `latest` and `next`, default host) | `687f282e8625c6b8d11ff58211a90524be2e4317` |
-| [0.1.5-rc.3](https://github.com/deepseek-ai/deepseek-harness/releases/tag/dsh-v0.1.5-rc.3) (earlier release, formerly npm `latest`) | `a4c74a91e06b00fe0b0937bde982170c526cc842` |
-| [0.1.7-rc.1](https://github.com/deepseek-ai/deepseek-harness/releases/tag/dsh-v0.1.7-rc.1) (earlier release, formerly npm `next`) | `46a7f68b0922371ce7144b668b90e377d8e799f4` |
+| [0.2.1-rc.2](https://github.com/deepseek-ai/deepseek-harness/releases/tag/dsh-v0.2.1-rc.2) (npm `latest` and `next`) | `687f282e8625c6b8d11ff58211a90524be2e4317` |
 
-All three are prereleases. The development linker checks the recorded release revision, not only the package version. `0.1.2-rc.1`, `0.1.3-alpha.2`, `0.1.5-rc.1` and `0.1.6-alpha.2` were dropped in round 28, and the code that served only them was deleted. Compatibility with other releases, unreleased commits or arbitrary custom profiles is not claimed. Better Sidebar integration was exercised against 0.18.0.
+It is a prerelease. The development linker checks the recorded release revision, not only the package version. `0.1.5-rc.3` and `0.1.7-rc.1` were dropped on 2026-10-22; `a28b116` is the last revision that supports them, and a Harness home that stays on them stays on a plugin revision up to it. `0.1.2-rc.1`, `0.1.3-alpha.2`, `0.1.5-rc.1` and `0.1.6-alpha.2` were dropped in round 28, and the code that served only them was deleted. Compatibility with other releases, unreleased commits or arbitrary custom profiles is not claimed. Better Sidebar integration was exercised against 0.18.0.
 
 You need:
 
@@ -73,7 +71,7 @@ If several Harness versions run on the same machine, use a separate linked check
 
 A Harness home (`DSH_HOME`) and the plugin's state move from 0.1.5-rc.3 or 0.1.7-rc.1 to 0.2.1-rc.2 without a migration step: 0.2.1-rc.2 reads the existing session logs, and the host change does not touch the plugin's store (`swarm.sqlite`, schema 7). The way back is closed, so before the first 0.2.x start:
 
-1. **Stop the host and back up the home.** Copy `$DSH_HOME/sessions` together with the plugin's state: `statePath` (by default `~/.dsh/agent-swarm/swarm.sqlite` with its `-wal` and `-shm` files; this default ignores `DSH_HOME`) and `workspacesRoot`. Going back to 0.1.x means restoring that backup, which discards everything done on 0.2.x.
+1. **Stop the host and back up the home.** Copy `$DSH_HOME/sessions` together with the plugin's state: `statePath` (by default `~/.dsh/agent-swarm/swarm.sqlite` with its `-wal` and `-shm` files; this default ignores `DSH_HOME`) and `workspacesRoot`. Going back to 0.1.x means restoring that backup, which discards everything done on 0.2.x, and running a plugin revision that still supports 0.1.x (up to `a28b116`): 0.1.7-rc.1 refuses to install the current plugin and skips a mounted one, and 0.1.5-rc.3 loads it but logs that it is unsupported there.
 2. **Review the shared agent instructions.** 0.2.x also loads `AGENTS.md` from the shared agents directory (`$DSH_AGENTS_HOME`, by default `~/.agents`), beside `$DSH_HOME/AGENTS.md`. Workers mount their owner's agent preset, so under the Standard, Creator and PTC presets that file reaches every owner and worker prompt. The Minimal preset loads no instruction files.
 3. **Do not move a home with live missions back to 0.1.x.**
 
@@ -90,7 +88,7 @@ Running on 0.2.x also changes the following:
 - **Minimal-preset members compact.** The 0.2.x Minimal preset mounts compaction and `/compact`, so a member created from a Minimal owner compacts at task boundaries and under host pressure, and its summary requests are charged to it. On 0.1.x such a member never compacts.
 - **Tool changes can arrive in the history.** On a route whose model declares tool updates (`deepseek-flash` in the 0.2.x DeepSeek catalog), the management tools an owner gains at its promotion arrive as an in-history message instead of starting a new request series.
 - **Owner-only plugin routes.** The 0.2.1-rc.2 host answers HTTP 403 on the plugin's routes to any connection whose principal is not the owner. Every browser connection and API socket it creates is an owner, so the browser panel is unaffected.
-- **Previews need no host patch.** A preview root started on 0.2.x needs no rebuilt `ui-conversation` overlay; the input-editor defect it patches does not exist there. `scripts/update-preview.mjs` refuses to boot a root whose rebuilt host packages come from another release, so an existing 0.1.x preview moves to 0.2.x as a new root from `scripts/start-preview.mjs`.
+- **Previews need no host patch.** A preview root started on 0.2.x needs no rebuilt `ui-conversation` overlay; the input-editor defect it patches does not exist there. `scripts/update-preview.mjs` refuses to boot a root whose rebuilt host packages come from another release, so an existing 0.1.x preview moves to 0.2.x as a new root from `scripts/start-preview.mjs`. It can no longer be updated in place from the current plugin either: `update-preview` refuses its 0.1.x release, and with `--allow-unsupported-harness` a 0.1.7-rc.1 host skips the updated plugin, whose peer ranges name only 0.2.1-rc.2.
 - **Unchanged upstream limits.** A session blocked in a tool call, such as `job_output` waiting on a job, still reads swarm notices only at its next step (dsh-external#624 and dsh-external#632 remain open).
 
 [Known limitations](known-limitations.md) records the details: the move back under Supported Harness versions; the shared instructions, the tool updates and the blocked tool calls under Harness integration; the compaction under Resources and budgets; and the routes under Interface and observation.
