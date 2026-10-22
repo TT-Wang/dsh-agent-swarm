@@ -379,7 +379,7 @@ test('cold worker history paginates native events, renders inert tool results, a
   assert.deepEqual(history.getSnapshot().entries.map(entry => entry.event.seq), [2, 8])
   assert.equal(transcriptEntry(history.getSnapshot().entries[0]).text, 'Assignment')
   const toolMessage = isError => ({ event: { seq: 9, type: 'tool/result', data: { message: { role: 'tool', toolCallId: 'call-9', isError, content: [{ type: 'text', text: 'output' }] } } } })
-  assert.deepEqual(transcriptEntry(toolMessage(true)), { role: 'Tool error', text: 'output' }, 'a 0.1.7 tool-role failure is labelled correctly')
+  assert.deepEqual(transcriptEntry(toolMessage(true)), { role: 'Tool error', text: 'output' }, 'a tool-role failure is labelled correctly')
   assert.deepEqual(transcriptEntry(toolMessage(false)), { role: 'Tool result', text: 'output' })
   history.open('worker-b', 'Reviewer')
   history.close()
