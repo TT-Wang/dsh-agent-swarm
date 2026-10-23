@@ -6,17 +6,19 @@ Current **0.7.0** working-tree checks and the historical **0.6.0** baseline are 
 | --- | --- |
 | `0.2.1-rc.2` (npm `latest` and `next`) | `687f282e8625c6b8d11ff58211a90524be2e4317` |
 
-## Self-review batch A: CORE-02, CORE-05, CORE-01, CORE-04, CORE-03 (2026-10-24)
+## Self-review batch A: CORE-02, CORE-05, CORE-01, CORE-04, CORE-03, and CORE-06 from the live smoke (2026-10-24)
 
-**Head**: `17fbd1c`, where the final gates ran, and this record's revision (documentation only), branch
-`swarm/batch-a-core` on `dac6704` (main), not merged. Batch A (verdicts, evidence basis, durable identities) of the
-follow-ups from the owner's 2026-10-22 self-review, in the order its verification set: CORE-02, CORE-05, CORE-01,
-CORE-04 and CORE-03 (`09d6c5d` to `6dc97f6`), each followed by a correctness review (the medium findings of the
-CORE-05 and CORE-03 reviews were repaired within their slices, `498b58a` and `630f015`); one review repair round over
-the batch (`e13f804` to `17fbd1c`); and this record. The verification read `a28b116`; every anchor was re-located on
-`dac6704`, after the 0.1.x drop and the W8 route rule. `src` against `dac6704`: +713 −286, net +427. By slice: CORE-02
-+200 −44 (net +156), CORE-05 +109 −96 (+13), CORE-01 +95 −23 (+72), CORE-04 +141 −66 (+75), CORE-03 +102 −34 (+68),
-and the repair round +136 −93 (+43).
+**Head**: `1218e86`, where the final gates ran (the third gate run below), and this record's revision
+(documentation only), branch `swarm/batch-a-core` on `dac6704` (main), not merged. Batch A (verdicts, evidence basis,
+durable identities) of the follow-ups from the owner's 2026-10-22 self-review, in the order its verification set:
+CORE-02, CORE-05, CORE-01, CORE-04 and CORE-03 (`09d6c5d` to `6dc97f6`), each followed by a correctness review (the
+medium findings of the CORE-05 and CORE-03 reviews were repaired within their slices, `498b58a` and `630f015`); one
+review repair round over the batch (`e13f804` to `17fbd1c`); the first version of this record (`268a2c5`); CORE-06
+(`1218e86`), the fix for what the owner's live smokes found at `268a2c5`; and this amendment. The verification read
+`a28b116`; every anchor was re-located on `dac6704`, after the 0.1.x drop and the W8 route rule. `src` against
+`dac6704` at `17fbd1c`: +713 −286, net +427. By slice: CORE-02 +200 −44 (net +156), CORE-05 +109 −96 (+13), CORE-01
++95 −23 (+72), CORE-04 +141 −66 (+75), CORE-03 +102 −34 (+68), and the repair round +136 −93 (+43). CORE-06 adds
++367 −209 (+158), so `src` against `dac6704` at `1218e86` is +1076 −491, net +585.
 
 **What each slice leaves at the head.**
 
@@ -158,6 +160,97 @@ a test that fails without it, checked with the reviewer's mutants or their equiv
 
 `17fbd1c` documents the dispute exits in `docs/known-limitations.md`; the README summary still holds.
 
+**The live smokes at `268a2c5`** (2026-10-24). The owner's session ran both real-provider smokes at `268a2c5` on
+`deepseek-official` / `deepseek-v4-flash`; their reports are kept with the batch's gate runner, outside the repository.
+
+- `test:deepseek` passed: 27,792 tokens, 11 steps (10 model responses). Its source declares `node check.cjs`, so the
+  reviewer's acceptance rested on checks; the CORE-01 path without checks did not run.
+- `test:command-deepseek` hit the smoke's external limit, 36 model steps and 525,767 reported tokens against its cap
+  of 500,000 tokens, with the owner alone reporting 358,670 tokens (the runtime accounted 43,147 to workers). The
+  owner's plan gave the implementation task `maxSteps` 8. Each "Resource review" notice made the owner raise a task's
+  allocation with `swarm_budget`, as the protocol asks: five raises, the implementation's `maxSteps` to 9, 11 and 15,
+  then its review's to 10 and 13. Every raise moved the task row's revision. The implementer's `swarm_submit`, which
+  had read the task before its artifact capture, was refused twice with `StaleTaskRevisionError` ("it presents
+  revision 12 but the durable task is at revision 13; another write was accepted after this writer read the task",
+  then 16 against 17; `putTask` and `refuseStaleTask` in `src/store.ts`) and accepted on its third call. Each refusal
+  cost the worker steps, which triggered more resource reviews and more raises, until the limit stopped the run with the
+  implementation submitted late, its review still running and the mission active. The revision guard dates from the
+  S5r batch (`0eb26c6`), not from this batch.
+
+**Root cause.** A transition that awaited I/O wrote back the copy of a row it had read before the await, and that
+write went through the per-task revision guard (`src/store.ts` `putTask`/`refuseStaleTask`). That guard was added in
+S5r (`0eb26c6`). In `submit` (`src/runtime.ts`), `ownAttempt` read the task and `fenceAttempt` wrote it. Then
+`await captureArtifact` ran, and `ownAttempt` re-checked the attempt, but its fresh row was thrown away. The commit
+then did `store.put('tasks', task)` with the row read before the capture. `controlTask` (what
+`swarm_budget(taskId, taskBudget)` calls) is synchronous and outside the mission queue, so the owner's
+allocation-only raise during the capture moved the revision, and submit was refused with `StaleTaskRevisionError`
+even though nothing it depends on had changed. The same hazard was in four more places:
+
+1. A review's lease fence after `await inspectArtifact` (`Attempts.fenceAttempt` on the copy read before the await).
+2. `applyDelivery` wrote the mission copy from before the apply, silently reverting a usage charge (mission rows have
+   no revision guard).
+3. The staged-plan member repair wrote a member copy read before `await invalidateComposition`, reverting a usage
+   report.
+4. Every other continuation re-read its row by hand (the S1 sites).
+
+It was reproduced deterministically, without a provider, with a capture gate and `controlTask` amend `{ maxSteps }`.
+Main `dac6704` fails the same way: it was exported with `git archive` into a scratch directory, its `node_modules`
+linked to the 0.2.1-rc.2 link farm, and built. An export rather than a git worktree was used, so the shared
+repository metadata was not touched.
+
+**CORE-06: a transition that awaited writes the row its commit reads** (`1218e86`). One owner,
+`SwarmRuntime.revise` (`Kernel.revise`). A transition that awaited I/O after reading a task, member or mission row
+writes it only through `revise`, which opens the commit, reads the row inside it (a mission through `mission`, which
+folds its clock) and hands it to the transition's change. The change re-validates the transition's fence on that row
+and sets only the fields the transition owns; `revise` writes the row and runs the transition's effects in the same
+transaction. A concurrent write the transition does not conflict with (an owner's `swarm_budget` raise, a published
+claim, a usage charge) is kept. A conflicting one refuses the transition with its own typed code (the change throws)
+or, for background work, makes it moot (nothing written, nothing published). Inside an open commit `revise` joins it.
+The revision guard stays as the backstop for a whole-row write of a stale task copy, and `docs/known-limitations.md`
+states the rule. The audit, site by site:
+
+- `submit`: a bug; it wrote the pre-capture copy. It now uses `revise`: `submissionFence` checks the attempt on the
+  row the commit reads and refuses with a typed code, `[task_cancelled]`, `[task_attempt_fenced]` or
+  `[task_attempt_stale]`, naming the captured artifact; any other check (budget pause, prerequisite) keeps its own
+  refusal. The live claim, `rework_unchanged`, the artifact checks and `missingReviewPath` are decided on that row.
+  Owned fields: `artifact`, `output`, `status`.
+- `verify` phase 1 (`src/runtime.ts` and `Attempts.fenceAttempt`): a bug; the lease fence wrote the review copy read
+  before `inspectArtifact`. `fenceAttempt` now uses `revise` and is moot when the attempt has moved, so the
+  `ownAttempt` that follows refuses with `task_attempt_stale`.
+- `verify` phase 2, verdict and deferral: it already re-read and re-checked by hand. Its final commits now use
+  `revise` on the review row. The attempt check (`heldAttempt`) and the source facts (a single `currentSource`
+  closure, so each coded refusal still appears once) are asked at the start of the turn and again inside the commit.
+  The commit that only records runs on an environment mismatch is unchanged.
+- Claim → `assign`: `assign` now uses `revise` with a `sameChoice` fence (the row half of `stillChosen`,
+  `src/board.ts`) and refuses with `[task_changed_during_preparation]`; the claim's own `stillChosen`/ready check
+  after the await is kept. The dispatcher (`src/scheduling.ts`) assigns through the same `assign`, and its
+  preparation failure after `prepareTask` uses `revise` with `sameChoice` (moot).
+- `Attempts.closeOutIdleAttempt`: the checkpoint-failed and checkpointed outcomes now use `revise` instead of the hand
+  re-read (S1); the nudge branch writes in the turn it reads and is unchanged. `Attempts.recoverExpired`: the
+  lease-expiry checkpoint and the expiry now use `revise`; `renewActiveOperation` reads by id in the turn that writes
+  and is unchanged. `Attempts.resumeStoppedAttempt`'s deferred path: the barrier release after stop and
+  `checkpointTask`, and the stop-failure record, now use `revise`; the synchronous force, marker and legacy-peer
+  writes are unchanged.
+- `applyDelivery` (mission): a bug; it reverted concurrent mission writes. It now uses `revise` and owns
+  `appliedDelivery`.
+- `repairDraftAdmissions`: a bug on the member row (a copy read before `invalidateComposition`). The member now uses
+  `revise` with the `assertStaged` fence and owns the route fields, `phase`, and `sessionId` when it changes; the
+  mission plan fields also use `revise`.
+- `addMember`: the baseline (mission) and the failure path (member) now use `revise`; the new member row is a fresh
+  insert. The `launchDraft` activation (mission) now uses `revise`, fenced by `active()`, `assertCurrent` and staged;
+  the draft rows keep their own revision check. Control's deferred member stop after `workers.stop` and
+  `gates.beginBudgetStop`'s deferred quiesce now use `revise`. The `notices.flushOutbox` mission acknowledgement uses
+  `revise`, joined to its commit; the delivery row is still re-read inside that commit (deliveries are outside the
+  rule's tables).
+- Unchanged: `startPlan`'s final commit already reads the mission inside its commit (its start rows are outside the
+  rule). `publish`, `controlTask`/`swarm_budget`, `updateBudget`, `control`, `cancel`, `propose` and replacement,
+  `challenge`, `handoff`, `escalate`, `message`, `post`, `wait`, `subscribe` and `amendScope` have no await between
+  read and write. `beforeStep`, `recordToolRun`, `onIdle`, `onActivity`, `onStartFailure`, `recordStarted`,
+  `onRecoveryFallback`, the usage gates (`usage`, `usageSnapshot`, `recordOwnerUsage`), `blockBudget`,
+  `resumeBudgetTasks`, `blockTaskCeiling`, the workspace admission's `fenceWorkspace`, `recordOutboxStarvation` and
+  `start()`'s recovery read their row by id in the turn that writes it. `schedule` never writes the mission it read
+  when the pass started after its awaits; its helpers use it only for the id and the deadline.
+
 **User-facing changes.**
 
 - `swarm_challenge` of a claim no verdict can still judge (refuted by a rejection, before the rework too; superseded;
@@ -176,6 +269,12 @@ a test that fails without it, checked with the reviewer's mutants or their equiv
 - Apply result: a lock left by a killed host whose PID a later process reuses is reclaimed. Otherwise the refusal
   names the lock and the holding process, and the operations guide says when the lock may be removed by hand.
 - An unchanged attempt silence is escalated once, from a basis that only moves forward.
+- CORE-06: an owner's `swarm_budget` raise, a published claim or a usage charge made while a submission captures its
+  artifact, a review inspects it, a claim or the dispatcher prepares a workspace, or a delivery is applied, is kept:
+  it no longer makes that transition fail, and the transition no longer reverts it. A submission a conflicting write
+  overtakes is refused with that write's own code, `[task_cancelled]` (new), `[task_attempt_fenced]` (new) or
+  `[task_attempt_stale]` naming the captured artifact, instead of the stale-revision error; a review whose attempt was
+  withdrawn during its inspection is refused with `[task_attempt_stale]`.
 
 **The full-log oracle at the head against `dac6704`** (`npm run test:oracle`). One commit changed the logs: `2d27e52`
 (CORE-01), re-recorded with `node scripts/replay/oracle.mjs --runs 3 --write` (three identical runs). It changed 19
@@ -196,13 +295,14 @@ basis is `checks`, since no scenario accepts a source without checks:
 
 No other commit changed a line: no scenario has same-task supersession (CORE-02 reorders nothing there), none defers a
 review (schema 8 and the deciding-pass rows), and neither the lock identity nor the silence basis appears in a log.
-Both gate runs below reproduced every log, and the `test:replay` digest is unchanged,
+CORE-06 (`1218e86`) changed none either, so nothing was re-recorded for it. All three gate runs below reproduced every
+log, and the `test:replay` digest is unchanged,
 `sha256:61a921e64088b78b957cd6aeaa563d5436d4a6eae4b0130725d1f3c74c6f971e`.
 
-**Regressions.** The full suite has 1986 tests at `dac6704` and 2021 at `17fbd1c`: CORE-02 adds 10, CORE-05 4,
-CORE-01 5, CORE-04 5, CORE-03 4 and the repair round 7 (and rewrites one R16-G5a test). For this record, the head's
-test files were also run against a `dac6704` build, and the CORE-01 and CORE-03 changes were reverted in a build of
-the head, each in a scratch copy since removed.
+**Regressions.** The full suite has 1986 tests at `dac6704`, 2021 at `17fbd1c` and 2038 at `1218e86`: CORE-02 adds
+10, CORE-05 4, CORE-01 5, CORE-04 5, CORE-03 4, the repair round 7 (and rewrites one R16-G5a test) and CORE-06 17.
+For the first record, the test files at `17fbd1c` were also run against a `dac6704` build, and the CORE-01 and CORE-03
+changes were reverted in a build of `17fbd1c`, each in a scratch copy since removed.
 
 - CORE-02: `tests/claim-judgeability.test.mjs` (new, 12 tests): the rule; (a) with the owner's resume after the
   refused challenges; (b1); (b2); withdrawn work; a review's own claim before and after its verdict; completion over an
@@ -241,30 +341,53 @@ the head, each in a scratch copy since removed.
   attempt. Both fail with `src/scheduling.ts` restored to its state before `c808a63` in a build of the head. A third
   test pins `SwarmStore.attemptEventAt`, and a fourth (`630f015`) that the instrument ends a review attempt at its
   verdict; before its fix that test read an end at 50000 and a worst gap of 46000, where it expects 12000 and 8000.
+- CORE-06: `tests/write-after-await.test.mjs` (new, 17 tests), run against builds of `268a2c5` and `dac6704`
+  (`git archive` exports, as in the root cause above). Eleven regressions fail on both:
+  - a submission racing a task `maxSteps` raise is accepted and keeps `maxSteps` 20;
+  - task and mission budget raises made during a submission are accepted and survive it;
+  - a claim published during the capture is kept and pinned to the artifact;
+  - a submission racing an owner cancel is refused with `task_cancelled`, and one racing a structural amendment with
+    `task_attempt_fenced`;
+  - a lease lapsing during the capture is refused with `task_attempt_stale`, and the message names the artifact;
+  - a review racing a raise on it reaches its verdict and keeps the raise;
+  - a review whose attempt is withdrawn during its inspection is refused with `task_attempt_stale`, not
+    `stale_task_revision`;
+  - a delivery apply racing a usage charge keeps `usedTokens` 500 (it was 0 before the fix);
+  - a staged-plan repair racing a member usage report keeps `accountedTokens` 777;
+  - `revise` itself: a moot or refused call commits nothing and publishes nothing, and a call joined inside an open
+    commit works.
+
+  Six pins pass on both: a claim racing a raise; a claim racing a reassignment, refused with
+  `task_changed_during_preparation`; a preparation failure; an idle close-out; a lease-expiry checkpoint; a stop
+  barrier. Two existing files change: `makeRuntimeStub` (`tests/faults/harness.mjs`) gains a stub `revise`, and
+  `tests/refusal-runtime-annotations.test.mjs` annotates `task_cancelled` and `task_attempt_fenced`. Before the fix, a
+  scratch reproduction outside the suite (a capture gate and `controlTask` amend `{ maxSteps }`) gave
+  `StaleTaskRevisionError`, revision 3 against 4, on `268a2c5` and on `dac6704`; on `1218e86` it passes (status
+  `submitted`, `maxSteps` 20).
 
 **Gates**, each run with `node_modules` linked to the 0.2.1-rc.2 link farm and `DSH_HARNESS_ROOT` set to the pinned
 clone (`dsh-v0.2.1-rc.2`, `687f282e86`).
 
-| Check | `6dc97f6` (2026-10-23 23:23 to 23:32) | `17fbd1c` (2026-10-24 01:02 to 01:14) |
-| --- | --- | --- |
-| `npm run typecheck` / `npm run build` | passed / passed | passed / passed |
-| `node --test tests/*.test.mjs` | 2013/2014 (286 s): `S1/R17-G5` failed (below) | 2021/2021 (299 s), 0 cancelled, 0 skipped |
-| `npm run test:harness` | failed in `tests/harness-boundary-compaction.mjs` (below); re-run passed, 4 scripts | passed, 4 scripts |
-| `npm run test:replay` | digest unchanged | digest unchanged |
-| `npm run test:oracle` | 12/12 identical | 12/12 identical |
-| `npm run test:pack` | passed (254 archive entries, 254 published files) | passed (254, 254) |
-| `npm run test:profile` | passed | passed |
-| `npm run test:bundle` | 7/7 | 7/7 |
-| `node scripts/faults/run.mjs` | 24/24 | 24/24 |
-| `npm run test:web` | passed, 13 checks | 13 checks passed, then killed after its report (exit 143, below); re-run alone passed, 13 checks |
-| `npm run test:command-web` | passed, 11 checks | passed, 11 checks |
-| `npm run test:isolation` | 6/6 | 6/6 |
-| `npm run test:load` | D8 load envelope OK: observation bounded (max 1039 B and 1042 B, ratio 1.00x) | the same |
+| Check | `6dc97f6` (2026-10-23 23:23 to 23:32) | `17fbd1c` (2026-10-24 01:02 to 01:14) | `1218e86` (2026-10-24 03:02 to 03:16) |
+| --- | --- | --- | --- |
+| `npm run typecheck` / `npm run build` | passed / passed | passed / passed | passed / passed |
+| `node --test tests/*.test.mjs` | 2013/2014 (286 s): `S1/R17-G5` failed (below) | 2021/2021 (299 s), 0 cancelled, 0 skipped | 2038/2038 (451 s), 0 cancelled, 0 skipped |
+| `npm run test:harness` | failed in `tests/harness-boundary-compaction.mjs` (below); re-run passed, 4 scripts | passed, 4 scripts | passed, 4 scripts |
+| `npm run test:replay` | digest unchanged | digest unchanged | digest unchanged |
+| `npm run test:oracle` | 12/12 identical | 12/12 identical | 12/12 identical |
+| `npm run test:pack` | passed (254 archive entries, 254 published files) | passed (254, 254) | passed (254, 254) |
+| `npm run test:profile` | passed | passed | passed |
+| `npm run test:bundle` | 7/7 | 7/7 | 7/7 |
+| `node scripts/faults/run.mjs` | 24/24 | 24/24 | 24/24 |
+| `npm run test:web` | passed, 13 checks | 13 checks passed, then killed after its report (exit 143, below); re-run alone passed, 13 checks | passed, 13 checks (64 s) |
+| `npm run test:command-web` | passed, 11 checks | passed, 11 checks | passed, 11 checks (57 s) |
+| `npm run test:isolation` | 6/6 | 6/6 | 6/6 |
+| `npm run test:load` | D8 load envelope OK: observation bounded (max 1039 B and 1042 B, ratio 1.00x) | the same | the same |
 
 The pack has three files more than at `af154be`: `lib/process-identity.js` with its `.d.ts` and `.js.map`. Every web
 smoke's `report.json` records `harnessHead` `687f282e8625c6b8d11ff58211a90524be2e4317`. The harness, pack and profile
 logs carry 9, 11 and 7 `[mission_operation_pending]` lines at `6dc97f6` (where the harness run stopped in its second
-script) and 19, 10 and 6 at `17fbd1c`.
+script), 19, 10 and 6 at `17fbd1c`, and 30, 14 and 9 at `1218e86`.
 
 At `6dc97f6` two gates failed, each on a path the batch does not change. The load was not recorded for this run.
 
@@ -300,18 +423,33 @@ predates the batch: the same `finally` never clears the 10 s timer of its `Promi
 web smoke stays alive 10 s after its child exits, a third of the runner's grace, and `browser.close()` has no bound of
 its own.
 
+At `1218e86` every gate passed on its first run, so nothing was re-run; the web smokes exited 64 s and 57 s after
+they started, with no kill. One-minute load averages read 20.5 to 23.7 at the samples taken during the run
+(fifteen-minute 25.5 to 27.9), with other sessions' Harness processes running on the machine. None of the four
+full-suite failures CORE-06's own checks met (below) recurred.
+
 **Repair-round checks** (before the final gates): typecheck and build; the lock tests 29/29 with none skipped;
 `tests/check-failure-exits.test.mjs` 12/12; `claim-judgeability`, `rework-review` and `rework-in-place` 44/44;
 `verdict-honesty` with `claim-judgeability` 21/21; `declared-check-retry` 8/8, whose new CORE-05 label test fails with
 the old lookup patched back into the lib; related subsets of 480, 439 and 576 tests; `test:oracle` 12/12 identical;
 `test:replay`; faults 24/24.
 
+**CORE-06 checks** (before the final gates): typecheck (both tsconfigs) and build; the scratch reproduction and
+`tests/write-after-await.test.mjs` against `268a2c5`, `dac6704` and the fix (above); a first full suite at 2016 of
+2021, whose 5 failures came from the change (four stub kernels without `revise`, and a computed `PolicyError` code),
+both fixed; a full suite on the final code at 2034 of 2038, whose 4 failures were `[mission_operation_pending]`
+bounded waits and one bounded stop timer, hit while other test files ran at the same time, and whose three files
+(`declared-check-retry`, `liveness-create-path`, `owner-decisions`) passed 35 of 35 alone and had not failed in the
+first run; `test:harness` (4 scripts); `test:oracle` (12 scenarios, every log unchanged); faults 24/24.
+
 **Not exercised.**
 
-- `test:deepseek` and `test:command-deepseek`, which make real provider requests with the owner's key. CORE-01 changes
-  what a live reviewer of a source without checks must do; the prompt, the `swarm_verify` description and the refusal
-  say so, but no live model has yet been seen to publish a claim before it accepts. `test:validation-repair-web` and
-  `test:sidebar-service` did not run either.
+- `test:deepseek` and `test:command-deepseek` at `1218e86`. They make real provider requests with the owner's key, so
+  no gate run includes them; the owner's session ran both at `268a2c5` (above) and re-runs them on `1218e86` after
+  this record, to confirm that budget raises during a submission no longer cost steps. CORE-01 changes what a live
+  reviewer of a source without checks must do; the prompt, the `swarm_verify` description and the refusal say so, but
+  both live sources at `268a2c5` declared `node check.cjs`, so no live model has yet been seen to publish a claim
+  before it accepts a source without checks. `test:validation-repair-web` and `test:sidebar-service` did not run either.
 - The schema 8 upgrade ran on stores the tests rewrite into a schema 7 shape, never on a real home's store.
 - Process births were read on macOS only (`ps`); the linux reading (`/proc`) did not run on this machine. A recycled
   PID is simulated with a fabricated birth (`recycledBirth()`), not by wrapping the PID space.
@@ -349,6 +487,13 @@ the old lookup patched back into the lib; related subsets of 480, 439 and 576 te
   tick loads the attempt's tool runs and deliveries in full, and an operation's end names no attempt. In
   `src/trace.ts`, the `task/checkpointed` branch of `orchestratorCommands` cannot run, since that event is not in
   `ATTEMPT_FENCING_EVENTS`.
+- Writes after an await (CORE-06). `addMember` checks the `maxWorkers` budget before its awaits and does not re-check
+  it after them, so an owner who lowers `maxWorkers` during workspace preparation can end up one worker over the new
+  limit; that is an admission decision, not a stale-row write. `renewActiveOperation` caps renewed leases at the
+  deadline the scheduling pass read when it started, so an owner's deadline extension during the pass gives a shorter
+  lease until the next renewal; no stale row is written. Delivery, draft and start rows are outside `revise`: the
+  outbox acknowledgement, consumption and follow-ups re-read delivery rows inside their commits, and any other
+  asynchronous delivery writer still needs review (known-limitations).
 - Batch B of the self-review (F3, T2, T1, F2) is not on this branch.
 
 ## Harness 0.2.1-rc.2 only: 0.1.5-rc.3 and 0.1.7-rc.1 dropped (2026-10-22)
