@@ -43,7 +43,7 @@ class CommitPerAttempt extends FakeWorkers {
 /** An owner, an author and the only independent reviewer of the author's work. */
 async function fixture(t) {
   const { dir, runtime, workers, budget } = await makeRuntime(t, { workers: new CommitPerAttempt(), clock: new FakeClock(),
-    config: { maxEvents: 5000, maxTasksPerMember: 100, checkTimeoutMs: undefined }, budget: { maxTasks: 100 } })
+    config: { maxEvents: 5000, maxTasksPerMember: 100, checkTimeoutMs: undefined }, budget: { maxTasks: 100, maxExperiments: 2 } })
   await runtime.start()
   const owner = { sessionId: 'judgeability-owner' }
   const mission = runtime.create(owner, { title: 'Judgeability', objective: 'Dispute only what a verdict can judge', workspace: dir, scope: ['src/'], acceptance: ['works'], budget }, { grantRoot: dir, source: 'session' })
@@ -96,8 +96,10 @@ async function fixture(t) {
     assert.equal(evidence(claimed).challenges.length, 0, 'a refused challenge records no dispute')
     return message
   }
+  /** Why a claim `review` refuted by rejecting `task` is refused. */
+  const refutedBy = (task, review) => `was refuted when review ${review.id} rejected task ${task.id} at commit ${current(task).artifact.commit}`
   return { runtime, workers, owner, mission, author, reviewer, actor, current, evidence, events, eventsOf, propose, proposeReview, claim, publish,
-    submitClaimed, submit, verify, challenge, refused }
+    submitClaimed, submit, verify, challenge, refused, refutedBy }
 }
 
 test('the rule: archived, then cancelled, then refuted (superseded when a claim refuted it), then a review\'s own claim', () => {
@@ -197,6 +199,111 @@ test('(b2) a claim of a replaced task is not disputed once the repair is accepte
     `Use \`swarm_challenge\` with the \`evidenceId\` of a claim of task ${repair.id} a verdict can still judge instead: ${repaired.id}.`)
   assert.deepEqual([f.current(repair).status, f.current(repairReview).status, f.current(dependent).status], ['accepted', 'accepted', 'running'])
   assert.deepEqual(f.events('task/invalidated'), [])
+})
+
+/**
+ * The exit a refusal names is one the runtime then accepts. The task that
+ * answers for a refuted claim is its carrier (`carrier`, src/task-graph.ts),
+ * the one task owner control acts on, and the owner's exit is the one owner
+ * control takes for it (`reworkableRejection`, `reworksSpent`).
+ */
+test('a refuted claim of a rejected task a pending repair carries names that repair\'s next claim, never a resume of the task the repair replaced', async t => {
+  const f = await fixture(t)
+  const original = f.propose('Implement')
+  const refutedClaim = await f.submit(original, 'The first attempt works')
+  const rejecting = f.proposeReview(original)
+  await f.verify(rejecting, 'reject')
+  const repair = f.propose('Repair', { replaces: [original.id] })
+  const because = f.refutedBy(original, rejecting)
+  await f.refused(f.owner, refutedClaim, because, `Task ${repair.id} has no claim a verdict can judge yet; wait for its next claim, then use \`swarm_challenge\` with that \`evidenceId\`.`)
+  // A resume of the original is not the exit: the repair carries it.
+  assert.throws(() => f.runtime.controlTask(f.owner, f.mission.id, original.id, 'resume', {}, 'Rework instead'), error => error.code === 'task_replaced' && error.message.includes(`carried by its replacement ${repair.id}`))
+  // The exit is real: once the repair publishes, its claim is the one to challenge.
+  const claimed = await f.claim(f.author, repair)
+  const repaired = await f.publish(f.author, claimed, 'The repair works')
+  await f.refused(f.owner, refutedClaim, because, `Use \`swarm_challenge\` with the \`evidenceId\` of a claim of task ${repair.id} a verdict can still judge instead: ${repaired.id}.`)
+  f.challenge(f.owner, repaired)
+  assert.equal(f.evidence(repaired).status, 'challenged')
+})
+
+test('a rejected repair a pending repair replaced in turn is not the answer: the dispute waits on the task that carries the obligation now', async t => {
+  const f = await fixture(t)
+  const first = f.propose('Implement')
+  const firstClaim = await f.submit(first, 'The first attempt works')
+  const firstReview = f.proposeReview(first)
+  await f.verify(firstReview, 'reject')
+  const second = f.propose('Repair', { replaces: [first.id] })
+  const secondClaim = await f.submit(second, 'The repair works')
+  const secondReview = f.proposeReview(second)
+  await f.verify(secondReview, 'reject')
+  const third = f.propose('Repair the repair', { replaces: [second.id] })
+  assert.deepEqual([first, second, third].map(task => f.current(task).status), ['blocked', 'blocked', 'pending'])
+  const wait = `Task ${third.id} has no claim a verdict can judge yet; wait for its next claim, then use \`swarm_challenge\` with that \`evidenceId\`.`
+  // The first live replacement of the original is the rejected repair, which a
+  // resume would refuse ([task_replaced]): the carrier is the pending repair.
+  await f.refused(f.owner, firstClaim, f.refutedBy(first, firstReview), wait)
+  await f.refused(f.owner, secondClaim, f.refutedBy(second, secondReview), wait)
+  await f.refused(f.actor(f.reviewer), firstClaim, f.refutedBy(first, firstReview), wait)
+  for (const replaced of [first, second]) {
+    assert.throws(() => f.runtime.controlTask(f.owner, f.mission.id, replaced.id, 'resume', {}, 'Rework instead'),
+      error => error.code === 'task_replaced' && error.message.includes(`carried by its replacement ${third.id} (pending)`), 'owner control names the carrier its refusal leaves to act on')
+  }
+  const claimed = await f.claim(f.author, third)
+  const latest = await f.publish(f.author, claimed, 'The second repair works')
+  await f.refused(f.owner, firstClaim, f.refutedBy(first, firstReview), `Use \`swarm_challenge\` with the \`evidenceId\` of a claim of task ${third.id} a verdict can still judge instead: ${latest.id}.`)
+})
+
+test('a refuted claim of a rejected experiment names its replacement, never a resume: a rejected experiment stays blocked', async t => {
+  const f = await fixture(t)
+  const experiment = f.propose('Try an idea', { experiment: true })
+  const refutedClaim = await f.submit(experiment, 'The idea works')
+  const rejecting = f.proposeReview(experiment)
+  await f.verify(rejecting, 'reject')
+  const because = f.refutedBy(experiment, rejecting)
+  const message = await f.refused(f.owner, refutedClaim, because, `The rejection is yours to decide: task ${experiment.id} is a rejected experiment, which stays blocked, so repair it with a replacement: use \`swarm_propose\` naming \`replaces\`.`)
+  assert.ok(!message.includes('swarm_control') && !/\bresume\b/.test(message), message)
+  await f.refused(f.actor(f.author), refutedClaim, because, `If you hold that rejection wrong, call \`swarm_escalate\` with \`taskId\` ${experiment.id} so the owner decides.`)
+  // A resume is refused, and the replacement the refusal names is admitted.
+  assert.throws(() => f.runtime.controlTask(f.owner, f.mission.id, experiment.id, 'resume', {}, 'Rework instead'), error => error.code === 'task_refuted')
+  const replacement = f.propose('Try the idea again', { experiment: true, replaces: [experiment.id] })
+  assert.equal(f.current(replacement).status, 'pending')
+})
+
+test('a refuted claim of a task whose reworks are spent names the raised maxRework, the resume owner control accepts', async t => {
+  const f = await fixture(t)
+  const source = f.propose('Implement')
+  f.runtime.controlTask(f.owner, f.mission.id, source.id, 'amend', { maxRework: 1 }, 'One rework at most')
+  await f.submit(source, 'The first attempt works')
+  const rejecting = f.proposeReview(source)
+  await f.verify(rejecting, 'reject')
+  f.runtime.controlTask(f.owner, f.mission.id, source.id, 'resume', {}, 'Rework it once')
+  const refutedClaim = await f.submit(source, 'The reworked attempt works')
+  await f.verify(rejecting, 'reject')
+  assert.deepEqual([f.current(source).status, f.current(source).reworkCount, f.evidence(refutedClaim).status], ['blocked', 1, 'refuted'])
+  await f.refused(f.owner, refutedClaim, f.refutedBy(source, rejecting),
+    `The rejection is yours to decide: task ${source.id} was already reworked 1/1 time(s), so resume it with \`swarm_control\`, its \`taskId\`, \`action\` resume and a higher \`maxRework\` in \`changes\` to rework it again, or propose a replacement with \`swarm_propose\` naming \`replaces\`.`)
+  // A plain resume is refused; the named one reworks the task in place.
+  assert.throws(() => f.runtime.controlTask(f.owner, f.mission.id, source.id, 'resume', {}, 'Rework again'), error => error.code === 'task_rework_exhausted')
+  assert.equal(f.runtime.controlTask(f.owner, f.mission.id, source.id, 'resume', { maxRework: 2 }, 'Rework again').status, 'pending')
+  assert.equal(f.current(rejecting).status, 'pending', 'the rejecting review re-opens for the resubmission')
+})
+
+test('a reviewer\'s claim a rework archived on the review names the reviewed source\'s claims a verdict can still judge', async t => {
+  const f = await fixture(t)
+  const source = f.propose('Implement')
+  await f.submit(source, 'The first attempt works')
+  const review = f.proposeReview(source)
+  const claimedReview = await f.claim(f.reviewer, review)
+  const finding = await f.publish(f.reviewer, claimedReview, 'The artifact fails test X')
+  await f.runtime.verify(f.actor(f.reviewer), f.mission.id, { taskId: review.id, attemptId: claimedReview.attempt.id, verdict: 'reject', reason: 'Fails test X' })
+  const rejected = f.current(source).artifact.commit
+  f.runtime.controlTask(f.owner, f.mission.id, source.id, 'resume', {}, 'Rework the rejected artifact')
+  const because = `belongs to the round of task ${review.id} that review ${review.id} closed by rejecting commit ${rejected}; the rework archived it with that rejection`
+  await f.refused(f.owner, finding, because, `Task ${source.id} has no claim a verdict can judge yet; wait for its next claim, then use \`swarm_challenge\` with that \`evidenceId\`.`)
+  const reworked = await f.submit(source, 'The reworked attempt works')
+  await f.refused(f.owner, finding, because, `Use \`swarm_challenge\` with the \`evidenceId\` of a claim of task ${source.id} a verdict can still judge instead: ${reworked.id}.`)
+  f.challenge(f.owner, reworked)
+  assert.equal(f.evidence(reworked).status, 'challenged')
 })
 
 test('a claim of work the owner withdrew supports no result: its challenge is refused and names nothing left to dispute', async t => {

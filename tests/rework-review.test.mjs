@@ -479,6 +479,8 @@ test('the rejecting reviewer\'s claims are archived with its verdict: disputing 
     assert.equal(error.code, 'evidence_not_judgeable')
     assert.ok(error.message.startsWith('[evidence_not_judgeable] '), error.message)
     assert.ok(error.message.includes(`belongs to the round of task ${review.id} that review ${review.id} closed by rejecting commit ${rejected}`), error.message)
+    // The dispute moves to the reviewed source, never the review: the accepted source published no claim, so its repair is new work.
+    assert.ok(error.message.endsWith(`No claim a verdict can judge carries this dispute; propose the repair of task ${source.id} as new work with \`swarm_propose\` and an \`objective\` that names it.`), error.message)
     assert.deepEqual(assessText(error.message, index), [], 'the exit resolves in the published tool schema')
     return true
   })

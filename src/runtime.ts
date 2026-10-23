@@ -27,7 +27,7 @@ import { validScope, scopeSubset } from './scope.ts'
 import { AdmissionError, assertDeclaredOutputs, assertScopeSelectors, citedCovers, dependencyAssumptions, formatDiagnostic, isNoopCheck, loadPackageScripts, normalizeReviewDependencies, normalizeScopeSelectors, normalizeTaskCeilings, reconcileTaskAdmission, requireHostChecks, taskCeilingBlock, taskGraphDefects, TaskGraphAdmissionError, memberRouteDiagnostic, type MemberRouteEntry, type TaskGraphNode } from './admission.ts'
 import { canBorrowTask, canOwnReview, strandedReview } from './assignment.ts'
 import { executionClock, executionElapsed, exhaustedDimensions } from './resource-time.ts'
-import { TERMINAL_STATES, blockCauses, currentEvidenceIds, finishedAttempt, holdsAttempt, holdsOpenAttempt, judgeableClaims, memberTask, missionSubject, openAttempt, pendingStopOwner, quiescencePending, reviewEvidence, selectAcceptedDelivery, stopPending, subjectsOfTasks, taskEdges, taskGraphIndex, taskSubject, terminal, uncoveredCriteria, unjudgeable, type BlockCause, type HeldTask, type Unjudgeable } from './task-graph.ts'
+import { TERMINAL_STATES, blockCauses, currentEvidenceIds, finishedAttempt, holdsAttempt, holdsOpenAttempt, judgeableClaims, memberTask, missionSubject, openAttempt, pendingStopOwner, quiescencePending, reviewEvidence, selectAcceptedDelivery, stopPending, subjectsOfTasks, taskEdges, taskGraphIndex, taskOwnerId, taskSubject, terminal, uncoveredCriteria, unjudgeable, type BlockCause, type HeldTask, type TaskGraphIndex, type Unjudgeable } from './task-graph.ts'
 import { checkSyntaxDetail, declaredPlanChecks, orderedTasks, pairReviews, planAdvisories, validatePlan } from './plans.ts'
 import { OWNER_ONLY_TOOLS, UNCONFINED_HOST_TOOLS, type AcceptanceBasis, type Actor, type AutoStart, BoardQuery, Budget, CheckAttribution, CreateMissionInput, CriticalPath, criterionId, Delivery, DraftPlan, Escalation, Evidence, EvidenceStatus, Member, Mission, nextWorkerName, ObserveQuery, MessageInput, PlanInput, Post, PostInput, PostKind, PROVIDER_OUTAGE_WINDOW_MS, MemberRouteRefusal, ProposeTaskInput, ProviderOutage, providerQuiescent, PublishInput, RecoveryFallback, RequestStartInput, RuntimeConfig, Snapshot, Task, TaskAmendment, TaskRejection, TaskCeiling, ToolRun, VerificationCleanupFailure, WorkerAdapter, WorkerActivity, Workstream } from './types.ts'
 import { requireArtifactChecks } from './artifact-policy.ts'
@@ -79,6 +79,15 @@ const AUTO_REVIEW_RECOVERY_ATTEMPTS = 2
  */
 export const DEFAULT_MAX_REWORK = 2
 /**
+ * Whether `task`'s owner re-opens after independent rejection are spent: it was
+ * reworked `maxRework` times (`DEFAULT_MAX_REWORK` when it sets none). A
+ * resume then reworks it only with a raised `maxRework`. The rejection
+ * decision, owner task control and the refusal of a dispute all ask it here.
+ */
+function reworksSpent(task: Pick<Task, 'reworkCount' | 'maxRework'>): boolean {
+  return (task.reworkCount ?? 0) >= (task.maxRework ?? DEFAULT_MAX_REWORK)
+}
+/**
  * The repair path the verify site's rejection decision names to the owner and
  * to the author: rework in place first, a replacement second. A rejected
  * experiment stays blocked, so it is offered the replacement alone; a task past
@@ -92,7 +101,7 @@ function rejectionRepair(source: Task, reviewId: string): { owner: string; autho
   const used = source.reworkCount ?? 0
   const max = source.maxRework ?? DEFAULT_MAX_REWORK
   return {
-    owner: `${used < max ? `Rework it in place with ${resume} (rework ${used + 1}/${max}): its author resumes from the rejected commit and review ${reviewId} re-reviews the resubmission`
+    owner: `${!reworksSpent(source) ? `Rework it in place with ${resume} (rework ${used + 1}/${max}): its author resumes from the rejected commit and review ${reviewId} re-reviews the resubmission`
       : `It was reworked ${used}/${max} times; raise changes.maxRework in ${resume} to rework it again`}. Otherwise propose a replacement with ${replaces}, or adjust the plan.`,
     author: `Repair path: the owner can re-open this task for you with ${resume}; then rework it from your rejected commit and resubmit. Otherwise a replacement repairs it: ${replaces} and the same kind (${source.kind}), inheriting its acceptance. Until then do not resubmit; it stays blocked.`,
   }
@@ -1649,7 +1658,7 @@ export class SwarmRuntime implements Kernel {
       if (attemptId !== undefined) {
         if (task.attempt?.id !== attemptId) throw new Error('Escalation attempt does not belong to that task')
         if (task.attempt.ownerId !== member.id) throw new Error('Escalation attempt is not owned by the caller')
-      } else if ((task.attempt?.ownerId ?? task.assigneeId) !== member.id) throw new Error('Escalation task is not owned by the caller')
+      } else if (taskOwnerId(task) !== member.id) throw new Error('Escalation task is not owned by the caller')
     }
     const escalationId = id('esc'), dedupKey = `escalation:${escalationId}`
     const escalation: Escalation = {
@@ -1874,68 +1883,66 @@ export class SwarmRuntime implements Kernel {
   /**
    * What the refusal of a challenge of a claim of `owning` no verdict can
    * judge (`unjudgeable`; one code for every reason) says: why, and the exit
-   * the caller has. The dispute
-   * moves to the claims a verdict can still judge of the task that now answers
-   * for this one: the reworked task for a claim a rework archived on it, the
-   * reviewed source for a review's own claim (archived or not), the task
-   * carrying a cancelled task's obligation, the task of the claim that
-   * superseded it, the live replacement of a rejected task. While that task can
-   * still publish a claim, the caller waits for one. Otherwise the dispute is a
-   * decision. A rejection is the owner's: `swarm_control` resume reworks the
-   * task in place, and its review then judges the resubmission, or a
-   * replacement repairs it; a member asks the owner with `swarm_escalate`, by
-   * the task when it owns that task. A cancelled task with no carrier holds no
-   * result left to dispute.
+   * the caller has. The dispute moves to the work the claim was about: the
+   * task of the claim that superseded it, else its own task, and for a
+   * review's claim (archived or not) the source it reviews. That work is
+   * answered for by its carrier (`carrier`), the one task owner control acts
+   * on: a live replacement of a rejected, replaced or cancelled task, or the
+   * task itself. A caller challenges that task's claims a verdict can still
+   * judge, or waits for its next claim while it can still publish one. A
+   * cancelled carrier holds no result left to dispute. Otherwise the dispute is
+   * a decision. A rejection is the owner's, and the exit named is the one
+   * owner control takes (`reworkableRejection`, `reworksSpent`): a resume that
+   * reworks the task in place, where its review judges the resubmission, or
+   * with a raised `maxRework` once its reworks are spent; a replacement where
+   * resume cannot rework it (a rejected experiment). A member asks the owner
+   * with `swarm_escalate`, by `taskId` when it answers for the task
+   * (`taskOwnerId`).
    */
   private unjudgeableDispute(owning: Task, why: Unjudgeable, member: Member | undefined): { because: string; exit: string } {
     const graph = this.boardOf(owning.missionId).graph
     let because: string
-    let answering: Task | undefined
+    let disputed: Task | undefined = owning
     switch (why.kind) {
       case 'archived':
         because = `belongs to the round of task ${owning.id} that review ${why.rejection.reviewTaskId} closed by rejecting commit ${why.rejection.commit}; the rework archived it with that rejection`
-        answering = owning.kind === 'verification' ? graph.reviewSource(owning) : owning
         break
-      case 'cancelled': {
+      case 'cancelled':
         because = `belongs to task ${owning.id}, which is cancelled and so supports no result`
-        const carrier = graph.effective(owning.id)
-        answering = carrier === undefined || carrier.id === owning.id ? undefined : carrier
         break
-      }
       case 'superseded': {
         because = `is refuted and superseded by evidence ${why.by}, which a verdict verified`
         const by = this.store.get('evidence', why.by)
-        answering = by === undefined ? undefined : graph.byId.get(by.taskId)
+        disputed = by === undefined ? undefined : graph.byId.get(by.taskId)
         break
       }
       case 'refuted': {
         const rejecting = this.rejectingReview(owning)
         because = `was refuted when ${rejecting === undefined ? 'an independent review' : `review ${rejecting.id}`} rejected task ${owning.id}${rejecting?.reviewedCommit === undefined ? '' : ` at commit ${rejecting.reviewedCommit}`}`
-        answering = graph.liveReplacement(owning.id)
         break
       }
       case 'review-evidence':
         because = `is review ${owning.id}'s own evidence for its verdict on task ${owning.reviewOf}; a verdict judges the claims of the work it reviews, and nothing reviews a review`
-        answering = graph.reviewSource(owning)
         break
     }
-    const claims = answering === undefined ? [] : judgeableClaims(answering, evidenceId => this.store.get('evidence', evidenceId))
-    let exit: string
-    if (answering !== undefined && claims.length > 0) exit = `Use \`swarm_challenge\` with the \`evidenceId\` of a claim of task ${answering.id} a verdict can still judge instead: ${claims.map(claim => claim.id).join(', ')}.`
-    else if (answering !== undefined && answering.kind !== 'verification' && (answering.status === 'pending' || answering.status === 'running')) exit = `Task ${answering.id} has no claim a verdict can judge yet; wait for its next claim, then use \`swarm_challenge\` with that \`evidenceId\`.`
-    else if (why.kind === 'cancelled' && answering === undefined) exit = `No result rests on it, so nothing is left to dispute; to dispute live work, use \`swarm_challenge\` with the \`evidenceId\` of one of its claims.`
-    else {
-      const decided = answering ?? owning
-      const rejection = !decided.experiment && this.rejectingReview(decided) !== undefined
-      if (member === undefined) exit = rejection
-        ? `The rejection is yours to decide: resume task ${decided.id} with \`swarm_control\`, its \`taskId\` and \`action\` resume to rework it in place, where its review judges the resubmission, or propose a replacement with \`swarm_propose\` naming \`replaces\`.`
-        : `No claim a verdict can judge carries this dispute; propose the repair of task ${decided.id} as new work with \`swarm_propose\` and an \`objective\` that names it.`
-      else {
-        const owns = (decided.attempt?.ownerId ?? decided.assigneeId) === member.id
-        exit = `If you hold ${rejection ? 'that rejection' : 'it'} wrong, call \`swarm_escalate\` with ${owns ? `\`taskId\` ${decided.id}` : `a \`body\` naming task ${decided.id}`} so the owner decides.`
-      }
+    const work = disputed?.kind === 'verification' ? graph.reviewSource(disputed) : disputed
+    const carrier = work === undefined ? undefined : graph.carrier(work.id)
+    const answering = carrier?.status === 'cancelled' ? undefined : carrier
+    if (answering === undefined) return { because, exit: 'No result rests on it, so nothing is left to dispute; to dispute live work, use `swarm_challenge` with the `evidenceId` of one of its claims.' }
+    const claims = judgeableClaims(answering, evidenceId => this.store.get('evidence', evidenceId))
+    if (claims.length > 0) return { because, exit: `Use \`swarm_challenge\` with the \`evidenceId\` of a claim of task ${answering.id} a verdict can still judge instead: ${claims.map(claim => claim.id).join(', ')}.` }
+    if (answering.status === 'pending' || answering.status === 'running') return { because, exit: `Task ${answering.id} has no claim a verdict can judge yet; wait for its next claim, then use \`swarm_challenge\` with that \`evidenceId\`.` }
+    const rejected = this.rejectingReview(answering) !== undefined
+    if (member !== undefined) {
+      const by = taskOwnerId(answering) === member.id ? `\`taskId\` ${answering.id}` : `a \`body\` naming task ${answering.id}`
+      return { because, exit: `If you hold ${rejected ? 'that rejection' : 'it'} wrong, call \`swarm_escalate\` with ${by} so the owner decides.` }
     }
-    return { because, exit }
+    const replacement = 'or propose a replacement with `swarm_propose` naming `replaces`.'
+    if (this.reworkableRejection(answering, graph) !== undefined) return { because, exit: reworksSpent(answering)
+      ? `The rejection is yours to decide: task ${answering.id} was already reworked ${answering.reworkCount ?? 0}/${answering.maxRework ?? DEFAULT_MAX_REWORK} time(s), so resume it with \`swarm_control\`, its \`taskId\`, \`action\` resume and a higher \`maxRework\` in \`changes\` to rework it again, ${replacement}`
+      : `The rejection is yours to decide: resume task ${answering.id} with \`swarm_control\`, its \`taskId\` and \`action\` resume to rework it in place, where its review judges the resubmission, ${replacement}` }
+    if (rejected) return { because, exit: `The rejection is yours to decide: task ${answering.id} ${answering.experiment ? 'is a rejected experiment, which stays blocked' : 'cannot be reworked in place now'}, so repair it with a replacement: use \`swarm_propose\` naming \`replaces\`.` }
+    return { because, exit: `No claim a verdict can judge carries this dispute; propose the repair of task ${answering.id} as new work with \`swarm_propose\` and an \`objective\` that names it.` }
   }
   /** Fence the old attempt immediately; quiescence and reassignment occur after this tool returns. */
   handoff(actor: Actor, missionId: string, input: { taskId: string; attemptId: string; to?: string; summary: string }): { handoff: string } {
@@ -2015,6 +2022,20 @@ export class SwarmRuntime implements Kernel {
     if (commit === undefined) return undefined
     return this.store.list('tasks', task.missionId).find(review => review.reviewOf === task.id && review.status === 'blocked'
       && review.verificationRecovery === undefined && review.reviewedCommit === commit)
+  }
+  /**
+   * The independent rejection an owner resume of `task` reworks in place
+   * (`reopenForRework`): its rejecting review, unless a live replacement
+   * carries the task (resume is then refused, `task_replaced`), the task is an
+   * experiment (a rejected experiment stays blocked; only a replacement repairs
+   * it) or a stop is pending on it (its resume is the cleanup retry). Whether a
+   * rework is left is `reworksSpent`. Owner task control enforces this one
+   * rule and the refusal of a dispute (`unjudgeableDispute`) names it, so the
+   * refusal never offers an exit the control refuses.
+   */
+  private reworkableRejection(task: Task, graph: TaskGraphIndex): Task | undefined {
+    if (graph.carrier(task.id)?.id !== task.id || task.experiment || stopPending(task)) return undefined
+    return this.rejectingReview(task)
   }
   /**
    * Re-open an independently rejected task in place (owner resume). The
@@ -3189,8 +3210,8 @@ export class SwarmRuntime implements Kernel {
     // replacement chain is not cancelled, even behind a withdrawn repair.
     // Nothing below writes before the amendment commits, so this graph is the board each decision reads.
     const graph = taskGraphIndex(this.store.list('tasks', missionId))
-    const carrier = graph.liveReplacement(task.id)
-    if (carrier !== undefined) throw new PolicyError('task_replaced', 'conflict_error', `[task_replaced] Task ${task.id} is carried by its replacement ${carrier.id} (${carrier.status}), so it is neither amended nor resumed. Amend or resume that replacement with \`swarm_control\` and its \`taskId\` while it is live; withdraw it with \`swarm_cancel\` and its \`taskId\` to re-open this task, or withdraw this task once the replacement is accepted.`)
+    const carrier = graph.carrier(task.id)!
+    if (carrier.id !== task.id) throw new PolicyError('task_replaced', 'conflict_error', `[task_replaced] Task ${task.id} is carried by its replacement ${carrier.id} (${carrier.status}), so it is neither amended nor resumed. Amend or resume that replacement with \`swarm_control\` and its \`taskId\` while it is live; withdraw it with \`swarm_cancel\` and its \`taskId\` to re-open this task, or withdraw this task once the replacement is accepted.`)
     // A submitted artifact may acquire additional checks without changing its
     // content, authorship or obligations. The verdict fences this exact check list.
     const strengthenSubmittedChecks = task.status === 'submitted' && action === 'amend'
@@ -3203,9 +3224,8 @@ export class SwarmRuntime implements Kernel {
     if (structural && (task.artifact !== undefined || task.status === 'submitted')) throw new PolicyError('artifact_policy_immutable', 'conflict_error', `[artifact_policy_immutable] Task ${task.id} holds a submitted or rejected artifact, so its scope, outputs, dependencies, checks and assignee are fixed. Resume a rejected task with \`swarm_control\` and \`action\` resume first, then amend it; otherwise propose a replacement with \`swarm_propose\` naming \`replaces\`.`)
     const causes = this.taskBlockCauses(task)
     // An independently rejected source re-opens in place when it resumes (the
-    // rework below). A rejected experiment stays blocked, and a pending stop
-    // keeps its resume as the cleanup retry.
-    const rejection = task.experiment || stopPending(task) ? undefined : this.rejectingReview(task)
+    // rework below), unless `reworkableRejection` says why it cannot.
+    const rejection = this.reworkableRejection(task, graph)
     if (rejection === undefined && task.status === 'blocked' && causes.has('refuted') && !causes.has('review-deferred')) throw new PolicyError('task_refuted', 'conflict_error', 'Refuted work requires a replacement preserving its original acceptance')
     const next: Task = { ...task }
     for (const key of ['maxSteps', 'maxFindings', 'maxRecoveryAttempts', 'checkTimeoutMs', 'maxRework'] as const) {
@@ -3269,7 +3289,7 @@ export class SwarmRuntime implements Kernel {
     const resumes = action === 'resume' || (rejection === undefined ? implied : changes.maxRework !== undefined && (task.reworkCount ?? 0) < changes.maxRework)
     const rework = resumes ? rejection : undefined
     const maxRework = next.maxRework ?? DEFAULT_MAX_REWORK
-    if (rework !== undefined && (task.reworkCount ?? 0) >= maxRework) throw new PolicyError('task_rework_exhausted', 'budget_error', `[task_rework_exhausted] Task ${task.id} was already reworked ${task.reworkCount}/${maxRework} time(s) after independent rejection, so it stays blocked. Raise \`maxRework\` in \`changes\` with \`swarm_control\` to resume it again, or withdraw it with \`swarm_cancel\` and its \`taskId\` and propose a replacement with \`swarm_propose\` naming \`replaces\`: ["${task.id}"].`)
+    if (rework !== undefined && reworksSpent(next)) throw new PolicyError('task_rework_exhausted', 'budget_error', `[task_rework_exhausted] Task ${task.id} was already reworked ${task.reworkCount}/${maxRework} time(s) after independent rejection, so it stays blocked. Raise \`maxRework\` in \`changes\` with \`swarm_control\` to resume it again, or withdraw it with \`swarm_cancel\` and its \`taskId\` and propose a replacement with \`swarm_propose\` naming \`replaces\`: ["${task.id}"].`)
     // Any other blocked task that carries an artifact (a rejected experiment, or
     // work invalidated after it submitted) keeps it immutable: a resume would
     // only fence the historical author and re-pend work that can never change.

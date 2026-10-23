@@ -46,6 +46,28 @@ export function taskGraphIndex(tasks: readonly Task[]) {
    */
   const liveReplacement = (id: string): Task | undefined => replacementDescendants(id).find(task => task.status !== 'cancelled')
   /**
+   * The task that carries `id`'s obligation now: `id` itself while no
+   * replacement of it is live (`liveReplacement`), otherwise the carrier of
+   * that replacement, recursively. Owner task control acts only on a carrier
+   * (it refuses any other, `task_replaced`), so this is the task a decision
+   * about `id`'s work is made on: a rejected repair of `id` that a pending
+   * repair replaced in turn is carried by that pending repair. Unlike
+   * `lineage`, it never ends on a withdrawn repair while the task that repair
+   * replaced can still be resumed. A cancelled carrier is only ever `id`
+   * itself, with no live replacement. Undefined for an id outside the index.
+   */
+  const carrier = (id: string): Task | undefined => {
+    const seen = new Set<string>()
+    let current = byId.get(id)
+    while (current !== undefined && !seen.has(current.id)) {
+      seen.add(current.id)
+      const next = liveReplacement(current.id)
+      if (next === undefined) return current
+      current = next
+    }
+    return current
+  }
+  /**
    * `id` and every task it replaces, transitively: the one backward walk over
    * `replaces`, both parents of a `replaces: [a, b]` repair included, in
    * breadth-first order from `id`. Only indexed rows are returned, so an id
@@ -227,7 +249,7 @@ export function taskGraphIndex(tasks: readonly Task[]) {
     })
   }
   return { byId, lineage, effective, identities, dependencyMet, dependenciesMet, danglingReference, effectiveDependencies, unfinishedDependencies,
-    reviewSource, covers, replacementDescendants, liveReplacement, replacedLineage, criteriaOf, checklist }
+    reviewSource, covers, replacementDescendants, liveReplacement, carrier, replacedLineage, criteriaOf, checklist }
 }
 
 /** Each mission criterion whose id `covered` lacks, as the id and its quoted text (`c2 "text"`), in mission order. */
@@ -378,6 +400,16 @@ export function holdsAttempt(row: Task | undefined, missionId: string, attemptId
  */
 export function openAttempt(tasks: readonly Task[], memberId: string): HeldTask | undefined {
   return tasks.find((task): task is HeldTask => holdsOpenAttempt(task) && task.attempt.ownerId === memberId)
+}
+
+/**
+ * The member that answers for `task`: its attempt's owner, else its assignee.
+ * A member escalates about a task by its `taskId` only when it answers for it
+ * (`escalate`), so the refusal of a dispute names the `taskId` exit to that
+ * member alone and asks any other to name the task in the escalation's body.
+ */
+export function taskOwnerId(task: Pick<Task, 'attempt' | 'assigneeId'>): string | undefined {
+  return task.attempt?.ownerId ?? task.assigneeId
 }
 
 /**
