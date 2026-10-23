@@ -27,7 +27,7 @@ import { validScope, scopeSubset } from './scope.ts'
 import { AdmissionError, assertDeclaredOutputs, assertScopeSelectors, citedCovers, dependencyAssumptions, formatDiagnostic, isNoopCheck, loadPackageScripts, normalizeReviewDependencies, normalizeScopeSelectors, normalizeTaskCeilings, reconcileTaskAdmission, requireHostChecks, taskCeilingBlock, taskGraphDefects, TaskGraphAdmissionError, memberRouteDiagnostic, type MemberRouteEntry, type TaskGraphNode } from './admission.ts'
 import { canBorrowTask, canOwnReview, strandedReview } from './assignment.ts'
 import { executionClock, executionElapsed, exhaustedDimensions } from './resource-time.ts'
-import { TERMINAL_STATES, blockCauses, currentEvidenceIds, finishedAttempt, holdsAttempt, holdsOpenAttempt, memberTask, missionSubject, openAttempt, pendingStopOwner, quiescencePending, selectAcceptedDelivery, stopPending, subjectsOfTasks, taskEdges, taskGraphIndex, taskSubject, terminal, uncoveredCriteria, type BlockCause, type HeldTask } from './task-graph.ts'
+import { TERMINAL_STATES, blockCauses, currentEvidenceIds, finishedAttempt, holdsAttempt, holdsOpenAttempt, judgeableClaims, memberTask, missionSubject, openAttempt, pendingStopOwner, quiescencePending, selectAcceptedDelivery, stopPending, subjectsOfTasks, taskEdges, taskGraphIndex, taskSubject, terminal, uncoveredCriteria, type BlockCause, type HeldTask } from './task-graph.ts'
 import { checkSyntaxDetail, declaredPlanChecks, orderedTasks, pairReviews, planAdvisories, validatePlan } from './plans.ts'
 import { OWNER_ONLY_TOOLS, UNCONFINED_HOST_TOOLS, type Actor, type AutoStart, BoardQuery, Budget, CheckAttribution, CreateMissionInput, CriticalPath, criterionId, Delivery, DraftPlan, Escalation, Evidence, EvidenceStatus, Member, Mission, nextWorkerName, ObserveQuery, MessageInput, PlanInput, Post, PostInput, PostKind, PROVIDER_OUTAGE_WINDOW_MS, MemberRouteRefusal, ProposeTaskInput, ProviderOutage, providerQuiescent, PublishInput, RecoveryFallback, RequestStartInput, RuntimeConfig, Snapshot, Task, TaskAmendment, TaskRejection, TaskCeiling, ToolRun, VerificationCleanupFailure, WorkerAdapter, WorkerActivity, Workstream } from './types.ts'
 import { requireArtifactChecks } from './artifact-policy.ts'
@@ -1233,8 +1233,10 @@ export class SwarmRuntime implements Kernel {
       const { task, member } = this.ownAttempt(actor, missionId, input.taskId, input.attemptId)
       if (task.kind === 'verification') throw new Error('[verification_requires_verify] Verification tasks must use swarm_verify Call `swarm_verify` with `taskId` and `verdict`, then retry.')
       this.bounded(input.output)
-      // A refuted claim, or one a rework archived, supports nothing.
-      const liveClaim = currentEvidenceIds(task).some(evidenceId => this.store.get('evidence', evidenceId)?.status !== 'refuted')
+      // Only a claim the verdict can still judge supports the submission: a
+      // refuted claim, or one a rework archived, supports nothing.
+      const evidenceOf = (evidenceId: string) => this.store.get('evidence', evidenceId)
+      const liveClaim = judgeableClaims(task, evidenceOf).length > 0
       if (task.kind === 'research' && !liveClaim) throw new Error('[research_evidence_required] Research submission requires host-backed evidence. Supply host-backed evidence with `swarm_publish` and its `toolRunIds`, then retry with `swarm_submit` and its `taskId`.')
       this.attempts.fenceAttempt(this.mission(missionId), task, this.config.leaseMs)
       // A declared output that is not written is refused at capture with
@@ -1270,8 +1272,9 @@ export class SwarmRuntime implements Kernel {
       const missingReview = this.missingReviewPath(task)
       this.commit(missionId, () => {
         this.store.put('tasks', task)
-        // A refuted or archived claim stays pinned to the artifact it was judged on (F3-B).
-        for (const evidenceId of currentEvidenceIds(task)) { const e = this.store.get('evidence', evidenceId)!; if (e.status === 'refuted') continue; e.artifact = artifact; this.store.put('evidence', e) }
+        // The claims the verdict will judge are pinned to this artifact; a
+        // refuted or archived one stays pinned to the artifact it was judged on (F3-B).
+        for (const evidence of judgeableClaims(task, evidenceOf)) { evidence.artifact = artifact; this.store.put('evidence', evidence) }
         // Submission is routine progress: the durable event reaches the UI; the reviewer receives its assignment.
         this.store.event(missionId, 'task/submitted', member.id, { taskId: task.id, artifact,
           ...(repeated === undefined ? {} : { repeatsRejection: { commit: repeated.commit, reviewTaskId: repeated.reviewTaskId, rejection: task.rejections!.indexOf(repeated) } }),
@@ -1391,13 +1394,44 @@ export class SwarmRuntime implements Kernel {
           for (const memberId of lineage.released) released.add(memberId)
         }
         const verdictEvidence: Array<{ id: string; outcome: string }> = []
-        for (const evidenceId of currentEvidenceIds(source)) {
-          const evidence = this.store.get('evidence', evidenceId)!
-          // F3-B: a claim is never both refuted and verified. One refuted by an
-          // earlier verdict or a superseding claim stays refuted, and one a
-          // rework archived stays with the rejection that refuted it: this
-          // verdict neither verifies it again nor records a second refutation.
-          if (evidence.status === 'refuted') continue
+        // F3-B: a claim is never both refuted and verified. The verdict judges
+        // only the source's claims a verdict can still judge (`judgeableClaims`):
+        // one refuted by an earlier verdict or a superseding claim stays
+        // refuted, and one a rework archived stays with the rejection that
+        // refuted it, so this verdict neither verifies it again nor records a
+        // second refutation.
+        const judged = judgeableClaims(source, evidenceId => this.store.get('evidence', evidenceId))
+        const judgedById = new Map(judged.map(evidence => [evidence.id, evidence]))
+        // An acceptance resolves supersession among the claims it judges before
+        // it verifies any: a claim that a judged claim it would verify (any but
+        // an inconclusive one, which is never verified) names in `supersedes`
+        // is refuted by that claim, never verified first. The last such claim
+        // wins, as the link of a predecessor two claims supersede always did.
+        const supersededBy = new Map<string, Evidence>()
+        if (passed) for (const claim of judged) if (claim.outcome !== 'inconclusive') for (const previous of claim.supersedes) supersededBy.set(previous, claim)
+        /**
+         * Refute what `claim` supersedes (`supersededBy`), `head` being the
+         * verified claim at the end of its chain. A judged predecessor this
+         * acceptance supersedes passes the refutation on to what it
+         * supersedes in turn (it was never verified, so they are not either);
+         * an inconclusive one supersedes nothing. One of an earlier verdict or
+         * of the replaced lineage already refuted keeps its single refutation:
+         * supersession only adds the lineage link. `publish` admits only
+         * existing claims to `supersedes`, so every chain is finite.
+         */
+        const supersede = (claim: Evidence, head: Evidence): void => {
+          for (const previous of claim.supersedes) {
+            if (supersededBy.get(previous) !== claim) continue
+            const old = judgedById.get(previous) ?? this.store.get('evidence', previous)!
+            const alreadyRefuted = old.status === 'refuted'
+            old.status = 'refuted'; old.refutedBy = claim.id; this.store.put('evidence', old)
+            const reason = claim === head ? `Superseded by verified evidence ${claim.id}` : `Superseded by evidence ${claim.id}, itself superseded by verified evidence ${head.id}`
+            if (!alreadyRefuted) this.store.event(missionId, 'evidence/refuted', member.id, { evidenceId: old.id, refutedBy: claim.id, taskId: old.taskId, verificationTaskId: task.id, reason, retired })
+            if (judgedById.has(old.id)) supersede(old, head)
+          }
+        }
+        for (const evidence of judged) {
+          const evidenceId = evidence.id
           // F-12: the durable log must reconstruct which claim became verified or
           // refuted and which reviews the verdict retired; `task/accepted` alone
           // names neither the evidence nor the retired tasks.
@@ -1412,6 +1446,8 @@ export class SwarmRuntime implements Kernel {
             verdictEvidence.push(evidence)
             continue
           }
+          // Refuted with the claim that supersedes it, after that claim's verdict.
+          if (supersededBy.has(evidenceId)) continue
           // Status follows the verdict and the claim's own outcome: an inconclusive
           // claim is never promoted to verified knowledge.
           const status: EvidenceStatus = evidence.outcome === 'inconclusive' ? 'unverified' : 'verified'
@@ -1420,15 +1456,7 @@ export class SwarmRuntime implements Kernel {
           if (status !== 'verified') continue
           verdictEvidence.push(evidence)
           this.store.event(missionId, 'evidence/verified', member.id, { evidenceId, outcome: evidence.outcome, taskId: source.id, verificationTaskId: task.id, commit: artifact.commit, retired })
-          for (const previous of evidence.supersedes) {
-            const old = this.store.get('evidence', previous)!
-            const alreadyRefuted = old.status === 'refuted'
-            old.status = 'refuted'; old.refutedBy = evidence.id; this.store.put('evidence', old)
-            // A predecessor already refuted by its own rejected verification
-            // keeps its single refutation; supersession only adds the lineage
-            // link. A claim is never refuted twice or both refuted and verified.
-            if (!alreadyRefuted) this.store.event(missionId, 'evidence/refuted', member.id, { evidenceId: old.id, refutedBy: evidence.id, taskId: old.taskId, verificationTaskId: task.id, reason: `Superseded by verified evidence ${evidence.id}`, retired })
-          }
+          supersede(evidence, evidence)
         }
         this.store.event(missionId, passed ? 'task/accepted' : 'task/rejected', member.id, { sourceTaskId: source.id, verificationTaskId: task.id, commit: artifact.commit, reason: rejection, checks: runIds,
           ...(passed ? {} : { checkFailures: failingChecks.slice(0, MAX_REPORTED_CHECK_FAILURES).map(check => ({ command: check.command, exitCode: check.exitCode, ...attributionOf(check), output: excerpt(check.output, 400) })) }) })

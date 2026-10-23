@@ -6,7 +6,7 @@
  * where it enters (`SwarmRuntime.task`, the admission graph check), never here.
  */
 import { canOwnReview } from './assignment.ts'
-import { criterionId, type Attempt, type EvidenceStatus, type FinishedAttempt, type Mission, type Task } from './types.ts'
+import { criterionId, type Attempt, type Evidence, type EvidenceStatus, type FinishedAttempt, type Mission, type Task, type TaskRejection } from './types.ts'
 
 const oldest = (tasks: readonly Task[]): Task | undefined => [...tasks].sort((a, b) => a.createdAt - b.createdAt || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))[0]
 
@@ -430,13 +430,72 @@ export function pendingStopOwner(tasks: readonly Task[], memberId: string): bool
 export type BlockCause = 'task-ceiling' | 'preparation-failed' | 'review-deferred' | 'needs-replacement' | 'refuted' | 'recovery-exhausted'
 
 /**
+ * The rejection a rework archived `evidenceId` with, or undefined while it is
+ * a claim of the task's current attempt generation. On a source it is the
+ * rejection that refuted the claim; on a review row a rework re-opened, the
+ * rejecting verdict whose round its reviewer published the claim in.
+ */
+export function archivingRejection(task: Pick<Task, 'rejections'>, evidenceId: string): TaskRejection | undefined {
+  return task.rejections?.find(rejection => rejection.evidenceIds.includes(evidenceId))
+}
+
+/**
  * The claims of the task's current attempt generation. A rework archives the
  * claims its rejection refuted in `rejections`: they stay refuted, but they no
  * longer block the task and no later submission or verdict touches them.
  */
 export function currentEvidenceIds(task: Pick<Task, 'evidenceIds' | 'rejections'>): string[] {
-  const archived = new Set(task.rejections?.flatMap(rejection => rejection.evidenceIds))
-  return (task.evidenceIds ?? []).filter(evidenceId => !archived.has(evidenceId))
+  return (task.evidenceIds ?? []).filter(evidenceId => archivingRejection(task, evidenceId) === undefined)
+}
+
+/**
+ * Why no verdict can judge a claim any more (`unjudgeable`):
+ *  - `archived`: a rework archived it with the rejection that closed its round;
+ *  - `cancelled`: its task is cancelled, so it supports no result;
+ *  - `superseded`: a claim that supersedes it (`by`) was verified, which refuted it;
+ *  - `refuted`: an independent rejection of its task refuted it;
+ *  - `review-evidence`: a review's own claim, the evidence for that review's
+ *    verdict. A verdict judges the claims of the work it reviews (`verify`)
+ *    and nothing reviews a review, so no verdict ever judges this one. It is
+ *    asked last: such a claim is otherwise current and standing.
+ */
+export type Unjudgeable =
+  | { readonly kind: 'archived'; readonly rejection: TaskRejection }
+  | { readonly kind: 'cancelled' }
+  | { readonly kind: 'superseded'; readonly by: string }
+  | { readonly kind: 'refuted' }
+  | { readonly kind: 'review-evidence' }
+
+/**
+ * Why no verdict can still judge `evidence`, a claim of `owning`, or undefined
+ * when one can: the claim is current (no rework archived it), it is not
+ * refuted (by a rejection or by supersession), its task is not cancelled, and
+ * its task is work a verdict judges, not a review. The one rule for "a claim a
+ * verdict can still judge": a challenge disputes only such a claim (a dispute
+ * of any other could never be resolved), a verdict judges only such claims of
+ * its source, a submission pins only those to its artifact, and only an open
+ * dispute of one holds completion.
+ */
+export function unjudgeable(evidence: Pick<Evidence, 'id' | 'status' | 'refutedBy'>, owning: Pick<Task, 'status' | 'kind' | 'rejections'>): Unjudgeable | undefined {
+  const rejection = archivingRejection(owning, evidence.id)
+  if (rejection !== undefined) return { kind: 'archived', rejection }
+  if (owning.status === 'cancelled') return { kind: 'cancelled' }
+  if (evidence.status === 'refuted') return evidence.refutedBy === undefined ? { kind: 'refuted' } : { kind: 'superseded', by: evidence.refutedBy }
+  if (owning.kind === 'verification') return { kind: 'review-evidence' }
+  return undefined
+}
+
+/** A verdict can still judge `evidence`, a claim of `owning` (`unjudgeable`). */
+export function judgeable(evidence: Pick<Evidence, 'id' | 'status' | 'refutedBy'>, owning: Pick<Task, 'status' | 'kind' | 'rejections'>): boolean {
+  return unjudgeable(evidence, owning) === undefined
+}
+
+/** The claims of `task` a verdict can still judge (`judgeable`), in publication order. */
+export function judgeableClaims(task: Pick<Task, 'status' | 'kind' | 'rejections' | 'evidenceIds'>, evidenceOf: (evidenceId: string) => Evidence | undefined): Evidence[] {
+  return currentEvidenceIds(task).flatMap(evidenceId => {
+    const evidence = evidenceOf(evidenceId)
+    return evidence !== undefined && judgeable(evidence, task) ? [evidence] : []
+  })
 }
 
 /**

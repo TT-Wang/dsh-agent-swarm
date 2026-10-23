@@ -24,7 +24,7 @@ import { assignmentAllows, authorIdsOf, canBorrowTask, canOwnReview, strandedRev
 import { memberPhaseOf } from './projection.ts'
 import { recoveryExit } from './check-results.ts'
 import { scopeKeysOverlap } from './scheduler.ts'
-import { TERMINAL_STATES, blockCauses, completionExempt, holdsOpenAttempt, missionSubject, openAttempt, pendingStopOwner, quiescencePending, selectAcceptedDelivery, stopPending, subjectsOfTasks, taskGraphIndex, taskSubject, terminal, uncoveredCriteria, type HeldTask, type TaskGraphIndex } from './task-graph.ts'
+import { TERMINAL_STATES, blockCauses, completionExempt, holdsOpenAttempt, judgeable, missionSubject, openAttempt, pendingStopOwner, quiescencePending, selectAcceptedDelivery, stopPending, subjectsOfTasks, taskGraphIndex, taskSubject, terminal, uncoveredCriteria, type HeldTask, type TaskGraphIndex } from './task-graph.ts'
 import { providerQuiescent, type AutoStart, type CheckResult, type Delivery, type Evidence, type Member, type Mission, type RuntimeConfig, type Task, type WorkerActivity } from './types.ts'
 
 /**
@@ -765,12 +765,15 @@ export function completionError(board: Board): string | undefined {
     try { selectAcceptedDelivery(tasks) }
     catch (error) { return error instanceof Error ? error.message : String(error) }
   }
-  // Evidence of explicitly cancelled work no longer supports an accepted result,
-  // and a claim a rework archived is history of a rejected commit that no
-  // verdict judges again; live disputes still block.
-  const dead = new Set(tasks.filter(task => task.status === 'cancelled').map(task => task.id))
-  const archived = new Set(tasks.flatMap(task => task.rejections?.flatMap(rejection => rejection.evidenceIds) ?? []))
-  const disputed = board.records.list('evidence', mission.id).filter(evidence => evidence.status === 'challenged' && !dead.has(evidence.taskId) && !archived.has(evidence.id))
+  // Only a dispute some verdict can still resolve holds completion: one of a
+  // claim a verdict can still judge (`judgeable`). A claim of cancelled work
+  // supports no result, and one a rework archived, a refuted one and a review's
+  // own claim are judged by no verdict again (a dispute recorded by an older
+  // build of one would otherwise hold the mission open forever).
+  const disputed = board.records.list('evidence', mission.id).filter(evidence => {
+    const owning = graph.byId.get(evidence.taskId)
+    return evidence.status === 'challenged' && owning !== undefined && judgeable(evidence, owning)
+  })
   if (disputed.length) return `Unresolved evidence challenges prevent completion: ${disputed.map(evidence => evidence.id).join(', ')}`
   return undefined
 }
