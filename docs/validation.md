@@ -8,9 +8,10 @@ Current **0.7.0** working-tree checks and the historical **0.6.0** baseline are 
 
 ## Harness 0.2.1-rc.2 only: 0.1.5-rc.3 and 0.1.7-rc.1 dropped (2026-10-22)
 
-**Head**: `d5c7f25` and this record (documentation only), branch `dsh021/drop-01x` on `a28b116` (main), not merged.
-The owner dropped `0.1.5-rc.3` and `0.1.7-rc.1` on 2026-10-22, so `0.2.1-rc.2` is the only supported host. 41
-commits (`15d00ec` to `ea487f0`) and one review repair round (`a80d012` to `d5c7f25`, no `src` change).
+**Head**: `fcf5b5e`, where the final gates ran, and this record's revision (documentation only), branch
+`dsh021/drop-01x` on `a28b116` (main), not merged. The owner dropped `0.1.5-rc.3` and `0.1.7-rc.1` on 2026-10-22, so
+`0.2.1-rc.2` is the only supported host. 41 commits (`15d00ec` to `ea487f0`), one review repair round (`a80d012` to
+`d5c7f25`, no `src` change) and this record (`fcf5b5e`, revised for the final gates).
 `src` against `a28b116`: +406 −281, net +125. The drop (`15d00ec` to `22383d8`) is +131 −155, net −24; the W8 route
 rule (`f3518a8` to `95e5772`) is +276 −127, net +149.
 
@@ -120,10 +121,11 @@ aside, so is every adapter call. The `test:replay` digest is unchanged.
   the default-search test's fake second release and the known-limitations clause about several listed releases.
 - `d5c7f25` (documents): known-limitations said the real-provider smokes last ran on 0.1.x; it now records the
   2026-10-22 runs on 0.2.1-rc.2.
-- The full-suite failures of the second gate run (below) were missed timer deadlines under load, not code defects,
-  and changed nothing.
+- The six full-suite failures of the gate run at `ea487f0` (below) were missed timer deadlines under load, not code
+  defects, and changed nothing.
 
-**Regressions.** The full suite has 1971 tests at `ea487f0` (1972 at `a28b116`); the repair round adds one.
+**Regressions.** The full suite has 1971 tests at `ea487f0` (1972 at `a28b116`); the repair round adds one, so
+`fcf5b5e` has 1972.
 
 - `tests/governance.test.mjs`: an effort the route does not accept is refused at `swarm_add_member` and on every
   launch path, before any effect, naming the accepted efforts; a model its provider refuses is refused at the member's
@@ -140,54 +142,92 @@ aside, so is every adapter call. The `test:replay` digest is unchanged.
   the adapter's text. `tests/harness-support.test.mjs`: `update-preview` boots a snapshot only on the release its SDK
   links. `tests/host-version.test.mjs`: exactly one supported release, named by every list that declares it.
 
-**Gates at `ea487f0`**, with `node_modules` linked to the 0.2.1-rc.2 link farm. A full run just before the first
-(2026-10-22 19:51) failed to load `tests/r17-profile.test.mjs` with `Harness 0.2.1-rc.2 verification requires its
-declared release revision`: another system on this machine had moved the HEAD of the shared 0.2.1-rc.2 clone, whose
-files were unchanged. The second run used a dedicated clone pinned at `dsh-v0.2.1-rc.2`.
+**Gates**, each run with `node_modules` linked to a 0.2.1-rc.2 link farm and `DSH_HARNESS_ROOT` set to the clone it
+links.
 
-| Check | First run (2026-10-22 19:52) | Second run (2026-10-23 14:57) |
+**The first gate run is invalidated.** It ran on 2026-10-22 at `ea487f0` against the shared clone
+`deepseek-harness-021rc2`. Another system on this machine runs Harness from that clone's source, and at 17:58 the
+clone's HEAD had been moved to the 0.2.0-rc.2 merge `639ed015`; its files were unchanged. The run's release-revision
+assertions failed on that HEAD: re-run at 19:51, the full suite failed to load `tests/r17-profile.test.mjs` with
+`Harness 0.2.1-rc.2 verification requires its declared release revision` (1964/1965). A pass against the same clone
+that evening (19:52 to 20:00), which the first version of this record counted, is not counted either: its smokes read
+`harnessHead` `687f282e`, but the clone's reflog records `639ed015` from 17:58 until 14:56 the next day, so what that
+pass ran against cannot be established. The machine then slept from 21:39 until 14:48 on 2026-10-23, which
+interrupted the batch. From 2026-10-23 on, `DSH_HARNESS_ROOT` and the link farm point at a dedicated clone of the same
+build pinned at `dsh-v0.2.1-rc.2` (`687f282e86`), and both runs below used it.
+
+| Check | `ea487f0` (2026-10-23 14:57) | `fcf5b5e` (2026-10-23 16:18) |
 | --- | --- | --- |
 | `npm run typecheck` / `npm run build` | passed / passed | passed / passed |
-| `node --test tests/*.test.mjs` | 1971/1971 (236 s) | 1965/1971 (672 s); re-runs 37/37 and 1971/1971 (470 s) |
+| `node --test tests/*.test.mjs` | 1965/1971 (672 s); re-runs 37/37 and 1971/1971 (470 s) | 1971/1972 (280 s); re-run 1972/1972 (317 s) |
 | `npm run test:harness` | passed | passed |
 | `npm run test:replay` | digest unchanged | digest unchanged |
 | `npm run test:oracle` | 12/12 identical | 12/12 identical |
 | `npm run test:pack` | passed (251 archive entries, 251 published files) | passed (251, 251) |
-| `npm run test:profile` | passed | passed |
+| `npm run test:profile` | passed | failed at the offline plugin add (below); with a pnpm that runs offline, passed |
 | `npm run test:bundle` | 7/7 | 7/7 |
 | `node scripts/faults/run.mjs` | 24/24 | 24/24 |
-| `npm run test:web` | passed, 13 checks | passed, 13 checks |
-| `npm run test:command-web` | passed, 11 checks | passed, 11 checks |
+| `npm run test:web` | passed, 13 checks | failed at the offline plugin add; with a pnpm that runs offline, passed, 13 checks |
+| `npm run test:command-web` | passed, 11 checks | failed at the offline plugin add; with a pnpm that runs offline, passed, 11 checks |
 
-The replay digest is `sha256:61a921e64088b78b957cd6aeaa563d5436d4a6eae4b0130725d1f3c74c6f971e`, and each web smoke's
-`report.json` records `harnessHead` `687f282e8625c6b8d11ff58211a90524be2e4317`. The second run's full suite took 2.8
-times the first run's time on an overloaded machine: the gate run's `uptime` read load averages of 170 to 195 on 8
-CPUs while macOS daemons caught up after an overnight sleep. Six tests missed a short timer deadline: four waited past
+The replay digest is `sha256:61a921e64088b78b957cd6aeaa563d5436d4a6eae4b0130725d1f3c74c6f971e`, and each passing web
+smoke's `report.json` records `harnessHead` `687f282e8625c6b8d11ff58211a90524be2e4317`. `test:harness` includes the new
+`tests/harness-effort-admission.mjs` in both runs.
+
+At `ea487f0` the full suite took 672 s on an overloaded machine: the gate run's `uptime` read load averages of 170 to
+195 on 8 CPUs while macOS daemons caught up after the sleep. Six tests missed a short timer deadline: four waited past
 the mission queue's bound and were rejected with `[mission_operation_pending]` (`S5 gate src/runtime.ts:6` in
 `tests/in-memory-gates.test.mjs`, 50 ms, and three tests in `tests/review-path.test.mjs`, 300 ms), `R19-M-d` saw its
 check exit 124 past its 500 ms deadline, and in `R14-F2(a)` the 25 ms scheduler tick started the task before the
 test's own claim (`task_not_ready`). None of the four files changed in this batch. Re-run alone, the four files passed
 37/37 in 22 s, and the whole suite then passed 1971/1971 in 470 s. The repair round re-ran the four files at its head,
-37/37 in 24 s at a load average of about 15. The harness, pack and profile logs carry 3 to 9 `[agent-swarm] Error:
-[mission_operation_pending]` lines in the first run and 15 to 31 in the second: the notice those compositions trigger
-on purpose, more often under load.
+37/37 in 24 s at a load average of about 15.
+
+At `fcf5b5e` one test failed, at load averages of about 10 to 31: `S1/R17-G5: a worker turn the body woke inside an
+adapter call keeps committing, ...` (`tests/scheduling-pass.test.mjs:859`) read `passLive: true` beside
+`wedged: true`, where it expects `passLive: false`. The board reports a live pass beside a wedge only while the body
+is not yet named and live work exists, and under load the test's probe can find a wedge event before the hung body is
+named, for instance one from an earlier body that crossed its fake-clock bound while it awaited real asynchronous
+work. The test, `src/scheduling.ts`, `src/board.ts` and `src/kernel.ts` are unchanged in this batch. The whole suite
+re-run passed 1972/1972 in 317 s, and the test passes when run alone. Under 16 parallel copies for three rounds it
+failed 31 of 48 runs at `fcf5b5e` and 32 of 48 at `a28b116`.
+
+Also at `fcf5b5e`, `test:profile`, `test:web` and `test:command-web` failed within 3 s, before any check, at the
+offline `dsh plugin add` that each runs with `COREPACK_ENABLE_NETWORK=0`. The Harness plugin manager runs the `pnpm`
+on `PATH`, here the corepack 0.34.0 shim. Corepack's home had been created anew at 15:32, after the `ea487f0` smokes
+passed, with no `lastKnownGood.json` and no copy of its default pnpm, so with the network disabled corepack stops with
+`Network access disabled by the environment` before pnpm runs. `test:profile` failed the same way re-run alone, and
+fails the same way at `a28b116`; no commit after `ea487f0` touches `package.json` or the smoke scripts. With a shim
+first on `PATH` that runs the pinned clone's own pnpm 11.28.5 (its `packageManager`), all three passed. The machine's
+corepack state was left as found.
+
+The harness, pack and profile logs carry `[agent-swarm] Error: [mission_operation_pending]` lines, the notice those
+compositions trigger on purpose, more often under load: 27, 31 and 15 at `ea487f0`, and 13, 8 and 8 at `fcf5b5e`.
+`test:harness` runs during the slices printed 9 to 42.
 
 **Repair-round checks** (the round changes no `src`, so the built lib is the one the gates ran):
 `npm run typecheck` passed; `tests/governance.test.mjs` 10/10; `tests/harness-support.test.mjs`,
 `tests/host-version.test.mjs`, `tests/host-scripts.test.mjs` and `tests/web-smoke-runner.test.mjs` 29/29.
 
 Not exercised on 0.2.1-rc.2 since this batch: `test:deepseek` and `test:command-deepseek`, which make real provider
-requests and need the owner's key. Both changed in this batch: each reads a tool result as the host's tool-role
-message, and the command smoke's text reader takes a flat block list. Their last runs were the owner's on 2026-10-22,
-before this branch (`test:deepseek` passed; `test:command-deepseek` failed on the effort refusal W8 now decides at
-admission). `test:load`, Better Sidebar and the attended preview have not run on 0.2.1-rc.2; the attended 5202
-preview still runs 0.1.7-rc.1 with a pinned plugin.
+requests and need the owner's key; the owner's session runs both after this batch. Both changed in this batch: each
+reads a tool result as the host's tool-role message, and the command smoke's text reader takes a flat block list.
+Their last runs were the owner's on 2026-10-22 at `a28b116`, before this branch: `test:deepseek` passed (30,319
+tokens, 10 steps), and `test:command-deepseek` failed when the host refused the worker effort `low` on
+`deepseek-v4-flash` at its model step, the effort W8 now refuses at admission. `test:validation-repair-web` did not
+run; it reuses the command smoke's claim path, which now always asserts the command chip. `test:load`, Better Sidebar
+and the attended preview have not run on 0.2.1-rc.2; the attended 5202 preview still runs 0.1.7-rc.1 with a pinned
+plugin.
 
 **Open after this batch** (not adopted here).
 
 - Several behavioral tests bound their waits by short timers (a 50 ms or 300 ms mission-queue bound, a 500 ms check
-  deadline, a 25 ms scheduler tick that races an explicit claim), so a heavily overloaded host fails them, as the
-  second gate run did.
+  deadline, a 25 ms scheduler tick that races an explicit claim), so a heavily overloaded host fails them, as the gate
+  run at `ea487f0` did. Under stress `S1/R17-G5` fails about as often at `a28b116` as here (32 and 31 of 48 runs),
+  mostly at its other assertion (the stranded drain woke one turn from inside the body: 30 and 26) and otherwise at
+  the gate's wedge assertion (2 and 5). The known-limitations list of wall-clock tests names none of these.
+- `test:profile`, `test:web` and `test:command-web` need a `pnpm` on `PATH` that installs offline; a corepack shim
+  whose home lacks its default pnpm fails them before any check.
 - The items the 2026-10-21 entry left open stand: no downgrade guard, cold workers resumed by other host paths, the
   stranded-inbox drain, the API-key route's credential codes as member failures, and
   `scripts/check-cancel-freeze.mjs` importing `isJsonValue`, which 0.2.1-rc.2 does not export.
