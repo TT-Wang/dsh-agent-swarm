@@ -27,7 +27,7 @@ import { validScope, scopeSubset } from './scope.ts'
 import { AdmissionError, assertDeclaredOutputs, assertScopeSelectors, citedCovers, dependencyAssumptions, formatDiagnostic, isNoopCheck, loadPackageScripts, normalizeReviewDependencies, normalizeScopeSelectors, normalizeTaskCeilings, reconcileTaskAdmission, requireHostChecks, taskCeilingBlock, taskGraphDefects, TaskGraphAdmissionError, memberRouteDiagnostic, type MemberRouteEntry, type TaskGraphNode } from './admission.ts'
 import { canBorrowTask, canOwnReview, strandedReview } from './assignment.ts'
 import { executionClock, executionElapsed, exhaustedDimensions } from './resource-time.ts'
-import { TERMINAL_STATES, blockCauses, currentEvidenceIds, finishedAttempt, holdsAttempt, holdsOpenAttempt, judgeableClaims, memberTask, missionSubject, openAttempt, pendingStopOwner, quiescencePending, selectAcceptedDelivery, stopPending, subjectsOfTasks, taskEdges, taskGraphIndex, taskSubject, terminal, uncoveredCriteria, type BlockCause, type HeldTask } from './task-graph.ts'
+import { TERMINAL_STATES, blockCauses, currentEvidenceIds, finishedAttempt, holdsAttempt, holdsOpenAttempt, judgeableClaims, memberTask, missionSubject, openAttempt, pendingStopOwner, quiescencePending, selectAcceptedDelivery, stopPending, subjectsOfTasks, taskEdges, taskGraphIndex, taskSubject, terminal, uncoveredCriteria, unjudgeable, type BlockCause, type HeldTask, type Unjudgeable } from './task-graph.ts'
 import { checkSyntaxDetail, declaredPlanChecks, orderedTasks, pairReviews, planAdvisories, validatePlan } from './plans.ts'
 import { OWNER_ONLY_TOOLS, UNCONFINED_HOST_TOOLS, type Actor, type AutoStart, BoardQuery, Budget, CheckAttribution, CreateMissionInput, CriticalPath, criterionId, Delivery, DraftPlan, Escalation, Evidence, EvidenceStatus, Member, Mission, nextWorkerName, ObserveQuery, MessageInput, PlanInput, Post, PostInput, PostKind, PROVIDER_OUTAGE_WINDOW_MS, MemberRouteRefusal, ProposeTaskInput, ProviderOutage, providerQuiescent, PublishInput, RecoveryFallback, RequestStartInput, RuntimeConfig, Snapshot, Task, TaskAmendment, TaskRejection, TaskCeiling, ToolRun, VerificationCleanupFailure, WorkerAdapter, WorkerActivity, Workstream } from './types.ts'
 import { requireArtifactChecks } from './artifact-policy.ts'
@@ -1804,21 +1804,21 @@ export class SwarmRuntime implements Kernel {
   }
   /** Preserve dissent; accepted source work must be repaired or independently re-reviewed. */
   challenge(actor: Actor, missionId: string, input: { evidenceId: string; reason: string; toolRunIds: string[] }): Evidence {
-    const { key } = this.active(actor, missionId)
+    const { key, member } = this.active(actor, missionId)
     const evidence = this.store.get('evidence', input.evidenceId)
     if (!evidence || evidence.missionId !== missionId) throw new Error('Unknown evidence')
-    // A claim a rework archived is history of a rejected commit, whether the
-    // author published it (the rejection refuted it) or the rejecting reviewer
-    // did (on the review row the rework re-opened): no later verdict judges it,
-    // so a dispute of it could never be resolved, and it would re-open the
-    // reworked task or the review that accepted the rework.
+    // Only a claim a verdict can still judge is disputed (`unjudgeable`): a
+    // dispute of any other could never be resolved, and the fence below would
+    // act on it anyway. It cancelled the review whose rejection refuted the
+    // claim, so the owner's in-place rework was lost to a false
+    // task_needs_replacement; it re-opened accepted work over a superseded
+    // claim; and it fenced the dependents of a replaced task while its repair
+    // stayed accepted. A refusal records nothing.
     const owning = this.task(missionId, evidence.taskId)
-    const archivedBy = owning.rejections?.find(rejection => rejection.evidenceIds.includes(evidence.id))
-    if (archivedBy !== undefined) {
-      const live = currentEvidenceIds(owning)
-      throw new PolicyError('evidence_archived', 'conflict_error', `[evidence_archived] Evidence ${evidence.id} belongs to the round of task ${owning.id} that review ${archivedBy.reviewTaskId} closed by rejecting commit ${archivedBy.commit}; the rework archived it with that rejection, so no verdict can judge it again. ${live.length
-        ? `Use \`swarm_challenge\` with the \`evidenceId\` of a live claim of that task instead: ${live.join(', ')}.`
-        : 'That task has no live claim yet; wait for its next claim, then use `swarm_challenge` with that `evidenceId`.'}`)
+    const why = unjudgeable(evidence, owning)
+    if (why !== undefined) {
+      const { because, exit } = this.unjudgeableDispute(owning, why, member)
+      throw new PolicyError('evidence_not_judgeable', 'conflict_error', `[evidence_not_judgeable] Evidence ${evidence.id} ${because}, so no verdict can judge it again and a challenge of it could never be resolved; nothing was recorded. ${exit}`)
     }
     this.bounded(input.reason)
     for (const runId of input.toolRunIds) { const run = this.store.get('tool_runs', runId); if (!run || run.missionId !== missionId) throw new Error('Unknown counterevidence tool run') }
@@ -1856,6 +1856,72 @@ export class SwarmRuntime implements Kernel {
     for (const dependent of interrupted) this.attempts.resumeStoppedAttempt(missionId, dependent)
     this.kick(missionId)
     return evidence
+  }
+  /**
+   * What the refusal of a challenge of a claim of `owning` no verdict can
+   * judge (`unjudgeable`; one code for every reason) says: why, and the exit
+   * the caller has. The dispute
+   * moves to the claims a verdict can still judge of the task that now answers
+   * for this one: the reworked task for a claim a rework archived on it, the
+   * reviewed source for a review's own claim (archived or not), the task
+   * carrying a cancelled task's obligation, the task of the claim that
+   * superseded it, the live replacement of a rejected task. While that task can
+   * still publish a claim, the caller waits for one. Otherwise the dispute is a
+   * decision. A rejection is the owner's: `swarm_control` resume reworks the
+   * task in place, and its review then judges the resubmission, or a
+   * replacement repairs it; a member asks the owner with `swarm_escalate`, by
+   * the task when it owns that task. A cancelled task with no carrier holds no
+   * result left to dispute.
+   */
+  private unjudgeableDispute(owning: Task, why: Unjudgeable, member: Member | undefined): { because: string; exit: string } {
+    const graph = this.boardOf(owning.missionId).graph
+    let because: string
+    let answering: Task | undefined
+    switch (why.kind) {
+      case 'archived':
+        because = `belongs to the round of task ${owning.id} that review ${why.rejection.reviewTaskId} closed by rejecting commit ${why.rejection.commit}; the rework archived it with that rejection`
+        answering = owning.kind === 'verification' ? graph.reviewSource(owning) : owning
+        break
+      case 'cancelled': {
+        because = `belongs to task ${owning.id}, which is cancelled and so supports no result`
+        const carrier = graph.effective(owning.id)
+        answering = carrier === undefined || carrier.id === owning.id ? undefined : carrier
+        break
+      }
+      case 'superseded': {
+        because = `is refuted and superseded by evidence ${why.by}, which a verdict verified`
+        const by = this.store.get('evidence', why.by)
+        answering = by === undefined ? undefined : graph.byId.get(by.taskId)
+        break
+      }
+      case 'refuted': {
+        const rejecting = this.rejectingReview(owning)
+        because = `was refuted when ${rejecting === undefined ? 'an independent review' : `review ${rejecting.id}`} rejected task ${owning.id}${rejecting?.reviewedCommit === undefined ? '' : ` at commit ${rejecting.reviewedCommit}`}`
+        answering = graph.liveReplacement(owning.id)
+        break
+      }
+      case 'review-evidence':
+        because = `is review ${owning.id}'s own evidence for its verdict on task ${owning.reviewOf}; a verdict judges the claims of the work it reviews, and nothing reviews a review`
+        answering = graph.reviewSource(owning)
+        break
+    }
+    const claims = answering === undefined ? [] : judgeableClaims(answering, evidenceId => this.store.get('evidence', evidenceId))
+    let exit: string
+    if (answering !== undefined && claims.length > 0) exit = `Use \`swarm_challenge\` with the \`evidenceId\` of a claim of task ${answering.id} a verdict can still judge instead: ${claims.map(claim => claim.id).join(', ')}.`
+    else if (answering !== undefined && answering.kind !== 'verification' && (answering.status === 'pending' || answering.status === 'running')) exit = `Task ${answering.id} has no claim a verdict can judge yet; wait for its next claim, then use \`swarm_challenge\` with that \`evidenceId\`.`
+    else if (why.kind === 'cancelled' && answering === undefined) exit = `No result rests on it, so nothing is left to dispute; to dispute live work, use \`swarm_challenge\` with the \`evidenceId\` of one of its claims.`
+    else {
+      const decided = answering ?? owning
+      const rejection = !decided.experiment && this.rejectingReview(decided) !== undefined
+      if (member === undefined) exit = rejection
+        ? `The rejection is yours to decide: resume task ${decided.id} with \`swarm_control\`, its \`taskId\` and \`action\` resume to rework it in place, where its review judges the resubmission, or propose a replacement with \`swarm_propose\` naming \`replaces\`.`
+        : `No claim a verdict can judge carries this dispute; propose the repair of task ${decided.id} as new work with \`swarm_propose\` and an \`objective\` that names it.`
+      else {
+        const owns = (decided.attempt?.ownerId ?? decided.assigneeId) === member.id
+        exit = `If you hold ${rejection ? 'that rejection' : 'it'} wrong, call \`swarm_escalate\` with ${owns ? `\`taskId\` ${decided.id}` : `a \`body\` naming task ${decided.id}`} so the owner decides.`
+      }
+    }
+    return { because, exit }
   }
   /** Fence the old attempt immediately; quiescence and reassignment occur after this tool returns. */
   handoff(actor: Actor, missionId: string, input: { taskId: string; attemptId: string; to?: string; summary: string }): { handoff: string } {
@@ -1965,7 +2031,7 @@ export class SwarmRuntime implements Kernel {
    * artifact and the claims its reviewer published against the rejected commit
    * move into the row's own `rejections`, as the source archives its
    * rejection, so a verdict on the resubmission never carries them (a dispute
-   * of one is refused with [evidence_archived] and none blocks completion);
+   * of one is refused with [evidence_not_judgeable] and none blocks completion);
    * the epoch fences the finished attempt; and the rejecting reviewer
    * stays its assignee, which keeps it independent (a reviewer never authors its
    * source). The resubmission is therefore reviewed at once by its paired

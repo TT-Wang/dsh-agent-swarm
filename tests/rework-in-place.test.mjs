@@ -170,9 +170,9 @@ test('a claim a rework archived cannot be challenged: the refusal names the live
   const challenge = evidenceId => f.runtime.challenge(f.owner, f.mission.id, { evidenceId, reason: 'Re-open the old dispute', toolRunIds: [] })
   const refusal = (live, message) => error => {
     assert.ok(error instanceof PolicyError)
-    assert.equal(error.code, 'evidence_archived')
+    assert.equal(error.code, 'evidence_not_judgeable')
     assert.equal(error.category, 'conflict_error')
-    assert.ok(error.message.startsWith('[evidence_archived] '), error.message)
+    assert.ok(error.message.startsWith('[evidence_not_judgeable] '), error.message)
     assert.ok(error.message.includes(`belongs to the round of task ${source.id} that review ${rejecting.id} closed by rejecting commit ${rejectedCommit}`), error.message)
     assert.match(error.message, live)
     assert.deepEqual(assessText(error.message, index), [], 'the exit resolves in the published tool schema')
@@ -180,10 +180,10 @@ test('a claim a rework archived cannot be challenged: the refusal names the live
     return true
   }
   const messages = []
-  assert.throws(() => challenge(archived.id), refusal(/has no live claim yet; wait for its next claim, then use `swarm_challenge`/, messages))
+  assert.throws(() => challenge(archived.id), refusal(new RegExp(`Task ${source.id} has no claim a verdict can judge yet; wait for its next claim, then use \`swarm_challenge\``), messages))
   assert.equal(f.evidence(archived.id).status, 'refuted', 'the refused challenge leaves the history claim refuted')
   const kept = await f.submit(source, 'The reworked attempt works')
-  assert.throws(() => challenge(archived.id), refusal(new RegExp(`Use \`swarm_challenge\` with the \`evidenceId\` of a live claim of that task instead: ${kept.id}\\.`), messages))
+  assert.throws(() => challenge(archived.id), refusal(new RegExp(`Use \`swarm_challenge\` with the \`evidenceId\` of a claim of task ${source.id} a verdict can still judge instead: ${kept.id}\\.`), messages))
   await f.verify(f.pendingReviewOf(source) ?? f.proposeReview(source), 'accept', 'The rework meets the criterion')
   assert.equal(f.current(source).status, 'accepted')
   const claimed = await f.runtime.claim(f.actor(f.reviewer), f.mission.id, dependent.id)

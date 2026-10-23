@@ -476,8 +476,8 @@ test('the rejecting reviewer\'s claims are archived with its verdict: disputing 
   await f.verify(reviewer, review, 'accept', 'The rework meets the criterion')
   assert.deepEqual([f.current(source).status, f.current(review).status], ['accepted', 'accepted'], 'the same review row accepts the rework')
   assert.throws(() => f.runtime.challenge(f.owner, f.mission.id, { evidenceId: finding.id, reason: 'Dispute the round-1 finding', toolRunIds: [] }), error => {
-    assert.equal(error.code, 'evidence_archived')
-    assert.ok(error.message.startsWith('[evidence_archived] '), error.message)
+    assert.equal(error.code, 'evidence_not_judgeable')
+    assert.ok(error.message.startsWith('[evidence_not_judgeable] '), error.message)
     assert.ok(error.message.includes(`belongs to the round of task ${review.id} that review ${review.id} closed by rejecting commit ${rejected}`), error.message)
     assert.deepEqual(assessText(error.message, index), [], 'the exit resolves in the published tool schema')
     return true
