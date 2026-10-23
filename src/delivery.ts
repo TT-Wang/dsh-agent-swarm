@@ -7,6 +7,7 @@ import { tmpdir } from 'node:os'
 import path from 'node:path'
 import type { DeliveryApplication, DeliveryInspection } from './types.js'
 import { assertContainedSymlinkChain, type SymlinkChainLookup } from './workspaces.js'
+import { ownBirth, ownerAbandoned, recordedOwner, type LockOwner } from './process-identity.js'
 
 interface DeliveryInput { source: string; baselineCommit: string; resultCommit: string }
 interface Entry { kind: 'file' | 'symlink'; bytes: Buffer; mode: number }
@@ -188,37 +189,41 @@ async function privateDirectory(gitDir: string): Promise<string> {
   return directory
 }
 /**
- * A lock without a readable owner is the crash window between `mkdir` and the
- * atomic owner rename, so it is reclaimable after this grace period. A readable
- * owner is reclaimable only when its pid is gone.
+ * The apply lock is a directory holding `owner.json`, `{ pid, birth }` in the
+ * identity process-identity.ts owns for every lock the plugin takes. A lock
+ * without a readable owner is the crash window between `mkdir` and the atomic
+ * owner rename, so it is reclaimable after this grace period. A readable owner's
+ * lock is reclaimable only when `ownerAbandoned` shows that owner gone: its PID
+ * is free, or held by a process born at another time.
  */
 const LOCK_GRACE_MS = 30_000
 const LOCK_RETRIES = 5
-async function lockOwner(lock: string): Promise<{ pid: number; createdAt?: number } | undefined> {
-  try {
-    const value = JSON.parse(await readFile(path.join(lock, 'owner.json'), 'utf8')) as unknown
-    if (typeof value !== 'object' || value === null || Array.isArray(value)) return undefined
-    const owner = value as { pid?: unknown; createdAt?: unknown }
-    if (!Number.isSafeInteger(owner.pid) || (owner.pid as number) <= 0) return undefined
-    return { pid: owner.pid as number, ...(Number.isSafeInteger(owner.createdAt) ? { createdAt: owner.createdAt as number } : {}) }
-  } catch { return undefined }
+async function lockOwner(lock: string): Promise<LockOwner | undefined> {
+  try { return recordedOwner(JSON.parse(await readFile(path.join(lock, 'owner.json'), 'utf8'))) } catch { return undefined }
 }
-function ownerAlive(pid: number): boolean {
-  try { process.kill(pid, 0); return true }
-  catch (failure) { return !(failure instanceof Error && 'code' in failure && failure.code === 'ESRCH') }
-}
-async function lockStale(lock: string): Promise<boolean> {
+/** Why `lock` may not be taken over yet, or `undefined` when it is stale. */
+async function lockHolder(lock: string): Promise<string | undefined> {
   const owner = await lockOwner(lock)
-  if (owner !== undefined) return !ownerAlive(owner.pid)
+  if (owner !== undefined) {
+    return ownerAbandoned(owner) ? undefined
+      : `${lock} is held by process ${owner.pid}; if that process is not applying a delivery, remove ${lock} and retry`
+  }
   const info = await lstat(lock).catch(() => undefined)
-  return info === undefined || Date.now() - info.mtimeMs >= LOCK_GRACE_MS
+  if (info === undefined || Date.now() - info.mtimeMs >= LOCK_GRACE_MS) return undefined
+  return `${lock} has no readable owner yet and is reclaimed ${LOCK_GRACE_MS / 1000} s after it last changed`
 }
 async function acquire(directory: string): Promise<() => Promise<void>> {
   const lock = path.join(directory, 'apply.lock')
+  // Read before the lock exists, so the crash window between `mkdir` and the
+  // owner rename is never widened by reading this process's birth.
+  const owner = JSON.stringify({ pid: process.pid, birth: ownBirth() })
   for (let attempt = 0; ; attempt++) {
     try { await mkdir(lock, { mode: 0o700 }); break } catch (error) {
       if (!(error instanceof Error && 'code' in error && error.code === 'EEXIST')) throw error
-      if (attempt >= LOCK_RETRIES - 1 || !(await lockStale(lock))) throw new Error('Another delivery is being applied to this project')
+      const holder = await lockHolder(lock)
+      if (holder !== undefined || attempt >= LOCK_RETRIES - 1) {
+        throw new Error(`Another delivery is being applied to this project: ${holder ?? `${lock} was re-created by another contender each of the ${LOCK_RETRIES} times this delivery reclaimed it`}`)
+      }
       // Reclaim atomically: the winner of the rename owns the removal, so two
       // contenders cannot both delete a lock the other just created.
       const discarded = `${lock}.stale-${randomUUID()}`
@@ -227,7 +232,7 @@ async function acquire(directory: string): Promise<() => Promise<void>> {
   }
   const temporary = path.join(directory, `owner-${randomUUID()}.tmp`)
   try {
-    await writeFile(temporary, JSON.stringify({ pid: process.pid, createdAt: Date.now() }), { mode: 0o600, flag: 'wx' })
+    await writeFile(temporary, owner, { mode: 0o600, flag: 'wx' })
     await rename(temporary, path.join(lock, 'owner.json'))
   } catch (error) {
     await rm(lock, { recursive: true, force: true }).catch(() => undefined)
@@ -404,9 +409,14 @@ export async function applyDelivery(input: DeliveryInput, signal?: AbortSignal):
     }
     throw error
   } finally {
-    for (const file of temporaryFiles) await unlink(file).catch(() => undefined)
-    for (const directory of createdDirectories.reverse()) await rmdir(directory).catch(() => undefined)
-    if (temporary) await rm(temporary, { recursive: true, force: true })
-    try { await release?.() } finally { activeSources.delete(source); sourceIdentities.delete(source) }
+    // The lock is released whatever the scratch cleanup does: a cleanup failure
+    // must not leave this live host owning the lock until it restarts.
+    try {
+      for (const file of temporaryFiles) await unlink(file).catch(() => undefined)
+      for (const directory of createdDirectories.reverse()) await rmdir(directory).catch(() => undefined)
+      if (temporary) await rm(temporary, { recursive: true, force: true })
+    } finally {
+      try { await release?.() } finally { activeSources.delete(source); sourceIdentities.delete(source) }
+    }
   }
 }

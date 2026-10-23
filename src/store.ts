@@ -12,11 +12,11 @@ import { DatabaseSync } from 'node:sqlite'
 import { mkdirSync, openSync, closeSync, readSync, fsyncSync, readFileSync, unlinkSync, writeFileSync, chmodSync, existsSync, readdirSync, copyFileSync, renameSync, rmSync, statSync, lstatSync, constants } from 'node:fs'
 import { dirname, join, basename, resolve } from 'node:path'
 import { createHash, randomUUID } from 'node:crypto'
-import { execFileSync } from 'node:child_process'
 import { criterionId, type Attempt, type AutoStart, type Delivery, type DraftPlan, type Evidence, type Member, type Mission, type PlanTask, type Post, type PostKind, type SwarmEvent, type Task, type ToolRun, type Workstream } from './types.ts'
 import type { AdmissionReason, AdmissionRecord, LimitRule } from './scheduler.ts'
 import { PROGRESS_KINDS, type EventKind } from './events.ts'
 import { taskGraphIndex } from './task-graph.ts'
+import { ownBirth, ownerAbandoned, recordedOwner } from './process-identity.ts'
 // R17-G7: one derivation for the derived member status; the store never persists it.
 import { deriveMemberStatus, memberPhaseOf } from './projection.ts'
 
@@ -189,56 +189,27 @@ export function withWriterRetry<T>(operation: () => T, options: { attempts?: num
   throw new WriterBusyError(`SQLite writer stayed busy after ${attempts} attempt(s): ${message}`, attempts, lastError)
 }
 
-interface RuntimeLock { pid: number; nonce?: string; birth?: string }
-
-function validProcessBirth(birth: string): boolean {
-  return /^linux:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}:\d+$/.test(birth)
-    || /^darwin:(Sun|Mon|Tue|Wed|Thu|Fri|Sat) (Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2} \d{2}:\d{2}:\d{2} \d{4}$/.test(birth)
-}
-
-/** A PID is reusable. Unknown platforms or inaccessible identity remain conservative. */
-function processBirth(pid: number): string | undefined {
-  try {
-    if (process.platform === 'linux') {
-      const stat = readFileSync(`/proc/${pid}/stat`, 'utf8')
-      const start = stat.slice(stat.lastIndexOf(')') + 2).split(' ')[19]
-      if (start === undefined || !/^\d+$/.test(start)) return undefined
-      return `linux:${readFileSync('/proc/sys/kernel/random/boot_id', 'utf8').trim()}:${start}`
-    }
-    if (process.platform === 'darwin') {
-      const start = execFileSync('ps', ['-p', String(pid), '-o', 'lstart='], {
-        encoding: 'utf8', timeout: 1000, stdio: ['ignore', 'pipe', 'ignore'], env: { ...process.env, LC_ALL: 'C', TZ: 'UTC' },
-      }).trim()
-      return start ? `darwin:${start}` : undefined
-    }
-  } catch { /* No trustworthy identity: retain the lock while the PID lives. */ }
-  return undefined
-}
-
+/**
+ * The runtime lock records its owner as `{ pid, nonce, birth }`; the owner
+ * identity and the rule that a lock may be taken over are process-identity.ts's,
+ * shared with the delivery apply lock. The nonce is this lock's own: release
+ * removes only the lock this store wrote.
+ */
 function acquireRuntimeLock(lockPath: string, nonce: string): void {
   try {
     const fd = openSync(lockPath, 'wx', 0o600)
-    try { writeFileSync(fd, JSON.stringify({ pid: process.pid, nonce, birth: processBirth(process.pid) })); fsyncSync(fd) }
+    try { writeFileSync(fd, JSON.stringify({ pid: process.pid, nonce, birth: ownBirth() })); fsyncSync(fd) }
     finally { closeSync(fd) }
     return
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error
   }
   const original = readFileSync(lockPath, 'utf8')
-  let lock: RuntimeLock
-  try { lock = JSON.parse(original) as RuntimeLock } catch { throw new Error(`Unrecognized runtime lock: ${lockPath}; inspect it before removing`) }
-  if (!Number.isInteger(lock?.pid) || lock.pid < 1) throw new Error('Invalid swarm runtime lock')
-  let abandoned = false
-  try { process.kill(lock.pid, 0) }
-  catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ESRCH') abandoned = true
-    else if ((error as NodeJS.ErrnoException).code !== 'EPERM') throw error
-  }
-  if (!abandoned && typeof lock.birth === 'string' && validProcessBirth(lock.birth)) {
-    const current = processBirth(lock.pid)
-    abandoned = current !== undefined && validProcessBirth(current) && current.split(':')[0] === lock.birth.split(':')[0] && current !== lock.birth
-  }
-  if (!abandoned) throw new Error(`Swarm database is already owned by process ${lock.pid}`)
+  let value: unknown
+  try { value = JSON.parse(original) } catch { throw new Error(`Unrecognized runtime lock: ${lockPath}; inspect it before removing`) }
+  const owner = recordedOwner(value)
+  if (owner === undefined) throw new Error('Invalid swarm runtime lock')
+  if (!ownerAbandoned(owner)) throw new Error(`Swarm database is already owned by process ${owner.pid}`)
   if (readFileSync(lockPath, 'utf8') !== original) throw new Error(`Swarm runtime lock changed during recovery: ${lockPath}; retry opening`)
   unlinkSync(lockPath)
   acquireRuntimeLock(lockPath, nonce)
