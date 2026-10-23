@@ -6,7 +6,7 @@ import { createHash } from 'node:crypto'
 import { mkdtemp, mkdir, readFile, readdir, realpath, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
-import { fileURLToPath } from 'node:url'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 import { parseEnv, promisify } from 'node:util'
 import { bootHarness, harnessEntry, importHarness } from '../tests/fixtures/built-harness.mjs'
 
@@ -55,6 +55,8 @@ const build = {
   harnessHead: (await execute('git', ['rev-parse', 'HEAD'], { cwd: harnessRoot })).stdout.trim(),
   pluginJavaScriptSHA256: digest.digest('hex'), javaScriptFileCount: builtFiles.length,
 }
+// What a completed mission delivers is the runtime's rule, read from the build under test.
+const { verifiedDelivery } = await import(pathToFileURL(join(artifactRoot, 'lib/task-graph.js')).href)
 const temporary = await realpath(await mkdtemp(join(tmpdir(), 'dsh-swarm-command-deepseek-')))
 const workspace = join(temporary, 'workspace'), runRoot = join(temporary, 'runtime')
 process.env.DEEPSEEK_API_KEY = apiKey
@@ -219,9 +221,12 @@ try {
   assert(finalSnapshot.members.length >= 2)
   const participatingWorkers = finalSnapshot.members.filter(member => usage.some(entry => entry.sessionId === member.sessionId))
   assert(participatingWorkers.length >= 2, 'At least two independent workers must make actual DeepSeek requests')
+  // The runtime names the delivery: one reviewed implementation is a complete
+  // plan, and several implementation branches deliver the integration covering
+  // all of them. Its exact artifact needs an accepted independent verification.
+  const { delivery } = verifiedDelivery(finalSnapshot.tasks)
+  assert.deepEqual(finalSnapshot.deliveryTarget, { taskId: delivery.id, commit: delivery.artifact.commit }, 'The completed mission must project its verified delivery')
   const sources = finalSnapshot.tasks.filter(task => ['implementation', 'integration'].includes(task.kind) && task.status === 'accepted')
-  const integration = sources.find(task => task.kind === 'integration' && task.artifact)
-  assert(integration, 'A verified integration artifact must be delivered')
   for (const source of sources) {
     const review = finalSnapshot.tasks.find(task => task.kind === 'verification' && task.reviewOf === source.id && task.status === 'accepted')
     assert(review, `Accepted code task ${source.id} must have an accepted independent review`)
@@ -234,8 +239,8 @@ try {
   assert(finalSnapshot.events.some(event => event.type === 'automatic/completed'), 'Completion must come from the automatic runtime path')
   assert(!calls.some(call => call.name === 'swarm_create' || (call.name === 'swarm_control' && JSON.parse(call.arguments).action === 'complete')), 'This smoke must not fall back to direct creation or manual completion; primary budget adjustment and resume remain permitted')
   checks.noManualAdmissionOrCompletion = true
-  assert.match(integration.artifact.commit, /^[a-f0-9]{40}$/)
-  assert.match((await execute('git', ['show', `${integration.artifact.commit}:value.cjs`], { cwd: workspace })).stdout, /(?:module\.exports\s*=\s*2|exports\s*=\s*2)/)
+  assert.match(delivery.artifact.commit, /^[a-f0-9]{40}$/)
+  assert.match((await execute('git', ['show', `${delivery.artifact.commit}:value.cjs`], { cwd: workspace })).stdout, /(?:module\.exports\s*=\s*2|exports\s*=\s*2)/)
   assert.equal((await execute('git', ['rev-parse', 'HEAD'], { cwd: workspace })).stdout.trim(), baseCommit)
   assert.equal((await execute('git', ['status', '--porcelain'], { cwd: workspace })).stdout, '')
   assert.equal(await readFile(join(workspace, 'value.cjs'), 'utf8'), 'module.exports = 1\n')
@@ -265,7 +270,9 @@ try {
     costUSD: null, costNote: 'Provider-reported usage only; no billed dollar total is asserted.',
     checks, starts: finalStarts, generatedPlan, mission: finalSnapshot?.mission,
     members: finalSnapshot?.members.map(member => ({ id: member.id, name: member.name, role: member.role, sessionId: member.sessionId, status: member.status, model: member.model, provider: member.provider })),
-    tasks: finalSnapshot?.tasks.map(task => ({ id: task.id, kind: task.kind, status: task.status, artifact: task.artifact?.commit, reviewOf: task.reviewOf, assigneeId: task.assigneeId })),
+    tasks: finalSnapshot?.tasks.map(task => ({ id: task.id, kind: task.kind, status: task.status, artifact: task.artifact?.commit, reviewOf: task.reviewOf, assigneeId: task.assigneeId,
+      dependencies: task.dependencies, replaces: task.replaces, reviewedCommit: task.reviewedCommit, attemptOwnerId: task.attempt?.ownerId, priorOwnerIds: task.priorOwnerIds })),
+    deliveryTarget: finalSnapshot?.deliveryTarget,
     evidence: finalSnapshot?.evidence.map(evidence => ({ status: evidence.status, taskId: evidence.taskId, toolRunCount: evidence.toolRunIds.length })),
     tokenTotals: { all: totals(usage), owner: totals(usage.filter(item => item.sessionId === actor.sessionId)), workers: totals(usage.filter(item => item.sessionId !== actor.sessionId)), workerRuntimeAccounted: finalSnapshot?.mission.usedTokens },
     usage, calls, toolResults, deliveries, lifecycle, modelErrors, assistantMessages,

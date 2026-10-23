@@ -5,6 +5,7 @@
  * effective task, a prerequisite never met). An id a caller supplies is refused
  * where it enters (`SwarmRuntime.task`, the admission graph check), never here.
  */
+import { canOwnReview } from './assignment.ts'
 import { criterionId, type Attempt, type EvidenceStatus, type FinishedAttempt, type Mission, type Task } from './types.ts'
 
 const oldest = (tasks: readonly Task[]): Task | undefined => [...tasks].sort((a, b) => a.createdAt - b.createdAt || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))[0]
@@ -261,6 +262,31 @@ export function selectAcceptedDelivery(tasks: readonly Task[]): Task {
   const finals = candidates.filter(candidate => !candidates.some(other => other.id !== candidate.id && graph.covers(other, candidate.id)))
   if (finals.length !== 1) throw new Error('A unique accepted integration of all implementation results is required; repair or combine the current delivery obligations before completing')
   return finals[0]!
+}
+
+/**
+ * The code a mission delivers and the verdict that accepted it. The delivery is
+ * the task `selectAcceptedDelivery` names, the rule that completion, the
+ * snapshot's `deliveryTarget` and the owner's inspect/apply all use: the one accepted
+ * implementation, or, while an integration obligation remains, the unique
+ * accepted integration covering every implementation (several implementation
+ * branches always need one). The review is the accepted verification of that
+ * delivery's exact artifact. `verify` is the one path that accepts a code task:
+ * in one transaction it accepts the source and its review, records the judged
+ * commit as the review's `reviewedCommit`, and admits only a reviewer that
+ * `canOwnReview` allows. A delivery without such a review is one no independent
+ * verdict accepted. A reader that checks a finished board (the live command
+ * smoke) asks this rather than re-deriving the selection.
+ */
+export function verifiedDelivery(tasks: readonly Task[]): { delivery: Task; review: Task } {
+  const delivery = selectAcceptedDelivery(tasks)
+  const commit = delivery.artifact?.commit
+  const review = tasks.find(task => task.kind === 'verification' && task.reviewOf === delivery.id && task.status === 'accepted'
+    && commit !== undefined && task.reviewedCommit === commit)
+  if (review === undefined) throw new Error(`Delivery ${delivery.id} has no accepted verification of its artifact ${commit ?? '(none)'}`)
+  const reviewer = review.attempt?.ownerId ?? review.assigneeId
+  if (reviewer === undefined || !canOwnReview(delivery, reviewer)) throw new Error(`Review ${review.id} of delivery ${delivery.id} was not made by a member independent of its authors`)
+  return { delivery, review }
 }
 
 /**
