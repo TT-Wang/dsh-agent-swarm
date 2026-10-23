@@ -2,7 +2,7 @@
 import type { Context } from '@deepseek-ai/cordis'
 import type { JsonSchemaNode, ToolDefinition, ToolExecution } from '@deepseek-ai/dsh-tools'
 import { authorizeWorkspace, type WorkspaceAuthorized } from './authorization.ts'
-import { PolicyError } from './policy-error.ts'
+import { PolicyError, thrownText } from './policy-error.ts'
 import { validatePlan } from './plans.ts'
 import { openAttempt } from './task-graph.ts'
 import type { SwarmRuntime } from './runtime.ts'
@@ -100,6 +100,45 @@ function optionalInteger(args: Args, key: string): number | undefined {
   return Number(value)
 }
 function optionalText(args: Args, key: string): string | undefined { return args[key] === undefined ? undefined : text(args, key) }
+
+/**
+ * The one owner of a swarm tool's failure text. The Harness renders a tool's
+ * rejection as `Error: <message>`, reading an Error's `message` (or a string
+ * `message` property) and `String()`-ing any other value, so a plain object
+ * reads "[object Object]" and its text is lost. Every rejection of a swarm
+ * tool leaves through here, and its trace span records the same text: an
+ * Error stays as it is; the session's own cancellation cause, a plain object
+ * (`AgentCancelCause`, such as `{ kind: 'disposed' }`), becomes a typed
+ * `[tool_cancelled]` refusal; any other value a typed `[tool_failed]` refusal,
+ * each carrying the value's readable text (`thrownText`).
+ */
+export function toolFailure(name: string, reason: unknown, host: AbortSignal): Error {
+  // A hostile value can trap even `instanceof`; the owner of the text is total.
+  let error = false
+  try { error = reason instanceof Error } catch { /* Not an Error: described below. */ }
+  if (error) return reason as Error
+  if (host.aborted && reason === host.reason) return toolCancelled(name, reason)
+  return new PolicyError('tool_failed', 'tool_error', `[tool_failed] ${name} failed with a thrown value that is not an Error: ${thrownText(reason)}. Read the current state with swarm_observe before calling ${name} again.`)
+}
+function toolCancelled(name: string, cause: unknown): PolicyError {
+  return new PolicyError('tool_cancelled', 'tool_error', `[tool_cancelled] ${name} was cancelled by its session (${thrownText(cause)}) before it returned. What it committed before the cancellation stands: read the current state with swarm_observe before calling ${name} again.`)
+}
+/**
+ * The signal one call runs under. The Harness aborts the call's own signal
+ * with the session's cancellation cause, which every `throwIfAborted()` and
+ * abort race below the tool throws as it is, into the tool result and into
+ * any record of the failure (an automatic request's recorded reason). This
+ * signal aborts with the call's `[tool_cancelled]` refusal instead, so the
+ * cancellation reads as one wherever its reason lands. `release` detaches it
+ * from the host signal once the call settles.
+ */
+function callSignal(name: string, host: AbortSignal): { signal: AbortSignal; release: () => void } {
+  const controller = new AbortController()
+  const abort = () => controller.abort(toolCancelled(name, host.reason))
+  if (host.aborted) abort()
+  else host.addEventListener('abort', abort, { once: true })
+  return { signal: controller.signal, release: () => host.removeEventListener('abort', abort) }
+}
 
 /** A JSON path the model can act on: every property name backticked, array indices bracketed. */
 const schemaPath = (segments: readonly (string | number)[]): string =>
@@ -297,41 +336,51 @@ export function registerTools(ctx: Context, runtime: SwarmRuntime, defaultBudget
       },
       presentCall: () => ({ card: 'generic', title: name.replaceAll('_', ' '), kind: 'read' }),
       async execute(value, exec) {
-        exec.signal.throwIfAborted()
-        // The session id is every span's actor, so an agent without one is refused here.
-        if (!exec.agent?.id) throw new Error('[session_required] Swarm tools require an authenticated Harness agent session; call this tool from an authenticated session and retry with the same `missionId`.')
-        let args = object(value)
-        const called = args
-        const actor = { sessionId: exec.agent.id, signal: exec.signal }
-        // A null on an optional property is an omission, removed first (`withoutUnsetNulls`).
-        args = withoutUnsetNulls(definition.parameters, args) as Args
-        // The command: the call checked against this tool's own published schema;
-        // then (H4) a planning workspace bound to the calling session or a root the
-        // human configured once, never to the model's word. The arguments keep the
-        // canonical workspace; the authorization reaches the runtime beside them.
-        const command = async (): Promise<unknown> => {
-          assertToolArguments(name, definition.parameters, args)
-          if (typeof run === 'function') return await run(args, actor, called)
-          const authorization = await boundPlanWorkspace(exec, text(args, 'workspace'), runtime.config.grants)
-          args = { ...args, workspace: authorization.workspace }
-          return await run.bound(args, actor, authorization)
-        }
-        const startedAt = Date.now(), started = performance.now()
-        const [outcome] = await Promise.allSettled([command()])
-        // D6: exactly one span per call, carrying the command's own outcome and the
-        // arguments it ran with; recording cannot change that outcome (`TraceRecorder.record`).
-        const result = outcome.status === 'fulfilled' ? outcome.value : undefined
-        trace?.record(name, () => {
-          const context = spanContext(runtime, name, actor.sessionId, args, result)
-          return context && { ...context, actor: actor.sessionId, input: { tool: name, arguments: args }, startedAt, durationMs: Math.round(performance.now() - started),
-            ...(outcome.status === 'fulfilled' ? { status: 'ok' as const, output: { result } }
-              : { status: 'error' as const, errorType: errorTypeFor(outcome.reason), output: { error: outcome.reason instanceof Error ? outcome.reason.message : String(outcome.reason) } }) }
-        })
-        if (outcome.status === 'rejected') throw outcome.reason
-        const missionId = name === 'swarm_launch' ? (result as Snapshot).mission.id : name === 'swarm_create' ? (result as { id: string }).id : args[missionKey]
-        const snapshot = typeof missionId === 'string' ? runtime.snapshot(actor, missionId) : undefined
-        return JSON.parse(JSON.stringify({ result, snapshot }))
+        // Every failure of the call leaves through `toolFailure`, and the call
+        // runs under a signal whose abort reason already is one (`callSignal`).
+        const call = callSignal(name, exec.signal)
+        try { return await invoke(value, exec, call.signal) }
+        catch (error) { throw toolFailure(name, error, exec.signal) }
+        finally { call.release() }
       },
+    }
+    async function invoke(value: unknown, exec: ToolExecution, signal: AbortSignal): Promise<unknown> {
+      signal.throwIfAborted()
+      // The session id is every span's actor, so an agent without one is refused here.
+      if (!exec.agent?.id) throw new Error('[session_required] Swarm tools require an authenticated Harness agent session; call this tool from an authenticated session and retry with the same `missionId`.')
+      let args = object(value)
+      const called = args
+      const actor = { sessionId: exec.agent.id, signal }
+      // A null on an optional property is an omission, removed first (`withoutUnsetNulls`).
+      args = withoutUnsetNulls(definition.parameters, args) as Args
+      // The command: the call checked against this tool's own published schema;
+      // then (H4) a planning workspace bound to the calling session or a root the
+      // human configured once, never to the model's word. The arguments keep the
+      // canonical workspace; the authorization reaches the runtime beside them.
+      const command = async (): Promise<unknown> => {
+        assertToolArguments(name, definition.parameters, args)
+        if (typeof run === 'function') return await run(args, actor, called)
+        const authorization = await boundPlanWorkspace(exec, text(args, 'workspace'), runtime.config.grants)
+        args = { ...args, workspace: authorization.workspace }
+        return await run.bound(args, actor, authorization)
+      }
+      const startedAt = Date.now(), started = performance.now()
+      const [outcome] = await Promise.allSettled([command()])
+      // D6: exactly one span per call, carrying the command's own outcome and the
+      // arguments it ran with; recording cannot change that outcome (`TraceRecorder.record`).
+      // A failure is recorded as the text the tool result carries (`toolFailure`).
+      const result = outcome.status === 'fulfilled' ? outcome.value : undefined
+      const failure = outcome.status === 'rejected' ? toolFailure(name, outcome.reason, exec.signal) : undefined
+      trace?.record(name, () => {
+        const context = spanContext(runtime, name, actor.sessionId, args, result)
+        return context && { ...context, actor: actor.sessionId, input: { tool: name, arguments: args }, startedAt, durationMs: Math.round(performance.now() - started),
+          ...(failure === undefined ? { status: 'ok' as const, output: { result } }
+            : { status: 'error' as const, errorType: errorTypeFor(failure), output: { error: failure.message } }) }
+      })
+      if (failure !== undefined) throw failure
+      const missionId = name === 'swarm_launch' ? (result as Snapshot).mission.id : name === 'swarm_create' ? (result as { id: string }).id : args[missionKey]
+      const snapshot = typeof missionId === 'string' ? runtime.snapshot(actor, missionId) : undefined
+      return JSON.parse(JSON.stringify({ result, snapshot }))
     }
     ctx.tools.register(definition)
   }

@@ -19,3 +19,23 @@ export class PolicyError extends Error {
    */
   override toString(): string { return `Error: ${this.message}` }
 }
+
+/**
+ * A thrown value's readable text, never "[object Object]": an Error's
+ * message, a string as itself, an object's string `message`, any other
+ * object as its JSON, a primitive as its string. A value that cannot be read
+ * (a cyclic object, a trapping proxy) is named as such, so the text is total.
+ */
+export function thrownText(value: unknown): string {
+  try {
+    if (value instanceof Error) return value.message
+    if (typeof value === 'string') return value
+    if (typeof value === 'function') return `a function ${JSON.stringify(value.name)}`
+    if (value === null || typeof value !== 'object') return String(value)
+    const message = (value as { message?: unknown }).message
+    if (typeof message === 'string') return message
+    const json = JSON.stringify(value)
+    if (json !== undefined) return json
+  } catch { /* An unreadable value is named below. */ }
+  return 'a thrown value that cannot be read'
+}
