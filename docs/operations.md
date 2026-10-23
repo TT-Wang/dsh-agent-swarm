@@ -32,7 +32,7 @@ npm run link:dsh
 npm run build
 ```
 
-`link:dsh` links every Harness package from that checkout into `node_modules`, so the mounted plugin runs on the host's own modules, and links the build tools the plugin declares from it. On its own it needs no `npm install`. It also works over `npm ci` (see [Development and verification](#development-and-verification)): it then replaces each Harness package npm installed with the checkout's, after checking that both are the same version, and keeps the tools the lockfile installed. `npm ci` removes the links, so run `link:dsh` again after it.
+`link:dsh` links every Harness package from that checkout into `node_modules`, so the mounted plugin runs on the host's own modules, and links the build tools the plugin declares from it. On its own it needs no `npm install`. It also works over `npm ci` (see [Development and verification](#development-and-verification)): it then replaces each Harness package npm installed with the checkout's, after checking that both are the same version, and keeps the tools the lockfile installed. `npm ci` removes the links, so run `link:dsh` again after it. When `node_modules` is itself a link, `npm ci` also empties the directory it points to; see [Development and verification](#development-and-verification) before running it there.
 
 Choose **one** of the following mounts, using the matching Harness CLI and running the command from the plugin checkout root.
 
@@ -227,6 +227,8 @@ npm run verify
 ```
 
 This runs typecheck, build, the behavioral suite, packaged-artifact loading, real Loader composition, CLI profile installation, the declarative bundle checks and both browser workflows.
+
+`npm ci` deletes everything in `node_modules` before it installs, and when `node_modules` is a symbolic link it deletes the contents of the directory the link points to. In a checkout whose `node_modules` links to a link farm that other checkouts share, that empties the farm for all of them. Remove the link itself first (`rm node_modules`, without a trailing slash): `npm ci` then installs into a new directory and leaves the farm as it was.
 
 | Command | Coverage |
 | --- | --- |

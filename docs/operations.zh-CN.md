@@ -34,7 +34,7 @@ npm run link:dsh
 npm run build
 ```
 
-`link:dsh` 把该检出中的每个 Harness 包链接进 `node_modules`，使挂载的插件运行在宿主自己的模块上，并从检出链接插件声明的构建工具。单独使用时不需要 `npm install`。它也可以在 `npm ci` 之后运行（见[开发与验证](#development-and-verification)）：这时它先确认 npm 安装的每个 Harness 包与检出中的版本相同，再用检出中的包替换它，并保留 lockfile 安装的工具。`npm ci` 会删除这些链接，因此每次 `npm ci` 之后都要重新运行 `link:dsh`。
+`link:dsh` 把该检出中的每个 Harness 包链接进 `node_modules`，使挂载的插件运行在宿主自己的模块上，并从检出链接插件声明的构建工具。单独使用时不需要 `npm install`。它也可以在 `npm ci` 之后运行（见[开发与验证](#development-and-verification)）：这时它先确认 npm 安装的每个 Harness 包与检出中的版本相同，再用检出中的包替换它，并保留 lockfile 安装的工具。`npm ci` 会删除这些链接，因此每次 `npm ci` 之后都要重新运行 `link:dsh`。如果 `node_modules` 本身是一个链接，`npm ci` 还会清空它指向的目录；在这样的检出中运行它之前，请先阅读[开发与验证](#development-and-verification)。
 
 使用匹配版本的 Harness CLI，在插件仓库根目录选择以下**一种**挂载方式。
 
@@ -241,6 +241,8 @@ npm run verify
 ```
 
 该命令执行类型检查、构建、行为测试、打包工件加载、真实 Loader 组合、CLI profile 安装、声明式 bundle 检查和两条浏览器工作流。
+
+`npm ci` 在安装前会删除 `node_modules` 中的全部内容；如果 `node_modules` 是符号链接，它删除的是链接所指目录中的内容。若某个检出的 `node_modules` 链接到多个检出共用的链接集合（link farm），这会清空该链接集合，所有共用它的检出都受影响。因此请先删除链接本身（`rm node_modules`，末尾不加斜杠）：`npm ci` 随后安装到一个新目录，链接集合保持原样。
 
 | 命令 | 覆盖范围 |
 | --- | --- |
