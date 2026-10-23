@@ -462,6 +462,45 @@ test('admission prepares each member route as its model step does, so the adapte
   assert.equal(f.ctx.agents.get(SessionId(f.member.sessionId)), undefined, 'admission opens no worker session')
 })
 
+/**
+ * A refused effort is answered with the efforts its model declares, which
+ * admission asks the host for after the prepared call refused it. A failed
+ * lookup is the route's host failure like any other: an unavailable route,
+ * its host detail logged and never returned (SURFACE-R3-01). It used to escape
+ * admission as the raw host value.
+ */
+test('admission answers a refused effort whose declared efforts cannot be read as an unavailable route, logging the host detail', async t => {
+  const reads = new Map()
+  const lookupFailures = new Map([
+    ['catalog-object', Object.freeze({ kind: 'catalog-offline' })],
+    ['catalog-error', new Error('catalog unreadable at /private/host/catalog.json')],
+  ])
+  // The prepared call reads the model and refuses its effort; the lookup of the
+  // declared efforts reads it again, and fails.
+  const f = await fixture(t, undefined, { start: false, modelInfo: model => {
+    const read = (reads.get(model) ?? 0) + 1
+    reads.set(model, read)
+    if (read > 1 && lookupFailures.has(model)) throw lookupFailures.get(model)
+    return reasoningModel(model)
+  } })
+  const warnings = []
+  f.ctx.logger.exporter({ levels: { default: 3 }, export: message => { if (message.type === 'warn') warnings.push(message.args.slice(1)) } })
+  const routes = await f.adapter.memberRoutes('owner-session', [
+    { provider: 'other-provider', model: 'catalog-object', reasoningEffort: 'low' },
+    { provider: 'other-provider', model: 'catalog-error', reasoningEffort: 'low' },
+  ])
+  assert.deepEqual(routes, [
+    { verdict: 'unavailable', provider: 'other-provider', model: 'catalog-object' },
+    { verdict: 'unavailable', provider: 'other-provider', model: 'catalog-error' },
+  ])
+  assert.deepEqual(warnings, [
+    ['other-provider', 'catalog-object', '{"kind":"catalog-offline"}'],
+    ['other-provider', 'catalog-error', 'Error: catalog unreadable at /private/host/catalog.json'],
+  ])
+  assert.deepEqual([...reads.values()], [2, 2], 'each route was refused by its prepared call, then its lookup failed')
+  assert.equal(f.requests.length, 0, 'admission sends no provider request')
+})
+
 test('workers inherit a native model and effort switch before the owner sends another request', async t => {
   const f = await fixture(t, undefined, { modelInfo: reasoningModel, configureOwner: async ({ ctx, owner }) => {
     owner.agent.session.append('model/selection', {

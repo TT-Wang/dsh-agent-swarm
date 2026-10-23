@@ -7,7 +7,7 @@ import type {} from '@deepseek-ai/dsh-api-session-controller/types'
 import type {} from '@deepseek-ai/dsh-session-projection'
 import type {} from '@deepseek-ai/dsh-agent-default-model'
 import type { MemberRoute, MemberRouteInput } from './types.js'
-import { PolicyError } from './policy-error.js'
+import { PolicyError, thrownText } from './policy-error.js'
 import { memberRouteRefusal } from './scheduler.js'
 
 function sameSelection(left: ModelSelection, right: ModelSelection): boolean {
@@ -77,7 +77,8 @@ export function workerRoute(inherited: ModelSelection | undefined, member: Membe
  * (`memberRouteRefusal`, src/scheduler.ts), so admission and a step refuse on
  * one rule: a refused effort is answered with the efforts that model declares
  * (`llm.resolveModelInfo`), another `member`-class code is the route refusing
- * its model, and any other failure is an unavailable route. The host's text can
+ * its model, and any other failure, a failed lookup of those efforts included,
+ * is an unavailable route (`resolvedRoute`). The host's text can
  * carry host paths or internal route codes (SURFACE-R3-01), so it is logged and
  * never returned. A worker that runs no route of its own has nothing to resolve.
  */
@@ -92,24 +93,44 @@ export async function memberRoutes(ctx: Context, ownerSessionId: string, members
   return routes
 }
 
+/**
+ * One member route's verdict. Every host failure on the way, the prepared
+ * call's or the declared efforts' lookup's (`routeAnswer`), is read here by one
+ * rule and logged, never returned.
+ */
 async function resolvedRoute(ctx: Context, route: ModelSelection, signal?: AbortSignal): Promise<MemberRoute> {
+  const { provider, model } = route
+  try {
+    return await routeAnswer(ctx, route, signal)
+  } catch (error) {
+    signal?.throwIfAborted()
+    const refusal = memberRouteRefusal(error)
+    const detail = error instanceof Error ? `${error.name}: ${error.message}` : thrownText(error)
+    try { ctx.logger.warn('agent-swarm: model route %s/%s refused at admission: %s', provider, model, detail) } catch { /* Logging must never mask the answer. */ }
+    // A refused effort reaches here only unanswered by the efforts its model
+    // declares (`routeAnswer`): the route is unavailable.
+    return refusal === undefined || refusal.code === 'UNSUPPORTED_REASONING_EFFORT'
+      ? { verdict: 'unavailable', provider, model }
+      : { verdict: 'model-refused', provider, model, code: refusal.code }
+  }
+}
+
+/**
+ * The route as the host answers it: accepted, or its named effort refused and
+ * answered with the efforts its model declares. Any other failure, and a
+ * failed lookup of the declared efforts, is thrown to `resolvedRoute`.
+ */
+async function routeAnswer(ctx: Context, route: ModelSelection, signal?: AbortSignal): Promise<MemberRoute> {
   const { provider, model, reasoningEffort } = route
   try {
     await ctx.llm.prepareCall(route, signal)
     return { verdict: 'accepted' }
   } catch (error) {
-    signal?.throwIfAborted()
-    const refusal = memberRouteRefusal(error)
-    if (refusal?.code === 'UNSUPPORTED_REASONING_EFFORT' && reasoningEffort !== undefined) {
-      const declared = (await ctx.llm.resolveModelInfo(provider, model, signal)).reasoning?.efforts ?? []
-      return { verdict: 'effort-unsupported', provider, model, effort: reasoningEffort, efforts: declared.map(effort => effort.id) }
-    }
-    const detail = error instanceof Error ? `${error.name}: ${error.message}` : String(error)
-    try { ctx.logger.warn('agent-swarm: model route %s/%s refused at admission: %s', provider, model, detail) } catch { /* Logging must never mask the answer. */ }
     // A route that names no effort runs its model's default, which the host
     // requires to be one the model declares, so its effort is never refused.
-    return refusal === undefined || refusal.code === 'UNSUPPORTED_REASONING_EFFORT'
-      ? { verdict: 'unavailable', provider, model }
-      : { verdict: 'model-refused', provider, model, code: refusal.code }
+    if (reasoningEffort === undefined || memberRouteRefusal(error)?.code !== 'UNSUPPORTED_REASONING_EFFORT') throw error
   }
+  signal?.throwIfAborted()
+  const declared = (await ctx.llm.resolveModelInfo(provider, model, signal)).reasoning?.efforts ?? []
+  return { verdict: 'effort-unsupported', provider, model, effort: reasoningEffort, efforts: declared.map(effort => effort.id) }
 }
