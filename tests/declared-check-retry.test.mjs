@@ -23,11 +23,11 @@
  */
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { setup, taskOf, events, MISSION_ACCEPTANCE, SwarmRuntime, FakeWorkers } from './faults/harness.mjs'
+import { setup, taskOf, events, eventually, MISSION_ACCEPTANCE, SwarmRuntime, FakeWorkers } from './faults/harness.mjs'
 
 const CHECK = 'node --test tests/first.test.mjs'
 const failing = output => ({ command: CHECK, exitCode: 1, output })
-const passing = () => ({ command: CHECK, exitCode: 0, output: 'tests 1, pass 1, fail 0\n' })
+const passing = (output = 'tests 1, pass 1, fail 0\n') => ({ command: CHECK, exitCode: 0, output })
 
 /** Claim, submit, admit a real independent review and take the verdict. */
 async function verifySource(f, task) {
@@ -192,4 +192,112 @@ test('R16-G5a: the failed first pass survives a lost process and the retry compl
     if (revived !== undefined) await revived.dispose()
     await f.cleanup()
   }
+})
+
+/**
+ * CORE-05: a verification names the attempt the caller holds, never one read
+ * off the board. The runner used to look the attempt up as the member's current
+ * open attempt when the first pass failed. A review attempt fenced while that
+ * pass ran had none, so its failure was never made durable: the pair was held
+ * in memory under `member:commit:source`, which no attempt id scoped. The
+ * fenced attempt could never use it (its verdict is refused), but the same
+ * member's next attempt on the same review and commit picked it up, wrote the
+ * dead attempt's two passes under its own id and cited the dead retry's row as
+ * its verdict's check. And when the next attempt was already open as the first
+ * pass returned, the dead attempt's failure was written under it, so its one
+ * clean pass was recorded as a retry.
+ *
+ * The fence here is the owner's mission pause during the first pass; the
+ * worker's signal is not aborted, so the retry finishes before the stop lands,
+ * which is the window in which the hold was written.
+ */
+async function fencedReviewFixture() {
+  const f = await setup({ checks: [CHECK], config: { tickMs: 60_000 } })
+  // No scheduling pass dispatches the re-pended review: the test claims it.
+  f.runtime.kick = () => {}
+  const task = f.propose()
+  const claimed = await f.runtime.claim(f.actor(f.author), f.mission.id, task.id)
+  await f.runtime.submit(f.actor(f.author), f.mission.id, { taskId: task.id, attemptId: claimed.attempt.id, output: 'candidate' })
+  const review = f.runtime.propose(f.owner, f.mission.id, {
+    outputs: [], workstreamId: f.stream.id, title: `Review ${task.title}`, objective: 'Independent review', kind: 'verification',
+    reviewOf: task.id, scope: ['**'], acceptance: MISSION_ACCEPTANCE, assigneeId: f.reviewer.id,
+  })
+  const first = await f.runtime.claim(f.actor(f.reviewer), f.mission.id, review.id)
+  const verdict = attemptId => f.runtime.verify(f.actor(f.reviewer), f.mission.id, { taskId: review.id, attemptId, verdict: 'accept', reason: 'Independent host checks validate the submitted artifact' })
+  /** Pause fences the review attempt; once its stop settled, resume and claim the same review again. */
+  const pause = () => f.runtime.control(f.owner, f.mission.id, 'pause', 'The owner pauses while the first pass runs')
+  const reclaim = async () => {
+    await eventually(() => taskOf(f.runtime, review.id).resumeAfterStop === undefined && taskOf(f.runtime, review.id).status === 'pending', 'the fenced review was re-pended once its stop settled')
+    f.runtime.control(f.owner, f.mission.id, 'resume', 'The owner resumes the mission')
+    return (await f.runtime.claim(f.actor(f.reviewer), f.mission.id, review.id)).attempt.id
+  }
+  return { f, task, review, firstAttempt: first.attempt.id, verdict, pause, reclaim }
+}
+
+test('CORE-05: a review attempt fenced during its first pass keeps that failure durable under its own attempt, and the next attempt cites only its own passes', async () => {
+  const { f, task, review, firstAttempt, verdict, pause, reclaim } = await fencedReviewFixture()
+  try {
+    let calls = 0
+    f.workers.verifyArtifact = async () => {
+      calls += 1
+      if (calls === 1) { pause(); return [failing('first pass of the fenced attempt\n')] }
+      if (calls === 2) return [passing('retry of the fenced attempt\n')]
+      if (calls === 3) return [failing('first pass of the next attempt\n')]
+      return [passing('retry of the next attempt\n')]
+    }
+    await assert.rejects(verdict(firstAttempt), 'the fenced attempt cannot commit a verdict')
+    assert.equal(calls, 2, 'the fenced attempt ran its first pass and its retry')
+    const fenced = runsFor(f, review)
+    assert.equal(fenced.length, 1, 'the failed first pass is durable although its attempt was fenced while it ran')
+    assert.equal(fenced[0].attemptId, firstAttempt, 'the row names the attempt that ran the pass')
+    assert.equal(fenced[0].arguments.attempt, 1)
+    assert.equal(fenced[0].isError, true)
+    assert.equal(fenced[0].result.output, 'first pass of the fenced attempt\n')
+
+    const nextAttempt = await reclaim()
+    assert.notEqual(nextAttempt, firstAttempt)
+    await verdict(nextAttempt)
+    assert.equal(calls, 4)
+    assert.equal(taskOf(f.runtime, task.id).status, 'accepted', 'the next attempt reaches its own verdict')
+
+    const next = runsFor(f, review).filter(run => run.attemptId === nextAttempt)
+    assert.deepEqual(next.map(run => [run.arguments.attempt, run.result.output]), [[1, 'first pass of the next attempt\n'], [2, 'retry of the next attempt\n']],
+      'the next attempt records its own two passes and none of the fenced attempt\'s')
+    assert.deepEqual(runsFor(f, review).filter(run => run.attemptId === firstAttempt).map(run => run.id), [fenced[0].id], 'the fenced attempt keeps exactly its durable first pass')
+    assert.ok(!runsFor(f, review).some(run => run.result.output === 'retry of the fenced attempt\n'), 'the fenced attempt\'s retry, which decided nothing, is cited by no row')
+    const [accepted] = events(f.runtime, f.mission.id, 'task/accepted')
+    assert.deepEqual(accepted.data.checks, [next[1].id], 'the verdict cites the pass it classified')
+  } finally { await f.cleanup() }
+})
+
+test('CORE-05: a fenced attempt\'s failed first pass is never written under the next attempt already open on the same review', async () => {
+  const { f, review, firstAttempt, verdict, pause, reclaim } = await fencedReviewFixture()
+  try {
+    let calls = 0
+    let release
+    const held = new Promise(resolve => { release = resolve })
+    f.workers.verifyArtifact = async () => {
+      calls += 1
+      if (calls === 1) { pause(); await held; return [failing('first pass of the fenced attempt\n')] }
+      if (calls === 2) return [failing('retry of the fenced attempt\n')]
+      return [passing('single pass of the next attempt\n')]
+    }
+    const fencedVerdict = verdict(firstAttempt)
+    await eventually(() => calls === 1, 'the fenced attempt\'s first pass is running')
+    // The same member already holds the next attempt on the same review when
+    // the fenced attempt's first pass returns.
+    const nextAttempt = await reclaim()
+    release()
+    await assert.rejects(fencedVerdict, 'the fenced attempt cannot commit a verdict')
+    const fenced = runsFor(f, review)
+    assert.deepEqual(fenced.map(run => [run.attemptId, run.arguments.attempt, run.result.output]), [[firstAttempt, 1, 'first pass of the fenced attempt\n']],
+      'the failure is recorded under the attempt that ran it, not under the attempt the member holds now')
+
+    await verdict(nextAttempt)
+    const next = runsFor(f, review).filter(run => run.attemptId === nextAttempt)
+    assert.deepEqual(next.map(run => [run.arguments.attempt, run.result.output]), [[1, 'single pass of the next attempt\n']],
+      'a single clean pass is recorded as the first and only pass, never as a retry')
+    const [accepted] = events(f.runtime, f.mission.id, 'task/accepted')
+    assert.deepEqual(accepted.data.checks, [next[0].id])
+  } finally { await f.cleanup() }
 })

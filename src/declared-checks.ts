@@ -12,7 +12,7 @@
  * failures can defer review without converting infrastructure into a code verdict.
  */
 import { id } from './store.ts'
-import { memberTask, openAttempt } from './task-graph.ts'
+import { memberTask } from './task-graph.ts'
 import { unexecutedCheck } from './check-results.ts'
 import type { Kernel } from './kernel.ts'
 import type { WorkspaceAdmission } from './workspace-admission.ts'
@@ -109,48 +109,30 @@ const isDeclaredCheckEnvironment = (value: unknown): value is CheckEnvironment =
  * through this one type, so neither side can rename the key alone.
  */
 interface AssignmentEnvironment { checkEnvironment?: { note: string; environment: CheckEnvironment; selfRun?: CheckEnvironment } }
+/**
+ * CORE-05: the verification a declared-check run belongs to: the review task
+ * and the attempt its caller proved it holds before the checks ran. The run's
+ * durable rows name it, whatever happens to that attempt while they run.
+ */
+export interface VerificationAttempt { taskId: string; attemptId: string }
 
 export class DeclaredChecks {
-  /**
-   * S15: the attempts of the verification in flight. The key is
-   * `memberId:commit:sourceTaskId`, not `memberId:commit`: `run()` executes
-   * outside the mission lock and `recordRuns()` inside a later exclusive section,
-   * so two concurrent verifications by one member on one artifact could otherwise
-   * swap their held passes. The reviewed source is available on both sides —
-   * `run()` gets the source, and `recordRuns()` reads the verification task's
-   * `reviewOf` from the store — so the pairing is exact without a new parameter.
-   *
-   * R16-G5a: this map is only a cache now. A failed first pass is written to the
-   * durable `tool_runs` table before the retry starts (`recordFirstPass`), so a
-   * lost process can no longer lose the record that the check failed once. The
-   * map remains for the one case the durable rows cannot cover: a verification
-   * task that cannot be resolved from the board at the moment the first pass
-   * fails, where the pair is still held in-process and recorded by `recordRuns`.
-   */
-  private readonly checkRuns = new Map<string, CheckResult[][]>()
-
   constructor(private readonly k: Kernel, private readonly workspaceAdmission: WorkspaceAdmission) {}
-
-  /** The reviewed source a verification task belongs to. */
-  private sourceOf(verificationTaskId: string): string {
-    return this.k.store.get('tasks', verificationTaskId)?.reviewOf ?? verificationTaskId
-  }
-
-  /**
-   * R16-G5a: the verification task this member is running for one source, with
-   * its live attempt. Derived from the board for the same reason `sourceOf` is:
-   * `run()` has the member and the source, `recordRuns()` has the attempt id, and
-   * the durable rows must name the verification consistently on both sides.
-   */
-  private verificationAttempt(member: Member, source: Task): { taskId: string; attemptId: string } | undefined {
-    const open = openAttempt(this.k.store.list('tasks', member.missionId), member.id)
-    return open?.kind === 'verification' && open.reviewOf === source.id ? { taskId: open.id, attemptId: open.attempt.id } : undefined
-  }
 
   /**
    * R16-G5a: write one durable tool-run row per declared check of the FAILED
-   * first pass, before the retry runs. Returns false when the verification task
-   * cannot be resolved (the caller then keeps the pair in memory).
+   * first pass, before the retry runs, so a lost process can never lose the
+   * record that the check failed once.
+   *
+   * CORE-05: the rows name the verification attempt the caller holds
+   * (`run`'s `verification`), never one read off the board. That attempt may
+   * have been fenced while the pass ran (a lease expiry, an owner cancel or
+   * amendment, a mission pause or stop, a revoked workspace, a sibling
+   * verdict); the rows are still a true record of a host execution against
+   * this commit, and since its verdict is then refused, they are all that
+   * attempt leaves. Nothing is held in memory across calls, so no later
+   * attempt can cite a pass it never ran, and a member's next attempt open
+   * when a fenced attempt's pass returns is never credited with that failure.
    *
    * Co-firing guards, named: the retry rule itself (a first pass that passes
    * never reaches here, so a single-pass verification still records exactly one
@@ -159,9 +141,7 @@ export class DeclaredChecks {
    * `verify` (a failing check row is `isError`, so it can never satisfy
    * "acceptance requires independent host-recorded verification evidence").
    */
-  private recordFirstPass(member: Member, source: Task, artifact: Artifact, checks: ReadonlyArray<CheckResult>): boolean {
-    const verification = this.verificationAttempt(member, source)
-    if (verification === undefined) return false
+  private recordFirstPass(member: Member, verification: VerificationAttempt, artifact: Artifact, checks: ReadonlyArray<CheckResult>): void {
     this.k.commit(member.missionId, () => {
       let seq = this.k.store.countToolRuns(member.missionId)
       for (const check of checks) {
@@ -169,13 +149,13 @@ export class DeclaredChecks {
         this.k.store.put('tool_runs', run)
       }
     })
-    return true
   }
 
   /**
    * R16-G5a: whether the durable record already holds this attempt's failed first
-   * pass. Scoped by attempt id, so a later verification of the same commit can
-   * never pair with an earlier attempt's failure.
+   * pass, which is how `recordRuns` learns the retry rule fired. Scoped by
+   * attempt id, so a later verification of the same commit can never pair with
+   * an earlier attempt's failure.
    */
   private firstPassRecorded(missionId: string, where: { memberId: string; taskId: string; attemptId: string; commit: string }): boolean {
     return this.k.store.list('tool_runs', missionId).some(run => {
@@ -204,20 +184,20 @@ export class DeclaredChecks {
    * rule turned one timing accident into a preserve-and-replace cycle — round 13
    * paid two of those and the owner paid one more while gating it. So a failing
    * pass is re-run once on the same artifact and the retry decides: a real
-   * failure fails twice, a flake does not. The first pass is kept for the durable
-   * record (see `recordRuns`), never discarded.
+   * failure fails twice, a flake does not. The failed first pass is written
+   * durably under `verification` before the retry runs (`recordFirstPass`),
+   * never discarded; the verdict records the deciding pass (`recordRuns`).
+   *
+   * CORE-05: `verification` is the review task and attempt the caller proved it
+   * holds (`verify`'s `ownAttempt` before the checks), so the record names the
+   * attempt that ran the passes even when it is fenced while they run.
    */
-  async run(member: Member, source: Task, artifact: Artifact, signal?: AbortSignal): Promise<CheckResult[]> {
-    const key = `${member.id}:${artifact.commit}:${source.id}`
+  async run(member: Member, source: Task, artifact: Artifact, verification: VerificationAttempt, signal?: AbortSignal): Promise<CheckResult[]> {
     const first = await this.execute(member, source, artifact, signal)
-    if (first.every(check => check.exitCode === 0)) { this.checkRuns.delete(key); return first }
-    // R16-G5a: the failed first pass is durable before the retry starts. If the
-    // process is lost between the two passes, the record of the failure survives;
-    // when the verification task cannot be resolved, the pair stays in memory.
-    const durable = this.recordFirstPass(member, source, artifact, first)
-    const retry = await this.execute(member, source, artifact, signal)
-    if (!durable) this.checkRuns.set(key, [first, retry])
-    return retry
+    if (first.every(check => check.exitCode === 0)) return first
+    // R16-G5a: if the process is lost between the two passes, the record of the failure survives.
+    this.recordFirstPass(member, verification, artifact, first)
+    return await this.execute(member, source, artifact, signal)
   }
 
   /**
@@ -361,39 +341,26 @@ export class DeclaredChecks {
   }
 
   /**
-   * One durable tool-run row per declared check per attempt, in order, in the
-   * same transaction as the verdict. When the retry rule fired, both the failed
-   * first pass and the deciding retry are written, each row naming its attempt,
-   * command, exit code and output, so the durable record shows the flake instead
-   * of hiding it. The returned ids are the deciding attempt's rows, which is what
-   * the acceptance/rejection event names.
-   *
-   * R16-G5a: the first pass may already be durable (`recordFirstPass` wrote it
-   * before the retry, and a lost process keeps those rows). Then this transaction
-   * writes only the deciding pass, as attempt 2 — never a second copy of attempt
-   * 1. The lookup is scoped by attempt id, so a re-verification of the same
+   * One durable tool-run row per declared check of the deciding pass, in order,
+   * in the same transaction as the verdict, each row naming its pass, command,
+   * exit code and output. When the retry rule fired, the failed first pass is
+   * already durable under the same attempt (`recordFirstPass` wrote it before
+   * the retry, and a lost process keeps those rows), so this writes the
+   * deciding pass as attempt 2 — never a second copy of attempt 1 — and the
+   * durable record shows the flake instead of hiding it. The returned ids are
+   * the deciding pass's rows, which is what the acceptance/rejection event
+   * names. The lookup is scoped by attempt id, so a re-verification of the same
    * commit records its own attempt 1 instead of pairing with an older failure.
    */
   recordRuns(missionId: string, where: { memberId: string; taskId: string; attemptId: string; commit: string },
     checks: ReadonlyArray<CheckResult>): string[] {
-    const key = `${where.memberId}:${where.commit}:${this.sourceOf(where.taskId)}`
-    const held = this.checkRuns.get(key)
-    this.checkRuns.delete(key)
-    const recorded: Array<{ attempt: number; checks: ReadonlyArray<CheckResult> }> = held !== undefined
-      ? [{ attempt: 1, checks: held[0]! }, { attempt: 2, checks: held[1]! }]
-      : this.firstPassRecorded(missionId, where)
-        ? [{ attempt: 2, checks }]
-        : [{ attempt: 1, checks }]
-    const ids: string[] = []
+    const attempt = this.firstPassRecorded(missionId, where) ? 2 : 1
     let seq = this.k.store.countToolRuns(missionId)
-    for (const [index, entry] of recorded.entries()) {
-      const deciding = index === recorded.length - 1
-      for (const check of entry.checks) {
-        const run: ToolRun = { id: id('run'), seq: ++seq, missionId, memberId: where.memberId, taskId: where.taskId, attemptId: where.attemptId, tool: 'swarm.host_verification', arguments: { command: check.command, commit: where.commit, attempt: entry.attempt }, result: check, isError: check.exitCode !== 0, createdAt: this.k.now() }
-        this.k.store.put('tool_runs', run); if (deciding) ids.push(run.id)
-      }
-    }
-    return ids
+    return checks.map(check => {
+      const run: ToolRun = { id: id('run'), seq: ++seq, missionId, memberId: where.memberId, taskId: where.taskId, attemptId: where.attemptId, tool: 'swarm.host_verification', arguments: { command: check.command, commit: where.commit, attempt }, result: check, isError: check.exitCode !== 0, createdAt: this.k.now() }
+      this.k.store.put('tool_runs', run)
+      return run.id
+    })
   }
 
   /**

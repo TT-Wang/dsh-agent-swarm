@@ -1324,10 +1324,12 @@ export class SwarmRuntime implements Kernel {
         ? await this.workers.captureArtifact(member, task, input.deliverables, { requireOutputs: true })
         : undefined
       this.ownAttempt(actor, missionId, task.id, input.attemptId)
-      return { member, source, artifact, reviewArtifact, evidenceRevision, checksRevision: JSON.stringify(source.checks) }
+      return { member, source, artifact, reviewArtifact, evidenceRevision, checksRevision: JSON.stringify(source.checks), verification: { taskId: task.id, attemptId: input.attemptId } }
     })
     // M1a seam 5/7: the declared-check execution path is src/declared-checks.ts.
-    const checks = await this.declaredChecks.run(prepared.member, prepared.source, prepared.artifact, actor.signal)
+    // CORE-05: the checks run as the attempt this caller proved it holds above,
+    // so their record names it even if it is fenced while they run.
+    const checks = await this.declaredChecks.run(prepared.member, prepared.source, prepared.artifact, prepared.verification, actor.signal)
     this.declaredChecks.recordEnvelope(missionId, input.taskId, prepared.source.id, prepared.member.id)
     return this.exclusive(missionId, async () => {
       const { task, member } = this.ownAttempt(actor, missionId, input.taskId, input.attemptId)
