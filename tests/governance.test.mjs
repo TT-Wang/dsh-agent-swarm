@@ -171,8 +171,11 @@ test('W8 at a step: a refusal by the member\'s own route retires it once, releas
   const f = await setup(t)
   const ada = await f.addMember({ name: 'Ada', role: 'implementation', provider: 'deepseek-official', model: 'flash', reasoningEffort: 'high' })
   const alan = await f.addMember({ name: 'Alan', role: 'implementation' })
+  const grace = await f.addMember({ name: 'Grace', role: 'implementation' })
   const running = f.propose(f.owner, { title: 'Running', assigneeId: ada.id })
   const claimed = await f.runtime.claim({ sessionId: ada.sessionId }, f.mission.id, running.id)
+  // Assigned to Ada and not started: unpinned, so it is released with no handle to wait for.
+  const queued = f.propose(f.owner, { title: 'Queued', assigneeId: ada.id })
   const pinned = f.propose(f.owner, { title: 'Pinned', assigneeId: ada.id, assignmentMode: 'pinned' })
   // The route changed after admission: the host now refuses Ada's effort at her next step.
   const refusal = { code: 'UNSUPPORTED_REASONING_EFFORT', message: 'provider "deepseek-official" model "flash" does not support reasoning effort "high"' }
@@ -182,6 +185,8 @@ test('W8 at a step: a refusal by the member\'s own route retires it once, releas
   assert.equal(member(ada.id).status, 'stopped', 'the member is retired at the first refusal')
   assert.deepEqual(f.events('member/route-refused').map(event => event.data), [{ memberId: ada.id, code: refusal.code, error: refusal.message }])
   assert.equal(task(running.id).attempt, undefined, 'the attempt it held is fenced')
+  assert.equal(task(queued.id).status, 'pending')
+  assert.equal(task(queued.id).assigneeId, undefined, 'queued unpinned work no longer names the retired member')
   // Once the handle has stopped, the unpinned work is pending for any capable live member, its allowance intact.
   const released = await eventually(() => { const current = task(running.id); return current.status === 'pending' ? current : undefined }, 'the fenced task is re-pended')
   assert.equal(released.assigneeId, undefined)
@@ -191,7 +196,7 @@ test('W8 at a step: a refusal by the member\'s own route retires it once, releas
   const notices = f.ownerNotices().filter(content => content.startsWith('[member_route_refused]'))
   assert.equal(notices.length, 1)
   assert.match(notices[0], new RegExp(`^\\[member_route_refused\\] Ada \\(${ada.id}\\) was stopped: its route \\(provider "deepseek-official" model "flash" reasoning effort "high"\\) refused a model step with UNSUPPORTED_REASONING_EFFORT`))
-  assert.ok(notices[0].includes(`Its unpinned work returns to the board for a capable live member: ${running.id} (Running).`))
+  assert.ok(notices[0].includes(`Its unpinned work returns to the board for a capable live member: ${running.id} (Running), ${queued.id} (Queued).`))
   assert.ok(notices[0].includes(`Its pinned work waits for a new assignee: ${pinned.id} (Pinned)`))
   assert.match(notices[0], /Admit a replacement with `swarm_add_member`/)
   assert.doesNotMatch(notices[0], /does not support/, 'the host\'s text stays in the durable event')
@@ -199,8 +204,46 @@ test('W8 at a step: a refusal by the member\'s own route retires it once, releas
   f.workers.callbacks.routeRefused(ada.id, refusal)
   assert.equal(f.events('member/route-refused').length, 1)
   await assert.rejects(f.runtime.submit({ sessionId: ada.sessionId }, f.mission.id, { taskId: running.id, attemptId: claimed.attempt.id, output: 'late' }))
-  // The released work runs on another member.
+  // The released work runs on other members.
   const next = await f.runtime.claim({ sessionId: alan.sessionId }, f.mission.id, running.id)
+  assert.equal(next.attempt.ownerId, alan.id)
+  const taken = await f.runtime.claim({ sessionId: grace.sessionId }, f.mission.id, queued.id)
+  assert.equal(taken.attempt.ownerId, grace.id)
+})
+
+test('W8 at a step: a member refused while it holds no attempt is retired by stopping its handle, and the work it ran before returns to the board', async t => {
+  const f = await setup(t)
+  const ada = await f.addMember({ name: 'Ada', role: 'implementation', provider: 'deepseek-official', model: 'flash', reasoningEffort: 'high' })
+  const alan = await f.addMember({ name: 'Alan', role: 'implementation' })
+  const task = id => f.runtime.snapshot(f.owner, f.mission.id).tasks.find(item => item.id === id)
+  // Ada ran this work, then her worker failed to start once: the work waits for
+  // her next start, and no other member may borrow it, since it ran before.
+  const ran = f.propose(f.owner, { title: 'Ran before', assigneeId: ada.id })
+  await f.runtime.claim({ sessionId: ada.sessionId }, f.mission.id, ran.id)
+  f.runtime.onStartFailure(f.runtime.mission(f.mission.id), f.runtime.store.get('members', ada.id), new Error('worker could not start'))
+  assert.equal(task(ran.id).status, 'pending')
+  assert.equal(task(ran.id).assigneeId, ada.id)
+  assert.equal(task(ran.id).attempt, undefined, 'Ada holds no attempt')
+  assert.deepEqual(f.runtime.store.get('tasks', ran.id).priorOwnerIds, [ada.id])
+  // Her next start reaches a model step that her route now refuses. No attempt
+  // is fenced, so no stop on its way back to the board stops her handle: the
+  // retirement does.
+  const refusal = { code: 'UNSUPPORTED_REASONING_EFFORT', message: 'provider "deepseek-official" model "flash" does not support reasoning effort "high"' }
+  assert.equal(f.workers.stopped.includes(ada.id), false)
+  f.workers.callbacks.routeRefused(ada.id, refusal)
+  assert.equal(f.runtime.snapshot(f.owner, f.mission.id).members.find(item => item.id === ada.id).status, 'stopped')
+  assert.equal(task(ran.id).status, 'pending')
+  assert.equal(task(ran.id).assigneeId, undefined, 'the work no longer names the retired member')
+  f.workers.callbacks.routeRefused(ada.id, refusal)
+  await f.runtime.settle(f.mission.id)
+  assert.deepEqual(f.workers.stopped.filter(id => id === ada.id), [ada.id], 'the handle is stopped once')
+  assert.deepEqual(f.events('member/route-refused').map(event => event.data), [{ memberId: ada.id, code: refusal.code, error: refusal.message }])
+  const notices = f.ownerNotices().filter(content => content.startsWith('[member_route_refused]'))
+  assert.equal(notices.length, 1)
+  assert.ok(notices[0].includes(`Its unpinned work returns to the board for a capable live member: ${ran.id} (Ran before).`))
+  assert.doesNotMatch(notices[0], /Its pinned work/)
+  // The work that ran before runs on a live member.
+  const next = await f.runtime.claim({ sessionId: alan.sessionId }, f.mission.id, ran.id)
   assert.equal(next.attempt.ownerId, alan.id)
 })
 
