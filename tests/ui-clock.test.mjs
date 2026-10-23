@@ -1,17 +1,10 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { createRequire } from 'node:module'
-import { join } from 'node:path'
+import { JSDOM } from 'jsdom'
 import React, { act } from 'react'
-import { resolveHarnessRoot } from '../scripts/harness-target.mjs'
 import { SwarmBoard } from '../lib/types/client/SwarmBoard.js'
 import { CopyContext, zh } from '../lib/types/client/locale.js'
 import { uiSnapshot } from './fixtures/ui-snapshot.mjs'
-
-// Reuse the configured local Harness's test DOM; no dependency installation,
-// host process, live profile, browser service or model request is involved.
-const requireHarness = createRequire(join(resolveHarnessRoot(), 'package.json'))
-const { JSDOM } = requireHarness('jsdom')
 
 test('mounted overview uses one clock and one native projection; technical lease ticks never rerender the board', async t => {
   const dom = new JSDOM('<div id="mount"></div>', { pretendToBeVisual: true, url: 'http://localhost' })

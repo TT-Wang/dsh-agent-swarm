@@ -7,15 +7,10 @@
  */
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { createRequire } from 'node:module'
-import { join } from 'node:path'
+import { JSDOM } from 'jsdom'
 import React, { act } from 'react'
-import { resolveHarnessRoot } from '../scripts/harness-target.mjs'
 import { DraftEditor, newPlan } from '../lib/types/client/DraftEditor.js'
 import { uiSnapshot } from './fixtures/ui-snapshot.mjs'
-
-// Reuse the configured local Harness's test DOM, as tests/ui-clock.test.mjs does.
-const { JSDOM } = createRequire(join(resolveHarnessRoot(), 'package.json'))('jsdom')
 
 test('the draft editor adds, edits and guards criteria, cites them per deliverable, and drops a review\'s covers', async t => {
   const dom = new JSDOM('<div id="mount"></div>', { pretendToBeVisual: true, url: 'http://localhost' })

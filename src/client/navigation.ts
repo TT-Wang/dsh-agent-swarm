@@ -1,6 +1,8 @@
 import type { Context } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-api-session-controller/client'
 import type {} from '@deepseek-ai/dsh-client-ui-workspace/client'
+// The 'mainView' reference source is declared by ui-session.
+import type {} from '@deepseek-ai/dsh-client-ui-session/client'
 import type { SessionId } from '@deepseek-ai/dsh-session/types'
 
 /**

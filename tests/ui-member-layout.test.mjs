@@ -1,14 +1,9 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { createRequire } from 'node:module'
-import { join } from 'node:path'
+import { JSDOM } from 'jsdom'
 import React, { act } from 'react'
-import { resolveHarnessRoot } from '../scripts/harness-target.mjs'
 import { LiveWorkOverview } from '../lib/types/client/LiveWorkPanel.js'
 import { uiSnapshot } from './fixtures/ui-snapshot.mjs'
-
-const requireHarness = createRequire(join(resolveHarnessRoot(), 'package.json'))
-const { JSDOM } = requireHarness('jsdom')
 
 test('member activity updates preserve row order, keyboard focus and conversation identity; collapsed members retain full text', async t => {
   const dom = new JSDOM('<div id="mount"></div>', { pretendToBeVisual: true, url: 'http://localhost' })

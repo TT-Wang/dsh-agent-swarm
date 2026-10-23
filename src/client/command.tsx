@@ -2,6 +2,8 @@ import type { Context } from '@deepseek-ai/cordis'
 import type { CommandRowOwnerProps, CommandRowProps } from '@deepseek-ai/dsh-client-ui-chat/client'
 import type {} from '@deepseek-ai/dsh-client-ui-commands/client'
 import type {} from '@deepseek-ai/dsh-client-locale/client'
+// A row's sessionId is a session standard prop that ui-session declares.
+import type {} from '@deepseek-ai/dsh-client-ui-session/client'
 import { useSyncExternalStore } from 'react'
 import { currentSessionId } from './navigation.ts'
 
