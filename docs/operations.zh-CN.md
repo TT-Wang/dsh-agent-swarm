@@ -71,7 +71,7 @@ node "$DSH_HARNESS_ROOT/apps/cli/lib/bin.js" --profile web
 
 ## 将 0.1.x 的 Harness 主目录迁到 0.2.1-rc.2
 
-插件只在 0.2.1-rc.2 上运行。在 0.1.5-rc.3 或 0.1.7-rc.1 上用过的 Harness 主目录（`DSH_HOME`）和插件状态需要一次性迁过来，不需要额外的迁移步骤：0.2.1-rc.2 能读取已有的会话日志，宿主版本的变化也不会触及插件的存储（`swarm.sqlite`，schema 7）。但迁过去之后就回不来了，所以首次在 0.2.1-rc.2 上启动前：
+插件只在 0.2.1-rc.2 上运行。在 0.1.5-rc.3 或 0.1.7-rc.1 上用过的 Harness 主目录（`DSH_HOME`）和插件状态需要一次性迁过来，不需要额外的迁移步骤：0.2.1-rc.2 能读取已有的会话日志，宿主版本的变化也不会触及插件的存储（`swarm.sqlite`，schema 8）。但迁过去之后就回不来了，所以首次在 0.2.1-rc.2 上启动前：
 
 1. **停止宿主并备份主目录。** 把 `$DSH_HOME/sessions` 和插件状态一起复制：`statePath`（默认是 `~/.dsh/agent-swarm/swarm.sqlite` 及同目录的 `-wal`、`-shm` 文件；这个默认值不随 `DSH_HOME` 变化）和 `workspacesRoot`。回到 0.1.x 的唯一办法是恢复这份备份，在 0.2.1-rc.2 上完成的一切都会丢弃；同时还要换回不晚于 `a28b116` 的插件版本：0.1.7-rc.1 会拒绝安装当前插件并跳过已挂载的插件；0.1.5-rc.3 没有这项检查，当前插件会记录一条宿主不受支持的错误日志，在那里也不应指望它能正常工作。
 2. **检查共享的 agent 指令文件。** 0.2.1-rc.2 除了 `$DSH_HOME/AGENTS.md`，还会读取共享 agents 目录（`$DSH_AGENTS_HOME`，默认 `~/.agents`）中的 `AGENTS.md`。worker 挂载其 owner 的 agent 预设，因此在 Standard、Creator 和 PTC 预设下，这个文件会进入每个 owner 和 worker 的提示词；Minimal 预设不加载指令文件。
