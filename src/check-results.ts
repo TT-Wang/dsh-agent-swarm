@@ -1,9 +1,9 @@
 /**
  * Pure functions of declared-check result rows: the row for a check the host
- * could not execute, and the exit a deferred review names from its rows; with
- * the bounded excerpt every model-visible view uses. A leaf: it imports only
- * the row type, so the board, the workspace engine, the gates and the runtime
- * read it without importing the declared-check seam.
+ * could not execute, and the exit a deferred review names from its deciding
+ * pass's rows; with the bounded excerpt every model-visible view uses. A leaf:
+ * it imports only the row type, so the board, the workspace engine, the gates
+ * and the runtime read it without importing the declared-check seam.
  */
 import type { CheckResult } from './types.ts'
 
@@ -31,7 +31,7 @@ const RECOVERY_EXITS: Record<NonNullable<CheckResult['failureKind']>, (check: Ch
   },
 }
 
-/** A deferred review's exit: its last classified failure's (a pass stops at its first failing check), or resuming when no row has a kind. */
+/** A deferred review's exit, from the rows of the pass that decided to defer: its last classified failure's (a pass stops at its first failing check), or resuming when no row has a kind. */
 export function recoveryExit(checks: ReadonlyArray<CheckResult>): string {
   const failure = checks.findLast(check => check.failureKind !== undefined)
   return failure?.failureKind === undefined ? RESUME : RECOVERY_EXITS[failure.failureKind](failure)

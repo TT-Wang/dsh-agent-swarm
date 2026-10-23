@@ -333,7 +333,7 @@ test('a store an older build wrote is rewritten once, at open: each marker moves
       `v${version}: a pause and an idle signal naming another attempt leave; the held attempt keeps its own`)
     assert.deepEqual(taskOf(opened, plain.id), plainRow, `v${version}: a row without markers keeps its value`)
     assert.deepEqual(opened.store.changesSince(before).map(change => change.scopes), [[f.mission.id]], `v${version}: the upgrade is one recorded change`)
-    assert.equal(read('PRAGMA user_version'), 7)
+    assert.equal(read('PRAGMA user_version'), 8)
     await opened.dispose()
     // Once: a schema 7 store is not rewritten again (only an older build writes such a row), and nothing is written.
     write(older.slice(0, 1), 7)
@@ -369,7 +369,7 @@ test('opening an older store whose rows carry no marker writes nothing: the sche
     assert.deepEqual([opened.store.revision(), opened.store.changesSince(before)], [before, []], `v${version}: the upgrade rewrote no row, so it records no change`)
     assert.deepEqual(rows.map(row => taskOf(opened, row.id)), rows, `v${version}: every row keeps its value`)
     await opened.dispose()
-    assert.equal(readValue(statePath, 'PRAGMA user_version'), 7, `v${version}: the store is at schema 7`)
+    assert.equal(readValue(statePath, 'PRAGMA user_version'), 8, `v${version}: the store is at schema 8`)
   }
 })
 

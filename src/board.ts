@@ -703,7 +703,13 @@ export function reviewNeed(board: Board, source: Task): ReviewNeed {
 export function reviewPathBlocker(board: Board, source: Task, need: ReviewNeed, stalled?: boolean): string | undefined {
   const { mission, tasks, members, records } = board
   const deferred = tasks.find(task => task.status === 'blocked' && task.reviewOf === source.id && task.verificationRecovery !== undefined && task.verificationRecovery.commit === source.artifact?.commit)
-  if (deferred !== undefined) return `review ${deferred.id} deferred its verdict on this artifact: ${recoveryExit(records.toolRuns(mission.id, { taskId: deferred.id }).filter(run => run.tool === 'swarm.host_verification').map(run => run.result as CheckResult))}`
+  if (deferred?.verificationRecovery !== undefined) {
+    // The exit is the deciding pass's, from exactly the rows the deferral named: never the review's
+    // newest rows, which a fenced attempt's late pass can follow (CORE-05 records every failed first pass).
+    const results = new Map(records.toolRuns(mission.id, { taskId: deferred.id }).map(run => [run.id, run.result as CheckResult]))
+    const decided = deferred.verificationRecovery.toolRunIds.flatMap(runId => { const result = results.get(runId); return result === undefined ? [] : [result] })
+    return `review ${deferred.id} deferred its verdict on this artifact: ${recoveryExit(decided)}`
+  }
   if (tasks.length >= mission.budget.maxTasks) return `the mission task budget is exhausted (${tasks.length}/${mission.budget.maxTasks} admitted tasks), so no verification task can be admitted: raise maxTasks with swarm_budget(budget, reason), or ${WITHDRAW_SOURCE}`
   const authors = [...authorIdsOf(source)]
   if (!members.some(member => memberPhaseOf(member) !== 'stopped' && canOwnReview(source, member.id))) return `no live member other than the author (${authors.join(', ') || 'unknown'}) can review this artifact independently: add an independent member with swarm_add_member(role, maxOutputTokens), or ${WITHDRAW_SOURCE}`

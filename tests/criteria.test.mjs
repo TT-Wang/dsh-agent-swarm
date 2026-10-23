@@ -589,7 +589,7 @@ test('a v3 store cites the criteria its deliverables copied, once at open, and k
   // The one change: a repair admitted before inheritance answers for what it replaced.
   assert.equal(reason('repaired'), undefined)
   const probe = new DatabaseSync(config.statePath, { readOnly: true })
-  assert.equal(probe.prepare('PRAGMA user_version').get().user_version, 7)
+  assert.equal(probe.prepare('PRAGMA user_version').get().user_version, 8)
   probe.close()
   // Once: an upgraded store is not cited again. A v4 deliverable may hold a criterion's text as its own and cite nothing;
   // reopening leaves that row as it is and moves no state revision.
@@ -614,8 +614,8 @@ test('a v3 store cites the criteria its deliverables copied, once at open, and k
     await restored.dispose()
   }
   // A store from a later schema fails closed, as a v3 build refuses this one.
-  const future = new DatabaseSync(config.statePath); future.exec('PRAGMA user_version=8'); future.close()
-  assert.throws(() => new SwarmRuntime(config, new FakeWorkers()), /Unsupported swarm schema 8; expected 7/)
+  const future = new DatabaseSync(config.statePath); future.exec('PRAGMA user_version=9'); future.close()
+  assert.throws(() => new SwarmRuntime(config, new FakeWorkers()), /Unsupported swarm schema 9; expected 8/)
 })
 
 test('the v4 upgrade leaves every row as a v4 build would have written it: a repair keeps only the criteria its proposal added and a review only its review-only ones, so the amend guard answers the same whatever the row\'s age', async t => {

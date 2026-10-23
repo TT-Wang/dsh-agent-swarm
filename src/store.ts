@@ -54,8 +54,8 @@ export interface PostFilter {
   newest?: boolean
   limit?: number
 }
-/** v3 adds the append-only `posts` board table; v4 cites mission criteria by id (`citeCriteria`); v5 records an owner notice's consumption on its delivery (`consumptionOnDelivery`); v6 kept an attempt's markers on the row only with that attempt; v7 makes them fields of the attempt (`markersOnTheirAttempt`, whose upgrade settles a store before v6 as v6's did). Older versions are upgraded at open. */
-const SCHEMA_VERSION = 7
+/** v3 adds the append-only `posts` board table; v4 cites mission criteria by id (`citeCriteria`); v5 records an owner notice's consumption on its delivery (`consumptionOnDelivery`); v6 kept an attempt's markers on the row only with that attempt; v7 makes them fields of the attempt (`markersOnTheirAttempt`, whose upgrade settles a store before v6 as v6's did); v8 has a deferred review name its deciding pass's rows (`deferralsNameTheirPass`). Older versions are upgraded at open. */
+const SCHEMA_VERSION = 8
 const CHANGE_HISTORY = 1024
 const DEFAULT_BUSY_TIMEOUT_MS = 5000
 const DEFAULT_WRITER_ATTEMPTS = 3
@@ -368,6 +368,7 @@ export class SwarmStore {
         if (version < 4) this.citeCriteria()
         if (version < 5) this.consumptionOnDelivery()
         if (version < 7) this.markersOnTheirAttempt()
+        if (version < 8) this.deferralsNameTheirPass()
         this.db.exec(`PRAGMA user_version=${SCHEMA_VERSION}`)
       })
     } catch (error) {
@@ -502,6 +503,28 @@ export class SwarmStore {
         closeout, leaseWarned, gitWriteDenied,
       })
       this.upsert('tasks', task)
+    }
+  }
+  /**
+   * The v8 upgrade, once, in the opening transaction like any other change. A
+   * build before v8 recorded a review's deferral without naming the rows of the
+   * pass that decided it, and composed its exit from the review's newest
+   * host-verification rows. Each row holding a deferral now names them
+   * (`verificationRecovery.toolRunIds`): the rows its newest
+   * `task/verification-deferred` event names as `checks`. That event is written
+   * in the same transaction as the deferral by every build that defers, and a
+   * resume clears the deferral, so it is the event of the deferral the row
+   * holds. A row no such event names (none a build wrote) names no rows, so its
+   * exit is the resume every deferral offers.
+   */
+  private deferralsNameTheirPass(): void {
+    const deferral = this.db.prepare("SELECT data FROM events WHERE mission_id=? AND type='task/verification-deferred' AND json_extract(data,'$.verificationTaskId')=? ORDER BY seq DESC LIMIT 1")
+    for (const task of this.list('tasks')) {
+      const recovery: (Omit<NonNullable<Task['verificationRecovery']>, 'toolRunIds'> & { toolRunIds?: string[] }) | undefined = task.verificationRecovery
+      if (recovery === undefined || recovery.toolRunIds !== undefined) continue
+      const row = deferral.get(task.missionId, task.id)
+      const named = row === undefined ? undefined : (JSON.parse(String(row.data)) as { checks?: string[] }).checks
+      this.upsert('tasks', { ...task, verificationRecovery: { ...recovery, toolRunIds: named ?? [] } })
     }
   }
   /** Read a mission's records, or all records for host recovery. */

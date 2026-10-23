@@ -24,6 +24,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { setup, taskOf, events, eventually, MISSION_ACCEPTANCE, SwarmRuntime, FakeWorkers } from './faults/harness.mjs'
+import { reviewNeed, reviewPathBlocker } from '../lib/board.js'
 
 const CHECK = 'node --test tests/first.test.mjs'
 const failing = output => ({ command: CHECK, exitCode: 1, output })
@@ -299,5 +300,53 @@ test('CORE-05: a fenced attempt\'s failed first pass is never written under the 
       'a single clean pass is recorded as the first and only pass, never as a retry')
     const [accepted] = events(f.runtime, f.mission.id, 'task/accepted')
     assert.deepEqual(accepted.data.checks, [next[0].id])
+  } finally { await f.cleanup() }
+})
+
+/**
+ * CORE-05 pair: every failed first pass is durable now, also one a fenced
+ * attempt records after the same member's next attempt on the review has
+ * already deferred its verdict. That row is then the review's newest. The
+ * blocker used to compose the deferral's exit from the review's newest
+ * classified failure, so it named the late row's kind instead of the deciding
+ * pass's. The deferral now names its deciding pass's rows
+ * (`verificationRecovery.toolRunIds`, the rows its event names), and the exit
+ * is composed from exactly those.
+ */
+test('CORE-05: a fenced attempt\'s first pass recorded after the next attempt deferred leaves the deferral\'s exit with the pass that decided it', async () => {
+  const { f, task, review, firstAttempt, verdict, pause, reclaim } = await fencedReviewFixture()
+  try {
+    const timeout = output => ({ command: CHECK, exitCode: 124, failureKind: 'timeout', output })
+    const infrastructure = output => ({ command: CHECK, exitCode: 125, failureKind: 'infrastructure', output })
+    let calls = 0
+    let release
+    const held = new Promise(resolve => { release = resolve })
+    f.workers.verifyArtifact = async () => {
+      calls += 1
+      if (calls === 1) { pause(); await held; return [timeout('first pass of the fenced attempt\n')] }
+      if (calls === 2) return [timeout('first pass of the next attempt\n')]
+      if (calls === 3) return [infrastructure('retry of the next attempt\n')]
+      return [timeout('retry of the fenced attempt\n')]
+    }
+    const blocker = () => { const board = f.runtime.boardOf(f.mission.id), source = taskOf(f.runtime, task.id); return reviewPathBlocker(board, source, reviewNeed(board, source)) }
+    const fencedVerdict = verdict(firstAttempt)
+    await eventually(() => calls === 1, 'the fenced attempt\'s first pass is running')
+    const nextAttempt = await reclaim()
+    assert.equal((await verdict(nextAttempt)).status, 'blocked', 'the next attempt defers its verdict on its retry\'s infrastructure failure')
+    const [deferral] = events(f.runtime, f.mission.id, 'task/verification-deferred')
+    const exit = deferral.data.reason.slice(deferral.data.reason.indexOf('the host could not'), -1)
+    assert.equal(blocker(), `review ${review.id} deferred its verdict on this artifact: ${exit}`, 'the blocker names the deciding pass\'s exit, as the deferral does')
+
+    release()
+    await assert.rejects(fencedVerdict, 'the fenced attempt cannot commit a verdict')
+    assert.equal(calls, 4)
+    const rows = runsFor(f, review)
+    assert.deepEqual(rows.map(run => [run.attemptId, run.arguments.attempt, run.result.failureKind]),
+      [[nextAttempt, 1, 'timeout'], [nextAttempt, 2, 'infrastructure'], [firstAttempt, 1, 'timeout']], 'the fenced attempt\'s failed first pass is the review\'s newest row')
+    assert.equal(blocker(), `review ${review.id} deferred its verdict on this artifact: ${exit}`, 'a row recorded after the deferral moves nothing: the exit is still the deciding pass\'s')
+    assert.doesNotMatch(blocker(), /checkTimeoutMs/, 'neither the next attempt\'s first pass nor the fenced attempt\'s decided anything')
+    const recovery = taskOf(f.runtime, review.id).verificationRecovery
+    assert.deepEqual(recovery.toolRunIds, [rows[1].id], 'the deferral names the rows of the pass that decided it')
+    assert.deepEqual(deferral.data.checks, recovery.toolRunIds, 'the rows its event names')
   } finally { await f.cleanup() }
 })

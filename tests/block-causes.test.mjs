@@ -28,7 +28,7 @@ const steps = { code: 'task_ceiling_exhausted', dimension: 'maxSteps', used: 2, 
 const artifact = { commit: 'immutable-rejected', baseCommit: 'base', workspace: '/isolated', changedPaths: ['src/a.ts'] }
 const deterministic = { reason: 'Workspace requires repair', transient: false, attempts: 1 }
 const backingOff = { reason: 'Workspace busy', transient: true, attempts: 1, retryAt: at + 1000 }
-const deferred = { sourceTaskId: 'source', commit: 'c'.repeat(40), reason: 'Verification could not establish a verdict', at }
+const deferred = { sourceTaskId: 'source', commit: 'c'.repeat(40), reason: 'Verification could not establish a verdict', at, toolRunIds: [] }
 
 const ROWS = [
   // tests/rule-resource-review.test.mjs 'finding-ceiling migration retains a separate repair block'

@@ -1367,7 +1367,7 @@ export class SwarmRuntime implements Kernel {
           task.status = 'blocked'; task.output = this.bounded(reason)
           if (prepared.reviewArtifact !== undefined) task.reviewArtifact = prepared.reviewArtifact
           task.reviewedCommit = artifact.commit
-          task.verificationRecovery = { sourceTaskId: source.id, commit: artifact.commit, reason, at: this.now() }
+          task.verificationRecovery = { sourceTaskId: source.id, commit: artifact.commit, reason, at: this.now(), toolRunIds: runIds }
           this.store.put('tasks', task)
           this.store.event(missionId, 'task/verification-deferred', member.id, { sourceTaskId: source.id, verificationTaskId: task.id, commit: artifact.commit, reason, checks: runIds })
           this.notices.notify(missionId, reason, subjectsOfTasks([source, task], { id: missionId }), { from: member.id, trigger: 'task/verification-deferred', reason })

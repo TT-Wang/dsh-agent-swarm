@@ -527,7 +527,16 @@ export interface Task {
   /** Durable block reason when the task exhausted one of its own ceilings. */
   ceiling?: TaskCeiling
   preparationFailure?: { reason: string; transient: boolean; attempts: number; retryAt?: number }
-  verificationRecovery?: { sourceTaskId: string; commit: string; reason: string; at: number }
+  /**
+   * A review's deferred verdict on its source's exact artifact. `toolRunIds`
+   * are the durable host-verification rows of the pass that decided to defer,
+   * in recorded order: the rows its `task/verification-deferred` event names
+   * as `checks`, and the only rows the deferral's exit is composed from
+   * (`reviewPathBlocker`, src/board.ts). The review's other rows are not that
+   * pass: a failed first pass before its retry, an earlier attempt's passes,
+   * or a pass a fenced attempt recorded after the deferral.
+   */
+  verificationRecovery?: { sourceTaskId: string; commit: string; reason: string; at: number; toolRunIds: string[] }
   /** Per-command host verification timeout chosen for this task. */
   checkTimeoutMs?: number
   /** Durable quiescence transition; epoch matching prevents reopening invalidated work. */
