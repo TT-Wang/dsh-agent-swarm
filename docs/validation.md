@@ -20,6 +20,9 @@ review repair round over the batch (`e13f804` to `17fbd1c`); the first version o
 +95 −23 (+72), CORE-04 +141 −66 (+75), CORE-03 +102 −34 (+68), and the repair round +136 −93 (+43). CORE-06 adds
 +367 −209 (+158), so `src` against `dac6704` at `1218e86` is +1076 −491, net +585.
 
+**Merged** as `48ac499` (2026-10-24) on `dac6704`, after both live smokes passed at `82d4837` (`62a6d8a`). Main had not
+moved, so the merged tree is `62a6d8a`'s.
+
 **What each slice leaves at the head.**
 
 - **CORE-02: one rule for a claim a verdict can still judge** (`09d6c5d`, `3584ea0`; documents `0736ab3`; repair
