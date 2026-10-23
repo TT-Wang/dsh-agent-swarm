@@ -8,12 +8,13 @@ Current **0.7.0** working-tree checks and the historical **0.6.0** baseline are 
 
 ## Harness 0.2.1-rc.2 only: 0.1.5-rc.3 and 0.1.7-rc.1 dropped (2026-10-22)
 
-**Head**: `fcf5b5e`, where the final gates ran, and this record's revision (documentation only), branch
-`dsh021/drop-01x` on `a28b116` (main), not merged. The owner dropped `0.1.5-rc.3` and `0.1.7-rc.1` on 2026-10-22, so
-`0.2.1-rc.2` is the only supported host. 41 commits (`15d00ec` to `ea487f0`), one review repair round (`a80d012` to
-`d5c7f25`, no `src` change) and this record (`fcf5b5e`, revised for the final gates).
-`src` against `a28b116`: +406 −281, net +125. The drop (`15d00ec` to `22383d8`) is +131 −155, net −24; the W8 route
-rule (`f3518a8` to `95e5772`) is +276 −127, net +149.
+**Head**: `af154be`, where the gates of the live-smoke repair round ran, and this record's revision (documentation
+only), branch `dsh021/drop-01x` on `a28b116` (main), not merged. The owner dropped `0.1.5-rc.3` and `0.1.7-rc.1` on
+2026-10-22, so `0.2.1-rc.2` is the only supported host. 41 commits (`15d00ec` to `ea487f0`), one review repair round
+(`a80d012` to `d5c7f25`, no `src` change), this record (`fcf5b5e`, revised at `87025d6` for the final gates at
+`fcf5b5e`), and the live-smoke repair round (`ffef623` to `af154be`, below).
+`src` against `a28b116`: +617 −338, net +279. The drop (`15d00ec` to `22383d8`) is +131 −155, net −24; the W8 route
+rule (`f3518a8` to `95e5772`) is +276 −127, net +149; the live-smoke repair round is +222 −68, net +154.
 
 **What the drop deleted, and what stands in its place.** Each item existed only because 0.1.x was supported; the
 2026-10-21 entry records most of them as bridges between hosts.
@@ -125,7 +126,8 @@ aside, so is every adapter call. The `test:replay` digest is unchanged.
   defects, and changed nothing.
 
 **Regressions.** The full suite has 1971 tests at `ea487f0` (1972 at `a28b116`); the repair round adds one, so
-`fcf5b5e` has 1972.
+`fcf5b5e` has 1972. The live-smoke repair round adds 11, so `af154be` has 1983; its regressions are listed with it,
+below.
 
 - `tests/governance.test.mjs`: an effort the route does not accept is refused at `swarm_add_member` and on every
   launch path, before any effect, naming the accepted efforts; a model its provider refuses is refused at the member's
@@ -209,15 +211,141 @@ compositions trigger on purpose, more often under load: 27, 31 and 15 at `ea487f
 `npm run typecheck` passed; `tests/governance.test.mjs` 10/10; `tests/harness-support.test.mjs`,
 `tests/host-version.test.mjs`, `tests/host-scripts.test.mjs` and `tests/web-smoke-runner.test.mjs` 29/29.
 
-Not exercised on 0.2.1-rc.2 since this batch: `test:deepseek` and `test:command-deepseek`, which make real provider
-requests and need the owner's key; the owner's session runs both after this batch. Both changed in this batch: each
-reads a tool result as the host's tool-role message, and the command smoke's text reader takes a flat block list.
-Their last runs were the owner's on 2026-10-22 at `a28b116`, before this branch: `test:deepseek` passed (30,319
-tokens, 10 steps), and `test:command-deepseek` failed when the host refused the worker effort `low` on
-`deepseek-v4-flash` at its model step, the effort W8 now refuses at admission. `test:validation-repair-web` did not
-run; it reuses the command smoke's claim path, which now always asserts the command chip. `test:load`, Better Sidebar
-and the attended preview have not run on 0.2.1-rc.2; the attended 5202 preview still runs 0.1.7-rc.1 with a pinned
-plugin.
+Not exercised by these gate runs: `test:deepseek` and `test:command-deepseek`, which make real provider requests and
+need the owner's key. Both changed in this batch: each reads a tool result as the host's tool-role message, and the
+command smoke's text reader takes a flat block list. Before this branch, the owner ran them on 2026-10-22 at
+`a28b116`: `test:deepseek` passed (30,319 tokens, 10 steps), and `test:command-deepseek` failed when the host refused
+the worker effort `low` on `deepseek-v4-flash` at its model step, the effort W8 now refuses at admission. The owner's
+session then ran both at `87025d6`; the live-smoke repair round below records what they found.
+`test:validation-repair-web` did not run; it reuses the command smoke's claim path, which now always asserts the
+command chip. `test:load` and `test:isolation` first ran on 0.2.1-rc.2 at `87025d6` (below). Better Sidebar and the
+attended preview have not run on 0.2.1-rc.2; the attended 5202 preview still runs 0.1.7-rc.1 with a pinned plugin.
+
+**Live-smoke repair round** (2026-10-23; `ffef623` to `af154be`, `src` +222 −68, net +154).
+
+The owner's session ran both real-provider smokes at `87025d6` on `deepseek-official` / `deepseek-v4-flash` with
+thinking disabled, so the owner's route declares one effort, `off`. `test:deepseek` passed: 25,523 tokens, 10 steps.
+`test:command-deepseek` failed twice. The first run failed at the owner's step 3: the model streamed a tool call whose
+input was not valid JSON (`MALFORMED_RESPONSE`, "DeepSeek Messages stream: tool input is invalid JSON"). This is a
+provider flake that no plugin code reaches. The re-run exposed a launch-admission defect. The owner's first two
+`swarm_launch` calls were refused with typed plan errors, which it repaired. Its third named the member efforts `low`
+and `medium`, which the route does not declare. W8 promises a typed refusal there, naming the efforts the route
+declares, which the owner repairs in one retry. Instead:
+
+- the tool result was the literal text `Error: [object Object]`;
+- no mission was created;
+- the owner session recorded "cannot create effect on inactive context" (`INACTIVE_EFFECT`, thrown by the
+  working-directory service's `ensure()` from a timer);
+- the smoke failed with `Unknown mission` after 5 owner steps and 66,837 owner tokens.
+
+The earlier run at `a28b116`, before W8, launched and failed later, at the worker's step, on the same effort.
+
+**What happened.** The report's lifecycle shows the order, and `tests/harness-launch-refusal.mjs` replays it on the
+real Loader. The W8 refusal was never reached: the smoke tore the host down before admission answered.
+
+1. `ffef623`: `startPlan` linked the saved request to `mission_<draft>` when its launch began. That was before the
+   workspace re-check, the check preflight and the W8 route rule. So while the third launch was being admitted, the
+   request named a mission that did not exist. The smoke's poll followed the link, met `Unknown mission`, and tore the
+   host down in the middle of the launch. The request is now linked in the commit that creates its mission (`create`,
+   from `launchDraft`), so a launch refused before then links none. A host start drops a link that an earlier release
+   left to a mission that was never created.
+2. `9ddf955`: the teardown cancelled the launch with the session's cause, the plain object `{ kind: 'disposed' }`.
+   Every `throwIfAborted()` below the tool threw it as it was, and the tool layer rethrew it. The Harness renders a
+   value that is not an Error with `String()`, so the result read `Error: [object Object]`. Each call now runs under
+   its own signal (`callSignal`), whose abort reason is a typed `[tool_cancelled]` refusal naming the cause. Every
+   rejection leaves through `toolFailure`: an Error as itself, the session's cancellation cause as `[tool_cancelled]`,
+   and any other value as a typed `[tool_failed]` refusal carrying its readable text (`thrownText`).
+3. `4f1042f`: the planner's `watchIdle` then failed the start. Its recovery notice woke the owner after the Harness's
+   teardown had observed the owner's quiescence and before it unwound the owner's scope. The new turn's system-prompt
+   assembly met the unwound scope (`INACTIVE_EFFECT`). Admission never touched it. `wakeableAgent`
+   (`src/harness-workers.ts`) is now the one gate of every waking owner delivery, the planner's notices and the
+   mission outbox's. It requires a registered agent with a live scope whose last turn in this session object's
+   lifecycle did not end on a disposed cancel. A notice it skips stays pending for the session's next agent.
+
+**Review of the repair** (one medium finding, three low; `f55a1b1`, `e52fa91`, `af154be`). The medium finding: when a
+launch failed, its durable records still turned the thrown value into text with `String()`. Those records are the
+automatic request's error (`startPlan`'s catch in `src/runtime.ts`), the draft's error (`launchDraft`'s catch) and the
+native command's own `failStart` reason (`src/planner.ts`). The earlier "one owner of failure text" fix (`9ddf955`)
+covered tool results only (`toolFailure`). So a non-Error thrown out of the launch was stored as "[object Object]",
+and the planner's recovery notice quoted that to the owner's model as "Recorded reason". The reviewer's effobj probe
+hit this through a second gap (low #2): `resolvedRoute` in `src/model-selection.ts` looked up the model's declared
+efforts outside its guarded path. A failed lookup therefore escaped admission as the raw host value, without the typed
+`member_route_unavailable` verdict and without a log line.
+
+- `f55a1b1`: `recordedFailure` (`src/policy-error.ts`) is how a failed launch's records carry a thrown value. An Error
+  is recorded as its own `String()` rendering, byte for byte (`Error: <message>`), and any other value as `thrownText`.
+  It stays total when an Error's `toString` throws. `startPlan`'s `request.error` and `launchDraft`'s `draft.error` use
+  it. The native command's `failStart` reason uses `thrownText`, so an Error there still records its bare message.
+- `e52fa91` (low #2): `routeAnswer` returns the host's answer for a route: accepted, or a refused effort with the
+  efforts its model declares. It throws everything else, a failed declared-efforts lookup included. `resolvedRoute`
+  reads every host failure by one rule: it logs the detail (`thrownText` for a non-Error) and returns a typed verdict
+  (unavailable or model-refused). An aborted admission does not query the host again.
+- `af154be` (lows #3 and #4): the command path's planning wake, after `prepareStart`, asks `wakeableAgent` instead of
+  the bare registry. The scope guard in `wakeableAgent` (`agent.ctx.fiber.uid === null`) now has regressions.
+
+On the real Loader, the reviewer's probe (a host whose declared-efforts lookup throws `{ kind: 'catalog-offline' }`)
+recorded the start error `{"kind":"catalog-offline"}` after `f55a1b1`. After `e52fa91` the launch answers a typed
+`[member_route_unavailable]`, the text the request records and the notice quotes.
+
+**Regressions of the round.** Each fails without its fix: on `87025d6`, or with its site reverted in place and the
+lib rebuilt (then restored).
+
+- `tests/automatic.test.mjs` (`ffef623`): a refused launch leaves the request unlinked, and the launch that creates the
+  mission links it; a restart drops a dangling link. Both fail on `87025d6`. The S5c gate in
+  `tests/in-memory-gates.test.mjs` reads the failure event from the scope the request now names.
+- `tests/tool-failure-text.test.mjs` (`9ddf955`, `f55a1b1`): an Error leaves as itself; the session's cancellation
+  cause becomes `[tool_cancelled]`; any other value becomes `[tool_failed]` with its readable text; `recordedFailure`
+  renders a PolicyError, a TypeError, an Error whose `toString` throws, non-Error values and a trapping proxy. It fails
+  on `87025d6`.
+- `tests/harness-launch-refusal.mjs` (`4f1042f`, new, in `test:harness`): on the real Loader, through the native
+  `/agent-swarm` command, on a scripted route that declares only `off`. The undeclared efforts are refused with the
+  typed W8 refusal naming `off`, with no mission, member, worker or mission link, and the owner's corrected relaunch in
+  the same turn launches. `swarm_add_member` is refused alike. A non-Error throw answers `[tool_failed]`. A mission
+  notice skips an owner its disposal cancelled and reaches its resumed agent. A launch cancelled by the owner's
+  disposal answers `[tool_cancelled]`, opens no second turn and meets no inactive scope. Each scenario fails with its
+  fix reverted (the start link, the failure text, the call signal, the planner gate, the outbox gate, the
+  lifecycle-scoped read).
+- `tests/planner.test.mjs` (`f55a1b1`, `af154be`): a non-Error thrown inside the assembly gives a readable start error,
+  draft error and recovery-notice reason (fails with `startPlan` or `launchDraft` reverted to `String(error)`); one
+  thrown by the command's snapshot gives a readable start error and notice reason (fails with the `failStart` reason
+  reverted); an owner whose scope is unwound while its snapshot is prepared gets no planning message and no recovery
+  notice, and the notice reaches it once its scope is live (fails with the command path's registry check restored).
+- `tests/harness-workers.test.mjs` (`e52fa91`): an adapter whose second resolution of the model fails (a frozen object,
+  then an Error carrying a host path) gives unavailable routes and logs both details. It fails on the previous
+  `resolvedRoute`, where the frozen object escapes `memberRoutes`.
+- `tests/rule-owner-channel.test.mjs` (`af154be`): a mission notice is held in the outbox for an owner whose scope is
+  unwound (fiber uid `null`) and delivered once the scope is live. Removing the `fiber.uid === null` guard (the
+  reviewer's mutation M8) now fails this test and the planner's unwound-scope test.
+
+**Gates at `af154be`** (2026-10-23 18:38 to 18:47), with `node_modules` linked to the 0.2.1-rc.2 link farm and
+`DSH_HARNESS_ROOT` set to the pinned clone. Every gate passed on its first run, so nothing was re-run. The 1-minute
+load average read 7.0 to 27.0 on 8 CPUs.
+
+| Check | `af154be` |
+| --- | --- |
+| `npm run typecheck` / `npm run build` | passed / passed |
+| `node --test tests/*.test.mjs` | 1983/1983 (298 s), 0 cancelled |
+| `npm run test:harness` | passed, 4 compositions (including `tests/harness-launch-refusal.mjs`) |
+| `npm run test:replay` | digest unchanged |
+| `npm run test:oracle` | 12/12 identical |
+| `npm run test:pack` | passed (251 archive entries, 251 published files) |
+| `npm run test:profile` | passed |
+| `npm run test:bundle` | 7/7 |
+| `node scripts/faults/run.mjs` | 24/24 |
+| `npm run test:web` | passed, 13 checks |
+| `npm run test:command-web` | passed, 11 checks |
+| `npm run test:isolation` | 6/6 |
+| `npm run test:load` | D8 load envelope OK: N=16 and N=32, observation bounded (max 1039 B and 1042 B, ratio 1.00x) |
+
+The replay digest is still `sha256:61a921e64088b78b957cd6aeaa563d5436d4a6eae4b0130725d1f3c74c6f971e`, and both web
+smokes' `report.json` record `harnessHead` `687f282e8625c6b8d11ff58211a90524be2e4317`. The harness, pack and profile
+logs carry 14, 6 and 4 `[mission_operation_pending]` lines. The offline plugin add that failed at `fcf5b5e` passed here
+and in the owner's run at `87025d6` with the corepack shim on `PATH`: corepack's home has recorded pnpm 11.7.0 in
+`lastKnownGood.json` since 16:49. The owner's run at `87025d6` also passed `test:profile`, `test:isolation` (6/6),
+`test:load`, `test:web` (13 checks) and `test:command-web` (11 checks).
+
+The live smokes were not run at `af154be`; they need the owner's key. The owner's session re-runs
+`test:command-deepseek` on this head after this record.
 
 **Open after this batch** (not adopted here).
 
@@ -228,6 +356,15 @@ plugin.
   the gate's wedge assertion (2 and 5). The known-limitations list of wall-clock tests names none of these.
 - `test:profile`, `test:web` and `test:command-web` need a `pnpm` on `PATH` that installs offline; a corepack shim
   whose home lacks its default pnpm fails them before any check.
+- Other durable records still render a thrown value with `String()` and can store "[object Object]" for a non-Error:
+  the guard terminal's detail (`chainFailed`) and `preparationFailure`'s reason in `src/scheduling.ts`, `startWorker`'s
+  "Worker could not start" reason, `member.startError` and the `member/resume-failed` and `member/failed` events in
+  `src/runtime.ts`, and `src/check-results.ts`. Each needs its own regression, so the live-smoke repair left them.
+- Two writers record an automatic request's reason in different forms: `startPlan` stores `Error: <message>`
+  (`recordedFailure`) and the native command path the bare message (`thrownText`). Both were kept to move no recorded
+  text; unifying them is a separate decision.
+- The Harness gives no signal when an agent's disposal starts. `wakeableAgent` covers an idle owner disposed while its
+  snapshot is prepared only once the owner's scope has been unwound.
 - The items the 2026-10-21 entry left open stand: no downgrade guard, cold workers resumed by other host paths, the
   stranded-inbox drain, the API-key route's credential codes as member failures, and
   `scripts/check-cancel-freeze.mjs` importing `isJsonValue`, which 0.2.1-rc.2 does not export.
