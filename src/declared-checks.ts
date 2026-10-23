@@ -152,10 +152,16 @@ export class DeclaredChecks {
   }
 
   /**
-   * R16-G5a: whether the durable record already holds this attempt's failed first
-   * pass, which is how `recordRuns` learns the retry rule fired. Scoped by
-   * attempt id, so a later verification of the same commit can never pair with
-   * an earlier attempt's failure.
+   * R16-G5a: whether the durable record holds a failed first pass of this
+   * attempt at this commit, which `recordRuns` reads to label the pass it
+   * writes 2 (a retry) instead of 1. Scoped by attempt id, so a later
+   * verification of the same commit can never pair with an earlier attempt's
+   * failure. The lookup is scoped by attempt, not by `swarm_verify` call: a
+   * second call by the same live attempt, after
+   * `[checks_changed_during_verification]` or `[check_environment_mismatch]`,
+   * also finds the first call's failed first pass, so its single clean pass is
+   * labelled 2. Only that label is off: the verdict and the rows it cites are
+   * the second call's own.
    */
   private firstPassRecorded(missionId: string, where: { memberId: string; taskId: string; attemptId: string; commit: string }): boolean {
     return this.k.store.list('tool_runs', missionId).some(run => {
