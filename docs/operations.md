@@ -32,7 +32,7 @@ npm run link:dsh
 npm run build
 ```
 
-`link:dsh` links the shared runtime packages and build tools from that Harness checkout. A separate `npm install` in the plugin directory is not needed.
+`link:dsh` links every Harness package from that checkout into `node_modules`, so the mounted plugin runs on the host's own modules, and links the build tools the plugin declares from it. On its own it needs no `npm install`. It also works over `npm ci` (see [Development and verification](#development-and-verification)): it then replaces each Harness package npm installed with the checkout's, after checking that both are the same version, and keeps the tools the lockfile installed. `npm ci` removes the links, so run `link:dsh` again after it.
 
 Choose **one** of the following mounts, using the matching Harness CLI and running the command from the plugin checkout root.
 
@@ -211,7 +211,16 @@ Mount the swarm and slice layers in the same profile using each project's instal
 
 ## Development and verification
 
-After linking a Harness 0.2.1-rc.2 checkout:
+The behavioral suite has two tiers, listed in `scripts/test-tiers.mjs`. The hermetic tier needs only the packages `package-lock.json` pins, which include the 0.2.1-rc.2 Harness packages from the npm registry, so a fresh clone runs it without a Harness checkout:
+
+```sh
+git clone https://github.com/TT-Wang/dsh-agent-swarm.git
+cd dsh-agent-swarm
+npm ci
+npm test
+```
+
+It runs on every machine as that clone would: `DSH_HARNESS_ROOT` and `DSH_SOURCE` are removed and the search for a checkout is off, so a test that needs one fails there and belongs to the host tier. The host tier and the other gates need a built Harness 0.2.1-rc.2 checkout at the release commit. After `npm ci`, set `DSH_HARNESS_ROOT` and run `npm run link:dsh` (see [Build and install](#build-and-install)), then:
 
 ```sh
 npm run verify
@@ -221,7 +230,7 @@ This runs typecheck, build, the behavioral suite, packaged-artifact loading, rea
 
 | Command | Coverage |
 | --- | --- |
-| `npm test` | Build and the full behavioral suite. |
+| `npm test` | Build and the hermetic tier of the behavioral suite: every `tests/*.test.mjs` the host tier does not list. |
 | `npm run test:faults` | Fault injection; each scenario must establish that its fault fired. |
 | `npm run test:replay` | Deterministic replay over the durable log. |
 | `npm run test:oracle` | The full-log oracle: the replay scenario and the clocked fault scenarios must leave the recorded events, rows and adapter call trace (`scripts/replay/oracle/`). |
@@ -230,8 +239,10 @@ This runs typecheck, build, the behavioral suite, packaged-artifact loading, rea
 | `npm run test:harness` | Real Harness Loader composition. |
 | `npm run test:pack` / `npm run test:packed` | Packaged-artifact loading and declared behavior. |
 | `npm run test:profile` | Real CLI profile installation and lifecycle. |
-| `npm run test:bundle` | Bundle metadata, the empty-config plugin row both mounts insert, host composition, and the root rule and start line on real profile boots of both mounts. |
+| `npm run test:bundle` | The host tier of the behavioral suite (`tests/r17-profile.test.mjs`): bundle metadata, the empty-config plugin row both mounts insert, host composition, and the root rule and start line on real profile boots of both mounts. |
 | `npm run test:web` / `npm run test:command-web` | Sidebar and `/agent-swarm` browser workflows. |
+
+A package that `src/`, `tests/` or `scripts/` imports must be a devDependency at an exact version, and also a peer dependency when `src/` imports it; `tests/declared-dependencies.test.mjs` checks this and that `package-lock.json` matches `package.json`.
 
 These suites use temporary profiles and Git workspaces with scripted provider responses. They establish integration behavior, not model planning success rates. `npm run test:deepseek` and `npm run test:command-deepseek` make real provider requests, can incur charges and are excluded from `verify`. Completed runs and their limits are recorded in [validation](validation.md).
 

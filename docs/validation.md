@@ -3808,12 +3808,20 @@ The 0.6.0 browser checks exercised the dock fallback; Better Sidebar's public se
 
 ## Reproduce
 
-Use a built checkout of an exact revision in [compatibility.json](../compatibility.json). Set `DSH_HARNESS_ROOT` before linking and verification as described in the [README](../README.md).
+The behavioral suite has two tiers, listed in `scripts/test-tiers.mjs`. The hermetic tier needs only the packages `package-lock.json` pins, the 0.2.1-rc.2 Harness packages from npm included, so a fresh clone runs it with no Harness checkout:
+
+```sh
+npm ci
+npm test
+```
+
+Everything else needs a built checkout of an exact revision in [compatibility.json](../compatibility.json). Set `DSH_HARNESS_ROOT` as described in the [README](../README.md), link the checkout over the installed packages, and run the gates:
 
 ```sh
 npm run link:dsh
 npm run typecheck
 npm test
+npm run test:bundle
 npm run test:faults
 npm run test:replay
 npm run test:load
@@ -3828,7 +3836,7 @@ npm run test:validation-repair-web
 
 Browser checks need the matching Harness Web build and Playwright browser environment. Set `DSH_WEB_SMOKE_ARTIFACTS` to retain separate evidence directories for different host versions. Test profiles and repositories are isolated. Running the large Harness suites and multiple browsers concurrently can increase load enough to exceed small fixture timeouts; run them sequentially when reproducing. Optional `test:deepseek` and `test:command-deepseek` scripts use real provider credentials and are separate, billable checks. All three browser smokes run through `runWebSmoke` in `scripts/web-smoke-browser.mjs` with one scripted model, `tests/fixtures/web-scripted-llm.mjs`. Without `DSH_WEB_SMOKE_ARTIFACTS`, evidence goes to `artifacts/<smoke>`: `artifacts/web` (formerly `artifacts/sidebar`), `artifacts/command-web` and `artifacts/validation-repair-web`. A `--serve-only` run writes `report.json` with `scenario: "serve-only"` and no checks: it is a served host, not a passed scenario.
 
-The behavioral tests import the built `lib/` output. `npm test` builds first; a bare `node --test tests/*.test.mjs` needs `npm run link:dsh` and `npm run build` first, otherwise it stops at `ERR_MODULE_NOT_FOUND .../lib/runtime.js`. A clean checkout without linked dependencies stops earlier at `tsc: command not found`.
+The behavioral tests import the built `lib/` output. `npm test` builds first; running a tier directly (`node scripts/test-tiers.mjs hermetic`, or `host`) needs `npm run build` first, otherwise it stops at `ERR_MODULE_NOT_FOUND .../lib/runtime.js`. A clean checkout with neither `npm ci` nor `npm run link:dsh` stops earlier at `tsc: command not found`. The hermetic tier runs as a fresh clone would on any machine: its runner removes `DSH_HARNESS_ROOT` and `DSH_SOURCE`, and `scripts/harness-target.mjs` searches for no checkout while it runs, so a test that needs one fails there until it is listed in the host tier. The two tiers bind the release in different ways: the hermetic tier by the lockfile's integrity hashes for the npm registry's tarballs, the host tier and the other gates by the checkout's commit, which `assertSupportedHarness` compares with `compatibility.json`.
 
 `npm run test:harness`, `npm run test:pack` and `npm run test:profile` compose a real Harness profile whose sandbox requests `workspace-write`, so they require a host that permits nested `sandbox_apply`. Inside an outer workspace-write sandbox, macOS denies it (`sandbox-exec: sandbox_apply: Operation not permitted`) and the composition fails with `SandboxUnavailableError`. `test:pack` and `test:profile` detect an unusable nested sandbox before the composition and abort with that prerequisite; set `DSH_SWARM_SKIP_SANDBOX_PREFLIGHT=1` to attempt the composition anyway. `npm run test:harness` runs the composition directly and reports the same `SandboxUnavailableError`.
 

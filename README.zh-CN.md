@@ -137,6 +137,8 @@ Agent Swarm 位于原生右侧栏，默认折叠。发送 `/agent-swarm` 加自�
 
 Bundle 安装、升级、启动恢复与配置详见[使用与运维指南](docs/operations.zh-CN.md)。
 
+测试分为两层。在全新克隆中运行 `npm ci && npm test` 即执行封闭层，不需要 Harness 检出：`package-lock.json` 锁定了它用到的每个包，包括来自 npm 的 0.2.1-rc.2 Harness 包。宿主层和其他检查还需要已构建的检出，在 `npm ci` 之后用 `npm run link:dsh` 链接；见[开发与验证](docs/operations.zh-CN.md#development-and-verification)。
+
 ## 适用范围与实际边界
 
 - **本地执行。** 不支持分布式成员、非 Git 项目或 Windows 执行。多个宿主需要独立状态目录，插件唯一的[根目录规则](docs/operations.zh-CN.md#storage-roots)会让主目录不同的宿主各自得到独立目录；不支持并发恢复同一数据库。不晚于 `ba9a758` 时，插件行组合后没有配置的根目录不管 `DSH_HOME` 或 `DSH_AGENT_SWARM_ROOT` 是什么都在 `~/.dsh/agent-swarm`：直接挂载总是如此，bundle 挂载在后面的层替换了插件行的配置、又没有重新写出两个根目录时也是如此。这样的安装如果曾在其他 `DSH_HOME` 下或设置了 `DSH_AGENT_SWARM_ROOT` 运行，升级后会打开一个新的空存储，而在默认的 profile 上没有任何提示；旧存储不会被自动接管，沿用它的步骤见[存储根目录](docs/operations.zh-CN.md#storage-roots)。保留的 worktree 与成果引用需要显式清理；崩溃遗留的验证检出目录由同一任务下一次运行声明检查的验证回收；git 在记录路径前留下的锁定注册需手动删除。

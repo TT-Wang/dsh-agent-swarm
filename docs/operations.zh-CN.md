@@ -21,6 +21,8 @@
 - Harness 中可用的模型和供应商配置。**API key 和凭据由 Harness 管理**；插件默认使用主会话的模型。请在宿主中配置凭据，无需把 key 复制到插件中。
 - 本地 Git 项目。目前未实现分布式 worker 或非 Git 工作区。
 
+<a id="build-and-install"></a>
+
 ## 构建与安装
 
 ```sh
@@ -32,7 +34,7 @@ npm run link:dsh
 npm run build
 ```
 
-`link:dsh` 从该 Harness 检出链接共享运行时包和构建工具。插件目录不需要另行执行 `npm install`。
+`link:dsh` 把该检出中的每个 Harness 包链接进 `node_modules`，使挂载的插件运行在宿主自己的模块上，并从检出链接插件声明的构建工具。单独使用时不需要 `npm install`。它也可以在 `npm ci` 之后运行（见[开发与验证](#development-and-verification)）：这时它先确认 npm 安装的每个 Harness 包与检出中的版本相同，再用检出中的包替换它，并保留 lockfile 安装的工具。`npm ci` 会删除这些链接，因此每次 `npm ci` 之后都要重新运行 `link:dsh`。
 
 使用匹配版本的 Harness CLI，在插件仓库根目录选择以下**一种**挂载方式。
 
@@ -223,7 +225,16 @@ Worker 隔离依赖配置的 Harness 沙箱。会话工作目录在回合结束�
 
 ## 开发与验证
 
-链接 Harness 0.2.1-rc.2 检出后：
+行为测试分为两层，清单在 `scripts/test-tiers.mjs`。封闭层（hermetic）只需要 `package-lock.json` 锁定的包，其中包括来自 npm registry 的 0.2.1-rc.2 Harness 包，因此全新克隆无需 Harness 检出即可运行：
+
+```sh
+git clone https://github.com/TT-Wang/dsh-agent-swarm.git
+cd dsh-agent-swarm
+npm ci
+npm test
+```
+
+在任何机器上，它都按全新克隆的条件运行：移除 `DSH_HARNESS_ROOT` 和 `DSH_SOURCE`，并关闭对检出的查找，所以需要检出的测试会在这一层失败，它应属于宿主层。宿主层和其他检查需要位于发布提交的已构建 Harness 0.2.1-rc.2 检出。`npm ci` 之后设置 `DSH_HARNESS_ROOT` 并运行 `npm run link:dsh`（见[构建与安装](#build-and-install)），然后：
 
 ```sh
 npm run verify
@@ -233,7 +244,7 @@ npm run verify
 
 | 命令 | 覆盖范围 |
 | --- | --- |
-| `npm test` | 构建和完整行为测试。 |
+| `npm test` | 构建和行为测试的封闭层：宿主层未列出的每个 `tests/*.test.mjs`。 |
 | `npm run test:faults` | 故障注入；每个场景须证明故障实际发生。 |
 | `npm run test:replay` | 基于持久日志的确定性回放。 |
 | `npm run test:oracle` | 全日志 oracle：回放场景和时钟化的故障场景必须留下已记录的事件、行和适配器调用轨迹（`scripts/replay/oracle/`）。 |
@@ -242,8 +253,10 @@ npm run verify
 | `npm run test:harness` | 真实 Harness Loader 组合。 |
 | `npm run test:pack` / `npm run test:packed` | 打包工件加载与声明行为。 |
 | `npm run test:profile` | 真实 CLI profile 安装与生命周期。 |
-| `npm run test:bundle` | Bundle 元数据、两种挂载插入的空配置插件行、宿主组合，以及两种挂载在真实 profile 启动时的根目录规则和启动日志。 |
+| `npm run test:bundle` | 行为测试的宿主层（`tests/r17-profile.test.mjs`）：Bundle 元数据、两种挂载插入的空配置插件行、宿主组合，以及两种挂载在真实 profile 启动时的根目录规则和启动日志。 |
 | `npm run test:web` / `npm run test:command-web` | 侧栏和 `/agent-swarm` 浏览器工作流。 |
+
+`src/`、`tests/` 或 `scripts/` 导入的包必须是精确版本的 devDependency；`src/` 导入的包还必须是 peer dependency。`tests/declared-dependencies.test.mjs` 检查这一点，并检查 `package-lock.json` 与 `package.json` 一致。
 
 这些测试使用临时 profile 和 Git 工作区，供应商回复由脚本提供。它们验证集成行为，不代表模型规划成功率。`npm run test:deepseek` 和 `npm run test:command-deepseek` 会发起真实供应商请求，可能产生费用，不包含在 `verify` 中。已完成的运行及其边界记录在[验证文档](validation.md)。
 
