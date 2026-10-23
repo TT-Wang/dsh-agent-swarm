@@ -317,6 +317,20 @@ test('the reason and the blocker take the exit from the deciding pass: the retry
  * deferral's own `task/verification-deferred` event names as `checks`, which
  * every build that defers writes in the same transaction.
  */
+
+/** The fixture's store as a build before schema 8 left it: `deferred` holds its deferral without `toolRunIds`, and `user_version` is `schema`. */
+function olderBuild(t, f, deferred) {
+  const { statePath } = f.runtime.config
+  const { toolRunIds: _named, ...stored } = deferred.verificationRecovery
+  const write = (schema, sql = '') => {
+    const db = new DatabaseSync(statePath)
+    try { db.prepare('UPDATE tasks SET value=? WHERE id=?').run(JSON.stringify({ ...deferred, verificationRecovery: stored }), deferred.id); db.exec(`${sql}PRAGMA user_version=${schema}`) } finally { db.close() }
+  }
+  const read = sql => { const db = new DatabaseSync(statePath, { readOnly: true }); try { return Object.values(db.prepare(sql).get())[0] } finally { db.close() } }
+  const open = () => { const opened = new SwarmRuntime(f.runtime.config, new FakeWorkers()); t.after(() => opened.dispose()); return opened }
+  return { write, read, open }
+}
+const blockerIn = (runtime, f, source) => { const board = runtime.boardOf(f.mission.id), row = taskOf(runtime, source.id); return reviewPathBlocker(board, row, reviewNeed(board, row)) }
 test('a deferral an older build stored names its deciding pass\'s rows once, at open, from the rows its event names (schema 8)', async t => {
   const f = await fakeFixture(t)
   const passes = [
@@ -334,15 +348,8 @@ test('a deferral an older build stored names its deciding pass\'s rows once, at 
   assert.match(path, /the host could not execute a check/)
   await f.runtime.dispose()
 
-  const { statePath } = f.runtime.config
-  const { toolRunIds: _named, ...stored } = deferred.verificationRecovery
-  const write = (schema, sql = '') => {
-    const db = new DatabaseSync(statePath)
-    try { db.prepare('UPDATE tasks SET value=? WHERE id=?').run(JSON.stringify({ ...deferred, verificationRecovery: stored }), review.id); db.exec(`${sql}PRAGMA user_version=${schema}`) } finally { db.close() }
-  }
-  const read = sql => { const db = new DatabaseSync(statePath, { readOnly: true }); try { return Object.values(db.prepare(sql).get())[0] } finally { db.close() } }
-  const open = () => { const opened = new SwarmRuntime(f.runtime.config, new FakeWorkers()); t.after(() => opened.dispose()); return opened }
-  const blockerOf = runtime => { const board = runtime.boardOf(f.mission.id), row = taskOf(runtime, source.id); return reviewPathBlocker(board, row, reviewNeed(board, row)) }
+  const { write, read, open } = olderBuild(t, f, deferred)
+  const blockerOf = runtime => blockerIn(runtime, f, source)
 
   write(7)
   const before = read('SELECT revision FROM state_revision WHERE id=1')
@@ -365,4 +372,45 @@ test('a deferral an older build stored names its deciding pass\'s rows once, at 
   const unnamed = open()
   assert.deepEqual(taskOf(unnamed, review.id).verificationRecovery.toolRunIds, [])
   assert.equal(blockerOf(unnamed), `review ${review.id} deferred its verdict on this artifact: resume the review with swarm_control(action: "resume", taskId, reason)`)
+})
+
+/**
+ * The newest event, not the oldest: a review that deferred, was resumed and
+ * deferred again on another kind has two `task/verification-deferred` events,
+ * and the deferral its row holds is the second. Named by the first, the
+ * upgraded blocker would give the first pass's exit, the wrong-exit defect the
+ * deferral's own rows fixed for this build.
+ */
+test('a deferral an older build stored after a resume names the rows of its latest deferral at open, never the first one\'s (schema 8)', async t => {
+  const f = await fakeFixture(t)
+  const timeout = [{ command: 'test -d .', exitCode: 124, failureKind: 'timeout', output: '[swarm] Execution timed out after 30000ms' }]
+  const infrastructure = [{ command: '(verification preparation)', exitCode: 125, failureKind: 'infrastructure', output: 'Host verification could not execute: Error: EMFILE' }]
+  const passes = [timeout, timeout, infrastructure, infrastructure]
+  f.workers.verifyArtifact = async () => passes.shift() ?? [{ command: 'test -d .', exitCode: 0, output: 'ok' }]
+  const source = f.propose()
+  const { review, verify } = await submitForReview(f, source)
+  assert.equal((await verify()).status, 'blocked')
+  assert.ok(deferredReason(f).includes('a check reached its deadline'), deferredReason(f))
+  await f.tool('swarm_control', { action: 'resume', taskId: review.id, reason: 'condition repaired' })
+  await f.runtime.settle(f.mission.id)
+  const taken = await f.runtime.claim(f.actor(f.reviewer), f.mission.id, review.id)
+  assert.equal((await f.runtime.verify(f.actor(f.reviewer), f.mission.id, { taskId: review.id, attemptId: taken.attempt.id, verdict: 'accept', reason: 'Review again' })).status, 'blocked')
+  const deferrals = events(f.runtime, f.mission.id, 'task/verification-deferred')
+  const rows = hostRuns(f)
+  assert.deepEqual(deferrals.map(event => event.data.checks), [[rows[1].id], [rows[3].id]], 'two deferrals of one review, each naming its own deciding pass')
+  const deferred = taskOf(f.runtime, review.id)
+  assert.deepEqual(deferred.verificationRecovery.toolRunIds, [rows[3].id])
+  const path = blockerIn(f.runtime, f, source)
+  assert.match(path, /the host could not execute a check/)
+  await f.runtime.dispose()
+
+  const { write, read, open } = olderBuild(t, f, deferred)
+  write(7)
+  const opened = open()
+  assert.deepEqual(taskOf(opened, review.id), deferred, 'the upgrade names the latest deferral\'s deciding pass, as this build records it')
+  const upgraded = blockerIn(opened, f, source)
+  assert.equal(upgraded, path, 'the blocker names the latest deferral\'s exit')
+  assert.doesNotMatch(upgraded, /reached its deadline|checkTimeoutMs/, 'never the first deferral\'s exit')
+  await opened.dispose()
+  assert.equal(read('PRAGMA user_version'), 8)
 })
