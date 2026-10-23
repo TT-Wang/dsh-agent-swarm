@@ -38,15 +38,16 @@ console.log(JSON.stringify(calls))`
   return new Promise((resolve, reject) => execFile(process.execPath, ['--input-type=module', '-e', script], { cwd: pluginRoot }, (error, stdout, stderr) => error ? reject(new Error(stderr || error.message)) : resolve(JSON.parse(stdout))))
 }
 
-test('the supported releases the plugin checks at runtime are exactly compatibility.json\'s, its peer ranges\' and the profile\'s', () => {
+test('the one supported release is compatibility.json\'s, the runtime check\'s, the profile\'s and every dsh-* peer and dev dependency\'s', () => {
   const compatibility = read('compatibility.json')
   const versions = compatibility.supportedHosts.map(host => host.version)
+  assert.equal(versions.length, 1, 'exactly one release is supported')
+  const [release] = versions
   assert.deepEqual(SUPPORTED_HARNESS_RELEASES, versions)
-  assert.ok(versions.includes(compatibility.defaultHost), 'the default host is a supported release')
   assert.deepEqual(read('profile/package.json').dsh.bundle.requires.harness, versions)
   const manifest = read('package.json')
-  for (const [name, range] of Object.entries(manifest.peerDependencies)) if (name.startsWith('@deepseek-ai/dsh-')) assert.equal(range, versions.join(' || '), name)
-  for (const [name, range] of Object.entries(manifest.devDependencies)) if (name.startsWith('@deepseek-ai/dsh-')) assert.equal(range, compatibility.defaultHost, `${name} is developed against the default host`)
+  for (const [name, range] of Object.entries(manifest.peerDependencies)) if (name.startsWith('@deepseek-ai/dsh-')) assert.equal(range, release, name)
+  for (const [name, range] of Object.entries(manifest.devDependencies)) if (name.startsWith('@deepseek-ai/dsh-')) assert.equal(range, release, name)
   // No engines.dsh: it would change no verdict, and only a plugin index would read
   // it. The host's gate lets a declared engines.dsh decide alone and ignores the
   // peers, but with one supported release it would name the release the peers name.
