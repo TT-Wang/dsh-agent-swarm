@@ -99,6 +99,27 @@ export function isRuntimeContext(source: { kind: string }): boolean {
 }
 
 /**
+ * The agent registered for `sessionId` while it can still take waking input,
+ * or undefined. The Harness disposes an agent by cancelling it with cause
+ * `disposed`, awaiting its quiescence, unwinding its scope and only then
+ * leaving the registry; input sent in between is the sender's defect: a wake
+ * opens a turn whose first step meets the unwound scope (`INACTIVE_EFFECT`,
+ * from the working-directory service the system prompt asks first). The
+ * registry alone cannot tell, so a wakeable agent is also one whose scope is
+ * live and whose last turn did not end on that cancel: its session's
+ * `turn/end`, read from this session object's own lifecycle, since the
+ * session's next agent resumes the same log and is live. Every waking delivery
+ * to an owner (planning notices, mission notices) asks here; one it skips
+ * stays pending for the session's next agent.
+ */
+export function wakeableAgent(ctx: Context, sessionId: string): Agent | undefined {
+  const agent = ctx.agents.get(SessionId(sessionId))
+  if (agent === undefined || agent.ctx.fiber.uid === null) return undefined
+  const boundary = agent.session.snapshotEvents(agent.session.firstLifecycleSeq).findLast(event => event.type === 'turn/start' || event.type === 'turn/end')
+  return boundary?.type === 'turn/end' && boundary.data.reason.kind === 'aborted' && boundary.data.reason.reason.kind === 'disposed' ? undefined : agent
+}
+
+/**
  * Keep lifecycle policy in the runtime, but apply it at the native consumer
  * boundary too: transport acknowledgement can precede consumption by a turn.
  * A turn opened by stale input alone is rejected before its first step, so no
@@ -1029,7 +1050,7 @@ export class HarnessWorkers implements WorkerAdapter {
     if (delivery.to !== member.id || delivery.missionId !== member.missionId) throw new Error('Delivery recipient or mission mismatch')
     if (member.id === 'owner') {
       if (this.closing) throw new Error('Worker adapter is disposed')
-      const owner = this.ctx.agents.get(SessionId(member.sessionId))
+      const owner = wakeableAgent(this.ctx, member.sessionId)
       if (owner === undefined) throw new Error('Mission owner is offline; notification remains in the durable outbox')
       const message = this.deliveryMessage(delivery)
       const seen = owner.session.snapshotEvents().some(event => (event.type === 'user/message' && event.data.id === message.id)

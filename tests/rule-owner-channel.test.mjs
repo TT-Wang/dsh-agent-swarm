@@ -95,7 +95,7 @@ test('R03: a host append rejection is never an acknowledgement, even one naming 
   const f = await fixture(t), ctx = new Context()
   const delivery = { id: 'exact', missionId: f.mission.id, from: 'runtime', to: 'owner', kind: 'control', content: 'old decision', createdAt: Date.now(), subjects: ['task@1'], notice: { class: 'decision', dedupKey: 'fallthrough:fact' } }
   const refusal = Object.assign(new Error('invariant violated by "@dsh-external/dsh-agent-swarm": refusing an owner-facing fallthrough decision'), { name: 'InvariantError', code: 'INVARIANT' })
-  ctx.provide('agents', { get: () => ({ session: { snapshotEvents: () => [] }, send: () => { throw refusal } }) })
+  ctx.provide('agents', { get: () => ({ ctx, session: { snapshotEvents: () => [] }, send: () => { throw refusal } }) })
   ctx.provide('sessions', { flush: async () => {} })
   const adapter = new HarnessWorkers(ctx, { workspacesRoot: f.root, checkTimeoutMs: 1000, maxCheckOutputBytes: 1024 })
   t.after(() => adapter.dispose())
@@ -382,7 +382,8 @@ function plannerFixture(t) {
   const request = { id: 'start', ownerSessionId: 'owner', commandId: 'command', status: 'planning', planningEpoch: 3, planningDeadlineAt: Date.now() + 60000, updatedAt: Date.now(), goal: 'Plan work', workspace: '/project' }
   request.planningWarning = { deadline: request.planningDeadlineAt, threshold: 30000 }
   requests.set(request.id, request)
-  const agent = { id: 'owner', session: { snapshotEvents: () => events }, send(message) { sent.push(message); events.push({ type: 'user/message', data: message }) } }
+  // `ctx.fiber` is the agent's live scope (`wakeableAgent`).
+  const agent = { id: 'owner', ctx: { fiber: { uid: 1 } }, session: { snapshotEvents: () => events }, send(message) { sent.push(message); events.push({ type: 'user/message', data: message }) } }
   const ctx = { agents: { get: () => agent }, sessions: { async flush() { if (failFlush) throw new Error('persistence offline') } },
     on: () => () => {}, effect: factory => disposers.push(factory()), inject() {}, commands: { register: () => () => {} } }
   const runtime = makeRuntimeStub({ config: { tickMs: 60000 }, bounds: { stallPassTimeoutMs: 1000 }, store: { list: () => [...requests.values()], get: (_table, id) => structuredClone(requests.get(id)), put: (_table, row) => requests.set(row.id, structuredClone(row)) },

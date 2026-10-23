@@ -2,10 +2,10 @@
 import type { Context } from '@deepseek-ai/cordis'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import { freezeMessage, MessageId, type UserMessage } from '@deepseek-ai/dsh-llm'
-import { SessionId } from '@deepseek-ai/dsh-session'
 import { realpath } from 'node:fs/promises'
 import { registerSwarmCommand } from './command.ts'
 import { ownerModelSelection } from './model-selection.ts'
+import { wakeableAgent } from './harness-workers.ts'
 import { runProcess } from './workspaces.ts'
 import type { SwarmRuntime } from './runtime.ts'
 import type { AutoStart } from './types.ts'
@@ -93,12 +93,15 @@ export function registerAutomaticStart(ctx: Context, runtime: SwarmRuntime): voi
   const deliver = async (request: AutoStart, kind: 'planning' | 'failure' | 'warning', signal: AbortSignal) => {
     const epoch = request.planningEpoch ?? 1
     const actor = { sessionId: request.ownerSessionId, signal }
-    const agent = ctx.agents.get(SessionId(request.ownerSessionId))
+    // Only an owner that can still take a wake (`wakeableAgent`): an owner
+    // being disposed, whose planning turn the disposal cancelled, leaves the
+    // notice pending for the session's next agent.
+    const agent = wakeableAgent(ctx, request.ownerSessionId)
     if (agent === undefined) return
     if (kind === 'planning') await runtime.prepareStart(actor, request.id, epoch)
     signal.throwIfAborted()
     const current = pending(request.id, epoch, kind)
-    if (current === undefined || ctx.agents.get(agent.id) !== agent) return
+    if (current === undefined || wakeableAgent(ctx, request.ownerSessionId) !== agent) return
     if (kind === 'warning' && current.planningWarning?.deadline !== request.planningWarning?.deadline) return
     const message = kind === 'planning' ? planningMessage(current) : kind === 'warning' ? planningWarningMessage(current) : recoveryMessage(current)
     const seen = agent.session.snapshotEvents().some(event => (event.type === 'user/message' && event.data.id === message.id)
@@ -161,7 +164,7 @@ export function registerAutomaticStart(ctx: Context, runtime: SwarmRuntime): voi
         const kind = request.status === 'planning' && request.planningDispatchPending ? 'planning'
           : request.status === 'failed' && request.recoveryNoticePending ? 'failure'
             : ['planning', 'launching'].includes(request.status) && request.planningWarning !== undefined && request.planningWarning.deadline === request.planningDeadlineAt && request.planningWarning?.deliveredAt === undefined ? 'warning' : undefined
-        if (kind === undefined || ctx.agents.get(SessionId(request.ownerSessionId)) === undefined) continue
+        if (kind === undefined || wakeableAgent(ctx, request.ownerSessionId) === undefined) continue
         const key = `${request.id}:${request.planningEpoch ?? 1}:${kind}${kind === 'warning' ? `:${request.planningWarning?.deadline}` : ''}`
         if (inFlight.has(key)) continue
         inFlight.add(key)

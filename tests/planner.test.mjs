@@ -61,7 +61,8 @@ async function fixture(t, options = {}) {
   idleGates.push(pending)
   const messages = []
   const inbox = fakeInbox(session)
-  const agent = { id: session.id, session, inbox, options: { provider: 'current', model: 'current-model' },
+  // `ctx` is the agent's scope: a waking delivery asks that it is still live (`wakeableAgent`).
+  const agent = { id: session.id, session, inbox, ctx, options: { provider: 'current', model: 'current-model' },
     send(message, target) { inbox.append(target, message); messages.push(message) },
     followup(message) { this.send(message, 'next-turn') }, whenIdle() { return idleGates.at(-1).promise },
   }
@@ -230,7 +231,7 @@ test('one owner with a hung flush cannot block another owner recovery notice', a
   const session = await f.ctx.sessions.create(SessionId('other-planner-owner'), { meta: { cwd: f.root } })
   const inbox = fakeInbox(session)
   const received = []
-  const other = { id: session.id, session, inbox, send(message, target) { inbox.append(target, message); received.push(message) } }
+  const other = { id: session.id, session, inbox, ctx: f.ctx, send(message, target) { inbox.append(target, message); received.push(message) } }
   f.agents.set(other.id, other)
   const actor = { sessionId: other.id }
   const second = f.runtime.requestStart(actor, { commandId: 'other-command', goal: 'other owner goal', workspace: f.root }, { grantRoot: f.root, source: 'session' })
