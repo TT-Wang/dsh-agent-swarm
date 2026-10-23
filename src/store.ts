@@ -54,6 +54,36 @@ export interface PostFilter {
   newest?: boolean
   limit?: number
 }
+/**
+ * CORE-03: the claim's attempt record (`task/claimed`), the event that opens an
+ * attempt's lifetime in the log.
+ */
+const CLAIM_PATH = '$.attempt.id'
+/**
+ * CORE-03: the payload paths at which a durable event names the attempt it is
+ * about, each read as `json_extract(data, path)`: the claim's attempt record;
+ * an attempt-scoped row, a member's `swarm_*` span among them (`$.attemptId`);
+ * and an operation its member ran under the attempt (`$.activity.attemptId`).
+ * An event that names the attempt's task (`ATTEMPT_TASK_PATH`) is the
+ * attempt's from its claim on. Only these paths attribute: an id anywhere else
+ * in a payload, such as a sibling proposal's `dependencies` or `reviewOf` or an
+ * outage's `taskIds`, names a relation, not a report by the attempt.
+ * `SwarmStore.attemptEventAt` reads them.
+ */
+export const ATTEMPT_PATHS = [CLAIM_PATH, '$.attemptId', '$.activity.attemptId'] as const
+/** The path at which an event names an attempt's task (`ATTEMPT_PATHS`). */
+export const ATTEMPT_TASK_PATH = '$.taskId'
+/** The partial index over the event rows that carry one attribution path. */
+const attributionIndex = (path: string): string => `events_at_${path.slice(2).replaceAll('.', '_')}`
+/**
+ * `SwarmStore.attemptEventAt` over the whole log, one term per path, each read
+ * through its own index. `?1` is the mission, `?2` the attempt, `?3` its task.
+ */
+const ATTEMPT_EVENT_AT = `SELECT MAX(at) AS at FROM (${[
+  ...ATTEMPT_PATHS.map(path => `SELECT MAX(created_at) AS at FROM events WHERE mission_id=?1 AND json_extract(data,'${path}')=?2`),
+  `SELECT MAX(created_at) AS at FROM events WHERE mission_id=?1 AND json_extract(data,'${ATTEMPT_TASK_PATH}')=?3
+    AND seq>=(SELECT MIN(seq) FROM events WHERE mission_id=?1 AND json_extract(data,'${CLAIM_PATH}')=?2)`,
+].join(' UNION ALL ')})`
 /** v3 adds the append-only `posts` board table; v4 cites mission criteria by id (`citeCriteria`); v5 records an owner notice's consumption on its delivery (`consumptionOnDelivery`); v6 kept an attempt's markers on the row only with that attempt; v7 makes them fields of the attempt (`markersOnTheirAttempt`, whose upgrade settles a store before v6 as v6's did); v8 has a deferred review name its deciding pass's rows (`deferralsNameTheirPass`). Older versions are upgraded at open. */
 const SCHEMA_VERSION = 8
 const CHANGE_HISTORY = 1024
@@ -334,6 +364,13 @@ export class SwarmStore {
         this.db.exec('CREATE TABLE IF NOT EXISTS events (seq INTEGER PRIMARY KEY AUTOINCREMENT, mission_id TEXT NOT NULL, type TEXT NOT NULL, actor TEXT NOT NULL, data TEXT NOT NULL, created_at INTEGER NOT NULL); CREATE INDEX IF NOT EXISTS events_mission ON events(mission_id, seq);')
         this.db.exec("CREATE INDEX IF NOT EXISTS events_task_fact ON events(mission_id, type, json_extract(data,'$.taskId'), seq); CREATE INDEX IF NOT EXISTS events_type ON events(mission_id, type, seq);")
         this.db.exec("CREATE INDEX IF NOT EXISTS events_trace_attempt ON events(mission_id, json_extract(data,'$.attemptId'), json_extract(data,'$.step'), seq) WHERE type='trace/span';")
+        // CORE-03: one partial index per attribution path, over only the rows that
+        // carry it, in log order and covering the instant: `attemptEventAt` reads
+        // the rows naming one attempt, its claim's sequence in one seek, and its
+        // task's rows from that sequence on, never the mission's whole log.
+        for (const path of [...ATTEMPT_PATHS, ATTEMPT_TASK_PATH]) {
+          this.db.exec(`CREATE INDEX IF NOT EXISTS ${attributionIndex(path)} ON events(mission_id, json_extract(data,'${path}'), seq, created_at) WHERE json_extract(data,'${path}') IS NOT NULL;`)
+        }
         this.db.exec('CREATE TABLE IF NOT EXISTS state_revision (id INTEGER PRIMARY KEY CHECK (id=1), revision INTEGER NOT NULL); INSERT OR IGNORE INTO state_revision(id,revision) VALUES(1,0); CREATE TABLE IF NOT EXISTS state_changes (revision INTEGER PRIMARY KEY, scopes TEXT NOT NULL);')
         // Each upgrade runs once: for a store older than the version that introduced it.
         if (version < 4) this.citeCriteria()
@@ -745,6 +782,19 @@ export class SwarmStore {
   /** The mission's progress clock: its newest progress-kind row in the whole append-only log (never the event window), else its creation. */
   progressAt(mission: Mission): number {
     return Number(this.db.prepare(`SELECT COALESCE(MAX(created_at), ?) AS at FROM events WHERE mission_id=? AND type IN (${PROGRESS_KINDS.map(() => '?').join()})`).get(mission.createdAt, mission.id, ...PROGRESS_KINDS)?.at)
+  }
+  /**
+   * CORE-03: the newest instant at which the whole append-only event log, never
+   * the presentation window, names one attempt (`ATTEMPT_PATHS`), or undefined
+   * when no event does. An event naming its task (`ATTEMPT_TASK_PATH`) counts
+   * from the attempt's claim on: the lifetime is a range of the log, from the
+   * claim's sequence, so a clock that stepped back cannot hand an earlier
+   * attempt's row to this one. Rows are only appended, so the answer only moves
+   * forward.
+   */
+  attemptEventAt(missionId: string, taskId: string, attemptId: string): number | undefined {
+    const at = this.db.prepare(ATTEMPT_EVENT_AT).get(missionId, attemptId, taskId)?.at
+    return at === null || at === undefined ? undefined : Number(at)
   }
   /** Durable task fact lookup, independent of the presentation event window. */
   latestTaskEvent(missionId: string, taskId: string, type: string): SwarmEvent | undefined {

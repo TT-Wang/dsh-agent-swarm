@@ -9,6 +9,7 @@ import { NO_LIVE_PATH_FAMILIES, noticeFamily, taskFromSubject } from '../lib/not
 import { stallRoots, waitsLegitimately } from '../lib/board.js'
 import { TERMINAL_STATES, taskSubject } from '../lib/task-graph.js'
 import { ATTEMPT_FENCING_EVENTS } from '../lib/types.js'
+import { ATTEMPT_PATHS, ATTEMPT_TASK_PATH } from '../lib/store.js'
 
 
 /**
@@ -77,6 +78,16 @@ export function wakePrecision(runtime, missionId) {
 /** Mirrors `isAttemptCloser` in its old src/scheduling.ts form: the shared fencing vocabulary. */
 const isAttemptCloser = type => ATTEMPT_FENCING_EVENTS.some(kind => kind === type)
 
+/** The value at one `$.a.b` attribution path of an event payload. */
+const atPath = (data, path) => path.slice(2).split('.').reduce((value, key) => value !== null && typeof value === 'object' ? value[key] : undefined, data)
+/**
+ * Whether an event names attempt `attemptId`, or its task, at a named path: the
+ * store's attribution rule (`ATTEMPT_PATHS`, `ATTEMPT_TASK_PATH`), which
+ * `SwarmStore.attemptEventAt` runs in SQL for the live bound. The caller holds
+ * the task path to the attempt's lifetime.
+ */
+const namesAttempt = (data, taskId, attemptId) => ATTEMPT_PATHS.some(path => atPath(data, path) === attemptId) || atPath(data, ATTEMPT_TASK_PATH) === taskId
+
 /**
  * R16-D: the silence projection. Read from the durable store alone — the
  * retained event window, the tool-run rows, the delivery rows and the current
@@ -93,8 +104,8 @@ const isAttemptCloser = type => ATTEMPT_FENCING_EVENTS.some(kind => kind === typ
  * Definitions, stated so a reader can falsify them:
  *  - an attempt's durable elements are its `task/claimed` dispatch (and the
  *    assignment delivery written with it), every durable event naming its task
- *    or attempt while it was current, every delivery naming them, and every
- *    recorded tool run of the attempt;
+ *    or attempt at a named path while it was current (`namesAttempt`), every
+ *    delivery naming them, and every recorded tool run of the attempt;
  *  - its reporting gap is the longest interval between consecutive elements,
  *    closed at its end (or at read time while it is live);
  *  - it ended unreported when it is no longer the task's current attempt and no
@@ -104,11 +115,12 @@ const isAttemptCloser = type => ATTEMPT_FENCING_EVENTS.some(kind => kind === typ
  * Limits: the attempt intervals come from the retained event window
  * (`maxEvents`); an attempt that ended with no closing event is dated at its
  * last durable element; the attempt bound quoted is the bound in force at read
- * time. Attribution uses the scheduler's own `identityIn`, the same predicate
- * the live attempt-silence bound reads.
+ * time. Attribution is the store's named-path rule, the one the live
+ * attempt-silence bound reads; a verdict names its review at
+ * `$.verificationTaskId`, which no path reads, so a review attempt that ended
+ * in a verdict is dated at its last durable element.
  */
 export function silenceReport(runtime, missionId) {
-  const scheduling = runtime.scheduling
   const now = Date.now()
   const bounds = { passMs: runtime.bounds.stallPassTimeoutMs, passReleaseMs: runtime.bounds.stallPassReleaseBoundMs, attemptMs: runtime.bounds.attemptSilenceBoundMs }
   const events = runtime.store.events(missionId, runtime.config.maxEvents)
@@ -135,7 +147,7 @@ export function silenceReport(runtime, missionId) {
     // closer ends that attempt at this instant and takes it out of the open set.
     let closedTask
     for (const [taskId, interval] of open) {
-      if (!scheduling.identityIn(event.data, taskId, interval.attemptId)) continue
+      if (!namesAttempt(event.data, taskId, interval.attemptId)) continue
       interval.elements.push({ at: event.createdAt, kind: 'event', isClaim: false })
       if (isAttemptCloser(event.type)) { interval.endedAt = Math.min(interval.endedAt ?? event.createdAt, event.createdAt); closedTask = taskId }
     }

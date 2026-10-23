@@ -600,8 +600,9 @@ export class Scheduling {
    * escalates it by name from the queue-external tick.
    *
    * Durable progress is any durable row a reader can attribute to the attempt:
-   * its own `task/claimed` event, a recorded tool run, a durable event naming
-   * the task or the attempt, or a delivery naming them. A renewed lease is
+   * an event that names it, or its task from its claim on, at a named path
+   * (`ATTEMPT_PATHS` in src/store.ts; its own `task/claimed` event among them),
+   * a recorded tool run, or a delivery naming it or its task. A renewed lease is
    * deliberately NOT progress (the renewal path says so itself: "liveness
    * bookkeeping, not a new progress timestamp"), so a lease that stays alive
    * while nothing is recorded cannot mask the silence.
@@ -622,7 +623,9 @@ export class Scheduling {
    *    is the same queue-external tick that names a wedged pass, so a pass that
    *    cannot run its own recovery sweep cannot hide the attempt.
    *  - the notice dedup: the key is `attempt-silent:<attemptId>:<lastDurableAt>`,
-   *    so one silence escalates once and a recording re-arms the clock.
+   *    so one silence escalates once and a recording re-arms the clock. The
+   *    basis is read from whole tables, never the event window, so it only
+   *    moves forward and an unchanged silence keeps its key (CORE-03).
    * ----------------------------------------------------------------------- */
 
   /**
@@ -679,33 +682,22 @@ export class Scheduling {
   }
 
   /**
-   * R16-D: the newest durable row a reader can attribute to one attempt. The
-   * attempt's own `task/claimed` event is the floor, so a dispatch that recorded
-   * nothing else measures its silence from the dispatch itself.
+   * R16-D, CORE-03: the newest durable row a reader can attribute to one
+   * attempt, read from whole tables and never from the presentation event
+   * window: the newest event naming it (`SwarmStore.attemptEventAt`), its
+   * recorded tool runs, and the deliveries naming it or its task. Its
+   * assignment delivery, written in the commit that claims it and never
+   * deleted, is the floor, so a dispatch that recorded nothing else measures
+   * its silence from the dispatch. Each term is a maximum over rows that are
+   * never deleted and whose instants never change, so the basis only moves
+   * forward.
    */
   private lastDurableAt(missionId: string, task: Task, attempt: Attempt): number {
-    let latest = 0
-    for (const event of this.k.store.events(missionId, this.k.config.maxEvents)) {
-      if (latest >= event.createdAt) continue
-      if (event.type === 'task/claimed') {
-        if (this.identityIn(event.data, task.id, attempt.id)) latest = event.createdAt
-        continue
-      }
-      if (this.identityIn(event.data, task.id, attempt.id)) latest = Math.max(latest, event.createdAt)
-    }
+    let latest = this.k.store.attemptEventAt(missionId, task.id, attempt.id) ?? 0
     for (const run of this.k.store.toolRuns(missionId, { attemptId: attempt.id })) latest = Math.max(latest, run.createdAt)
     for (const delivery of this.k.store.list('deliveries', missionId)) {
       if (delivery.attemptId === attempt.id || delivery.taskId === task.id) latest = Math.max(latest, delivery.createdAt)
     }
     return latest
-  }
-
-  /** Whether a durable payload names this task or this attempt anywhere in its (bounded) object tree. */
-  private identityIn(data: unknown, taskId: string, attemptId: string, depth = 0): boolean {
-    if (depth > 3) return false
-    if (typeof data === 'string') return data === taskId || data === attemptId
-    if (Array.isArray(data)) return data.some(item => this.identityIn(item, taskId, attemptId, depth + 1))
-    if (data !== null && typeof data === 'object') return Object.values(data as Record<string, unknown>).some(item => this.identityIn(item, taskId, attemptId, depth + 1))
-    return false
   }
 }
