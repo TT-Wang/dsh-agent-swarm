@@ -7,20 +7,19 @@
 # `dsh plugin --profile <name> add <this package>`. The loader composes this
 # layer with the host bundles; nothing here is a hand-written absolute path.
 #
-# This layer inserts the plugin row and states the two roots it owns
-# explicitly instead of relying on an implicit default:
+# This layer inserts the plugin row with an empty config, exactly as the plugin
+# package's own layer does, so both mounts open the same store. The plugin
+# resolves its two roots itself, at start, by one rule (src/state-roots.ts):
 #
-#   root = $DSH_AGENT_SWARM_ROOT
-#          ?? ($DSH_HOME ?? $HOME/.dsh) + '/agent-swarm'
-#   statePath      = root + '/swarm.sqlite'
-#   workspacesRoot = root + '/workspaces'
+#   root           = $DSH_AGENT_SWARM_ROOT, else <Harness home>/agent-swarm
+#                    (the host's own home: $DSH_HOME, else ~/.dsh)
+#   statePath      = root/swarm.sqlite
+#   workspacesRoot = root/workspaces
 #
-# The expression is portable: it names no user, machine or checkout path, and
-# with no variable set it resolves to the plugin's own documented default
-# (`~/.dsh/agent-swarm/...`). A caller that needs another root — the attended
-# preview uses its own — sets `DSH_AGENT_SWARM_ROOT`, or overrides this row's
-# `config` in a later patch layer (a `--patch <file>` overlay or the profile's
-# own `cordis.patch.yml`), which is the layer order the launcher defines.
+# A caller that needs another root — the attended preview uses its own — sets
+# `DSH_AGENT_SWARM_ROOT`, or overrides this row's `config` in a later patch
+# layer (a `--patch <file>` overlay or the profile's own `cordis.patch.yml`),
+# which is the layer order the launcher defines.
 #
 # The client UI mounts with this row: the client module system scans mounted
 # rows for a package declaring `dsh.client` for the web platform, and the
@@ -35,6 +34,4 @@
 - insert:
     - id: dsh-external-agent-swarm
       name: '@dsh-external/dsh-agent-swarm'
-      config:
-        statePath: !!js "((process.env.DSH_AGENT_SWARM_ROOT ?? ((process.env.DSH_HOME ?? ((process.env.HOME ?? '') + '/.dsh')) + '/agent-swarm')) + '/swarm.sqlite')"
-        workspacesRoot: !!js "((process.env.DSH_AGENT_SWARM_ROOT ?? ((process.env.DSH_HOME ?? ((process.env.HOME ?? '') + '/.dsh')) + '/agent-swarm')) + '/workspaces')"
+      config: {}
