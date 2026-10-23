@@ -133,8 +133,7 @@ test('round mount refuses an unsupported Harness through update-preview before b
 test('round mount forwards --allow-unsupported-harness to update-preview, and only when given', async t => {
   const s = scene(t)
   const copy = join(s.root, 'project')
-  mkdirSync(join(copy, 'scripts'), { recursive: true })
-  for (const script of ['round.mjs', 'host.mjs']) copyFileSync(join(project, 'scripts', script), join(copy, 'scripts', script))
+  for (const [path, source] of Object.entries(await withLocalImports(project, 'scripts/round.mjs'))) { mkdirSync(dirname(join(copy, path)), { recursive: true }); writeFileSync(join(copy, path), source) }
   writeFileSync(join(copy, 'scripts/update-preview.mjs'), 'console.log(JSON.stringify(process.argv.slice(2)))\n')
   const lab = join(s.root, 'lab')
   mkdirSync(lab)

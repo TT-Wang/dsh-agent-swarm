@@ -142,3 +142,39 @@ test('the gate records every suite: passed, skipped with what it lacked, failed,
   assert.match(result.stdout, /skipped for:\n {2}harness: The hermetic test tier has no Harness checkout/)
   assert.match(result.stdout, /incomplete: test:host was skipped: no harness/)
 })
+
+test('the round gate runs the commit\'s own gate, and promote takes its record only when it is complete for that commit\'s manifest', async t => {
+  const repo = await scratchRepo(t, 'scripts/round.mjs', { typecheck: ok, test: ok, 'test:host': ok }, { typecheck: [], test: [], 'test:host': ['harness'] })
+  const lab = join(repo.root, 'lab')
+  const round = (...args) => run([join(repo.source, 'scripts/round.mjs'), ...args, '--lab', lab], repo.source)
+  const recordOf = sha => JSON.parse(readFileSync(join(lab, 'gates', `${sha}.json`), 'utf8'))
+
+  // A host without the checkout: the gate records the skip, and neither it nor promote calls that complete.
+  const incomplete = await round('gate', '--commit', repo.head)
+  assert.equal(incomplete.code, 1, incomplete.stderr)
+  assert.deepEqual(JSON.parse(incomplete.stdout.slice(incomplete.stdout.lastIndexOf('{\n  "command"'))).problems, [`test:host was skipped: no harness (${recordOf(repo.head).prerequisites.harness.reason})`])
+  assert.deepEqual(recordOf(repo.head).suites.map(suite => [suite.name, suite.status]), [['typecheck', 'pass'], ['test', 'pass'], ['test:host', 'skipped']], 'the record lists the commit\'s manifest, in its order')
+  const refused = await round('promote', '--commit', repo.head, '--dry-run')
+  assert.equal(refused.code, 2)
+  assert.match(refused.stderr, new RegExp(`the recorded gate for ${repo.head.slice(0, 12)} is not a complete gate of its manifest:\\n- test:host was skipped: no harness`))
+
+  // The next commit gives its host suite only an opt-in prerequisite: the same host now gates it completely.
+  const next = repo.commit({ typecheck: ok, test: ok, 'test:host': ok }, { typecheck: [], test: [], 'test:host': ['provider'] }, 'opt-in host suite')
+  const complete = await round('gate', '--commit', next)
+  assert.equal(complete.code, 0, complete.stderr)
+  const promoted = await round('promote', '--commit', next, '--dry-run')
+  assert.equal(promoted.code, 0, promoted.stderr)
+  assert.equal(JSON.parse(promoted.stdout).gated, true)
+
+  // A record that is green but names no suites, as the round gate wrote until the manifest, proves nothing about them.
+  const later = repo.commit({ typecheck: ok, test: ok, 'test:host': ok, 'test:oracle': ok }, { typecheck: [], test: [], 'test:host': ['provider'], 'test:oracle': [] }, 'a new suite')
+  writeFileSync(join(lab, 'gates', `${later}.json`), JSON.stringify({ commit: later, green: true, results: [{ name: 'typecheck', exitCode: 0 }], at: 'then' }))
+  const dormant = await round('promote', '--commit', later, '--dry-run')
+  assert.equal(dormant.code, 2)
+  assert.match(dormant.stderr, /the record lists no suites/)
+  // Nor does a record of the previous manifest: the suite the commit added is not in it.
+  writeFileSync(join(lab, 'gates', `${later}.json`), JSON.stringify({ ...recordOf(next), commit: later }))
+  const stale = await round('promote', '--commit', later, '--dry-run')
+  assert.equal(stale.code, 2)
+  assert.match(stale.stderr, /the record lacks test:oracle, which the manifest lists/)
+})
