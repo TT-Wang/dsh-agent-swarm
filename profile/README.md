@@ -70,7 +70,8 @@ other plugin setting keeps its documented default; see
 insert the row with no root of its own, the host profile loader composing the
 bundle into exactly one row, the declared conflict being real, and real
 `dsh --profile web` hosts opening the store under `$DSH_HOME/agent-swarm` (on
-the bundle and on the direct mount, with the start log and the warning that
-names the default home's store), under `DSH_AGENT_SWARM_ROOT` and under a caller
-overlay, while serving the plugin's client bundle in the boot graph.
-`tests/state-roots.test.mjs` covers each step of the rule and the warning.
+the bundle and on the direct mount, whose one start line, at the rank a console
+exporter shows by default, names the default home's store), under
+`DSH_AGENT_SWARM_ROOT` and under a caller overlay, while serving the plugin's
+client bundle in the boot graph. `tests/state-roots.test.mjs` covers each step
+of the rule and the start line.

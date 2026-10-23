@@ -99,27 +99,34 @@ const SOURCE_LABEL: Record<SwarmRootSource, string> = {
   default: 'default home',
 }
 
-interface RootsLogger { info(message: string): void, warn(message: string): void }
+interface RootsLogger { info(message: string): void }
 
 /**
- * Log the resolved roots once at start, and warn once, naming both paths, when
- * this start opens a new store while a lower step of the rule already holds
- * one. A changed `$DSH_HOME`, a dropped `$DSH_AGENT_SWARM_ROOT` or an upgrade
- * from a build that ignored them then never opens an empty store silently.
- * Nothing is adopted: under another home that store belongs to another host.
- * Call it after a pending restore is applied, so a restored store counts as
- * present.
- * @returns the other stores the warning named.
+ * Log the start report: one line, once per start, naming the roots this start
+ * opens, the step that chose each, and whether the store is new. When it is
+ * new and a lower step of the rule under this same environment already holds
+ * a store (`$DSH_HOME/agent-swarm` below a `$DSH_AGENT_SWARM_ROOT`, and
+ * `~/.dsh/agent-swarm`; see `otherStores`), the same line names that store and
+ * the root that keeps it. Nothing else is probed: a store under another
+ * non-default home, under a `$DSH_AGENT_SWARM_ROOT` since dropped, or beside a
+ * configured `statePath` is never named, and the line only says the store is
+ * new. Nothing is adopted: under another home that store belongs to another
+ * host.
+ *
+ * The line is logged at info, the rank a log exporter shows at its default
+ * threshold: Cordis ranks a warning below info, so a separate warning would be
+ * dropped wherever the routine roots are shown. Call it after a pending
+ * restore is applied, so a restored store is not reported as new.
+ * @returns the other stores the line named.
  */
 export function reportSwarmRoots(logger: RootsLogger | undefined, roots: SwarmRoots): string[] {
-  const found = existsSync(roots.statePath) ? [] : roots.otherStores.filter(path => existsSync(path))
+  const isNew = !existsSync(roots.statePath)
+  const found = isNew ? roots.otherStores.filter(path => existsSync(path)) : []
+  const [nearest] = found
   try {
-    logger?.info(`agent-swarm: store ${roots.statePath} (${SOURCE_LABEL[roots.sources.statePath]}), workspaces ${roots.workspacesRoot} (${SOURCE_LABEL[roots.sources.workspacesRoot]})`)
-    const [nearest] = found
-    if (nearest !== undefined) {
-      logger?.warn(`agent-swarm: opening a new store at ${roots.statePath}, but a store already exists at ${found.join(' and at ')}; its missions are not moved. `
-        + `To keep using it, stop this host and set ${SWARM_ROOT_ENV}=${dirname(nearest)} (or configure statePath and workspacesRoot).`)
-    }
+    logger?.info(`agent-swarm: store ${roots.statePath} (${SOURCE_LABEL[roots.sources.statePath]}${isNew ? ', new' : ''}), workspaces ${roots.workspacesRoot} (${SOURCE_LABEL[roots.sources.workspacesRoot]})`
+      + (nearest === undefined ? '' : `. A store already exists at ${found.join(' and at ')}; its missions are not moved. `
+        + `To keep using it, stop this host and set ${SWARM_ROOT_ENV}=${dirname(nearest)} (or configure statePath and workspacesRoot).`))
   } catch { /* Logging must never veto the plugin. */ }
   return found
 }
