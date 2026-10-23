@@ -242,7 +242,7 @@ npm run verify
 | `npm run test:harness` | 真实 Harness Loader 组合。 |
 | `npm run test:pack` / `npm run test:packed` | 打包工件加载与声明行为。 |
 | `npm run test:profile` | 真实 CLI profile 安装与生命周期。 |
-| `npm run test:bundle` | Bundle 元数据、可移植根目录、宿主组合与真实 profile 启动。 |
+| `npm run test:bundle` | Bundle 元数据、两种挂载插入的空配置插件行、宿主组合，以及两种挂载在真实 profile 启动时的根目录规则和启动日志。 |
 | `npm run test:web` / `npm run test:command-web` | 侧栏和 `/agent-swarm` 浏览器工作流。 |
 
 这些测试使用临时 profile 和 Git 工作区，供应商回复由脚本提供。它们验证集成行为，不代表模型规划成功率。`npm run test:deepseek` 和 `npm run test:command-deepseek` 会发起真实供应商请求，可能产生费用，不包含在 `verify` 中。已完成的运行及其边界记录在[验证文档](validation.md)。

@@ -230,7 +230,7 @@ This runs typecheck, build, the behavioral suite, packaged-artifact loading, rea
 | `npm run test:harness` | Real Harness Loader composition. |
 | `npm run test:pack` / `npm run test:packed` | Packaged-artifact loading and declared behavior. |
 | `npm run test:profile` | Real CLI profile installation and lifecycle. |
-| `npm run test:bundle` | Bundle metadata, portable roots, host composition and real profile boot. |
+| `npm run test:bundle` | Bundle metadata, the empty-config plugin row both mounts insert, host composition, and the root rule and start line on real profile boots of both mounts. |
 | `npm run test:web` / `npm run test:command-web` | Sidebar and `/agent-swarm` browser workflows. |
 
 These suites use temporary profiles and Git workspaces with scripted provider responses. They establish integration behavior, not model planning success rates. `npm run test:deepseek` and `npm run test:command-deepseek` make real provider requests, can incur charges and are excluded from `verify`. Completed runs and their limits are recorded in [validation](validation.md).
