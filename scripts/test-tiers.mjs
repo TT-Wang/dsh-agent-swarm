@@ -23,6 +23,7 @@ import { spawn } from 'node:child_process'
 import { existsSync, readdirSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { TIER_ENV } from './harness-target.mjs'
 
 const PROJECT = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 
@@ -34,9 +35,6 @@ export const TIERS = {
 
 /** The node:test files that boot a real host from a built Harness checkout. */
 export const HOST_TIER = ['tests/r17-profile.test.mjs']
-
-/** The environment variable that tells harness-target the hermetic tier is running. */
-export const TIER_ENV = 'DSH_SWARM_TEST_TIER'
 
 /** The tier's files, relative to the project: the host tier's as HOST_TIER lists them, the hermetic tier's sorted by name. */
 export function tierFiles(tier, project = PROJECT) {

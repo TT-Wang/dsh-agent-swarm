@@ -9,7 +9,9 @@ import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
 import { readdirSync, readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
-import { HOST_TIER, TIERS, TIER_ENV, tierEnvironment, tierFiles } from '../scripts/test-tiers.mjs'
+import { TIER_ENV } from '../scripts/harness-target.mjs'
+import { withLocalImports } from './fixtures/local-imports.mjs'
+import { HOST_TIER, TIERS, tierEnvironment, tierFiles } from '../scripts/test-tiers.mjs'
 
 const PROJECT = fileURLToPath(new URL('..', import.meta.url))
 const manifest = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'))
@@ -38,4 +40,10 @@ test('npm test runs the hermetic tier after the build, and test:bundle runs the 
   assert.equal(manifest.scripts['test:bundle'], 'node scripts/test-tiers.mjs host')
   const listed = execFileSync(process.execPath, ['scripts/test-tiers.mjs', 'host', '--list'], { cwd: PROJECT, encoding: 'utf8' })
   assert.deepEqual(listed.trim().split('\n'), HOST_TIER)
+})
+
+test('the tier marker belongs to harness-target, which reads it: the operator scripts that select a release import no test runner', async () => {
+  const closure = Object.keys(await withLocalImports(PROJECT, 'scripts/harness-target.mjs'))
+  assert.ok(!closure.includes('scripts/test-tiers.mjs'), `harness-target imports ${closure.join(', ')}`)
+  assert.ok(Object.keys(await withLocalImports(PROJECT, 'scripts/test-tiers.mjs')).includes('scripts/harness-target.mjs'), 'the runner takes the marker from harness-target')
 })

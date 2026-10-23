@@ -5,9 +5,17 @@ import { homedir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { execFileSync } from 'node:child_process'
-import { TIER_ENV } from './test-tiers.mjs'
 
 const project = resolve(dirname(fileURLToPath(import.meta.url)), '..')
+
+/**
+ * The environment variable whose value `hermetic` turns the search below off.
+ * The hermetic test tier's runner (scripts/test-tiers.mjs) sets it; this
+ * module reads it, so the operator scripts that select a release depend on no
+ * test runner.
+ */
+export const TIER_ENV = 'DSH_SWARM_TEST_TIER'
+
 /**
  * An explicit root is taken as given. Otherwise the candidates are the
  * installed source `~/.dsh/source/current`, then the sibling checkout named

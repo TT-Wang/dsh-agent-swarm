@@ -17,7 +17,7 @@ import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { resolveHarnessRoot as resolveFaultHarness } from './faults/loader.mjs'
 import { withLocalImports } from './fixtures/local-imports.mjs'
-import { TIER_ENV } from '../scripts/test-tiers.mjs'
+import { TIER_ENV } from '../scripts/harness-target.mjs'
 
 const project = fileURLToPath(new URL('../', import.meta.url))
 const compatibility = JSON.parse(readFileSync(join(project, 'compatibility.json'), 'utf8'))
