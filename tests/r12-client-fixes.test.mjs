@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import React from 'react'
 import { SwarmMonitor } from '../lib/types/client/monitor.js'
-import { readBudget, readDraft, readSnapshot, readStart } from '../lib/types/client/projection.js'
+import { readBudget, readDelivery, readDeliveryApplication, readDraft, readSnapshot, readStart } from '../lib/types/client/projection.js'
 import { ActivityPanel } from '../lib/types/client/ActivityPanel.js'
 import { newPlan } from '../lib/types/client/DraftEditor.js'
 import { registerWebApi } from '../lib/web-api.js'
@@ -121,7 +121,7 @@ const startItem = () => ({ id: 'start-1', ownerSessionId: 'owner', commandId: 'c
   planningEpoch: 1, draftId: 'draft-1', createdAt: 1, updatedAt: 2,
   baseline: { sourceHead: 'a'.repeat(40), snapshotCommit: 'b'.repeat(40), planningWorkspace: '/planning', changedPaths: ['src/api.ts'], createdAt: 1 } })
 
-test('F2: the draft, start and budget readers admit what the panel renders and refuse what would break it', () => {
+test('F2: the draft, start, budget and delivery readers admit what the panel renders and refuse what would break it', () => {
   assert.equal(readDraft(draftItem()) !== undefined, true)
   assert.equal(readStart(startItem()) !== undefined, true)
   const bare = draftItem(); delete bare.advisories; delete bare.error
@@ -187,6 +187,16 @@ test('F2: the draft, start and budget readers admit what the panel renders and r
   }
   const snapshot = uiSnapshot(); snapshot.mission.budget.deadlineAt = 'tomorrow'
   assert.equal(readSnapshot(snapshot), undefined, 'a mission budget is read by the same budget rule')
+  const delivery = { baselineCommit: 'a'.repeat(40), resultCommit: 'b'.repeat(40), changedPaths: ['src/api.ts'], diff: '+x', truncated: false }
+  assert.equal(readDelivery(delivery), delivery)
+  for (const broken of [{ ...delivery, diff: { text: '+x' } }, { ...delivery, changedPaths: 'src/api.ts' }, { ...delivery, truncated: 'no' }, { ...delivery, resultCommit: undefined }]) {
+    assert.equal(readDelivery(broken), undefined)
+  }
+  const application = { status: 'conflicts', changedPaths: ['src/api.ts'], conflicts: ['src/api.ts'] }
+  assert.equal(readDeliveryApplication(application), application)
+  for (const broken of [{ ...application, status: 'merged' }, { ...application, conflicts: 'src/api.ts' }, { ...application, changedPaths: undefined }]) {
+    assert.equal(readDeliveryApplication(broken), undefined)
+  }
 })
 
 test('F2: the monitor refuses a state whose draft, start or budget would break render, and keeps the last good view', async t => {
@@ -288,6 +298,27 @@ test('M4-F4: automatic mission selection releases old busy state; its late failu
   const resume = panel.find(node => node.props['data-action'] === 'resume')
   assert.equal(resume.props.disabled, false)
   assert.deepEqual(requests.map(item => item.payload.missionId), ['mission-demo', 'next-mission'])
+})
+
+test('F2: a malformed mission reply to a control or a task cancel is a request error, never the mission the board renders', async t => {
+  const data = live(), endpoints = []
+  const current = data.snapshots[0]
+  const malformed = { ...current, mission: { ...current.mission, status: 'paused', updatedAt: current.mission.updatedAt + 1 }, tasks: undefined }
+  const monitor = { getSnapshot: () => ({ ownerSessionId: 'owner', data, connection: 'connected', loading: false }), subscribe: () => () => {}, select() {}, refresh: async () => {},
+    request: async endpoint => { endpoints.push(endpoint); return { snapshot: malformed } } }
+  const panel = panelHarness(monitor); t.after(() => panel.dispose())
+  const board = () => panel.find(node => node.props.onCancelTask !== undefined && node.props.snapshot !== undefined)
+  const alert = () => panel.find(node => node.props.role === 'alert')?.props.children
+  panel.render()
+  panel.find(node => node.props['data-action'] === 'pause').props.onClick(); await flush(); panel.render()
+  assert.equal(alert(), 'Invalid mission from host')
+  assert.equal(board().props.snapshot, current, 'the board keeps the admitted mission')
+  assert.ok(panel.find(node => node.props['data-action'] === 'pause'), 'the refused reply did not pause the mission on screen')
+  assert.equal(panel.find(node => node.props['data-action'] === 'resume'), undefined)
+  board().props.onCancelTask(current.tasks[4]); await flush(); panel.render()
+  assert.equal(alert(), 'Invalid mission from host')
+  assert.equal(board().props.snapshot, current)
+  assert.deepEqual(endpoints, ['control', 'cancel'])
 })
 
 function webFixture({ release = async () => {}, listModels = async () => [] } = {}) {

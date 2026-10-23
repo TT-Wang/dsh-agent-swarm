@@ -1,8 +1,8 @@
 import { useEffect, useRef, useState } from 'react'
-import type { DeliveryApplication, DeliveryInspection, Snapshot, WorkspaceBaseline } from '../types.ts'
-import type { Request } from './monitor.ts'
+import type { DeliveryInspection, Snapshot, WorkspaceBaseline } from '../types.ts'
+import { validateState, type Request } from './monitor.ts'
 import { useCopy } from './locale.tsx'
-import { deliverableCommit } from './projection.ts'
+import { admitReply, deliverableCommit, readDelivery, readDeliveryApplication, readSnapshot } from './projection.ts'
 import type { LiveState } from '../live-types.ts'
 import { requestWithDeadline, RequestDeadlineError } from './request-deadline.ts'
 import { checkDeliveryOutcome, projectDeliveryState, type DeliveryObservation } from './delivery-state.ts'
@@ -41,6 +41,7 @@ export function DeliveryPanel({ snapshot, sessionId, request, onApplied, disable
     try {
       if (apply && uncertain) {
         const response = await requestWithDeadline<LiveState>(request, 'state', { sessionId })
+        validateState(response, sessionId)
         if (current()) {
           const latest = response.snapshots.find(item => item.mission.id === snapshot.mission.id)
           const checked = checkDeliveryOutcome(snapshot, resultCommit, latest)
@@ -52,14 +53,16 @@ export function DeliveryPanel({ snapshot, sessionId, request, onApplied, disable
           }
         }
       } else if (apply) {
-        const response = await requestWithDeadline<{ result: DeliveryApplication; snapshot?: Snapshot }>(request, 'apply-delivery', input)
+        const reply = await requestWithDeadline<{ snapshot?: unknown } | undefined>(request, 'apply-delivery', input)
+        const result = admitReply(reply, 'result', readDeliveryApplication, 'delivery result')
+        const latest = reply?.snapshot === undefined ? undefined : admitReply(reply, 'snapshot', readSnapshot, 'mission')
         if (current()) {
-          if (resultCommit) setObservation({ baseSnapshot: snapshot, commit: resultCommit, result: response.result, snapshot: response.snapshot })
+          if (resultCommit) setObservation({ baseSnapshot: snapshot, commit: resultCommit, result, snapshot: latest })
           onApplied()
         }
       } else {
-        const response = await requestWithDeadline<{ delivery: DeliveryInspection }>(request, 'delivery', input)
-        if (current()) setDelivery(response.delivery)
+        const inspection = admitReply(await requestWithDeadline<unknown>(request, 'delivery', input), 'delivery', readDelivery, 'delivery')
+        if (current()) setDelivery(inspection)
       }
     } catch (failure) {
       if (current()) {

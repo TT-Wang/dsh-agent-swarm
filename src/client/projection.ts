@@ -1,4 +1,4 @@
-import type { AutoStart, Budget, DraftPlan, Member, Snapshot, SwarmEvent, Task, Evidence } from '../types.ts'
+import type { AutoStart, Budget, DeliveryApplication, DeliveryInspection, DraftPlan, Member, Snapshot, SwarmEvent, Task, Evidence } from '../types.ts'
 import { TERMINAL_STATES, completionExempt, taskGraphIndex, selectAcceptedDelivery } from '../task-graph.ts'
 import { assignmentAllows, canOwnReview } from '../assignment.ts'
 
@@ -130,17 +130,20 @@ export function readAppliedDelivery(snapshot: Snapshot): AppliedDeliveryProjecti
 }
 
 /*
- * Transport admission. Every item of the owner's state the panel renders
- * enters through one reader in this section, which checks the fields its
- * renderers and the client's own merges dereference and returns undefined for
- * anything else: a mission snapshot (readSnapshot), a saved draft (readDraft),
- * a saved automatic request (readStart) and a budget (readBudget). The
- * monitor's reads and updates (monitor.ts) go through them, so a malformed or
- * version-skewed item is refused with a visible error before it reaches state.
- * The pane has no error boundary of its own: on Harness 0.2.1 the host wraps
- * the tab body in its slot error boundary, which retires the tab for every
- * conversation until a page reload, so admission is the panel's defence and a
- * render error is a bug.
+ * Transport admission. Every server item the panel renders, except a worker
+ * transcript's history page (read by `WorkerHistory`), enters through one
+ * reader in this section, which checks the fields its renderers and the
+ * client's own merges dereference and returns undefined for anything else: a
+ * mission snapshot (readSnapshot), a saved draft (readDraft), a saved
+ * automatic request (readStart), a budget (readBudget), and a delivery
+ * inspection or application (readDelivery, readDeliveryApplication). The
+ * monitor's reads and updates (monitor.ts) and every request reply
+ * (admitReply) go through them, so a malformed or version-skewed item is
+ * refused with a visible error before it reaches state, and no renderer
+ * re-checks a field. The pane has no error boundary of its own: on Harness
+ * 0.2.1 the host wraps the tab body in its slot error boundary, which retires
+ * the tab for every conversation until a page reload, so admission is the
+ * panel's defence and a render error is a bug.
  */
 const BUDGET_LIMITS = ['maxTokens', 'maxSteps', 'maxWorkers', 'maxDurationMs', 'maxTasks', 'maxExperiments'] as const
 /** The host-created project snapshot, on a mission or on a saved request. */
@@ -284,6 +287,31 @@ export function readStart(value: unknown): AutoStart | undefined {
     && optionalString(value.draftId) && optionalString(value.missionId) && optionalString(value.error)
     && (value.baseline === undefined || baseline(value.baseline))
     ? value as unknown as AutoStart : undefined
+}
+
+/** A delivery inspection as the delivery panel shows it. */
+export function readDelivery(value: unknown): DeliveryInspection | undefined {
+  return record(value) && typeof value.baselineCommit === 'string' && typeof value.resultCommit === 'string'
+    && strings(value.changedPaths) && typeof value.diff === 'string' && typeof value.truncated === 'boolean'
+    ? value as unknown as DeliveryInspection : undefined
+}
+
+/** A delivery application's outcome as the delivery panel shows it. */
+export function readDeliveryApplication(value: unknown): DeliveryApplication | undefined {
+  return record(value) && (value.status === 'applied' || value.status === 'conflicts')
+    && strings(value.changedPaths) && strings(value.conflicts)
+    ? value as unknown as DeliveryApplication : undefined
+}
+
+/**
+ * A request reply reaches the panel only through the reader of the item it
+ * carries under `key`: a reply that fails it is a request error, which the
+ * caller shows, never a value it renders.
+ */
+export function admitReply<T>(reply: unknown, key: string, read: (value: unknown) => T | undefined, item: string): T {
+  const value = record(reply) ? read(reply[key]) : undefined
+  if (value === undefined) throw new Error(`Invalid ${item} from host`)
+  return value
 }
 
 /** UI-only native tool metadata takes precedence; text JSON remains a compatibility path. */

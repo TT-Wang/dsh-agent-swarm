@@ -3,6 +3,7 @@ import { criterionId, type Budget, type DraftPlan, type PlanInput, type PlanMemb
 import type { ModelDirectory } from '@deepseek-ai/dsh-client-ui-model-selection/client'
 import type { Request } from './monitor.ts'
 import { useCopy } from './locale.tsx'
+import { admitReply, readDraft, readSnapshot } from './projection.ts'
 import { selectedOperation } from './selection.ts'
 
 const lines = (value: string) => value.split('\n')
@@ -92,10 +93,10 @@ export function DraftEditor({ sessionId, workspace, budget, draft, directory, re
     setBusy(action); setError('')
     await selectedOperation<{ draft?: DraftPlan; snapshot?: Snapshot }>(isSelected, async () => {
       if (action === 'save') {
-        return await request<{ draft: DraftPlan }>(saved ? 'update-draft' : 'create-draft', { sessionId, ...(saved ? { draftId: saved.id, revision: saved.revision } : {}), input: cleanPlan(input) })
+        return { draft: admitReply(await request<unknown>(saved ? 'update-draft' : 'create-draft', { sessionId, ...(saved ? { draftId: saved.id, revision: saved.revision } : {}), input: cleanPlan(input) }), 'draft', readDraft, 'draft') }
       } else if (saved) {
         if (action === 'launch') {
-          return await request<{ snapshot: Snapshot }>('launch-draft', { sessionId, draftId: saved.id, revision: saved.revision })
+          return { snapshot: admitReply(await request<unknown>('launch-draft', { sessionId, draftId: saved.id, revision: saved.revision }), 'snapshot', readSnapshot, 'mission') }
         } else await request('discard-draft', { sessionId, draftId: saved.id, revision: saved.revision })
       }
       return {}
@@ -114,7 +115,7 @@ export function DraftEditor({ sessionId, workspace, budget, draft, directory, re
     <div className="sw-row"><h2>{t('New mission')}</h2><span className="sw-chip">{t(dirty ? 'Unsaved changes' : 'Saved')}{saved ? ` · r${saved.revision}` : ''}</span></div>
     {error && <div className="sw-error" role="alert">{error}</div>}
     {saved?.error && <div className="sw-error">{saved.error}</div>}
-    {Array.isArray(saved?.advisories) && saved.advisories.length > 0 && <details className="sw-notice"><summary>{t('Plan preflight notes')}</summary><ul>{saved.advisories.filter(note => typeof note === 'string').slice(0, 20).map((note, index) => <li key={index}>{note}</li>)}</ul></details>}
+    {saved?.advisories !== undefined && saved.advisories.length > 0 && <details className="sw-notice"><summary>{t('Plan preflight notes')}</summary><ul>{saved.advisories.slice(0, 20).map((note, index) => <li key={index}>{note}</li>)}</ul></details>}
     {draft && saved && draft.revision !== saved.revision && dirty && <div className="sw-notice">This draft changed elsewhere. Save will check its revision; reopen it to load the latest version.</div>}
     <fieldset disabled={Boolean(busy) || !editable}>
       <label>{t('Title')}<input data-testid="draft-title" value={input.title} required onChange={event => update({ title: event.currentTarget.value })} /></label>

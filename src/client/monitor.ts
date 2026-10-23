@@ -106,8 +106,8 @@ export class SwarmMonitor {
 class InvalidSwarmStateError extends Error {}
 
 /**
- * The owner's state, as the initial read and a snapshot or delta update
- * receive it: every item the panel renders passes its
+ * The owner's state, as the initial read, a snapshot or delta update and the
+ * delivery panel's recheck receive it: every item the panel renders passes its
  * reader (projection.ts), so a malformed one refuses the whole state, the last
  * good view stays, and the error is shown instead of a render failure.
  */

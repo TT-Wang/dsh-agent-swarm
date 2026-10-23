@@ -7,7 +7,7 @@ import { SwarmMonitor } from './monitor.ts'
 import { SwarmBoard } from './SwarmBoard.tsx'
 import { DraftEditor } from './DraftEditor.tsx'
 import { useCopy } from './locale.tsx'
-import { completionBlocker, deliverableCommit } from './projection.ts'
+import { admitReply, completionBlocker, deliverableCommit, readSnapshot } from './projection.ts'
 import { selectedOperation } from './selection.ts'
 import { WorkerHistory } from './history.ts'
 import { WorkerTranscript } from './WorkerTranscript.tsx'
@@ -125,8 +125,8 @@ export function ActivityPanel({ sessions, modelDirectories, monitor, history, on
     const release = beginOperation(action)
     if (!release) return
     await selectedOperation(stillSelected,
-      () => monitor.request<{ snapshot: Snapshot }>('control', { sessionId: owner, missionId: snapshot.mission.id, action, reason: `User selected ${action} in the Agent Swarm monitor.` }), {
-        success: async result => { setLocalMission(result.snapshot); setStopArmed(false); await monitor.refresh() },
+      async () => admitReply(await monitor.request<unknown>('control', { sessionId: owner, missionId: snapshot.mission.id, action, reason: `User selected ${action} in the Agent Swarm monitor.` }), 'snapshot', readSnapshot, 'mission'), {
+        success: async mission => { setLocalMission(mission); setStopArmed(false); await monitor.refresh() },
         failure: failure => setError(failure instanceof Error ? failure.message : String(failure)),
         release,
       })
@@ -168,8 +168,8 @@ export function ActivityPanel({ sessions, modelDirectories, monitor, history, on
     const release = beginOperation(`cancel:${task.id}`)
     if (!release) return
     await selectedOperation(stillSelected,
-      () => monitor.request<{ snapshot: Snapshot }>('cancel', { sessionId: owner, missionId: snapshot.mission.id, taskId: task.id, reason: `User cancelled task ${task.id} in the Agent Swarm monitor.` }), {
-        success: async result => { setLocalMission(result.snapshot); await monitor.refresh() },
+      async () => admitReply(await monitor.request<unknown>('cancel', { sessionId: owner, missionId: snapshot.mission.id, taskId: task.id, reason: `User cancelled task ${task.id} in the Agent Swarm monitor.` }), 'snapshot', readSnapshot, 'mission'), {
+        success: async mission => { setLocalMission(mission); await monitor.refresh() },
         failure: failure => setError(failure instanceof Error ? failure.message : String(failure)),
         release,
       })
