@@ -131,7 +131,7 @@ Agent Swarm lives in the native right sidebar. The sidebar starts collapsed; sen
 
 For bundle installation, upgrades, startup recovery and configuration, see the [operations guide](docs/operations.md).
 
-The tests come in two tiers. In a fresh clone, `npm ci && npm test` runs the hermetic tier, which needs no Harness checkout: `package-lock.json` pins every package it uses, the 0.2.1-rc.2 Harness packages from npm included. The host tier and the other gates also need the built checkout, linked with `npm run link:dsh` after `npm ci`; see [development and verification](docs/operations.md#development-and-verification).
+The tests come in two tiers. In a fresh clone, `npm ci && npm test` runs the hermetic tier, which needs no Harness checkout: `package-lock.json` pins every package it uses, the 0.2.1-rc.2 Harness packages from npm included. The host tier and most other suites also need the built checkout, linked with `npm run link:dsh` after `npm ci`. `npm run verify` runs every suite of the gate manifest (the `gate` block of `package.json`) whose prerequisites the machine has, and records the others as skipped with the reason. The hosted CI runs it from a fresh clone on macOS, so CI covers only the suites that need no checkout, sandbox or browser; see [development and verification](docs/operations.md#development-and-verification).
 
 ## Scope and practical limits
 

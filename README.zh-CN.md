@@ -137,7 +137,7 @@ Agent Swarm 位于原生右侧栏，默认折叠。发送 `/agent-swarm` 加自�
 
 Bundle 安装、升级、启动恢复与配置详见[使用与运维指南](docs/operations.zh-CN.md)。
 
-测试分为两层。在全新克隆中运行 `npm ci && npm test` 即执行封闭层，不需要 Harness 检出：`package-lock.json` 锁定了它用到的每个包，包括来自 npm 的 0.2.1-rc.2 Harness 包。宿主层和其他检查还需要已构建的检出，在 `npm ci` 之后用 `npm run link:dsh` 链接；见[开发与验证](docs/operations.zh-CN.md#development-and-verification)。
+测试分为两层。在全新克隆中运行 `npm ci && npm test` 即执行封闭层，不需要 Harness 检出：`package-lock.json` 锁定了它用到的每个包，包括来自 npm 的 0.2.1-rc.2 Harness 包。宿主层和其他大多数套件还需要已构建的检出，在 `npm ci` 之后用 `npm run link:dsh` 链接。`npm run verify` 运行 gate 清单（`package.json` 的 `gate` 块）中前提条件在本机齐全的每个套件，其余套件记为跳过并注明原因。托管 CI 在 macOS 上从全新克隆运行它，因此 CI 只覆盖不需要检出、沙箱或浏览器的套件；见[开发与验证](docs/operations.zh-CN.md#development-and-verification)。
 
 ## 适用范围与实际边界
 

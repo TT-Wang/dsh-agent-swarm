@@ -234,33 +234,43 @@ npm ci
 npm test
 ```
 
-在任何机器上，它都按全新克隆的条件运行：移除 `DSH_HARNESS_ROOT` 和 `DSH_SOURCE`，并关闭对检出的查找，所以需要检出的测试会在这一层失败，它应属于宿主层。宿主层和其他检查需要位于发布提交的已构建 Harness 0.2.1-rc.2 检出。`npm ci` 之后设置 `DSH_HARNESS_ROOT` 并运行 `npm run link:dsh`（见[构建与安装](#build-and-install)），然后：
+在任何机器上，它都按全新克隆的条件运行：移除 `DSH_HARNESS_ROOT` 和 `DSH_SOURCE`，并关闭对检出的查找，所以需要检出的测试会在这一层失败，它应属于宿主层。宿主层和其他大多数套件需要位于发布提交的已构建 Harness 0.2.1-rc.2 检出。`npm ci` 之后设置 `DSH_HARNESS_ROOT` 并运行 `npm run link:dsh`（见[构建与安装](#build-and-install)），然后：
 
 ```sh
 npm run verify
 ```
 
-该命令执行类型检查、构建、行为测试、打包工件加载、真实 Loader 组合、CLI profile 安装、声明式 bundle 检查和两条浏览器工作流。
+`npm run verify` 运行 gate。它唯一的清单是 `package.json` 的 `gate` 块：在 `typecheck` 和 `test` 之后列出每个 `test:*` 脚本，以及它在 `npm ci` 安装的包之外还需要什么。前提条件共五种。`harness` 是已构建的检出，`sandbox` 是允许嵌套 `sandbox_apply` 的 macOS 沙箱，`browser` 是检出中的 Playwright 能启动的浏览器（`DSH_SMOKE_BROWSER`，默认 `chrome`）。这三种会实际探测。`provider`（真实的 DeepSeek key）和 `better-sidebar`（已安装的 Better Sidebar 0.18.0）需要显式选择：它们的套件会发起计费请求或依赖第三方安装，所以只有点名时才运行，例如 `npm run verify -- --with provider`。verify 按清单顺序运行前提条件齐全的每个套件，遇到第一个失败即停止。`DSH_HARNESS_ROOT` 或 `DSH_SOURCE` 指定的检出若不存在，会在任何套件运行前停止；之后各套件运行时，`DSH_HARNESS_ROOT` 被设为探测找到的检出。
+
+它逐个打印套件的结果：通过、失败、跳过（附缺少的前提条件及原因），或因前面的失败而未运行；并把同样的内容写成一份记录，`artifacts/gate/<commit>.json`（用 `--record <file>` 可写到别处）。记录包含 commit、工作树是否有未提交的修改、Harness 发布版本及其 commit、探测到的每个前提条件和每个套件。有套件失败时 verify 以 1 退出；跳过的套件不会让它失败。最后一行说明本次运行是否是一次完整的 gate：除了只因缺少需显式选择的前提条件而跳过的套件，其余每个套件都已通过。`node scripts/gate.mjs --plan` 只显示会运行什么以及原因，不运行任何套件。清单漏掉某个 `test:*` 脚本时，`tests/gate-manifest.test.mjs` 会失败。
+
+`node scripts/round.mjs gate --commit <sha>` 在一个干净的 worktree 中运行该 commit 自己的 gate，并把记录保存在 lab 中（`--lab`，默认 `~/.dsh/agent-swarm-lab`）。只有完整的 gate 才以 0 退出。`node scripts/round.mjs promote` 只在该记录列出的套件与该 commit 的清单完全一致、记录完整、且记录的正是该 commit 并无未提交修改时，才应用这个 commit。清单出现之前 round gate 写下的记录没有列出任何套件，会被拒绝。round gate 最后一次运行是在 2026-09-10；之后的各批次是依据保存在仓库之外的 gate 运行合并的（见[验证文档](validation.md)）。
+
+GitHub Actions 工作流（`.github/workflows/verify.yml`）在每次推送到 `main` 和每个 pull request 时，在 macOS runner 上不带任何 secret 地运行 `npm ci` 和 `npm run verify`。在那里它运行不需要其他前提条件的套件：类型检查、`npm test`、`test:packed`、`test:replay`、`test:oracle` 和 `test:load`；其余套件记为跳过，并上传记录。需要检出、沙箱或浏览器的套件只在具备这些条件的机器上运行。
 
 `npm ci` 在安装前会删除 `node_modules` 中的全部内容；如果 `node_modules` 是符号链接，它删除的是链接所指目录中的内容。若某个检出的 `node_modules` 链接到多个检出共用的链接集合（link farm），这会清空该链接集合，所有共用它的检出都受影响。因此请先删除链接本身（`rm node_modules`，末尾不加斜杠）：`npm ci` 随后安装到一个新目录，链接集合保持原样。
 
-| 命令 | 覆盖范围 |
-| --- | --- |
-| `npm test` | 构建和行为测试的封闭层：宿主层未列出的每个 `tests/*.test.mjs`。 |
-| `npm run test:faults` | 故障注入；每个场景须证明故障实际发生。 |
-| `npm run test:replay` | 基于持久日志的确定性回放。 |
-| `npm run test:oracle` | 全日志 oracle：回放场景和时钟化的故障场景必须留下已记录的事件、行和适配器调用轨迹（`scripts/replay/oracle/`）。 |
-| `npm run test:load` | 负载下的准入和调度。 |
-| `npm run test:isolation` | 仅宿主执行的沙箱和工作区隔离检查。 |
-| `npm run test:harness` | 真实 Harness Loader 组合。 |
-| `npm run test:pack` / `npm run test:packed` | 打包工件加载与声明行为。 |
-| `npm run test:profile` | 真实 CLI profile 安装与生命周期。 |
-| `npm run test:bundle` | 行为测试的宿主层（`tests/r17-profile.test.mjs`）：Bundle 元数据、两种挂载插入的空配置插件行、宿主组合，以及两种挂载在真实 profile 启动时的根目录规则和启动日志。 |
-| `npm run test:web` / `npm run test:command-web` | 侧栏和 `/agent-swarm` 浏览器工作流。 |
+| 命令 | 需要 | 覆盖范围 |
+| --- | --- | --- |
+| `npm run typecheck` | 无 | 两个 TypeScript 项目（`tsconfig.json`、`tsconfig.client.json`）。 |
+| `npm test` | 无 | 构建和行为测试的封闭层：宿主层未列出的每个 `tests/*.test.mjs`。 |
+| `npm run test:packed` | 无 | 在已构建的目录树上运行打包工件冒烟测试；`npm test` 也会运行它。 |
+| `npm run test:replay` | 无 | 基于持久日志的确定性回放。 |
+| `npm run test:oracle` | 无 | 全日志 oracle：回放场景和时钟化的故障场景必须留下已记录的事件、行和适配器调用轨迹（`scripts/replay/oracle/`）。 |
+| `npm run test:load` | 无 | 负载下的准入和调度。 |
+| `npm run test:faults` | `harness` | 故障注入；每个场景须证明故障实际发生。 |
+| `npm run test:bundle` | `harness` | 行为测试的宿主层（`tests/r17-profile.test.mjs`）：Bundle 元数据、两种挂载插入的空配置插件行、宿主组合，以及两种挂载在真实 profile 启动时的根目录规则和启动日志。 |
+| `npm run test:harness` | `harness`、`sandbox` | 真实 Harness Loader 组合。 |
+| `npm run test:pack` | `harness`、`sandbox` | 从干净检出打出的 tarball 加载打包工件。 |
+| `npm run test:profile` | `harness`、`sandbox` | 真实 CLI profile 安装与生命周期。 |
+| `npm run test:isolation` | `harness`、`sandbox` | 仅宿主执行的沙箱和工作区隔离检查。 |
+| `npm run test:web` / `test:command-web` / `test:validation-repair-web` | `harness`、`browser` | 侧栏和 `/agent-swarm` 浏览器工作流，以及无效计划的修复。 |
+| `npm run test:sidebar-service` | `better-sidebar`（需显式选择） | 已安装的 Better Sidebar 服务契约与 swarm 侧栏适配器。 |
+| `npm run test:deepseek` / `test:command-deepseek` | `harness`、`provider`（需显式选择） | 在真实 DeepSeek 供应商上运行一次 mission 和 `/agent-swarm` 命令；会计费。 |
 
 `src/`、`tests/` 或 `scripts/` 导入的包必须是精确版本的 devDependency；`src/` 导入的包还必须是 peer dependency。`tests/declared-dependencies.test.mjs` 检查这一点，并检查 `package-lock.json` 与 `package.json` 一致。
 
-这些测试使用临时 profile 和 Git 工作区，供应商回复由脚本提供。它们验证集成行为，不代表模型规划成功率。`npm run test:deepseek` 和 `npm run test:command-deepseek` 会发起真实供应商请求，可能产生费用，不包含在 `verify` 中。已完成的运行及其边界记录在[验证文档](validation.md)。
+这些测试使用临时 profile 和 Git 工作区，供应商回复由脚本提供。它们验证集成行为，不代表模型规划成功率。`npm run test:deepseek` 和 `npm run test:command-deepseek` 会发起真实供应商请求，可能产生费用，所以 `verify` 只在加上 `--with provider` 时运行它们。已完成的运行及其边界记录在[验证文档](validation.md)。
 
 真实 Loader 组合（`test:harness`、`test:pack`、故障套件的供应商层，以及走 DeepSeek API key 路由的 `test:deepseek`、`test:command-deepseek` 和 `scripts/check-cancel-freeze.mjs`）挂载当前宿主已构建的包；检出缺少某个包时，组合失败并给出该包的名字。启动后每个启用的行都必须处于激活状态：仍在等待某个服务的行会让启动失败，并指出它等待的服务。这些组合挂载以测试工作区为根的 `@deepseek-ai/dsh-fs-local` 和 `@deepseek-ai/dsh-working-directory`，`bash` 的工作目录由 working-directory 服务提供。DeepSeek 路由取自 `@deepseek-ai/dsh-llm-deepseek-api-key`。
 

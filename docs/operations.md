@@ -220,33 +220,43 @@ npm ci
 npm test
 ```
 
-It runs on every machine as that clone would: `DSH_HARNESS_ROOT` and `DSH_SOURCE` are removed and the search for a checkout is off, so a test that needs one fails there and belongs to the host tier. The host tier and the other gates need a built Harness 0.2.1-rc.2 checkout at the release commit. After `npm ci`, set `DSH_HARNESS_ROOT` and run `npm run link:dsh` (see [Build and install](#build-and-install)), then:
+It runs on every machine as that clone would: `DSH_HARNESS_ROOT` and `DSH_SOURCE` are removed and the search for a checkout is off, so a test that needs one fails there and belongs to the host tier. The host tier and most other suites need a built Harness 0.2.1-rc.2 checkout at the release commit. After `npm ci`, set `DSH_HARNESS_ROOT` and run `npm run link:dsh` (see [Build and install](#build-and-install)), then:
 
 ```sh
 npm run verify
 ```
 
-This runs typecheck, build, the behavioral suite, packaged-artifact loading, real Loader composition, CLI profile installation, the declarative bundle checks and both browser workflows.
+`npm run verify` runs the gate. Its one manifest is the `gate` block of `package.json`: every `test:*` script, after `typecheck` and `test`, with what it needs beyond the packages `npm ci` installs. There are five prerequisites. `harness` is the built checkout, `sandbox` is the macOS sandbox with a nested `sandbox_apply` permitted, and `browser` is a browser the checkout's Playwright launches (`DSH_SMOKE_BROWSER`, default `chrome`). These three are probed. `provider` (a live DeepSeek key) and `better-sidebar` (an installed Better Sidebar 0.18.0) are opt-in: their suites make billable requests or need a third-party install, so they run only when named, as in `npm run verify -- --with provider`. Verify runs every suite whose prerequisites are present, in the manifest's order, and stops at the first failure. A checkout that `DSH_HARNESS_ROOT` or `DSH_SOURCE` names but that does not exist stops it before any suite; the suites then run with `DSH_HARNESS_ROOT` set to the checkout the probe found.
+
+It prints each suite as passed, failed, skipped (with the prerequisite it lacked and why) or not run after a failure, and writes the same as a record, `artifacts/gate/<commit>.json` (`--record <file>` puts it elsewhere). The record holds the commit, whether the tree had uncommitted changes, the Harness release and commit, each prerequisite as found and each suite. Verify exits 1 when a suite failed; a skipped suite does not fail it. Its last line says whether the run was a complete gate: every suite passed except those skipped only for an opt-in prerequisite. `node scripts/gate.mjs --plan` shows what would run and why without running anything. `tests/gate-manifest.test.mjs` fails when a `test:*` script is missing from the manifest.
+
+`node scripts/round.mjs gate --commit <sha>` runs that commit's own gate in a clean worktree and keeps the record in the lab (`--lab`, default `~/.dsh/agent-swarm-lab`). It exits 0 only for a complete gate. `node scripts/round.mjs promote` applies the commit only when that record lists exactly the suites the commit's manifest lists, is complete, and is of that commit with no uncommitted changes. A record the round gate wrote before the manifest existed names no suites and is refused. The round gate last ran on 2026-09-10; later batches were merged on gate runs kept outside the repository (see [validation](validation.md)).
+
+The GitHub Actions workflow (`.github/workflows/verify.yml`) runs `npm ci` and `npm run verify` on a macOS runner with no secrets on every push to `main` and every pull request. There it runs the suites that need nothing more: typecheck, `npm test`, `test:packed`, `test:replay`, `test:oracle` and `test:load`. It records the others as skipped and uploads the record. The suites that need the checkout, the sandbox or a browser run only on a machine that has them.
 
 `npm ci` deletes everything in `node_modules` before it installs, and when `node_modules` is a symbolic link it deletes the contents of the directory the link points to. In a checkout whose `node_modules` links to a link farm that other checkouts share, that empties the farm for all of them. Remove the link itself first (`rm node_modules`, without a trailing slash): `npm ci` then installs into a new directory and leaves the farm as it was.
 
-| Command | Coverage |
-| --- | --- |
-| `npm test` | Build and the hermetic tier of the behavioral suite: every `tests/*.test.mjs` the host tier does not list. |
-| `npm run test:faults` | Fault injection; each scenario must establish that its fault fired. |
-| `npm run test:replay` | Deterministic replay over the durable log. |
-| `npm run test:oracle` | The full-log oracle: the replay scenario and the clocked fault scenarios must leave the recorded events, rows and adapter call trace (`scripts/replay/oracle/`). |
-| `npm run test:load` | Admission and scheduling under load. |
-| `npm run test:isolation` | Host-only sandbox and workspace confinement. |
-| `npm run test:harness` | Real Harness Loader composition. |
-| `npm run test:pack` / `npm run test:packed` | Packaged-artifact loading and declared behavior. |
-| `npm run test:profile` | Real CLI profile installation and lifecycle. |
-| `npm run test:bundle` | The host tier of the behavioral suite (`tests/r17-profile.test.mjs`): bundle metadata, the empty-config plugin row both mounts insert, host composition, and the root rule and start line on real profile boots of both mounts. |
-| `npm run test:web` / `npm run test:command-web` | Sidebar and `/agent-swarm` browser workflows. |
+| Command | Needs | Coverage |
+| --- | --- | --- |
+| `npm run typecheck` | nothing | Both TypeScript projects (`tsconfig.json`, `tsconfig.client.json`). |
+| `npm test` | nothing | Build and the hermetic tier of the behavioral suite: every `tests/*.test.mjs` the host tier does not list. |
+| `npm run test:packed` | nothing | The packed-artifact smoke on the built tree; `npm test` also runs it. |
+| `npm run test:replay` | nothing | Deterministic replay over the durable log. |
+| `npm run test:oracle` | nothing | The full-log oracle: the replay scenario and the clocked fault scenarios must leave the recorded events, rows and adapter call trace (`scripts/replay/oracle/`). |
+| `npm run test:load` | nothing | Admission and scheduling under load. |
+| `npm run test:faults` | `harness` | Fault injection; each scenario must establish that its fault fired. |
+| `npm run test:bundle` | `harness` | The host tier of the behavioral suite (`tests/r17-profile.test.mjs`): bundle metadata, the empty-config plugin row both mounts insert, host composition, and the root rule and start line on real profile boots of both mounts. |
+| `npm run test:harness` | `harness`, `sandbox` | Real Harness Loader composition. |
+| `npm run test:pack` | `harness`, `sandbox` | Packaged-artifact loading from a clean checkout's tarball. |
+| `npm run test:profile` | `harness`, `sandbox` | Real CLI profile installation and lifecycle. |
+| `npm run test:isolation` | `harness`, `sandbox` | Host-only sandbox and workspace confinement. |
+| `npm run test:web` / `test:command-web` / `test:validation-repair-web` | `harness`, `browser` | Sidebar and `/agent-swarm` browser workflows, and the repair of an invalid plan. |
+| `npm run test:sidebar-service` | `better-sidebar` (opt-in) | The installed Better Sidebar service contract with the swarm sidebar adapter. |
+| `npm run test:deepseek` / `test:command-deepseek` | `harness`, `provider` (opt-in) | A mission and the `/agent-swarm` command on the real DeepSeek provider; billable. |
 
 A package that `src/`, `tests/` or `scripts/` imports must be a devDependency at an exact version, and also a peer dependency when `src/` imports it; `tests/declared-dependencies.test.mjs` checks this and that `package-lock.json` matches `package.json`.
 
-These suites use temporary profiles and Git workspaces with scripted provider responses. They establish integration behavior, not model planning success rates. `npm run test:deepseek` and `npm run test:command-deepseek` make real provider requests, can incur charges and are excluded from `verify`. Completed runs and their limits are recorded in [validation](validation.md).
+These suites use temporary profiles and Git workspaces with scripted provider responses. They establish integration behavior, not model planning success rates. `npm run test:deepseek` and `npm run test:command-deepseek` make real provider requests and can incur charges, so `verify` runs them only with `--with provider`. Completed runs and their limits are recorded in [validation](validation.md).
 
 The real Loader compositions (`test:harness`, `test:pack`, the fault suite's provider tier, and `test:deepseek`, `test:command-deepseek` and `scripts/check-cancel-freeze.mjs` on the DeepSeek API-key route) mount the running host's built packages; a package the checkout lacks fails the composition with its name, and every enabled row must be active after boot: a row still waiting for a service fails the boot and names that service. They mount `@deepseek-ai/dsh-fs-local` and `@deepseek-ai/dsh-working-directory` rooted at the test workspace; the working-directory service gives `bash` its directory. The DeepSeek route comes from `@deepseek-ai/dsh-llm-deepseek-api-key`.
 

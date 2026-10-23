@@ -6,6 +6,8 @@ Current **0.7.0** working-tree checks and the historical **0.6.0** baseline are 
 | --- | --- |
 | `0.2.1-rc.2` (npm `latest` and `next`) | `687f282e8625c6b8d11ff58211a90524be2e4317` |
 
+Where entries say the owner runs a suite "in the round gate" or "in the gate" (the round-4 baselines of 2026-09-09), they describe the practice of that time. `scripts/round.mjs gate` last ran on 2026-09-10, and its own suite list never had `test:oracle`. The batches after it, up to batch A of 2026-10-24, were merged with a plain `git merge` on gate runs kept outside the repository, each with a suite list kept by hand. `test:isolation` was in none of them until the 0.1.x drop's gates of 2026-10-23, and `test:load` in none between 2026-09-24 and then. Since the gate manifest (2026-10-24), `npm run verify`, the round gate and CI run the suites one manifest lists, and each run records every suite as passed, failed, or skipped with the prerequisite it lacked; see [Reproduce](#reproduce).
+
 ## Self-review batch A: CORE-02, CORE-05, CORE-01, CORE-04, CORE-03, and CORE-06 from the live smoke (2026-10-24)
 
 **Head**: `1218e86`, where the final gates ran (the third gate run below), and this record's revision
@@ -3815,26 +3817,16 @@ npm ci
 npm test
 ```
 
-Everything else needs a built checkout of an exact revision in [compatibility.json](../compatibility.json). Set `DSH_HARNESS_ROOT` as described in the [README](../README.md), link the checkout over the installed packages, and run the gates:
+Everything else needs a built checkout of an exact revision in [compatibility.json](../compatibility.json). Set `DSH_HARNESS_ROOT` as described in the [README](../README.md), link the checkout over the installed packages, and run the gate:
 
 ```sh
 npm run link:dsh
-npm run typecheck
-npm test
-npm run test:bundle
-npm run test:faults
-npm run test:replay
-npm run test:load
-npm run test:harness
-npm run test:pack
-npm run test:packed
-npm run test:profile
-npm run test:web
-npm run test:command-web
-npm run test:validation-repair-web
+npm run verify
 ```
 
-Browser checks need the matching Harness Web build and Playwright browser environment. Set `DSH_WEB_SMOKE_ARTIFACTS` to retain separate evidence directories for different host versions. Test profiles and repositories are isolated. Running the large Harness suites and multiple browsers concurrently can increase load enough to exceed small fixture timeouts; run them sequentially when reproducing. Optional `test:deepseek` and `test:command-deepseek` scripts use real provider credentials and are separate, billable checks. All three browser smokes run through `runWebSmoke` in `scripts/web-smoke-browser.mjs` with one scripted model, `tests/fixtures/web-scripted-llm.mjs`. Without `DSH_WEB_SMOKE_ARTIFACTS`, evidence goes to `artifacts/<smoke>`: `artifacts/web` (formerly `artifacts/sidebar`), `artifacts/command-web` and `artifacts/validation-repair-web`. A `--serve-only` run writes `report.json` with `scenario: "serve-only"` and no checks: it is a served host, not a passed scenario.
+`npm run verify` runs, in order, every suite of the manifest in `package.json` (`gate`) whose prerequisites the machine has: `typecheck`, `npm test`, `test:packed`, `test:replay`, `test:oracle`, `test:load`, `test:faults`, `test:bundle`, `test:harness`, `test:pack`, `test:profile`, `test:isolation`, `test:web`, `test:command-web` and `test:validation-repair-web`. It records the others as skipped with the prerequisite they lacked in `artifacts/gate/<commit>.json`; `node scripts/gate.mjs --plan` lists them before a run. `test:sidebar-service` runs only with `--with better-sidebar`, and the real-provider smokes only with `--with provider`. [Development and verification](operations.md#development-and-verification) describes the prerequisites, the record and the round gate.
+
+Browser checks need the matching Harness Web build and Playwright browser environment. Set `DSH_WEB_SMOKE_ARTIFACTS` to retain separate evidence directories for different host versions. Test profiles and repositories are isolated. Running the large Harness suites and multiple browsers concurrently can increase load enough to exceed small fixture timeouts; run them sequentially when reproducing. The `test:deepseek` and `test:command-deepseek` scripts use real provider credentials and are billable, so `verify` runs them only with `--with provider`. All three browser smokes run through `runWebSmoke` in `scripts/web-smoke-browser.mjs` with one scripted model, `tests/fixtures/web-scripted-llm.mjs`. Without `DSH_WEB_SMOKE_ARTIFACTS`, evidence goes to `artifacts/<smoke>`: `artifacts/web` (formerly `artifacts/sidebar`), `artifacts/command-web` and `artifacts/validation-repair-web`. A `--serve-only` run writes `report.json` with `scenario: "serve-only"` and no checks: it is a served host, not a passed scenario.
 
 The behavioral tests import the built `lib/` output. `npm test` builds first; running a tier directly (`node scripts/test-tiers.mjs hermetic`, or `host`) needs `npm run build` first, otherwise it stops at `ERR_MODULE_NOT_FOUND .../lib/runtime.js`. A clean checkout with neither `npm ci` nor `npm run link:dsh` stops earlier at `tsc: command not found`. The hermetic tier runs as a fresh clone would on any machine: its runner removes `DSH_HARNESS_ROOT` and `DSH_SOURCE`, and `scripts/harness-target.mjs` searches for no checkout while it runs, so a test that needs one fails there until it is listed in the host tier. The two tiers bind the release in different ways: the hermetic tier by the lockfile's integrity hashes for the npm registry's tarballs, the host tier and the other gates by the checkout's commit, which `assertSupportedHarness` compares with `compatibility.json`.
 
