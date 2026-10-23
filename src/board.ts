@@ -24,7 +24,7 @@ import { assignmentAllows, authorIdsOf, canBorrowTask, canOwnReview, strandedRev
 import { memberPhaseOf } from './projection.ts'
 import { recoveryExit } from './check-results.ts'
 import { scopeKeysOverlap } from './scheduler.ts'
-import { TERMINAL_STATES, blockCauses, completionExempt, holdsOpenAttempt, missionSubject, openAttempt, pendingStopOwner, quiescencePending, selectAcceptedDelivery, stopPending, subjectsOfTasks, taskGraphIndex, taskSubject, terminal, uncoveredCriteria, type HeldTask, type TaskGraphIndex } from './task-graph.ts'
+import { TERMINAL_STATES, blockCauses, completionExempt, holdsOpenAttempt, judgeable, missionSubject, openAttempt, pendingStopOwner, quiescencePending, selectAcceptedDelivery, stopPending, subjectsOfTasks, taskGraphIndex, taskSubject, terminal, uncoveredCriteria, type HeldTask, type TaskGraphIndex } from './task-graph.ts'
 import { providerQuiescent, type AutoStart, type CheckResult, type Delivery, type Evidence, type Member, type Mission, type RuntimeConfig, type Task, type WorkerActivity } from './types.ts'
 
 /**
@@ -310,8 +310,17 @@ export function eligible(board: Board, task: Task, member: Member): boolean { re
  */
 export function stillChosen(board: Board, chosen: Task): Task | undefined {
   const fresh = board.tasks.find(task => task.id === chosen.id)
-  return fresh !== undefined && fresh.epoch === chosen.epoch && fresh.assigneeId === chosen.assigneeId
-    && fresh.plannedAssigneeId === chosen.plannedAssigneeId && fresh.assignmentMode === chosen.assignmentMode ? fresh : undefined
+  return fresh !== undefined && sameChoice(fresh, chosen) ? fresh : undefined
+}
+
+/**
+ * The row half of `stillChosen`: `fresh` is still the choice `chosen` was,
+ * its epoch and its assignment unchanged. An assignment asks it again on the
+ * row its commit reads (`SwarmRuntime.assign`, CORE-06).
+ */
+export function sameChoice(fresh: Task, chosen: Task): boolean {
+  return fresh.epoch === chosen.epoch && fresh.assigneeId === chosen.assigneeId
+    && fresh.plannedAssigneeId === chosen.plannedAssigneeId && fresh.assignmentMode === chosen.assignmentMode
 }
 
 /**
@@ -703,7 +712,13 @@ export function reviewNeed(board: Board, source: Task): ReviewNeed {
 export function reviewPathBlocker(board: Board, source: Task, need: ReviewNeed, stalled?: boolean): string | undefined {
   const { mission, tasks, members, records } = board
   const deferred = tasks.find(task => task.status === 'blocked' && task.reviewOf === source.id && task.verificationRecovery !== undefined && task.verificationRecovery.commit === source.artifact?.commit)
-  if (deferred !== undefined) return `review ${deferred.id} deferred its verdict on this artifact: ${recoveryExit(records.toolRuns(mission.id, { taskId: deferred.id }).filter(run => run.tool === 'swarm.host_verification').map(run => run.result as CheckResult))}`
+  if (deferred?.verificationRecovery !== undefined) {
+    // The exit is the deciding pass's, from exactly the rows the deferral named: never the review's
+    // newest rows, which a fenced attempt's late pass can follow (CORE-05 records every failed first pass).
+    const results = new Map(records.toolRuns(mission.id, { taskId: deferred.id }).map(run => [run.id, run.result as CheckResult]))
+    const decided = deferred.verificationRecovery.toolRunIds.flatMap(runId => { const result = results.get(runId); return result === undefined ? [] : [result] })
+    return `review ${deferred.id} deferred its verdict on this artifact: ${recoveryExit(decided)}`
+  }
   if (tasks.length >= mission.budget.maxTasks) return `the mission task budget is exhausted (${tasks.length}/${mission.budget.maxTasks} admitted tasks), so no verification task can be admitted: raise maxTasks with swarm_budget(budget, reason), or ${WITHDRAW_SOURCE}`
   const authors = [...authorIdsOf(source)]
   if (!members.some(member => memberPhaseOf(member) !== 'stopped' && canOwnReview(source, member.id))) return `no live member other than the author (${authors.join(', ') || 'unknown'}) can review this artifact independently: add an independent member with swarm_add_member(role, maxOutputTokens), or ${WITHDRAW_SOURCE}`
@@ -765,12 +780,15 @@ export function completionError(board: Board): string | undefined {
     try { selectAcceptedDelivery(tasks) }
     catch (error) { return error instanceof Error ? error.message : String(error) }
   }
-  // Evidence of explicitly cancelled work no longer supports an accepted result,
-  // and a claim a rework archived is history of a rejected commit that no
-  // verdict judges again; live disputes still block.
-  const dead = new Set(tasks.filter(task => task.status === 'cancelled').map(task => task.id))
-  const archived = new Set(tasks.flatMap(task => task.rejections?.flatMap(rejection => rejection.evidenceIds) ?? []))
-  const disputed = board.records.list('evidence', mission.id).filter(evidence => evidence.status === 'challenged' && !dead.has(evidence.taskId) && !archived.has(evidence.id))
+  // Only a dispute some verdict can still resolve holds completion: one of a
+  // claim a verdict can still judge (`judgeable`). A claim of cancelled work
+  // supports no result, and one a rework archived, a refuted one and a review's
+  // own claim are judged by no verdict again (a dispute recorded by an older
+  // build of one would otherwise hold the mission open forever).
+  const disputed = board.records.list('evidence', mission.id).filter(evidence => {
+    const owning = graph.byId.get(evidence.taskId)
+    return evidence.status === 'challenged' && owning !== undefined && judgeable(evidence, owning)
+  })
   if (disputed.length) return `Unresolved evidence challenges prevent completion: ${disputed.map(evidence => evidence.id).join(', ')}`
   return undefined
 }

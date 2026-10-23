@@ -173,7 +173,7 @@ test('a running review whose source comes to name no task gets one answer from e
   assert.equal(taskOf(f.runtime, review.id).assigneeId, f.author.id)
   // A deferred review's recovery reads its source the same way.
   const deferred = inject(f, source, { id: 'task_deferred_review', title: 'Deferred review', kind: 'verification', reviewOf: 'task_missing_source', covers: undefined, status: 'blocked',
-    verificationRecovery: { sourceTaskId: 'task_missing_source', commit: f.workers.artifact.commit, reason: 'deferred', at: f.clock.now() } })
+    verificationRecovery: { sourceTaskId: 'task_missing_source', commit: f.workers.artifact.commit, reason: 'deferred', at: f.clock.now(), toolRunIds: [] } })
   assert.throws(() => f.runtime.controlTask(f.owner, f.mission.id, deferred.id, 'resume', {}, 'retry the review'), error => error.code === 'review_artifact_changed',
     'its exact submitted artifact is gone')
 })

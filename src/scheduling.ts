@@ -12,7 +12,7 @@
  */
 import { id } from './store.ts'
 import { finishedAttempt, holdsOpenAttempt, openAttempt, pendingStopOwner, quiescencePending, subjectsOfTasks, taskSubject, terminal, TERMINAL_STATES, turnEnded, type HeldTask } from './task-graph.ts'
-import { asksHandle, eligible, isolationViolation, noticeSubjectsFor, overdueStop, passState, pastBound, startBlocker, stillDispatchable, takesWork, unschedulable, wedgeVerdict, type Board, type PassVerdict, type SchedulingPass } from './board.ts'
+import { asksHandle, eligible, isolationViolation, noticeSubjectsFor, overdueStop, passState, pastBound, sameChoice, startBlocker, stillDispatchable, takesWork, unschedulable, wedgeVerdict, type Board, type PassVerdict, type SchedulingPass } from './board.ts'
 import { factKey, guardTerminalNotice, silenceNotice, type Notice, type Notices, type SilentAttempt } from './notices.ts'
 import { AdmissionRefusedError } from './scheduler.ts'
 import { awaited, progressed, type Kernel } from './kernel.ts'
@@ -378,11 +378,16 @@ export class Scheduling {
             if (fresh === undefined) continue
             // The failed row, its events and the notice a block owes are one
             // transaction: a blocked row is never committed without its notice.
-            const failure = preparationFailure(fresh, error, this.k.now, this.k.config), failed = failure.task
-            this.k.commit(missionId, () => {
-              this.k.store.put('tasks', failed)
+            // CORE-06: the failure is recorded on the row that commit reads
+            // (`Kernel.revise`), while it is still the choice the sweep made.
+            let failure: PreparationFailure | undefined
+            this.k.revise(missionId, 'tasks', task.id, current => {
+              if (!sameChoice(current, fresh)) return false
+              failure = preparationFailure(current, error, this.k.now, this.k.config)
+              Object.assign(current, failure.task)
+            }, failed => {
               this.k.store.event(missionId, 'task/preparation-failed', 'runtime', { taskId: failed.id, epoch: failed.epoch, ...failed.preparationFailure, status: failed.status })
-              if (failure.notice === undefined) return
+              if (failure?.notice === undefined) return
               this.k.store.event(missionId, 'task/blocked', 'runtime', { taskId: failed.id, reason: failed.output })
               this.notices.notify(missionId, failure.notice.content, failure.notice.subjects, failure.notice.options)
             })
@@ -600,8 +605,9 @@ export class Scheduling {
    * escalates it by name from the queue-external tick.
    *
    * Durable progress is any durable row a reader can attribute to the attempt:
-   * its own `task/claimed` event, a recorded tool run, a durable event naming
-   * the task or the attempt, or a delivery naming them. A renewed lease is
+   * an event that names it, or its task from its claim on, at a named path
+   * (`ATTEMPT_PATHS` in src/store.ts; its own `task/claimed` event among them),
+   * a recorded tool run, or a delivery naming it or its task. A renewed lease is
    * deliberately NOT progress (the renewal path says so itself: "liveness
    * bookkeeping, not a new progress timestamp"), so a lease that stays alive
    * while nothing is recorded cannot mask the silence.
@@ -622,7 +628,9 @@ export class Scheduling {
    *    is the same queue-external tick that names a wedged pass, so a pass that
    *    cannot run its own recovery sweep cannot hide the attempt.
    *  - the notice dedup: the key is `attempt-silent:<attemptId>:<lastDurableAt>`,
-   *    so one silence escalates once and a recording re-arms the clock.
+   *    so one silence escalates once and a recording re-arms the clock. The
+   *    basis is read from whole tables, never the event window, so it only
+   *    moves forward and an unchanged silence keeps its key (CORE-03).
    * ----------------------------------------------------------------------- */
 
   /**
@@ -679,33 +687,25 @@ export class Scheduling {
   }
 
   /**
-   * R16-D: the newest durable row a reader can attribute to one attempt. The
-   * attempt's own `task/claimed` event is the floor, so a dispatch that recorded
-   * nothing else measures its silence from the dispatch itself.
+   * R16-D, CORE-03: the newest durable row a reader can attribute to one
+   * attempt, read from whole tables and never from the presentation event
+   * window: the newest event naming it (`SwarmStore.attemptEventAt`), its
+   * recorded tool runs, and the deliveries naming it or its task. Its
+   * assignment delivery, written in the commit that claims it and never
+   * deleted, is the floor, so a dispatch that recorded nothing else measures
+   * its silence from the dispatch. Each term is a maximum over rows that are
+   * never deleted and whose instants never change, so the basis only moves
+   * forward. The claim's sequence bounds the attempt's lifetime in the event
+   * term only: a delivery naming the task counts whichever attempt it was
+   * written under, so after the clock steps back an earlier attempt's delivery
+   * can raise the basis. That can delay an escalation, never invent one.
    */
   private lastDurableAt(missionId: string, task: Task, attempt: Attempt): number {
-    let latest = 0
-    for (const event of this.k.store.events(missionId, this.k.config.maxEvents)) {
-      if (latest >= event.createdAt) continue
-      if (event.type === 'task/claimed') {
-        if (this.identityIn(event.data, task.id, attempt.id)) latest = event.createdAt
-        continue
-      }
-      if (this.identityIn(event.data, task.id, attempt.id)) latest = Math.max(latest, event.createdAt)
-    }
+    let latest = this.k.store.attemptEventAt(missionId, task.id, attempt.id) ?? 0
     for (const run of this.k.store.toolRuns(missionId, { attemptId: attempt.id })) latest = Math.max(latest, run.createdAt)
     for (const delivery of this.k.store.list('deliveries', missionId)) {
       if (delivery.attemptId === attempt.id || delivery.taskId === task.id) latest = Math.max(latest, delivery.createdAt)
     }
     return latest
-  }
-
-  /** Whether a durable payload names this task or this attempt anywhere in its (bounded) object tree. */
-  private identityIn(data: unknown, taskId: string, attemptId: string, depth = 0): boolean {
-    if (depth > 3) return false
-    if (typeof data === 'string') return data === taskId || data === attemptId
-    if (Array.isArray(data)) return data.some(item => this.identityIn(item, taskId, attemptId, depth + 1))
-    if (data !== null && typeof data === 'object') return Object.values(data as Record<string, unknown>).some(item => this.identityIn(item, taskId, attemptId, depth + 1))
-    return false
   }
 }

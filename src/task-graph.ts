@@ -6,7 +6,7 @@
  * where it enters (`SwarmRuntime.task`, the admission graph check), never here.
  */
 import { canOwnReview } from './assignment.ts'
-import { criterionId, type Attempt, type EvidenceStatus, type FinishedAttempt, type Mission, type Task } from './types.ts'
+import { criterionId, type Attempt, type Evidence, type EvidenceStatus, type FinishedAttempt, type Mission, type Task, type TaskRejection, type ToolRun } from './types.ts'
 
 const oldest = (tasks: readonly Task[]): Task | undefined => [...tasks].sort((a, b) => a.createdAt - b.createdAt || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))[0]
 
@@ -45,6 +45,28 @@ export function taskGraphIndex(tasks: readonly Task[]) {
    * repair and is neither resumed, amended nor re-pended by a host restart.
    */
   const liveReplacement = (id: string): Task | undefined => replacementDescendants(id).find(task => task.status !== 'cancelled')
+  /**
+   * The task that carries `id`'s obligation now: `id` itself while no
+   * replacement of it is live (`liveReplacement`), otherwise the carrier of
+   * that replacement, recursively. Owner task control acts only on a carrier
+   * (it refuses any other, `task_replaced`), so this is the task a decision
+   * about `id`'s work is made on: a rejected repair of `id` that a pending
+   * repair replaced in turn is carried by that pending repair. Unlike
+   * `lineage`, it never ends on a withdrawn repair while the task that repair
+   * replaced can still be resumed. A cancelled carrier is only ever `id`
+   * itself, with no live replacement. Undefined for an id outside the index.
+   */
+  const carrier = (id: string): Task | undefined => {
+    const seen = new Set<string>()
+    let current = byId.get(id)
+    while (current !== undefined && !seen.has(current.id)) {
+      seen.add(current.id)
+      const next = liveReplacement(current.id)
+      if (next === undefined) return current
+      current = next
+    }
+    return current
+  }
   /**
    * `id` and every task it replaces, transitively: the one backward walk over
    * `replaces`, both parents of a `replaces: [a, b]` repair included, in
@@ -227,7 +249,7 @@ export function taskGraphIndex(tasks: readonly Task[]) {
     })
   }
   return { byId, lineage, effective, identities, dependencyMet, dependenciesMet, danglingReference, effectiveDependencies, unfinishedDependencies,
-    reviewSource, covers, replacementDescendants, liveReplacement, replacedLineage, criteriaOf, checklist }
+    reviewSource, covers, replacementDescendants, liveReplacement, carrier, replacedLineage, criteriaOf, checklist }
 }
 
 /** Each mission criterion whose id `covered` lacks, as the id and its quoted text (`c2 "text"`), in mission order. */
@@ -381,6 +403,16 @@ export function openAttempt(tasks: readonly Task[], memberId: string): HeldTask 
 }
 
 /**
+ * The member that answers for `task`: its attempt's owner, else its assignee.
+ * A member escalates about a task by its `taskId` only when it answers for it
+ * (`escalate`), so the refusal of a dispute names the `taskId` exit to that
+ * member alone and asks any other to name the task in the escalation's body.
+ */
+export function taskOwnerId(task: Pick<Task, 'attempt' | 'assigneeId'>): string | undefined {
+  return task.attempt?.ownerId ?? task.assigneeId
+}
+
+/**
  * W6: the owner of an open attempt ended its turn on it (`Attempts.onIdle`),
  * the one question of the idle close-out: the dispatch sweep closes out such
  * an attempt (it nudges, then checkpoints and re-pends with a coded terminal),
@@ -430,13 +462,99 @@ export function pendingStopOwner(tasks: readonly Task[], memberId: string): bool
 export type BlockCause = 'task-ceiling' | 'preparation-failed' | 'review-deferred' | 'needs-replacement' | 'refuted' | 'recovery-exhausted'
 
 /**
+ * The rejection a rework archived `evidenceId` with, or undefined while it is
+ * a claim of the task's current attempt generation. On a source it is the
+ * rejection that refuted the claim; on a review row a rework re-opened, the
+ * rejecting verdict whose round its reviewer published the claim in.
+ */
+export function archivingRejection(task: Pick<Task, 'rejections'>, evidenceId: string): TaskRejection | undefined {
+  return task.rejections?.find(rejection => rejection.evidenceIds.includes(evidenceId))
+}
+
+/**
  * The claims of the task's current attempt generation. A rework archives the
  * claims its rejection refuted in `rejections`: they stay refuted, but they no
  * longer block the task and no later submission or verdict touches them.
  */
 export function currentEvidenceIds(task: Pick<Task, 'evidenceIds' | 'rejections'>): string[] {
-  const archived = new Set(task.rejections?.flatMap(rejection => rejection.evidenceIds))
-  return (task.evidenceIds ?? []).filter(evidenceId => !archived.has(evidenceId))
+  return (task.evidenceIds ?? []).filter(evidenceId => archivingRejection(task, evidenceId) === undefined)
+}
+
+/**
+ * Why no verdict can judge a claim any more (`unjudgeable`):
+ *  - `archived`: a rework archived it with the rejection that closed its round;
+ *  - `cancelled`: its task is cancelled, so it supports no result;
+ *  - `superseded`: a claim that supersedes it (`by`) refuted it when an
+ *    acceptance verified that claim, or a claim superseding `by` in turn (an
+ *    acceptance refutes a chain link by link, so `by` may itself be refuted);
+ *  - `refuted`: an independent rejection of its task refuted it;
+ *  - `review-evidence`: a review's own claim, the evidence for that review's
+ *    verdict. A verdict judges the claims of the work it reviews (`verify`)
+ *    and nothing reviews a review, so no verdict ever judges this one. It is
+ *    asked last: such a claim is otherwise current and standing.
+ */
+export type Unjudgeable =
+  | { readonly kind: 'archived'; readonly rejection: TaskRejection }
+  | { readonly kind: 'cancelled' }
+  | { readonly kind: 'superseded'; readonly by: string }
+  | { readonly kind: 'refuted' }
+  | { readonly kind: 'review-evidence' }
+
+/**
+ * Why no verdict can still judge `evidence`, a claim of `owning`, or undefined
+ * when one can: the claim is current (no rework archived it), it is not
+ * refuted (by a rejection or by supersession), its task is not cancelled, and
+ * its task is work a verdict judges, not a review. The one rule for "a claim a
+ * verdict can still judge": a challenge disputes only such a claim (a dispute
+ * of any other could never be resolved), a verdict judges only such claims of
+ * its source, a submission pins only those to its artifact, and only an open
+ * dispute of one holds completion.
+ */
+export function unjudgeable(evidence: Pick<Evidence, 'id' | 'status' | 'refutedBy'>, owning: Pick<Task, 'status' | 'kind' | 'rejections'>): Unjudgeable | undefined {
+  const rejection = archivingRejection(owning, evidence.id)
+  if (rejection !== undefined) return { kind: 'archived', rejection }
+  if (owning.status === 'cancelled') return { kind: 'cancelled' }
+  if (evidence.status === 'refuted') return evidence.refutedBy === undefined ? { kind: 'refuted' } : { kind: 'superseded', by: evidence.refutedBy }
+  if (owning.kind === 'verification') return { kind: 'review-evidence' }
+  return undefined
+}
+
+/** A verdict can still judge `evidence`, a claim of `owning` (`unjudgeable`). */
+export function judgeable(evidence: Pick<Evidence, 'id' | 'status' | 'refutedBy'>, owning: Pick<Task, 'status' | 'kind' | 'rejections'>): boolean {
+  return unjudgeable(evidence, owning) === undefined
+}
+
+/** The claims of `task` a verdict can still judge (`judgeable`), in publication order. */
+export function judgeableClaims(task: Pick<Task, 'status' | 'kind' | 'rejections' | 'evidenceIds'>, evidenceOf: (evidenceId: string) => Evidence | undefined): Evidence[] {
+  return currentEvidenceIds(task).flatMap(evidenceId => {
+    const evidence = evidenceOf(evidenceId)
+    return evidence !== undefined && judgeable(evidence, task) ? [evidence] : []
+  })
+}
+
+/**
+ * The review evidence of attempt `attemptId` of `review`: the claims its
+ * reviewer published with `swarm_publish` on that attempt that still stand,
+ * in publication order. A review's claim stands while it is current (no
+ * rework archived it) and its review is not cancelled: no verdict judges a
+ * review's own claim (`unjudgeable` answers `review-evidence`), so nothing
+ * refutes it. Publication admitted only runs of the publishing attempt
+ * (`validateRuns`, src/runtime.ts), so the runs a claim cites name its attempt.
+ *
+ * An acceptance of a source that declares no host checks is the reviewer's
+ * judgement, and these claims are what it rests on: `verify` refuses one
+ * with none ([review_evidence_required]) and records their ids as its
+ * `review-evidence` basis (`AcceptanceBasis`). A swarm_* call is never a
+ * recorded run, so a reading through `swarm_observe` backs no claim: the
+ * review checkout is the artifact, and inspecting it there is recorded.
+ */
+export function reviewEvidence(review: Pick<Task, 'status' | 'kind' | 'rejections' | 'evidenceIds'>, attemptId: string,
+  evidenceOf: (evidenceId: string) => Evidence | undefined, runOf: (runId: string) => Pick<ToolRun, 'attemptId'> | undefined): Evidence[] {
+  return currentEvidenceIds(review).flatMap(evidenceId => {
+    const evidence = evidenceOf(evidenceId)
+    return evidence !== undefined && unjudgeable(evidence, review)?.kind === 'review-evidence'
+      && evidence.toolRunIds.length > 0 && evidence.toolRunIds.every(runId => runOf(runId)?.attemptId === attemptId) ? [evidence] : []
+  })
 }
 
 /**

@@ -249,6 +249,10 @@ test('a claim already refuted is neither verified again nor refuted twice when i
   const verifiedOf = id => f.events('evidence/verified').filter(event => event.data.evidenceId === id).length
   const verdictsOf = id => f.events('evidence/verdict').filter(event => event.data.evidenceId === id).length
   const before = { verified: verifiedOf(first.id), refuted: f.refutations(first.id).length, verdicts: verdictsOf(first.id) }
+  // F3-B at the first verdict too: the acceptance resolves supersession before
+  // it verifies anything, so the predecessor is refuted once and never verified.
+  assert.deepEqual(before, { verified: 0, refuted: 1, verdicts: 0 })
+  assertBoardIsConsistent(f, 'after the first acceptance')
 
   // Dissent on the surviving claim returns the source for a second verdict.
   f.runtime.challenge(f.owner, f.mission.id, { evidenceId: revised.id, reason: 'A counterexample questions the revised claim', toolRunIds: [] })
@@ -262,4 +266,74 @@ test('a claim already refuted is neither verified again nor refuted twice when i
   assert.equal(f.refutations(first.id).length, before.refuted, 'nor refute it a second time')
   assert.equal(verdictsOf(first.id), before.verdicts, 'nor record a verdict row for it')
   assert.ok(f.events('evidence/verified').some(event => event.data.evidenceId === revised.id && event.data.verificationTaskId === second.id), 'the live claim is verified by the second verdict')
+})
+
+test('a chain of claims one acceptance supersedes is refuted link by link, and only its head is verified', async t => {
+  const f = await fixture(t)
+  const source = f.proposeSource('Implement with two revisions')
+  const claimed = await f.runtime.claim(f.actor(f.author), f.mission.id, source.id)
+  const first = await f.publishEvidence(claimed, 'The first attempt satisfies the claim')
+  const second = await f.publishEvidence(claimed, 'The second attempt satisfies the claim', 'supported', [first.id])
+  const third = await f.publishEvidence(claimed, 'The third attempt satisfies the claim', 'supported', [second.id])
+  await f.runtime.submit(f.actor(f.author), f.mission.id, { taskId: source.id, attemptId: claimed.attempt.id, output: 'candidate' })
+  const review = f.proposeReview(source)
+  const claimedReview = await f.runtime.claim(f.actor(f.reviewer), f.mission.id, review.id)
+  await f.runtime.verify(f.actor(f.reviewer), f.mission.id, { taskId: review.id, attemptId: claimedReview.attempt.id, verdict: 'accept', reason: 'Checks pass' })
+  const verdictEvents = f.runtime.store.events(f.mission.id, 500).filter(event => ['evidence/verified', 'evidence/refuted'].includes(event.type))
+  assert.deepEqual(verdictEvents.map(event => [event.type, event.data.evidenceId, event.data.refutedBy, event.data.reason]), [
+    ['evidence/verified', third.id, undefined, undefined],
+    ['evidence/refuted', second.id, third.id, `Superseded by verified evidence ${third.id}`],
+    ['evidence/refuted', first.id, second.id, `Superseded by evidence ${second.id}, itself superseded by verified evidence ${third.id}`],
+  ], 'the head is verified, then each claim it supersedes is refuted by the claim naming it, once')
+  const row = claim => f.runtime.store.get('evidence', claim.id)
+  assert.deepEqual([first, second, third].map(claim => [row(claim).status, row(claim).refutedBy]), [['refuted', second.id], ['refuted', third.id], ['verified', undefined]])
+  assertBoardIsConsistent(f, 'after the chain was resolved')
+  // A challenge of a link names the claim that refuted it, which a verdict
+  // never verified for every link but the last, and moves the dispute to the
+  // claim the acceptance did verify.
+  const refusal = claim => {
+    try { f.runtime.challenge(f.owner, f.mission.id, { evidenceId: claim.id, reason: 'Dispute a superseded link', toolRunIds: [] }) } catch (error) { return error }
+    assert.fail(`a challenge of ${claim.id} is refused`)
+  }
+  for (const [link, by] of [[first, second], [second, third]]) {
+    const { code, message } = refusal(link)
+    assert.equal(code, 'evidence_not_judgeable')
+    assert.ok(message.startsWith(`[evidence_not_judgeable] Evidence ${link.id} is refuted and superseded by evidence ${by.id}, so no verdict can judge it again`), message)
+    assert.ok(!message.includes('verified'), `the refusal claims no verification of ${by.id}: ${message}`)
+    assert.ok(message.endsWith(`a claim of task ${source.id} a verdict can still judge instead: ${third.id}.`), message)
+  }
+})
+
+test('an inconclusive claim supersedes nothing: the claim it names is verified with it', async t => {
+  const f = await fixture(t)
+  const source = f.proposeSource('Implement with an inconclusive revision')
+  const claimed = await f.runtime.claim(f.actor(f.author), f.mission.id, source.id)
+  const first = await f.publishEvidence(claimed, 'The first attempt satisfies the claim')
+  const unsure = await f.publishEvidence(claimed, 'The revision may not hold on every platform', 'inconclusive', [first.id])
+  await f.runtime.submit(f.actor(f.author), f.mission.id, { taskId: source.id, attemptId: claimed.attempt.id, output: 'candidate' })
+  const review = f.proposeReview(source)
+  const claimedReview = await f.runtime.claim(f.actor(f.reviewer), f.mission.id, review.id)
+  await f.runtime.verify(f.actor(f.reviewer), f.mission.id, { taskId: review.id, attemptId: claimedReview.attempt.id, verdict: 'accept', reason: 'Checks pass' })
+  const row = claim => f.runtime.store.get('evidence', claim.id)
+  assert.deepEqual([row(first).status, row(unsure).status], ['verified', 'unverified'], 'an inconclusive claim is never verified, so it refutes nothing')
+  assert.deepEqual(f.refutations(first.id), [])
+  assertBoardIsConsistent(f, 'after the inconclusive revision')
+})
+
+test('an inconclusive link passes no refutation on: a claim superseded only by an inconclusive claim is verified, and the inconclusive one is refuted by its own superseder', async t => {
+  const f = await fixture(t)
+  const source = f.proposeSource('Implement with an inconclusive link')
+  const claimed = await f.runtime.claim(f.actor(f.author), f.mission.id, source.id)
+  const first = await f.publishEvidence(claimed, 'The first attempt satisfies the claim')
+  const unsure = await f.publishEvidence(claimed, 'The revision may not hold on every platform', 'inconclusive', [first.id])
+  const settled = await f.publishEvidence(claimed, 'The final revision holds on every platform', 'supported', [unsure.id])
+  await f.runtime.submit(f.actor(f.author), f.mission.id, { taskId: source.id, attemptId: claimed.attempt.id, output: 'candidate' })
+  const review = f.proposeReview(source)
+  const claimedReview = await f.runtime.claim(f.actor(f.reviewer), f.mission.id, review.id)
+  await f.runtime.verify(f.actor(f.reviewer), f.mission.id, { taskId: review.id, attemptId: claimedReview.attempt.id, verdict: 'accept', reason: 'Checks pass' })
+  const row = claim => f.runtime.store.get('evidence', claim.id)
+  assert.deepEqual([first, unsure, settled].map(claim => [row(claim).status, row(claim).refutedBy]), [['verified', undefined], ['refuted', settled.id], ['verified', undefined]])
+  assert.deepEqual(f.refutations(first.id), [], 'the verified claim is never refuted by the chain it heads')
+  assert.equal(f.refutations(unsure.id).length, 1)
+  assertBoardIsConsistent(f, 'after the chain with an inconclusive link')
 })

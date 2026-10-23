@@ -3,12 +3,14 @@
  * complete mission open (`completionError`, src/board.ts).
  *
  * Through the tools this branch is reached only by a claim of completion-exempt
- * work. A challenge re-opens accepted work (`submitted`, so the unfinished-work
- * branch answers first), and the verdict that accepts it again verifies every
- * current claim, so the dispute ends with it; a claim of cancelled work, or one a
- * rework archived, never blocks. A blocked optional experiment is the work whose
- * claims outlive it: its block holds nothing open, and a challenge of its claim
- * changes no task status.
+ * work. A challenge disputes only a claim a verdict can still judge
+ * (`unjudgeable`, src/task-graph.ts) and re-opens accepted work (`submitted`, so
+ * the unfinished-work branch answers first), and the verdict that accepts it
+ * again judges every such claim, so the dispute ends with it; a dispute of a
+ * claim no verdict can judge (of cancelled work, archived by a rework, refuted,
+ * or a review's own) never blocks (tests/claim-judgeability.test.mjs). A
+ * blocked optional experiment is the work whose claims outlive it: its block
+ * holds nothing open, and a challenge of its claim changes no task status.
  */
 import test from 'node:test'
 import assert from 'node:assert/strict'

@@ -388,7 +388,7 @@ test('a version-2 state file upgrades in place and gains the append-only board',
   const upgraded = new SwarmRuntime(f.config, newWorkers())
   t.after(() => upgraded.dispose())
   const schema = new DatabaseSync(f.config.statePath)
-  assert.equal(schema.prepare('PRAGMA user_version').get().user_version, 7, 'the store records the new schema version')
+  assert.equal(schema.prepare('PRAGMA user_version').get().user_version, 8, 'the store records the new schema version')
   assert.ok(schema.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='posts'").get(), 'the board table is created on open')
   schema.close()
 

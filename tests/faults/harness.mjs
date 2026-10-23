@@ -334,10 +334,31 @@ export const makeWorkspaces = (dir, overrides) => new Workspaces(workspaceOption
  * A partial runtime for a unit test that builds one component (Scheduling,
  * Attempts, RefusalRegistry, Notices, WorkspaceAdmission, OwnerReplyGuard, the
  * tool layer) without a store. It always carries `now()` and a config holding
- * the empty grant snapshot, the runtime dependencies every component reads, so
- * they are added here once; `overrides` supplies the rest and wins.
+ * the empty grant snapshot, the runtime dependencies every component reads, and
+ * `revise` over the store and commit the overrides supply, the one write a
+ * component makes after an await; they are added here once; `overrides`
+ * supplies the rest and wins.
  */
-export const makeRuntimeStub = (overrides = {}) => ({ now: () => Date.now(), config: { grants: NO_GRANTS }, ...overrides })
+export const makeRuntimeStub = (overrides = {}) => ({ now: () => Date.now(), config: { grants: NO_GRANTS }, revise: stubRevise, ...overrides })
+
+/**
+ * `Kernel.revise` (CORE-06) over a stub's own `store` and `commit`, the
+ * runtime's shape without its transaction: inside the commit, the row as the
+ * store holds it is handed to `change` and, unless the transition was moot,
+ * written with its effects. A stub has no transaction to abandon, so a moot
+ * transition still runs the stub's commit, which writes nothing.
+ */
+function stubRevise(missionId, table, rowId, change, effects) {
+  let written
+  this.commit(missionId, () => {
+    const current = this.store.get(table, rowId)
+    if (current === undefined || change(current) === false) return
+    this.store.put(table, current)
+    effects?.(current)
+    written = current
+  })
+  return written
+}
 
 /**
  * Runtime + mission + two members + a propose helper. The runtime, store,

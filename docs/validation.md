@@ -6,6 +6,497 @@ Current **0.7.0** working-tree checks and the historical **0.6.0** baseline are 
 | --- | --- |
 | `0.2.1-rc.2` (npm `latest` and `next`) | `687f282e8625c6b8d11ff58211a90524be2e4317` |
 
+## Self-review batch A: CORE-02, CORE-05, CORE-01, CORE-04, CORE-03, and CORE-06 from the live smoke (2026-10-24)
+
+**Head**: `1218e86`, where the final gates ran (the third gate run below), and this record's revision
+(documentation only), branch `swarm/batch-a-core` on `dac6704` (main), not merged. Batch A (verdicts, evidence basis,
+durable identities) of the follow-ups from the owner's 2026-10-22 self-review, in the order its verification set:
+CORE-02, CORE-05, CORE-01, CORE-04 and CORE-03 (`09d6c5d` to `6dc97f6`), each followed by a correctness review (the
+medium findings of the CORE-05 and CORE-03 reviews were repaired within their slices, `498b58a` and `630f015`); one
+review repair round over the batch (`e13f804` to `17fbd1c`); the first version of this record (`268a2c5`); CORE-06
+(`1218e86`), the fix for what the owner's live smokes found at `268a2c5`; and this amendment. The verification read
+`a28b116`; every anchor was re-located on `dac6704`, after the 0.1.x drop and the W8 route rule. `src` against
+`dac6704` at `17fbd1c`: +713 −286, net +427. By slice: CORE-02 +200 −44 (net +156), CORE-05 +109 −96 (+13), CORE-01
++95 −23 (+72), CORE-04 +141 −66 (+75), CORE-03 +102 −34 (+68), and the repair round +136 −93 (+43). CORE-06 adds
++367 −209 (+158), so `src` against `dac6704` at `1218e86` is +1076 −491, net +585.
+
+**What each slice leaves at the head.**
+
+- **CORE-02: one rule for a claim a verdict can still judge** (`09d6c5d`, `3584ea0`; documents `0736ab3`; repair
+  `b32a413`, `59e4c90`, `17fbd1c`). `unjudgeable(evidence, owningTask)` (`src/task-graph.ts`) says why no verdict can
+  judge a claim any more: `archived` (a rework archived it), `cancelled` (its task is), `superseded` or `refuted`
+  (refuted by a claim that superseded it, or by a rejection), and, asked last, `review-evidence` (a review's own claim:
+  `verify` judges the reviewed source's claims, and nothing reviews a review). `judgeable` and `judgeableClaims` build
+  on it, and every reader that decided this on its own now reads it: the verdict loop, submission's live-claim test and
+  artifact pinning, `completionError`'s disputed set (challenged and judgeable) and `challenge()`.
+  - `challenge()` refuses any other claim with one coded conflict refusal, `[evidence_not_judgeable]`, which replaces
+    `[evidence_archived]` and records nothing. Before, it set every claim a rework had not archived to challenged and
+    fenced the task's dependents and reviews: (a) on a claim a rejection refuted it cancelled the rejecting review, so
+    the owner's in-place resume was refused with `task_needs_replacement` and the false "invalidated after
+    submission"; (b1) on a claim superseded within its task it re-opened the accepted source, blocked its running
+    dependent and cancelled the accepting review; (b2) on a claim of a replaced, cancelled task it fenced a running
+    dependent of the original while the accepted repair stood; and on a review's own claim it turned an accepted
+    review back into a submission no verdict judges, or left a dispute nothing resolves, so the mission could not
+    complete.
+  - The refusal names the reason and the exit the caller has, and the runtime accepts that exit. The dispute moves to
+    the work the claim was about (the superseding claim's task; the reviewed source, for a review's claim; else the
+    claim's own task), and to the task that carries that work's obligation now: `graph.carrier(id)` is the task itself
+    while no replacement of it is live, else its live replacement's carrier, the one task owner control acts on. For a
+    rejection the owner's exit is the one control takes: `swarm_control` resume (with a raised `maxRework` once the
+    reworks are spent), or a replacement for a rejected experiment. A member asks for it with `swarm_escalate`, by
+    `taskId` when it answers for the task. Each rule the refusal states has one owner it shares: `controlTask` and the
+    refusal read `reworkableRejection`; `controlTask`, the repair path a rejection names (`rejectionRepair`) and the
+    refusal read `reworksSpent`; and `escalate` and the refusal read `taskOwnerId`. `controlTask`'s `[task_replaced]`
+    refusal names the carrier too: with T1 rejected, T2 replacing it and rejected, and T3 replacing T2 and pending, it
+    named the first live descendant and told the owner to resume T2, which control refuses.
+  - F3-B: an acceptance resolves supersession among the claims it judges before it verifies any. With same-task
+    supersession the first acceptance verified the predecessor in `evidenceIds` order and then refuted it under the
+    same verdict. The predecessor is now refuted after its superseder's `evidence/verified` and never verified; a chain
+    is refuted link by link, each `refutedBy` naming its own superseder, and a superseded claim's refusal names that
+    claim without calling it verified (only the chain's head is). An inconclusive claim is never verified, so it still
+    supersedes nothing.
+  - The repair round departs from the approved fix in one place: the answering task is `graph.carrier`, not
+    `graph.effective`, which follows a withdrawn repair (T1 blocked with its only repair T2 cancelled gives T2, while
+    control resumes T1) and can end on a cancelled branch while a blocked sibling repair carries the obligation.
+- **CORE-05: a check pass is recorded under the attempt that ran it** (`c5fb7a9`, `498b58a`, `09828fa`; documents
+  `2ba4b7e`; repair `166c35a`, `6c64ba2`). `verify()` hands `DeclaredChecks.run` the review task and attempt that its
+  phase-1 `ownAttempt` proved the caller holds (`VerificationAttempt`), and a failed first pass is always written
+  durably under that attempt. Before, the runner looked the attempt up on the board when the first pass failed. An
+  attempt fenced while that pass ran (a lapsed lease, an owner cancel or amendment, a pause or stop, a revoked
+  workspace, a sibling verdict) had none, so the pair was held in memory under `member:commit:source` with no attempt
+  id. The fenced attempt could never use it, and the same member's next attempt on the same review and commit picked
+  it up: it wrote the dead attempt's passes under its own id and cited the dead retry's row, or, if it was already
+  open when that pass returned, had its own single clean pass recorded as a retry. `checkRuns`,
+  `verificationAttempt`, `sourceOf` and the held-pair branch of `recordRuns` are deleted. In the repair round `run()`
+  returns `DecidingPass { checks, pass: 1 | 2 }` and `recordRuns` writes that pass, so the attempt-scoped lookup
+  `firstPassRecorded` goes too. It labelled a clean second call by the same attempt, after
+  `[checks_changed_during_verification]` or `[check_environment_mismatch]`, as pass 2, and its one intended case, a
+  pre-crash failure paired with a post-crash pass on the same attempt, cannot occur: `start()` re-pends every running
+  row and ends its attempt.
+  - The slice review's medium finding (`498b58a`): `reviewPathBlocker` (`src/board.ts`) composed a deferred review's
+    exit from the review's newest classified failure, and a fenced attempt's late first pass can now be that row, so
+    the owner could be told to raise `checkTimeoutMs` when the host needed repair. A deferral now names its deciding
+    pass's rows on the task, `verificationRecovery.toolRunIds` (the ids its `task/verification-deferred` event carries
+    as `checks`, written in the same transaction), and the blocker composes the exit from exactly those rows.
+  - **Schema 8.** Opening a store an older build wrote upgrades it once, in the opening transaction
+    (`SwarmStore.deferralsNameTheirPass`): each stored deferral takes the rows its review's newest deferral event
+    names (every build since `69211b9` writes that event with the deferral, and a resume clears the deferral). A
+    deferral no event names, which no build writes, names no rows, so its blocker offers the resume alone. As after
+    schema 7, an older build then refuses the store. The tests that pin the schema number move from 7 to 8, the
+    later-schema probe from 8 to 9, and two hand-built deferral fixtures gain the field.
+- **CORE-01: an acceptance without checks rests on published review evidence, and every acceptance records its
+  basis** (`2d27e52`; documents `0ac8f75`). When the source declares no host checks, `swarm_verify` accept needs at
+  least one claim the reviewer published with `swarm_publish` on the accepting attempt that still stands
+  (`reviewEvidence`, `src/task-graph.ts`: current, on a review that is not cancelled, citing only runs of that attempt;
+  exactly the claims `unjudgeable` answers `review-evidence` for). Without one it is refused with
+  `[review_evidence_required]` (`validation_error`); nothing is recorded and the attempt keeps running. This replaces
+  the count of the attempt's non-error tool runs, which accepted on one unrelated call and named none of it. Every
+  acceptance records its basis, `{ kind: 'checks', runIds }` (the deciding pass's rows, equal to `task/accepted`'s
+  `checks`) or `{ kind: 'review-evidence', evidenceIds }`, on `task/accepted`, on each verified `evidence/verdict` row,
+  on the accepting review (`acceptanceBasis`) and in the artifact registry (`review.basis`). `WORKER_PROMPT` and the
+  `swarm_verify` description tell the model the rule. Where the slice departs from the brief:
+  - A rejection records no basis: it needs no evidence, and its grounds are its check failures and reason. A basis on
+    every verdict would need a third kind (judgement with no evidence), archived into `TaskRejection` when a rework
+    re-opens the review.
+  - The basis kind follows whether the verdict classified host check rows, not `source.checks.length`; for the real
+    adapter the two agree, since a source without checks yields no check rows.
+  - `task/accepted` keeps its `checks` field. No schema bump: the field is optional, and an acceptance an older build
+    recorded has none (the registry leaves it out).
+  - A `swarm_observe` read stays uncitable by design. `swarm_*` calls are never recorded runs (the worker adapter skips
+    them and `recordToolRun` returns early); recording them would make protocol reads research evidence, renew leases
+    and feed the git-write and temp-rendezvous detectors; and the review workspace is checked out at the source's
+    artifact commit, so an honest review always has a recorded way to inspect it. The report's path-name heuristic was
+    not adopted.
+- **CORE-04: both file locks share one owner identity** (`7178f10`; documents `a65cf64`; repair `e13f804`).
+  `src/process-identity.ts` owns the identity a lock records, `{ pid, birth }` (`recordedOwner`; this process's birth
+  is read once, `ownBirth`), and the one takeover rule, `ownerAbandoned`: an owner is abandoned when no process holds
+  its PID, or when the process holding it has a valid birth on the same platform that differs from the recorded one. A
+  live PID with no birth, an unrecognised or unreadable one, or one from another platform keeps its lock.
+  `processBirth` and `validProcessBirth` moved there from `src/store.ts`. The store's runtime lock behaves as before,
+  except that a recorded PID of 2^31 or more is refused as an invalid lock instead of throwing a `TypeError` from
+  `process.kill`. The delivery apply lock's `owner.json` records `{ pid, birth }` and drops the `createdAt` nothing
+  read (older owner files still parse), so a host killed inside an apply window no longer leaves a lock that a later
+  holder of its PID keeps; the owner record is built before the `mkdir`. The refusal names the lock path and the
+  owner PID, with the exit of removing the lock by hand, and `applyDelivery` releases the lock in its own `finally`
+  after the scratch cleanup, so a failed `rm` of the scratch directory can no longer leave the live host holding the
+  lock until it restarts.
+- **CORE-03: the attempt-silence basis is read from the whole log** (`c808a63`, `630f015`, `6dc97f6`; documents
+  `9ae5cc9`). The attempt reporting bound measured silence from the newest row it found in the presentation window
+  (`store.events(missionId, maxEvents)`). A worker whose last report was one `swarm_*` span lost it once other members
+  wrote more than `maxEvents` rows: the basis fell back to the assignment delivery, and the same silence was told again
+  under a new dedup key, overstated by the span's age. `SwarmStore.attemptEventAt` now reads the event term from the
+  whole append-only log at named paths only (`ATTEMPT_PATHS`: `$.attempt.id`, `$.attemptId`, `$.activity.attemptId`,
+  and `$.taskId` from the claim's sequence on), each through its own partial index. `lastDurableAt` takes the max of
+  that, the attempt's tool runs and the deliveries naming it or its task, with the assignment delivery as the floor, so
+  the basis and the dedup key only move forward. The deep match (`identityIn`) is gone: a sibling's proposal naming
+  the task in `dependencies`, or an outage's `taskIds`, no longer re-arms the clock, and an operation run under the
+  attempt does. The dead `lastDurableAt === 0` branch of `silenceNotice` is removed. The slice review's medium finding
+  (`630f015`): the silence instrument (`tests/instruments.mjs`) closed an attempt only at an event that also passed
+  the progress test, and a verdict or deferral names its review only at `$.verificationTaskId`, so a review attempt
+  ran on past its verdict. Which tasks a fencing event closes is now one rule, `tasksClosedBy` beside
+  `ATTEMPT_FENCING_EVENTS` (`src/types.ts`), which the replay decoder reads, with no change in what it decodes, and
+  the instrument reads too. `6dc97f6` documents that the claim-sequence bound covers the event term only.
+
+**Review repair round** (2026-10-24; `e13f804` to `17fbd1c`). The batch review raised six medium issues. Each fix has
+a test that fails without it, checked with the reviewer's mutants or their equivalents on the new code.
+
+1. `e13f804` (tests): the CORE-04 tests skipped whenever `ownBirth()` or the recorded birth came back undefined, which
+   is the output of the code under test, so the recycled-PID takeover could be switched off with the suite green.
+   `tests/process-birth.mjs` now chooses by platform: on linux and darwin `establishedBirth()` asserts a birth in the
+   platform's format, and only another platform skips. The mutants P13 (`ownBirth` returns undefined), P14 (the darwin
+   `ps` branch returns undefined) and P11 (the store lock writes no birth) now fail.
+2. `6c64ba2` (tests): the schema 8 upgrade test wrote one deferral event, so reading the oldest (`ORDER BY seq ASC`)
+   passed. A review that deferred on a timeout, was resumed and deferred again on an infrastructure failure must now
+   name the second pass and give its exit (mutant C5 fails).
+3. and 4. `b32a413`: the dispute refusal re-derived resume eligibility and `escalate`'s ownership test, and answered
+   "which task now answers for this one" with two lineage rules (`liveReplacement` and `effective`). It now reads the
+   rules control and `escalate` own, through `graph.carrier` (above). Before, a refuted claim of a rejected experiment
+   was told to resume it (`task_refuted`), and one whose task had spent its reworks to resume without raising
+   `maxRework` (`task_rework_exhausted`).
+5. `59e4c90`: a superseded claim's refusal called the claim that refuted it one "a verdict verified", which is false
+   for every link of a chain but its head; the reason now reads "is refuted and superseded by evidence `<by>`".
+   Following `refutedBy` to the head was not taken, since the head can itself be challenged or refuted later.
+6. `166c35a`: the deciding pass's label comes from `run()` (above).
+
+`17fbd1c` documents the dispute exits in `docs/known-limitations.md`; the README summary still holds.
+
+**The live smokes at `268a2c5`** (2026-10-24). The owner's session ran both real-provider smokes at `268a2c5` on
+`deepseek-official` / `deepseek-v4-flash`; their reports are kept with the batch's gate runner, outside the repository.
+
+- `test:deepseek` passed: 27,792 tokens, 11 steps (10 model responses). Its source declares `node check.cjs`, so the
+  reviewer's acceptance rested on checks; the CORE-01 path without checks did not run.
+- `test:command-deepseek` hit the smoke's external limit, 36 model steps and 525,767 reported tokens against its cap
+  of 500,000 tokens, with the owner alone reporting 358,670 tokens (the runtime accounted 43,147 to workers). The
+  owner's plan gave the implementation task `maxSteps` 8. Each "Resource review" notice made the owner raise a task's
+  allocation with `swarm_budget`, as the protocol asks: five raises, the implementation's `maxSteps` to 9, 11 and 15,
+  then its review's to 10 and 13. Every raise moved the task row's revision. The implementer's `swarm_submit`, which
+  had read the task before its artifact capture, was refused twice with `StaleTaskRevisionError` ("it presents
+  revision 12 but the durable task is at revision 13; another write was accepted after this writer read the task",
+  then 16 against 17; `putTask` and `refuseStaleTask` in `src/store.ts`) and accepted on its third call. Each refusal
+  cost the worker steps, which triggered more resource reviews and more raises, until the limit stopped the run with the
+  implementation submitted late, its review still running and the mission active. The revision guard dates from the
+  S5r batch (`0eb26c6`), not from this batch.
+
+**Root cause.** A transition that awaited I/O wrote back the copy of a row it had read before the await, and that
+write went through the per-task revision guard (`src/store.ts` `putTask`/`refuseStaleTask`). That guard was added in
+S5r (`0eb26c6`). In `submit` (`src/runtime.ts`), `ownAttempt` read the task and `fenceAttempt` wrote it. Then
+`await captureArtifact` ran, and `ownAttempt` re-checked the attempt, but its fresh row was thrown away. The commit
+then did `store.put('tasks', task)` with the row read before the capture. `controlTask` (what
+`swarm_budget(taskId, taskBudget)` calls) is synchronous and outside the mission queue, so the owner's
+allocation-only raise during the capture moved the revision, and submit was refused with `StaleTaskRevisionError`
+even though nothing it depends on had changed. The same hazard was in four more places:
+
+1. A review's lease fence after `await inspectArtifact` (`Attempts.fenceAttempt` on the copy read before the await).
+2. `applyDelivery` wrote the mission copy from before the apply, silently reverting a usage charge (mission rows have
+   no revision guard).
+3. The staged-plan member repair wrote a member copy read before `await invalidateComposition`, reverting a usage
+   report.
+4. Every other continuation re-read its row by hand (the S1 sites).
+
+It was reproduced deterministically, without a provider, with a capture gate and `controlTask` amend `{ maxSteps }`.
+Main `dac6704` fails the same way: it was exported with `git archive` into a scratch directory, its `node_modules`
+linked to the 0.2.1-rc.2 link farm, and built. An export rather than a git worktree was used, so the shared
+repository metadata was not touched.
+
+**CORE-06: a transition that awaited writes the row its commit reads** (`1218e86`). One owner,
+`SwarmRuntime.revise` (`Kernel.revise`). A transition that awaited I/O after reading a task, member or mission row
+writes it only through `revise`, which opens the commit, reads the row inside it (a mission through `mission`, which
+folds its clock) and hands it to the transition's change. The change re-validates the transition's fence on that row
+and sets only the fields the transition owns; `revise` writes the row and runs the transition's effects in the same
+transaction. A concurrent write the transition does not conflict with (an owner's `swarm_budget` raise, a published
+claim, a usage charge) is kept. A conflicting one refuses the transition with its own typed code (the change throws)
+or, for background work, makes it moot (nothing written, nothing published). Inside an open commit `revise` joins it.
+The revision guard stays as the backstop for a whole-row write of a stale task copy, and `docs/known-limitations.md`
+states the rule. The audit, site by site:
+
+- `submit`: a bug; it wrote the pre-capture copy. It now uses `revise`: `submissionFence` checks the attempt on the
+  row the commit reads and refuses with a typed code, `[task_cancelled]`, `[task_attempt_fenced]` or
+  `[task_attempt_stale]`, naming the captured artifact; any other check (budget pause, prerequisite) keeps its own
+  refusal. The live claim, `rework_unchanged`, the artifact checks and `missingReviewPath` are decided on that row.
+  Owned fields: `artifact`, `output`, `status`.
+- `verify` phase 1 (`src/runtime.ts` and `Attempts.fenceAttempt`): a bug; the lease fence wrote the review copy read
+  before `inspectArtifact`. `fenceAttempt` now uses `revise` and is moot when the attempt has moved, so the
+  `ownAttempt` that follows refuses with `task_attempt_stale`.
+- `verify` phase 2, verdict and deferral: it already re-read and re-checked by hand. Its final commits now use
+  `revise` on the review row. The attempt check (`heldAttempt`) and the source facts (a single `currentSource`
+  closure, so each coded refusal still appears once) are asked at the start of the turn and again inside the commit.
+  The commit that only records runs on an environment mismatch is unchanged.
+- Claim → `assign`: `assign` now uses `revise` with a `sameChoice` fence (the row half of `stillChosen`,
+  `src/board.ts`) and refuses with `[task_changed_during_preparation]`; the claim's own `stillChosen`/ready check
+  after the await is kept. The dispatcher (`src/scheduling.ts`) assigns through the same `assign`, and its
+  preparation failure after `prepareTask` uses `revise` with `sameChoice` (moot).
+- `Attempts.closeOutIdleAttempt`: the checkpoint-failed and checkpointed outcomes now use `revise` instead of the hand
+  re-read (S1); the nudge branch writes in the turn it reads and is unchanged. `Attempts.recoverExpired`: the
+  lease-expiry checkpoint and the expiry now use `revise`; `renewActiveOperation` reads by id in the turn that writes
+  and is unchanged. `Attempts.resumeStoppedAttempt`'s deferred path: the barrier release after stop and
+  `checkpointTask`, and the stop-failure record, now use `revise`; the synchronous force, marker and legacy-peer
+  writes are unchanged.
+- `applyDelivery` (mission): a bug; it reverted concurrent mission writes. It now uses `revise` and owns
+  `appliedDelivery`.
+- `repairDraftAdmissions`: a bug on the member row (a copy read before `invalidateComposition`). The member now uses
+  `revise` with the `assertStaged` fence and owns the route fields, `phase`, and `sessionId` when it changes; the
+  mission plan fields also use `revise`.
+- `addMember`: the baseline (mission) and the failure path (member) now use `revise`; the new member row is a fresh
+  insert. The `launchDraft` activation (mission) now uses `revise`, fenced by `active()`, `assertCurrent` and staged;
+  the draft rows keep their own revision check. Control's deferred member stop after `workers.stop` and
+  `gates.beginBudgetStop`'s deferred quiesce now use `revise`. The `notices.flushOutbox` mission acknowledgement uses
+  `revise`, joined to its commit; the delivery row is still re-read inside that commit (deliveries are outside the
+  rule's tables).
+- Unchanged: `startPlan`'s final commit already reads the mission inside its commit (its start rows are outside the
+  rule). `publish`, `controlTask`/`swarm_budget`, `updateBudget`, `control`, `cancel`, `propose` and replacement,
+  `challenge`, `handoff`, `escalate`, `message`, `post`, `wait`, `subscribe` and `amendScope` have no await between
+  read and write. `beforeStep`, `recordToolRun`, `onIdle`, `onActivity`, `onStartFailure`, `recordStarted`,
+  `onRecoveryFallback`, the usage gates (`usage`, `usageSnapshot`, `recordOwnerUsage`), `blockBudget`,
+  `resumeBudgetTasks`, `blockTaskCeiling`, the workspace admission's `fenceWorkspace`, `recordOutboxStarvation` and
+  `start()`'s recovery read their row by id in the turn that writes it. `schedule` never writes the mission it read
+  when the pass started after its awaits; its helpers use it only for the id and the deadline.
+
+**User-facing changes.**
+
+- `swarm_challenge` of a claim no verdict can still judge (refuted by a rejection, before the rework too; superseded;
+  of cancelled work; a review's own claim) is refused with `[evidence_not_judgeable]`, which replaces
+  `[evidence_archived]` and names where the dispute can still go. Such a dispute can no longer cancel the review that
+  rejected a task, defeat the owner's resume or re-open accepted work. A dispute an older build recorded on a review's
+  own claim no longer holds a mission open; an accepted review an older build turned back to `submitted` that way
+  stays unfinished until the owner cancels it (there is no migration).
+- An acceptance no longer reports a superseded claim verified and then refuted: the predecessor is only refuted.
+- A reviewer of a source without checks must publish at least one claim with `swarm_publish` on its review attempt
+  before it accepts (`[review_evidence_required]` otherwise). Every acceptance shows what it rests on, in the event log
+  and in `swarm_registry` (`review.basis`).
+- The store moves to schema 8 the first time this build opens it, and older builds then refuse it; going back needs a
+  backup taken before. The operations guide and its zh-CN twin name schema 8.
+- A deferred review's blocker gives the exit of the pass that deferred it.
+- Apply result: a lock left by a killed host whose PID a later process reuses is reclaimed. Otherwise the refusal
+  names the lock and the holding process, and the operations guide says when the lock may be removed by hand.
+- An unchanged attempt silence is escalated once, from a basis that only moves forward.
+- CORE-06: an owner's `swarm_budget` raise, a published claim or a usage charge made while a submission captures its
+  artifact, a review inspects it, a claim or the dispatcher prepares a workspace, or a delivery is applied, is kept:
+  it no longer makes that transition fail, and the transition no longer reverts it. A submission a conflicting write
+  overtakes is refused with that write's own code, `[task_cancelled]` (new), `[task_attempt_fenced]` (new) or
+  `[task_attempt_stale]` naming the captured artifact, instead of the stale-revision error; a review whose attempt was
+  withdrawn during its inspection is refused with `[task_attempt_stale]`.
+
+**The full-log oracle at the head against `dac6704`** (`npm run test:oracle`). One commit changed the logs: `2d27e52`
+(CORE-01), re-recorded with `node scripts/replay/oracle.mjs --runs 3 --write` (three identical runs). It changed 19
+lines in four logs (F12 2, F19 11, paths 2, replay 4). Each line changes in one field and nothing else, and every
+basis is `checks`, since no scenario accepts a source without checks:
+
+- Eight `task/accepted` events gain `basis: { kind: 'checks', runIds }`, equal to their `checks`: F12 runtime 1
+  (event 10); F19 runtimes 14 and 15 (event 10 each), 16 (events 10 and 16) and 19 (event 12); paths runtime 4
+  (event 10); replay (event 37).
+- Two verified `evidence/verdict` events, the only two acceptances in the logs that verify a claim, gain the same
+  basis: F19 runtime 19 event 13 and replay event 38.
+- Eight accepting review rows gain `acceptanceBasis`, one per acceptance above: F12 `task#2`; F19 `task#2` in
+  runtimes 14 and 15, `task#2` and `task#4` in runtime 16, and `task#2` in runtime 19, which a later challenge of the
+  source's verified claim cancelled and which keeps its basis; paths `task#2`; replay `task#3`.
+- One `trace/span` row: replay's `swarm_verify` span output grows from 1064 to 1154 bytes, because the review task the
+  tool returns now carries its `acceptanceBasis` (90 bytes with the real 40-character run id; the log normalizes ids,
+  but the size is the real result's).
+
+No other commit changed a line: no scenario has same-task supersession (CORE-02 reorders nothing there), none defers a
+review (schema 8 and the deciding-pass rows), and neither the lock identity nor the silence basis appears in a log.
+CORE-06 (`1218e86`) changed none either, so nothing was re-recorded for it. All three gate runs below reproduced every
+log, and the `test:replay` digest is unchanged,
+`sha256:61a921e64088b78b957cd6aeaa563d5436d4a6eae4b0130725d1f3c74c6f971e`.
+
+**Regressions.** The full suite has 1986 tests at `dac6704`, 2021 at `17fbd1c` and 2038 at `1218e86`: CORE-02 adds
+10, CORE-05 4, CORE-01 5, CORE-04 5, CORE-03 4, the repair round 7 (and rewrites one R16-G5a test) and CORE-06 17.
+For the first record, the test files at `17fbd1c` were also run against a `dac6704` build, and the CORE-01 and CORE-03
+changes were reverted in a build of `17fbd1c`, each in a scratch copy since removed.
+
+- CORE-02: `tests/claim-judgeability.test.mjs` (new, 12 tests): the rule; (a) with the owner's resume after the
+  refused challenges; (b1); (b2); withdrawn work; a review's own claim before and after its verdict; completion over an
+  older build's dispute; and, from the repair round, five tests that each perform the exit they pin (a rejected task a
+  pending repair carries; the T1/T2/T3 chain, with control naming T3; a rejected experiment; spent reworks; an
+  archived reviewer claim naming the source's claims). All 12 fail on `dac6704` (the rule test against stub imports).
+  The repair round's mutants (no carrier; the first live descendant instead; no review-to-source mapping; no
+  experiment check; no spent-rework branch; control naming `liveReplacement`) each fail at least one.
+  `tests/verdict-honesty.test.mjs`: a chain is refuted link by link and its links' challenges are refused, each
+  naming its own superseder and no verification; the existing re-review test now also asserts that the first
+  acceptance never verifies the predecessor. Both fail on `dac6704`. Two new inconclusive cases pass on both, since an
+  inconclusive claim supersedes nothing, as before. `completion-disputes`, `rework-in-place` and `rework-review` move
+  to the new code, and `rework-review` asserts the archived review claim's full exit.
+- CORE-05: `tests/declared-check-retry.test.mjs`: a review attempt fenced during its first pass keeps that failure
+  under its own attempt, and the next attempt cites only its own passes; a next attempt already open is never
+  credited with it; a fenced attempt's first pass recorded after the next attempt deferred leaves the deferral's exit
+  alone (it fails on `c5fb7a9` with the `checkTimeoutMs` exit); a clean call after the same attempt's refused one
+  records pass 1. All four fail on `dac6704`. The rewritten R16-G5a test restarts the runtime for real (the dead
+  attempt's verdict is refused `task_attempt_stale`, and the next attempt records and cites its own pass 1) and passes
+  on both. `tests/check-failure-exits.test.mjs`: the schema 8 upgrade of a stored deferral, and of one deferred again
+  after a resume. Both fail on `dac6704`, as does the existing deciding-pass test, which now also asserts
+  `toolRunIds`.
+- CORE-01: `tests/acceptance-basis.test.mjs` (new, 5 tests). With the floor before CORE-01 restored in a build of the
+  head (any non-error run of the attempt), the acceptance without checks and the claim of an earlier attempt are
+  accepted and their tests fail; with the basis left off `task/accepted` and the review row, those two and the checked
+  acceptance fail. The rejection test pins what did not change (no evidence needed, no basis), and the rule test pins
+  `reviewEvidence`. `tests/runtime.test.mjs` (whose test pinned the old floor), `artifact-policy`,
+  `completion-obligations`, `refusal-runtime-annotations` and `trace-events` follow the new rule and fields.
+- CORE-04: `tests/delivery.test.mjs`: the apply lock records `{ pid, birth }`, is taken over from a recycled PID, and
+  refuses its own live owner and a legacy owner with the new message; a scratch cleanup failure still releases it.
+  Both fail on `dac6704`'s `src/delivery.ts` (a `dac6704` build with only `src/process-identity.ts` added, which the
+  tests' birth helper imports). `tests/process-identity.test.mjs` (new, 3 tests) pins the rule once, and
+  `tests/r12-store-fixes.test.mjs` asserts that the store lock records `ownBirth()`.
+- CORE-03: `tests/silence-bounds.test.mjs`: the basis is the attempt's newest durable row in the whole log, so the
+  window moving neither takes it back nor tells the silence twice; only a named path attributes an event to an
+  attempt. Both fail with `src/scheduling.ts` restored to its state before `c808a63` in a build of the head. A third
+  test pins `SwarmStore.attemptEventAt`, and a fourth (`630f015`) that the instrument ends a review attempt at its
+  verdict; before its fix that test read an end at 50000 and a worst gap of 46000, where it expects 12000 and 8000.
+- CORE-06: `tests/write-after-await.test.mjs` (new, 17 tests), run against builds of `268a2c5` and `dac6704`
+  (`git archive` exports, as in the root cause above). Eleven regressions fail on both:
+  - a submission racing a task `maxSteps` raise is accepted and keeps `maxSteps` 20;
+  - task and mission budget raises made during a submission are accepted and survive it;
+  - a claim published during the capture is kept and pinned to the artifact;
+  - a submission racing an owner cancel is refused with `task_cancelled`, and one racing a structural amendment with
+    `task_attempt_fenced`;
+  - a lease lapsing during the capture is refused with `task_attempt_stale`, and the message names the artifact;
+  - a review racing a raise on it reaches its verdict and keeps the raise;
+  - a review whose attempt is withdrawn during its inspection is refused with `task_attempt_stale`, not
+    `stale_task_revision`;
+  - a delivery apply racing a usage charge keeps `usedTokens` 500 (it was 0 before the fix);
+  - a staged-plan repair racing a member usage report keeps `accountedTokens` 777;
+  - `revise` itself: a moot or refused call commits nothing and publishes nothing, and a call joined inside an open
+    commit works.
+
+  Six pins pass on both: a claim racing a raise; a claim racing a reassignment, refused with
+  `task_changed_during_preparation`; a preparation failure; an idle close-out; a lease-expiry checkpoint; a stop
+  barrier. Two existing files change: `makeRuntimeStub` (`tests/faults/harness.mjs`) gains a stub `revise`, and
+  `tests/refusal-runtime-annotations.test.mjs` annotates `task_cancelled` and `task_attempt_fenced`. Before the fix, a
+  scratch reproduction outside the suite (a capture gate and `controlTask` amend `{ maxSteps }`) gave
+  `StaleTaskRevisionError`, revision 3 against 4, on `268a2c5` and on `dac6704`; on `1218e86` it passes (status
+  `submitted`, `maxSteps` 20).
+
+**Gates**, each run with `node_modules` linked to the 0.2.1-rc.2 link farm and `DSH_HARNESS_ROOT` set to the pinned
+clone (`dsh-v0.2.1-rc.2`, `687f282e86`).
+
+| Check | `6dc97f6` (2026-10-23 23:23 to 23:32) | `17fbd1c` (2026-10-24 01:02 to 01:14) | `1218e86` (2026-10-24 03:02 to 03:16) |
+| --- | --- | --- | --- |
+| `npm run typecheck` / `npm run build` | passed / passed | passed / passed | passed / passed |
+| `node --test tests/*.test.mjs` | 2013/2014 (286 s): `S1/R17-G5` failed (below) | 2021/2021 (299 s), 0 cancelled, 0 skipped | 2038/2038 (451 s), 0 cancelled, 0 skipped |
+| `npm run test:harness` | failed in `tests/harness-boundary-compaction.mjs` (below); re-run passed, 4 scripts | passed, 4 scripts | passed, 4 scripts |
+| `npm run test:replay` | digest unchanged | digest unchanged | digest unchanged |
+| `npm run test:oracle` | 12/12 identical | 12/12 identical | 12/12 identical |
+| `npm run test:pack` | passed (254 archive entries, 254 published files) | passed (254, 254) | passed (254, 254) |
+| `npm run test:profile` | passed | passed | passed |
+| `npm run test:bundle` | 7/7 | 7/7 | 7/7 |
+| `node scripts/faults/run.mjs` | 24/24 | 24/24 | 24/24 |
+| `npm run test:web` | passed, 13 checks | 13 checks passed, then killed after its report (exit 143, below); re-run alone passed, 13 checks | passed, 13 checks (64 s) |
+| `npm run test:command-web` | passed, 11 checks | passed, 11 checks | passed, 11 checks (57 s) |
+| `npm run test:isolation` | 6/6 | 6/6 | 6/6 |
+| `npm run test:load` | D8 load envelope OK: observation bounded (max 1039 B and 1042 B, ratio 1.00x) | the same | the same |
+
+The pack has three files more than at `af154be`: `lib/process-identity.js` with its `.d.ts` and `.js.map`. Every web
+smoke's `report.json` records `harnessHead` `687f282e8625c6b8d11ff58211a90524be2e4317`. The harness, pack and profile
+logs carry 9, 11 and 7 `[mission_operation_pending]` lines at `6dc97f6` (where the harness run stopped in its second
+script), 19, 10 and 6 at `17fbd1c`, and 30, 14 and 9 at `1218e86`.
+
+At `6dc97f6` two gates failed, each on a path the batch does not change. The load was not recorded for this run.
+
+- `S1/R17-G5` (`tests/scheduling-pass.test.mjs:859`) failed at its assertion that the stranded drain woke one turn
+  from inside the body (`0 !== 1`, line 936), the assertion the 2026-10-22 entry records failing most often under
+  stress at `a28b116` and at `fcf5b5e`. The batch changes `lastDurableAt` in `src/scheduling.ts`, which that
+  assertion does not read. Re-run alone the test passed, and its file passed 29/29. At `17fbd1c` the repair round
+  re-ran the file (29/29) and the test by name three times (3/3) at load averages of 16 to 24, and the final full
+  suite passed it.
+- `test:harness` stopped in `tests/harness-boundary-compaction.mjs` with `swarm_propose failed: undefined`
+  (`ownerCall`, line 123, called at line 204): no tool result followed the owner's input by the time the owner went
+  idle. Re-run, `test:harness` passed all four scripts; the script then passed 6 of 6 runs alone and 12 of 12 in two
+  rounds of six concurrent copies, and it passed in the final run. The repair round traced it to the owner session,
+  which the batch does not touch: `installOwnerDeliveryFilter` (`src/harness-workers.ts:131`) can reject or empty an
+  owner turn's opening step (line 149, since `ccbfdc1`), the pinned Harness's `AgentLoop.turn()` then returns without
+  re-checking its inbox, and a wake sent while that driver runs is not latched, so owner input that arrives in that
+  window waits for the next wake. `git diff dac6704..HEAD` is empty for `src/harness-workers.ts`, `src/index.ts`, that
+  script and `tests/fixtures`.
+
+At `17fbd1c` the web smoke's scenario passed: its `report.json` reads `passed: true` with 13 checks. The process then
+did not exit within 30 s of its report, so the batch's gate runner (kept outside the repository) killed it, exit 143,
+57 s in all. File times place the stall in the `finally` of `scripts/web-smoke-browser.mjs`, at
+`await browser?.close()` (line 284), before the `dsh web` child is signalled. The try block's report and the server
+log were written at 01:10:22 and the `finally`'s second report never was; the run's temporary root was still being
+written by the live child until the runner's kill at about 01:10:55; and Playwright's profile directory, which Chrome
+had begun to flush at 01:10:22, was never removed. Headless Chrome's shutdown stalled at load averages of 17 to 27,
+with `fseventsd` near 97% CPU. The batch changes neither smoke script (`git diff dac6704..HEAD -- scripts/` touches
+only the oracle logs). Re-run alone at a load average of 17.7 it passed, 13 checks, with its report at 21 s and its
+exit 10 s later. It is the only one of the 30 web runs in the gate logs killed after its report. The kill left that
+run's temporary root and Playwright profile in the system temporary directory, where they remain. It was not run at
+`dac6704`: a failure that does not recur on the branch cannot be confirmed there either. One contributing factor
+predates the batch: the same `finally` never clears the 10 s timer of its `Promise.race` (line 287), so every clean
+web smoke stays alive 10 s after its child exits, a third of the runner's grace, and `browser.close()` has no bound of
+its own.
+
+At `1218e86` every gate passed on its first run, so nothing was re-run; the web smokes exited 64 s and 57 s after
+they started, with no kill. One-minute load averages read 20.5 to 23.7 at the samples taken during the run
+(fifteen-minute 25.5 to 27.9), with other sessions' Harness processes running on the machine. None of the four
+full-suite failures CORE-06's own checks met (below) recurred.
+
+**Repair-round checks** (before the final gates): typecheck and build; the lock tests 29/29 with none skipped;
+`tests/check-failure-exits.test.mjs` 12/12; `claim-judgeability`, `rework-review` and `rework-in-place` 44/44;
+`verdict-honesty` with `claim-judgeability` 21/21; `declared-check-retry` 8/8, whose new CORE-05 label test fails with
+the old lookup patched back into the lib; related subsets of 480, 439 and 576 tests; `test:oracle` 12/12 identical;
+`test:replay`; faults 24/24.
+
+**CORE-06 checks** (before the final gates): typecheck (both tsconfigs) and build; the scratch reproduction and
+`tests/write-after-await.test.mjs` against `268a2c5`, `dac6704` and the fix (above); a first full suite at 2016 of
+2021, whose 5 failures came from the change (four stub kernels without `revise`, and a computed `PolicyError` code),
+both fixed; a full suite on the final code at 2034 of 2038, whose 4 failures were `[mission_operation_pending]`
+bounded waits and one bounded stop timer, hit while other test files ran at the same time, and whose three files
+(`declared-check-retry`, `liveness-create-path`, `owner-decisions`) passed 35 of 35 alone and had not failed in the
+first run; `test:harness` (4 scripts); `test:oracle` (12 scenarios, every log unchanged); faults 24/24.
+
+**Not exercised.**
+
+- A live source without checks. The owner's session re-ran both real-provider smokes at `82d4837` (this record on
+  `1218e86`): `test:deepseek` passed (28,663 tokens, 11 steps) and `test:command-deepseek` passed (owner 83,667
+  tokens, workers 46,946, 20 model responses; one implementation and its review accepted, no revision refusal; the
+  three refused calls were the protocol's own: an output outside scope and the effort `low` at launch, and a reviewer's
+  `swarm_submit` on its verification task, each repaired once). Both live sources declared `node check.cjs`, so no
+  live model has yet been seen to publish a claim before it accepts a source without checks (CORE-01).
+  `test:validation-repair-web` and `test:sidebar-service` did not run.
+- The schema 8 upgrade ran on stores the tests rewrite into a schema 7 shape, never on a real home's store.
+- Process births were read on macOS only (`ps`); the linux reading (`/proc`) did not run on this machine. A recycled
+  PID is simulated with a fabricated birth (`recycledBirth()`), not by wrapping the PID space.
+
+**Open after this batch** (not adopted here).
+
+- The owner-session stranding race behind the compaction failure (above). The proposed fix is one shared helper that
+  wakes the pending tail at the owner agent's next idle after the filter rejects or empties an opening, as members
+  already recover (`continueAfterRejectedStep`); `ownerCall` in the compaction script should also wait for its own
+  command's tool result rather than for `whenIdle` alone.
+- The web smoke's teardown: the uncleared 10 s timer and the unbounded `browser.close()` (above).
+- Timer-bound tests under load: `S1/R17-G5`, as the 2026-10-22 entry records, and `tests/r12-runtime-fixes.test.mjs`
+  "recovery returns with a stuck startup, starts siblings, and records one shared timeout" (a 40 ms startup timer),
+  which failed once in a slice's full-suite run and passes alone.
+- Disputes. The owner has no way to dispute or re-open an accepted source that published no claim of its own
+  (documented in known-limitations; the refusal points at proposing new work). The `swarm_challenge` description does
+  not say which claims are refused, which would be a model-visible change. The board fingerprint's
+  `challengedEvidence` still counts challenged rows of claims no verdict can judge, which only an older build writes.
+  `graph.lineage`/`effective` can resolve a dependency through a cancelled repair while a blocked sibling repair
+  carries the obligation; dependency resolution still reads it, while disputes and control read `carrier`. A rejected
+  task with a pending stop would be told to propose a replacement, which propose refuses
+  (`replacement_source_reassigning`); the state is unreachable today and has no branch of its own.
+- Verification. `run()` still runs the full retry for an attempt fenced during its first pass, whose verdict can never
+  commit. A rejection carries no basis; a basis on every verdict row needs a defined third kind. `WORKER_PROMPT` is at
+  1590 of the 1600 characters `tests/roles.test.mjs` allows. `swarm_registry` still over-reports one refutation after
+  a deferred, resumed and then otherwise blocked review (known-limitations).
+- The apply lock. A scratch cleanup failure after a delivery completed still rejects the call, though the files were
+  applied and the receipt written (the lock is now released, and a retry finds the receipt). Reclaiming a stale lock
+  is check-then-rename, so two contenders can race, and the code comment overstates what the rename guarantees (now in
+  known-limitations). The in-process `activeSources` refusal still names no lock or holder. The lock lives in the
+  checkout's own git directory, so linked worktrees of one repository do not share it.
+- Attempt silence. The delivery term has no lifetime bound, so after a clock step-back a delivery naming the task from
+  an earlier attempt can raise the basis (it can delay an escalation, never invent one); bounding it needs a log
+  position on delivery rows. An owner `swarm_observe` span naming a running task at `$.taskId` re-arms the clock, each
+  tick loads the attempt's tool runs and deliveries in full, and an operation's end names no attempt. In
+  `src/trace.ts`, the `task/checkpointed` branch of `orchestratorCommands` cannot run, since that event is not in
+  `ATTEMPT_FENCING_EVENTS`.
+- Writes after an await (CORE-06). `addMember` checks the `maxWorkers` budget before its awaits and does not re-check
+  it after them, so an owner who lowers `maxWorkers` during workspace preparation can end up one worker over the new
+  limit; that is an admission decision, not a stale-row write. `renewActiveOperation` caps renewed leases at the
+  deadline the scheduling pass read when it started, so an owner's deadline extension during the pass gives a shorter
+  lease until the next renewal; no stale row is written. Delivery, draft and start rows are outside `revise`: the
+  outbox acknowledgement, consumption and follow-ups re-read delivery rows inside their commits, and any other
+  asynchronous delivery writer still needs review (known-limitations).
+- Batch B of the self-review (F3, T2, T1, F2) is not on this branch.
+
 ## Harness 0.2.1-rc.2 only: 0.1.5-rc.3 and 0.1.7-rc.1 dropped (2026-10-22)
 
 **Head**: `af154be`, where the gates of the live-smoke repair round ran, and this record's revision (documentation

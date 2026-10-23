@@ -176,14 +176,15 @@ test('S13: an operation silence and an attempt silence are told by one notice of
   const holder = { id: 'member_1', name: 'Author' }
   const operation = silenceNotice(task, { family: 'operation-silent', holder, attemptId: 'attempt_1', activityId: 'activity_1', kind: 'tool', tool: 'bash',
     startedAt: 1_000, lastRecordedAt: 0, silentSince: 1_000, elapsedMs: 61_000, boundMs: 60_000 })
-  const silent = { family: 'attempt-silent', holder, subject: 'task_1@2', attemptId: 'attempt_1', lastDurableAt: 0, silentMs: 130_000, boundMs: 120_000 }
+  // The basis is never 0: the attempt's claim and assignment delivery are its floor (CORE-03).
+  const silent = { family: 'attempt-silent', holder, subject: 'task_1@2', attemptId: 'attempt_1', lastDurableAt: 5_000, silentMs: 130_000, boundMs: 120_000 }
   const attempt = silenceNotice(task, silent)
-  for (const [notice, dedupKey] of [[operation, 'operation-silent:attempt_1:activity_1:1000'], [attempt, 'attempt-silent:attempt_1:0']]) {
+  for (const [notice, dedupKey] of [[operation, 'operation-silent:attempt_1:activity_1:1000'], [attempt, 'attempt-silent:attempt_1:5000']]) {
     assert.deepEqual([notice.subjects, notice.options, notice.event], [['task_1@2'], { noticeClass: 'stall', dedupKey }, undefined], 'its delivery row is its only witness')
     assert.match(notice.content, /^Author \(member_1\) has held /)
   }
   assert.match(operation.content, /a tool operation `bash` for 1m 1s \(61000ms\)/)
-  assert.match(attempt.content, /since it was dispatched;/)
+  assert.match(attempt.content, /since durable row at 5000;/)
   assert.doesNotMatch(attempt.content, /scheduling pass/)
   const wedged = silenceNotice(task, { ...silent, wedgedPass: { operationId: 'operation_9', boundMs: 120 } })
   assert.match(wedged.content, /The mission's scheduling pass operation_9 is wedged past its 120ms bound, so the in-pass recovery sweep cannot run either\./)

@@ -8,6 +8,7 @@ import { chmod, lstat, mkdir, mkdtemp, readFile, readdir, readlink, realpath, rm
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { applyDelivery, inspectDelivery } from '../lib/delivery.js'
+import { NO_BIRTH, establishedBirth, recycledBirth } from './process-birth.mjs'
 
 const execute = promisify(execFile)
 async function git(cwd, ...args) {
@@ -257,5 +258,60 @@ test('an incomplete or corrupt apply lock is recoverable without stealing a live
   // A dead pid is stale immediately, as before.
   await mkdir(lock, { recursive: true })
   await writeFile(path.join(lock, 'owner.json'), JSON.stringify({ pid: 999999 }))
+  assert.equal((await applyDelivery(input)).status, 'applied')
+})
+
+test('CORE-04: the apply lock records its owner identity and is taken over from a recycled PID, never from a live owner', async t => {
+  const { source, worker, head } = await fixture(t)
+  await writeFile(path.join(worker, 'answer.txt'), 'swarm answer\n')
+  const input = { source, baselineCommit: head, resultCommit: await commit(worker) }
+  const lock = path.join(source, '.git', 'dsh-agent-swarm-delivery', 'apply.lock')
+  // Linux and macOS always establish a birth, so the lock records one there; only another platform skips the takeover below.
+  const birth = establishedBirth()
+  // The lock this process takes names it by the identity every lock shares, and nothing else.
+  let recorded
+  await atRenameBarrier(async (_from, to) => { if (to.endsWith(path.join('apply.lock', 'owner.json'))) recorded = JSON.parse(await readFile(to, 'utf8')) },
+    async () => assert.equal((await applyDelivery(input)).status, 'applied'))
+  assert.deepEqual(recorded, birth === undefined ? { pid: process.pid } : { pid: process.pid, birth })
+  // A live owner keeps its lock, whether its file is a legacy one without a
+  // birth or carries the owner's own birth; the refusal names the lock and the
+  // owner, so a lock left behind can be found and removed by hand.
+  const refusal = `Another delivery is being applied to this project: ${lock} is held by process ${process.pid}; if that process is not applying a delivery, remove ${lock} and retry`
+  for (const owner of [{ pid: process.pid, createdAt: Date.now() }, ...(birth === undefined ? [] : [{ pid: process.pid, birth }])]) {
+    await mkdir(lock, { recursive: true })
+    await writeFile(path.join(lock, 'owner.json'), JSON.stringify(owner))
+    await assert.rejects(applyDelivery(input), { message: refusal })
+    await rm(lock, { recursive: true, force: true })
+  }
+  if (birth === undefined) { t.skip(NO_BIRTH); return }
+  // The same live PID born at another time is a different process that was given
+  // the dead owner's PID: its lock is taken over at once.
+  await mkdir(lock, { recursive: true })
+  await writeFile(path.join(lock, 'owner.json'), JSON.stringify({ pid: process.pid, birth: recycledBirth(birth) }))
+  assert.equal((await applyDelivery(input)).status, 'applied')
+  await assert.rejects(lstat(lock), { code: 'ENOENT' })
+})
+
+test('CORE-04: a scratch cleanup failure still releases the apply lock', async t => {
+  const { source, worker, head } = await fixture(t)
+  await writeFile(path.join(worker, 'answer.txt'), 'swarm answer\n')
+  const input = { source, baselineCommit: head, resultCommit: await commit(worker) }
+  const lock = path.join(source, '.git', 'dsh-agent-swarm-delivery', 'apply.lock')
+  const original = filesystem.rm
+  let scratch
+  filesystem.rm = async (target, options) => {
+    if (path.basename(String(target)).startsWith('dsh-swarm-delivery-')) {
+      scratch = String(target)
+      throw Object.assign(new Error(`EBUSY: resource busy or locked, rm '${target}'`), { code: 'EBUSY' })
+    }
+    return await original(target, options)
+  }
+  syncBuiltinESMExports()
+  try { await assert.rejects(applyDelivery(input), { code: 'EBUSY' }) }
+  finally { filesystem.rm = original; syncBuiltinESMExports() }
+  t.after(async () => { if (scratch) await rm(scratch, { recursive: true, force: true }) })
+  assert.ok(scratch, 'the delivery reached its scratch cleanup')
+  await assert.rejects(lstat(lock), { code: 'ENOENT' }, 'the cleanup failure leaves no lock owned by this live process')
+  assert.equal(await readFile(path.join(source, 'answer.txt'), 'utf8'), 'swarm answer\n')
   assert.equal((await applyDelivery(input)).status, 'applied')
 })

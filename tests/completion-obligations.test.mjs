@@ -51,7 +51,9 @@ async function fixture(t) {
   async function accept(source) {
     const review = runtime.store.list('tasks', missionId).find(item => item.reviewOf === source.id && item.status === 'pending')
     const claimed = await runtime.claim(actor(reviewer), missionId, review.id)
-    await workers.callbacks.toolRun(reviewer.id, { tool: 'read_file', arguments: { path: 'docs/reviews/audit.md' }, result: 'Independently checked the submitted report', isError: false })
+    const runId = await workers.callbacks.toolRun(reviewer.id, { tool: 'read_file', arguments: { path: 'docs/reviews/audit.md' }, result: 'Independently checked the submitted report', isError: false })
+    // A source without checks is accepted on the reviewer's published review evidence (CORE-01).
+    runtime.publish(actor(reviewer), missionId, { taskId: review.id, attemptId: claimed.attempt.id, claim: 'The submitted report holds up', outcome: 'supported', toolRunIds: [runId] })
     await runtime.verify(actor(reviewer), missionId, { taskId: review.id, attemptId: claimed.attempt.id, verdict: 'accept', reason: 'Independent evidence supports the artifact' })
   }
   async function strandReport() {

@@ -7,6 +7,7 @@ import { join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { createHash } from 'node:crypto'
 import { SwarmStore, StaleTaskRevisionError } from '../lib/store.js'
+import { NO_BIRTH, establishedBirth, recycledBirth } from './process-birth.mjs'
 
 const storeModule = import.meta.resolve('../lib/store.js')
 const options = { snapshotIntervalMs: 0 }
@@ -130,9 +131,11 @@ test('R12: a demonstrably reused PID is reclaimed by both open and restore', t =
   const store = new SwarmStore(path, options)
   const ownLock = JSON.parse(readFileSync(`${path}.lock`, 'utf8'))
   store.close()
-  if (ownLock.birth === undefined) { t.skip('host cannot establish process birth; conservative refusal is covered'); return }
-  const reused = { ...ownLock, nonce: 'old-generation', birth: ownLock.birth.startsWith('linux:')
-    ? ownLock.birth.replace(/:\d+$/, ':0') : ownLock.birth.replace(/\d{4}$/, '1900') }
+  // Linux and macOS always establish a birth, and the lock records it; only another platform skips.
+  const birth = establishedBirth()
+  if (birth === undefined) { t.skip(NO_BIRTH); return }
+  assert.equal(ownLock.birth, birth, 'the runtime lock records this process\'s birth')
+  const reused = { ...ownLock, nonce: 'old-generation', birth: recycledBirth(birth) }
   writeFileSync(`${path}.lock`, JSON.stringify(reused))
   const reopened = new SwarmStore(path, options)
   assert.notEqual(JSON.parse(readFileSync(`${path}.lock`, 'utf8')).nonce, reused.nonce)

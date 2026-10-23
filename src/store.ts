@@ -12,18 +12,19 @@ import { DatabaseSync } from 'node:sqlite'
 import { mkdirSync, openSync, closeSync, readSync, fsyncSync, readFileSync, unlinkSync, writeFileSync, chmodSync, existsSync, readdirSync, copyFileSync, renameSync, rmSync, statSync, lstatSync, constants } from 'node:fs'
 import { dirname, join, basename, resolve } from 'node:path'
 import { createHash, randomUUID } from 'node:crypto'
-import { execFileSync } from 'node:child_process'
 import { criterionId, type Attempt, type AutoStart, type Delivery, type DraftPlan, type Evidence, type Member, type Mission, type PlanTask, type Post, type PostKind, type SwarmEvent, type Task, type ToolRun, type Workstream } from './types.ts'
 import type { AdmissionReason, AdmissionRecord, LimitRule } from './scheduler.ts'
 import { PROGRESS_KINDS, type EventKind } from './events.ts'
 import { taskGraphIndex } from './task-graph.ts'
+import { ownBirth, ownerAbandoned, recordedOwner } from './process-identity.ts'
 // R17-G7: one derivation for the derived member status; the store never persists it.
 import { deriveMemberStatus, memberPhaseOf } from './projection.ts'
 
 /** A fresh row id: the row kind, then a random UUID (`task_<uuid>`). */
 export const id = (prefix: string): string => `${prefix}_${randomUUID()}`
 
-interface Tables {
+/** The record type each table holds. */
+export interface Tables {
   missions: Mission
   members: Member
   workstreams: Workstream
@@ -37,6 +38,11 @@ interface Tables {
   limits: LimitRule
 }
 type Table = keyof Tables
+/**
+ * CORE-06: the tables whose rows a transition writes after an await, and so
+ * only through `SwarmRuntime.revise`, on the row its commit reads.
+ */
+export type RevisedTable = 'tasks' | 'members' | 'missions'
 /**
  * A store written before the scheduling pass guard moved into memory also holds
  * a `passes` table; nothing reads it, and it is left in place untouched.
@@ -54,8 +60,38 @@ export interface PostFilter {
   newest?: boolean
   limit?: number
 }
-/** v3 adds the append-only `posts` board table; v4 cites mission criteria by id (`citeCriteria`); v5 records an owner notice's consumption on its delivery (`consumptionOnDelivery`); v6 kept an attempt's markers on the row only with that attempt; v7 makes them fields of the attempt (`markersOnTheirAttempt`, whose upgrade settles a store before v6 as v6's did). Older versions are upgraded at open. */
-const SCHEMA_VERSION = 7
+/**
+ * CORE-03: the claim's attempt record (`task/claimed`), the event that opens an
+ * attempt's lifetime in the log.
+ */
+const CLAIM_PATH = '$.attempt.id'
+/**
+ * CORE-03: the payload paths at which a durable event names the attempt it is
+ * about, each read as `json_extract(data, path)`: the claim's attempt record;
+ * an attempt-scoped row, a member's `swarm_*` span among them (`$.attemptId`);
+ * and an operation its member ran under the attempt (`$.activity.attemptId`).
+ * An event that names the attempt's task (`ATTEMPT_TASK_PATH`) is the
+ * attempt's from its claim on. Only these paths attribute: an id anywhere else
+ * in a payload, such as a sibling proposal's `dependencies` or `reviewOf` or an
+ * outage's `taskIds`, names a relation, not a report by the attempt.
+ * `SwarmStore.attemptEventAt` reads them.
+ */
+export const ATTEMPT_PATHS = [CLAIM_PATH, '$.attemptId', '$.activity.attemptId'] as const
+/** The path at which an event names an attempt's task (`ATTEMPT_PATHS`). */
+export const ATTEMPT_TASK_PATH = '$.taskId'
+/** The partial index over the event rows that carry one attribution path. */
+const attributionIndex = (path: string): string => `events_at_${path.slice(2).replaceAll('.', '_')}`
+/**
+ * `SwarmStore.attemptEventAt` over the whole log, one term per path, each read
+ * through its own index. `?1` is the mission, `?2` the attempt, `?3` its task.
+ */
+const ATTEMPT_EVENT_AT = `SELECT MAX(at) AS at FROM (${[
+  ...ATTEMPT_PATHS.map(path => `SELECT MAX(created_at) AS at FROM events WHERE mission_id=?1 AND json_extract(data,'${path}')=?2`),
+  `SELECT MAX(created_at) AS at FROM events WHERE mission_id=?1 AND json_extract(data,'${ATTEMPT_TASK_PATH}')=?3
+    AND seq>=(SELECT MIN(seq) FROM events WHERE mission_id=?1 AND json_extract(data,'${CLAIM_PATH}')=?2)`,
+].join(' UNION ALL ')})`
+/** v3 adds the append-only `posts` board table; v4 cites mission criteria by id (`citeCriteria`); v5 records an owner notice's consumption on its delivery (`consumptionOnDelivery`); v6 kept an attempt's markers on the row only with that attempt; v7 makes them fields of the attempt (`markersOnTheirAttempt`, whose upgrade settles a store before v6 as v6's did); v8 has a deferred review name its deciding pass's rows (`deferralsNameTheirPass`). Older versions are upgraded at open. */
+const SCHEMA_VERSION = 8
 const CHANGE_HISTORY = 1024
 const DEFAULT_BUSY_TIMEOUT_MS = 5000
 const DEFAULT_WRITER_ATTEMPTS = 3
@@ -132,6 +168,14 @@ export function isSqliteBusy(error: unknown): boolean {
  * names the durable revision, not the caller's stale one, so the caller can
  * re-read and decide again; `code` is stable so callers branch on it, never on
  * message text.
+ *
+ * CORE-06: it is the backstop, not a transition's refusal. A transition that
+ * awaited I/O after reading its row writes through `SwarmRuntime.revise`, on
+ * the row its commit reads, so it never presents a revision another write
+ * moved past: a write it does not conflict with is kept, and one it conflicts
+ * with is refused by the transition's own fence, with that conflict's reason.
+ * This error reaches a caller only when a whole-row write of a copy read
+ * before another accepted write bypassed that shape.
  */
 export class StaleTaskRevisionError extends Error {
   readonly code = 'stale_task_revision' as const
@@ -189,56 +233,27 @@ export function withWriterRetry<T>(operation: () => T, options: { attempts?: num
   throw new WriterBusyError(`SQLite writer stayed busy after ${attempts} attempt(s): ${message}`, attempts, lastError)
 }
 
-interface RuntimeLock { pid: number; nonce?: string; birth?: string }
-
-function validProcessBirth(birth: string): boolean {
-  return /^linux:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}:\d+$/.test(birth)
-    || /^darwin:(Sun|Mon|Tue|Wed|Thu|Fri|Sat) (Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2} \d{2}:\d{2}:\d{2} \d{4}$/.test(birth)
-}
-
-/** A PID is reusable. Unknown platforms or inaccessible identity remain conservative. */
-function processBirth(pid: number): string | undefined {
-  try {
-    if (process.platform === 'linux') {
-      const stat = readFileSync(`/proc/${pid}/stat`, 'utf8')
-      const start = stat.slice(stat.lastIndexOf(')') + 2).split(' ')[19]
-      if (start === undefined || !/^\d+$/.test(start)) return undefined
-      return `linux:${readFileSync('/proc/sys/kernel/random/boot_id', 'utf8').trim()}:${start}`
-    }
-    if (process.platform === 'darwin') {
-      const start = execFileSync('ps', ['-p', String(pid), '-o', 'lstart='], {
-        encoding: 'utf8', timeout: 1000, stdio: ['ignore', 'pipe', 'ignore'], env: { ...process.env, LC_ALL: 'C', TZ: 'UTC' },
-      }).trim()
-      return start ? `darwin:${start}` : undefined
-    }
-  } catch { /* No trustworthy identity: retain the lock while the PID lives. */ }
-  return undefined
-}
-
+/**
+ * The runtime lock records its owner as `{ pid, nonce, birth }`; the owner
+ * identity and the rule that a lock may be taken over are process-identity.ts's,
+ * shared with the delivery apply lock. The nonce is this lock's own: release
+ * removes only the lock this store wrote.
+ */
 function acquireRuntimeLock(lockPath: string, nonce: string): void {
   try {
     const fd = openSync(lockPath, 'wx', 0o600)
-    try { writeFileSync(fd, JSON.stringify({ pid: process.pid, nonce, birth: processBirth(process.pid) })); fsyncSync(fd) }
+    try { writeFileSync(fd, JSON.stringify({ pid: process.pid, nonce, birth: ownBirth() })); fsyncSync(fd) }
     finally { closeSync(fd) }
     return
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error
   }
   const original = readFileSync(lockPath, 'utf8')
-  let lock: RuntimeLock
-  try { lock = JSON.parse(original) as RuntimeLock } catch { throw new Error(`Unrecognized runtime lock: ${lockPath}; inspect it before removing`) }
-  if (!Number.isInteger(lock?.pid) || lock.pid < 1) throw new Error('Invalid swarm runtime lock')
-  let abandoned = false
-  try { process.kill(lock.pid, 0) }
-  catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ESRCH') abandoned = true
-    else if ((error as NodeJS.ErrnoException).code !== 'EPERM') throw error
-  }
-  if (!abandoned && typeof lock.birth === 'string' && validProcessBirth(lock.birth)) {
-    const current = processBirth(lock.pid)
-    abandoned = current !== undefined && validProcessBirth(current) && current.split(':')[0] === lock.birth.split(':')[0] && current !== lock.birth
-  }
-  if (!abandoned) throw new Error(`Swarm database is already owned by process ${lock.pid}`)
+  let value: unknown
+  try { value = JSON.parse(original) } catch { throw new Error(`Unrecognized runtime lock: ${lockPath}; inspect it before removing`) }
+  const owner = recordedOwner(value)
+  if (owner === undefined) throw new Error('Invalid swarm runtime lock')
+  if (!ownerAbandoned(owner)) throw new Error(`Swarm database is already owned by process ${owner.pid}`)
   if (readFileSync(lockPath, 'utf8') !== original) throw new Error(`Swarm runtime lock changed during recovery: ${lockPath}; retry opening`)
   unlinkSync(lockPath)
   acquireRuntimeLock(lockPath, nonce)
@@ -363,11 +378,19 @@ export class SwarmStore {
         this.db.exec('CREATE TABLE IF NOT EXISTS events (seq INTEGER PRIMARY KEY AUTOINCREMENT, mission_id TEXT NOT NULL, type TEXT NOT NULL, actor TEXT NOT NULL, data TEXT NOT NULL, created_at INTEGER NOT NULL); CREATE INDEX IF NOT EXISTS events_mission ON events(mission_id, seq);')
         this.db.exec("CREATE INDEX IF NOT EXISTS events_task_fact ON events(mission_id, type, json_extract(data,'$.taskId'), seq); CREATE INDEX IF NOT EXISTS events_type ON events(mission_id, type, seq);")
         this.db.exec("CREATE INDEX IF NOT EXISTS events_trace_attempt ON events(mission_id, json_extract(data,'$.attemptId'), json_extract(data,'$.step'), seq) WHERE type='trace/span';")
+        // CORE-03: one partial index per attribution path, over only the rows that
+        // carry it, in log order and covering the instant: `attemptEventAt` reads
+        // the rows naming one attempt, its claim's sequence in one seek, and its
+        // task's rows from that sequence on, never the mission's whole log.
+        for (const path of [...ATTEMPT_PATHS, ATTEMPT_TASK_PATH]) {
+          this.db.exec(`CREATE INDEX IF NOT EXISTS ${attributionIndex(path)} ON events(mission_id, json_extract(data,'${path}'), seq, created_at) WHERE json_extract(data,'${path}') IS NOT NULL;`)
+        }
         this.db.exec('CREATE TABLE IF NOT EXISTS state_revision (id INTEGER PRIMARY KEY CHECK (id=1), revision INTEGER NOT NULL); INSERT OR IGNORE INTO state_revision(id,revision) VALUES(1,0); CREATE TABLE IF NOT EXISTS state_changes (revision INTEGER PRIMARY KEY, scopes TEXT NOT NULL);')
         // Each upgrade runs once: for a store older than the version that introduced it.
         if (version < 4) this.citeCriteria()
         if (version < 5) this.consumptionOnDelivery()
         if (version < 7) this.markersOnTheirAttempt()
+        if (version < 8) this.deferralsNameTheirPass()
         this.db.exec(`PRAGMA user_version=${SCHEMA_VERSION}`)
       })
     } catch (error) {
@@ -502,6 +525,28 @@ export class SwarmStore {
         closeout, leaseWarned, gitWriteDenied,
       })
       this.upsert('tasks', task)
+    }
+  }
+  /**
+   * The v8 upgrade, once, in the opening transaction like any other change. A
+   * build before v8 recorded a review's deferral without naming the rows of the
+   * pass that decided it, and composed its exit from the review's newest
+   * host-verification rows. Each row holding a deferral now names them
+   * (`verificationRecovery.toolRunIds`): the rows its newest
+   * `task/verification-deferred` event names as `checks`. That event is written
+   * in the same transaction as the deferral by every build that defers, and a
+   * resume clears the deferral, so it is the event of the deferral the row
+   * holds. A row no such event names (none a build wrote) names no rows, so its
+   * exit is the resume every deferral offers.
+   */
+  private deferralsNameTheirPass(): void {
+    const deferral = this.db.prepare("SELECT data FROM events WHERE mission_id=? AND type='task/verification-deferred' AND json_extract(data,'$.verificationTaskId')=? ORDER BY seq DESC LIMIT 1")
+    for (const task of this.list('tasks')) {
+      const recovery: (Omit<NonNullable<Task['verificationRecovery']>, 'toolRunIds'> & { toolRunIds?: string[] }) | undefined = task.verificationRecovery
+      if (recovery === undefined || recovery.toolRunIds !== undefined) continue
+      const row = deferral.get(task.missionId, task.id)
+      const named = row === undefined ? undefined : (JSON.parse(String(row.data)) as { checks?: string[] }).checks
+      this.upsert('tasks', { ...task, verificationRecovery: { ...recovery, toolRunIds: named ?? [] } })
     }
   }
   /** Read a mission's records, or all records for host recovery. */
@@ -751,6 +796,19 @@ export class SwarmStore {
   /** The mission's progress clock: its newest progress-kind row in the whole append-only log (never the event window), else its creation. */
   progressAt(mission: Mission): number {
     return Number(this.db.prepare(`SELECT COALESCE(MAX(created_at), ?) AS at FROM events WHERE mission_id=? AND type IN (${PROGRESS_KINDS.map(() => '?').join()})`).get(mission.createdAt, mission.id, ...PROGRESS_KINDS)?.at)
+  }
+  /**
+   * CORE-03: the newest instant at which the whole append-only event log, never
+   * the presentation window, names one attempt (`ATTEMPT_PATHS`), or undefined
+   * when no event does. An event naming its task (`ATTEMPT_TASK_PATH`) counts
+   * from the attempt's claim on: the lifetime is a range of the log, from the
+   * claim's sequence, so a clock that stepped back cannot hand an earlier
+   * attempt's row to this one. Rows are only appended, so the answer only moves
+   * forward.
+   */
+  attemptEventAt(missionId: string, taskId: string, attemptId: string): number | undefined {
+    const at = this.db.prepare(ATTEMPT_EVENT_AT).get(missionId, attemptId, taskId)?.at
+    return at === null || at === undefined ? undefined : Number(at)
   }
   /** Durable task fact lookup, independent of the presentation event window. */
   latestTaskEvent(missionId: string, taskId: string, type: string): SwarmEvent | undefined {

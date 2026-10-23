@@ -527,7 +527,16 @@ export interface Task {
   /** Durable block reason when the task exhausted one of its own ceilings. */
   ceiling?: TaskCeiling
   preparationFailure?: { reason: string; transient: boolean; attempts: number; retryAt?: number }
-  verificationRecovery?: { sourceTaskId: string; commit: string; reason: string; at: number }
+  /**
+   * A review's deferred verdict on its source's exact artifact. `toolRunIds`
+   * are the durable host-verification rows of the pass that decided to defer,
+   * in recorded order: the rows its `task/verification-deferred` event names
+   * as `checks`, and the only rows the deferral's exit is composed from
+   * (`reviewPathBlocker`, src/board.ts). The review's other rows are not that
+   * pass: a failed first pass before its retry, an earlier attempt's passes,
+   * or a pass a fenced attempt recorded after the deferral.
+   */
+  verificationRecovery?: { sourceTaskId: string; commit: string; reason: string; at: number; toolRunIds: string[] }
   /** Per-command host verification timeout chosen for this task. */
   checkTimeoutMs?: number
   /** Durable quiescence transition; epoch matching prevents reopening invalidated work. */
@@ -556,6 +565,14 @@ export interface Task {
   evidenceIds: string[]
   reviewOf?: string
   reviewedCommit?: string
+  /**
+   * On a review that accepted its source: what that acceptance rests on
+   * (`AcceptanceBasis`), written once in the verdict's transaction. It stays,
+   * as `reviewedCommit` does, when a challenge later cancels the review. Absent
+   * on a review that never accepted, and on one accepted by a build that did
+   * not record it.
+   */
+  acceptanceBasis?: AcceptanceBasis
   /** Blocked or cancelled tasks this repair replaces; their acceptance and covers apply to it through the lineage. */
   replaces?: string[]
   /**
@@ -574,6 +591,21 @@ export interface Task {
   handoff?: string
   createdAt: number
 }
+/**
+ * What an independent acceptance rests on, recorded with the verdict on
+ * `task/accepted`, on each `evidence/verdict` row it writes and on the
+ * accepting review (`Task.acceptanceBasis`):
+ *  - `checks`: the source declares host checks, and every one passed on the
+ *    exact artifact; `runIds` are the durable host-verification rows of the
+ *    pass the verdict classified.
+ *  - `review-evidence`: the source declares none, so the acceptance is the
+ *    reviewer's judgement, backed by the claims it published with
+ *    `swarm_publish` on the accepting attempt (`reviewEvidence`,
+ *    src/task-graph.ts); `evidenceIds` is never empty.
+ */
+export type AcceptanceBasis =
+  | { kind: 'checks'; runIds: string[] }
+  | { kind: 'review-evidence'; evidenceIds: string[] }
 export interface Evidence {
   id: string
   missionId: string
@@ -840,14 +872,16 @@ export const UNCONFINED_HOST_TOOLS: readonly string[] = [
  *  - the replay decoder (`src/trace.ts`) opens one attempt per `task/claimed`
  *    and refuses the whole log with `ReplayTruncationError` when one never
  *    closes;
- *  - the scheduling board model (`src/scheduling.ts`) ends the attempt interval
+ *  - the silence instrument (`tests/instruments.mjs`, R16-D; the scheduling
+ *    board model's until nothing in src/ read it) ends the attempt interval
  *    with the same set.
  *
  * The two readers used to carry hand-mirrored copies. They drifted: neither had
  * `task/restart-repended` (emitted when a host restart re-pends a running task,
  * `src/runtime.ts`) nor `task/ceiling-exhausted` (emitted when a task blocks at
  * its own ceiling, `src/runtime.ts`), so a log containing either made the replay
- * refuse its own mission as truncated. One list, both readers.
+ * refuse its own mission as truncated. One list, both readers; which task's
+ * attempt such an event closes is one rule too (`tasksClosedBy`).
  */
 export const ATTEMPT_FENCING_EVENTS: readonly EventKind[] = [
   // `attempt/fenced` is the uniform closer every fence writes through
@@ -861,6 +895,30 @@ export const ATTEMPT_FENCING_EVENTS: readonly EventKind[] = [
   'task/handoff-started', 'task/invalidated', 'task/review-retired',
   'task/closeout-abandoned', 'task/closeout-failed', 'task/accepted', 'task/rejected',
 ]
+/**
+ * The payload fields at which a fencing event names a task whose attempt it
+ * closes: the task it fences (`taskId`), the source a verdict, a deferral or an
+ * invalidation is about (`sourceTaskId`), and the review that reached the
+ * verdict or deferred it (`verificationTaskId`). A verdict names its review at
+ * the last field only.
+ */
+const ATTEMPT_CLOSING_FIELDS = ['taskId', 'sourceTaskId', 'verificationTaskId'] as const
+/**
+ * The tasks whose open attempt one durable event closes: none unless it is a
+ * fencing event (`ATTEMPT_FENCING_EVENTS`), else each task it names at an
+ * `ATTEMPT_CLOSING_FIELDS` field. The closing rule of both readers of the set.
+ * It is not the rule for progress: which events report for an attempt is the
+ * store's named-path attribution (`ATTEMPT_PATHS` in `src/store.ts`).
+ */
+export function tasksClosedBy(event: Pick<SwarmEvent, 'type' | 'data'>): string[] {
+  if (!(ATTEMPT_FENCING_EVENTS as readonly string[]).includes(event.type)) return []
+  const data = event.data
+  if (data === null || typeof data !== 'object') return []
+  return ATTEMPT_CLOSING_FIELDS.flatMap(field => {
+    const taskId = (data as Record<string, unknown>)[field]
+    return typeof taskId === 'string' && taskId ? [taskId] : []
+  })
+}
 
 export interface SwarmEvent {
   seq: number

@@ -46,6 +46,12 @@ test('verdictRows maps every evidence id and retired sibling into the client con
     evidence: [{ id: 'evidence-1', outcome: 'supported' }, { id: 'evidence-2', outcome: 'inconclusive' }], retired: ['review-9'] })
   assert.deepEqual(rows.map(row => [row.evidenceId, row.verdict, row.retired, row.taskId, row.verificationTaskId]),
     [['evidence-1', 'refuted', ['review-9'], 'task-1', 'task-2'], ['evidence-2', 'refuted', ['review-9'], 'task-1', 'task-2']])
+  assert.equal(rows.some(row => 'basis' in row), false, 'a rejection records no basis')
+  // CORE-01: every row of an acceptance carries what it rests on.
+  const basis = { kind: 'review-evidence', evidenceIds: ['evidence-9'] }
+  const verified = verdictRows({ sourceTaskId: 'task-1', verificationTaskId: 'task-2', verdict: 'verified', basis, reason: 'judged',
+    evidence: [{ id: 'evidence-1', outcome: 'supported' }, { id: 'evidence-2', outcome: 'disproved' }], retired: [] })
+  assert.deepEqual(verified.map(row => [row.evidenceId, row.verdict, row.basis]), [['evidence-1', 'verified', basis], ['evidence-2', 'verified', basis]])
 })
 
 test('F-13: the read path pages older events with a before cursor instead of tail-only', async t => {

@@ -44,11 +44,17 @@
  */
 import test from 'node:test'
 import assert from 'node:assert/strict'
+import { mkdtempSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { DatabaseSync } from 'node:sqlite'
 import { silenceReport } from './instruments.mjs'
-import { FakeWorkers, eventually, makeRuntime } from './faults/harness.mjs'
+import { FakeClock, FakeWorkers, eventually, makeRuntime } from './faults/harness.mjs'
 import { noticeFamily } from '../lib/notices.js'
 import { formatSpan } from '../lib/kernel.js'
 import { passState, wedgeVerdict } from '../lib/board.js'
+import { SwarmStore } from '../lib/store.js'
+import { TraceRecorder } from '../lib/trace.js'
 
 /** The body queued or running for `missionId`, judged on its board: its publication state and its verdict. */
 const stateOf = (runtime, missionId) => passState(runtime.boardOf(missionId))
@@ -70,9 +76,9 @@ class Workers extends FakeWorkers {
   isIdle(memberId) { return this.options.idle === undefined ? true : this.options.idle(memberId) }
 }
 
-async function scenario(t, { workers = new Workers(), config = {} } = {}) {
+async function scenario(t, { workers = new Workers(), config = {}, clock } = {}) {
   const { dir: directory, runtime, budget } = await makeRuntime(t, {
-    workers,
+    workers, clock,
     config: { tickMs: 25, maxEvents: 500, maxTasksPerMember: 9, checkTimeoutMs: undefined, ...config },
     budget: { maxTokens: 100000, maxSteps: 100, maxTasks: 20, maxExperiments: 2 },
   })
@@ -396,6 +402,150 @@ test('R16-D8: the silence projection reads both gaps, the wedge record and the u
   assert.ok(report.attemptsEnded >= 1)
   assert.equal(report.passReleases.count, 1, 'the wedge count comes from the durable stall events')
   assert.equal(report.passReleases.worst.runId, wedged.operationId)
+})
+
+/**
+ * CORE-03: the attempt bound reads a durable fact, never the presentation
+ * window. A worker whose last report was one `swarm_*` call has only that span
+ * (swarm_* calls are never tool runs); once other members' rows push it and the
+ * claim past `maxEvents`, a windowed basis fell back to the dispatch, so the
+ * silence was overstated and told a second time under a new key.
+ */
+test('CORE-03: the silence basis is the attempt\'s newest durable row in the whole log, so the window moving neither takes it back nor tells the silence twice', async t => {
+  const clock = new FakeClock()
+  const f = await scenario(t, { clock, config: { maxEvents: 40, leaseMs: 3_600_000, attemptSilenceBoundMs: 60_000 } })
+  const quiet = await f.addMember('Quiet')
+  const busy = await f.addMember('Busy')
+  const quietTask = f.propose('Reports once', { assigneeId: quiet.id })
+  const attemptId = (await f.runtime.claim(f.actorFor(quiet), f.mission.id, quietTask.id)).attempt.id
+  // The pass that claim's workspace check let run settles before the next propose and hand claim.
+  await f.runtime.settle(f.mission.id)
+  const busyTask = f.propose('Reports often', { assigneeId: busy.id })
+  const busyAttempt = (await f.runtime.claim(f.actorFor(busy), f.mission.id, busyTask.id)).attempt.id
+  // The writer of a member's `swarm_*` span (src/tools.ts), with the identity the tool layer derives for it.
+  const recorder = new TraceRecorder(f.runtime.store)
+  const report = (member, taskId, attempt) => recorder.record('swarm_post', () => ({
+    missionId: f.mission.id, actor: member.id, taskId, attemptId: attempt, input: {}, output: {}, status: 'ok', startedAt: clock.now(), durationMs: 0 }))
+  clock.advance(5_000)
+  report(quiet, quietTask.id, attemptId)
+  const reportedAt = clock.now()
+  const inWindow = () => f.runtime.store.events(f.mission.id, f.runtime.config.maxEvents).filter(event => event.data?.attemptId === attemptId || event.data?.attempt?.id === attemptId)
+  assert.deepEqual(inWindow().map(event => event.type), ['task/claimed', 'trace/span'], 'the claim and the span are in the window when the silence is first told')
+  const told = () => f.escalations(`attempt-silent:${attemptId}:`).map(delivery => delivery.notice.dedupKey)
+  clock.advance(60_000)
+  await f.runtime.tick()
+  assert.deepEqual(told(), [`attempt-silent:${attemptId}:${reportedAt}`], 'the silence is told once, measured from the span')
+  // Another member's reports move the window past every row naming the quiet attempt.
+  for (let i = 0; i < 50; i++) { clock.advance(10); report(busy, busyTask.id, busyAttempt) }
+  assert.deepEqual(inWindow(), [], 'neither its claim nor its span is in the window any more')
+  clock.advance(1_000)
+  await f.runtime.tick()
+  const silent = f.runtime.scheduling.silentAttempt(f.runtime.store.get('tasks', quietTask.id), f.runtime.mission(f.mission.id))
+  assert.equal(silent?.lastDurableAt, reportedAt, 'the basis is still the span: it is read from the whole log')
+  assert.deepEqual(told(), [`attempt-silent:${attemptId}:${reportedAt}`], 'the unchanged silence is not told again under an older basis')
+  assert.match(f.escalations(`attempt-silent:${attemptId}:`)[0].content, new RegExp(`since durable row at ${reportedAt};`), 'the notice names the instant it measured from')
+})
+
+test('CORE-03: only a named path attributes an event to an attempt: a sibling naming the task re-arms nothing, an operation run under the attempt does', async t => {
+  const clock = new FakeClock()
+  const f = await scenario(t, { clock, config: { leaseMs: 3_600_000, attemptSilenceBoundMs: 60_000 } })
+  const builder = await f.addMember('Builder')
+  const task = f.propose('Silent work', { assigneeId: builder.id })
+  await f.runtime.claim(f.actorFor(builder), f.mission.id, task.id)
+  const claimedAt = clock.now()
+  // The instant the bound measures from, read past any bound.
+  const basis = () => f.runtime.scheduling.silentAttempt(f.runtime.store.get('tasks', task.id), f.runtime.mission(f.mission.id), clock.now() + 3_600_000)?.lastDurableAt
+  assert.equal(basis(), claimedAt, 'a dispatch that recorded nothing else is measured from the dispatch')
+  clock.advance(1_000)
+  const dependent = f.propose('Builds on the silent work', { dependencies: [task.id] })
+  const proposal = f.runtime.store.events(f.mission.id, f.runtime.config.maxEvents).find(event => event.type === 'task/proposed' && event.data.id === dependent.id)
+  assert.deepEqual(proposal.data.dependencies, [task.id], 'the sibling\'s proposal names the task')
+  assert.equal(basis(), claimedAt, 'as a dependency: a relation, not a report by the attempt')
+  clock.advance(1_000)
+  f.workers.callbacks.activity(builder.id, { id: 'operation_1', kind: 'model', startedAt: clock.now(), updatedAt: clock.now() })
+  const operationAt = clock.now()
+  clock.advance(1_000)
+  f.workers.callbacks.activity(builder.id, undefined)
+  assert.equal(basis(), operationAt, 'an operation its member ran under the attempt names it ($.activity.attemptId)')
+})
+
+test('CORE-03: SwarmStore.attemptEventAt reads the whole log by named paths, from the claim on for the task, each path through its own index', t => {
+  const directory = mkdtempSync(join(tmpdir(), 'silence-basis-'))
+  t.after(() => rmSync(directory, { recursive: true, force: true }))
+  const path = join(directory, 'state.sqlite')
+  let now = 0
+  const store = new SwarmStore(path, { snapshotIntervalMs: 0, now: () => now })
+  t.after(() => store.close())
+  const at = (instant, type, data) => { now = instant; store.transaction(() => store.event('m', type, 'runtime', data)) }
+  const basis = () => store.attemptEventAt('m', 'task', 'attempt')
+  // An earlier attempt's row logged before the claim, under a clock that later stepped back.
+  at(5_000, 'task/blocked', { taskId: 'task', reason: 'the previous attempt' })
+  assert.equal(basis(), undefined, 'nothing names an attempt before its claim')
+  at(2_000, 'task/claimed', { taskId: 'task', attempt: { id: 'attempt', epoch: 1, ownerId: 'member' } })
+  assert.equal(basis(), 2_000, 'the claim opens the attempt; a row of its task logged before it is not the attempt\'s, whatever its clock reads')
+  at(3_000, 'trace/span', { taskId: 'task', attemptId: 'attempt', step: 'swarm_post' })
+  assert.equal(basis(), 3_000, 'a span names the attempt ($.attemptId)')
+  at(3_500, 'task/proposed', { id: 'sibling', dependencies: ['task'], reviewOf: 'task' })
+  at(3_600, 'provider/outage', { memberId: 'member', taskIds: ['task'] })
+  at(3_700, 'trace/span', { taskId: 'other', attemptId: 'other-attempt', step: 'swarm_post' })
+  assert.equal(basis(), 3_000, 'an id anywhere else in a payload names a relation, and another attempt is not this one')
+  at(4_000, 'member/activity', { memberId: 'member', activity: { id: 'operation', kind: 'tool', attemptId: 'attempt' } })
+  assert.equal(basis(), 4_000, 'an operation run under the attempt names it ($.activity.attemptId)')
+  at(4_500, 'task/lease-expiring', { taskId: 'task', ownerId: 'member' })
+  assert.equal(basis(), 4_500, 'a row naming its task from the claim on is the attempt\'s ($.taskId)')
+  for (let i = 0; i < 200; i++) at(6_000 + i, 'mission/budget-warning', { dimension: 'tokens' })
+  assert.equal(store.events('m', 100).some(event => event.data.taskId === 'task'), false, 'every row naming the attempt has left the presentation window')
+  assert.equal(basis(), 4_500, 'the whole log still answers')
+  assert.equal(store.attemptEventAt('m', 'task', 'unknown'), undefined, 'an attempt no row names has no event instant')
+  const db = new DatabaseSync(path, { readOnly: true })
+  try {
+    const indexes = db.prepare("SELECT name FROM sqlite_master WHERE type='index' AND name LIKE 'events_at_%'").all().map(row => row.name).sort()
+    assert.deepEqual(indexes, ['events_at_activity_attemptId', 'events_at_attemptId', 'events_at_attempt_id', 'events_at_taskId'], 'each named path has its own index')
+  } finally { db.close() }
+})
+
+/**
+ * The silence instrument keeps two rules apart. Progress is the store's
+ * named-path rule, the one the live bound reads. An attempt ends at the closer
+ * the replay decoder ends it at (`tasksClosedBy`), and that closer is its last
+ * element. A verdict names its review only at `$.verificationTaskId`, which no
+ * progress path reads, so a closer read through the progress rule left the
+ * review open past its verdict: the silent stretch up to the verdict was lost,
+ * and a later row naming the review's task was charged to the finished attempt.
+ */
+test('CORE-03: the silence instrument ends a review attempt at its verdict, whatever names the review afterwards', t => {
+  const directory = mkdtempSync(join(tmpdir(), 'silence-closer-'))
+  t.after(() => rmSync(directory, { recursive: true, force: true }))
+  let now = 0
+  const store = new SwarmStore(join(directory, 'state.sqlite'), { snapshotIntervalMs: 0, now: () => now })
+  t.after(() => store.close())
+  const at = (instant, type, data) => { now = instant; store.transaction(() => store.event('m', type, 'runtime', data)) }
+  const claim = (instant, taskId, attemptId, ownerId) => at(instant, 'task/claimed', { taskId, attempt: { id: attemptId, epoch: 1, ownerId } })
+  claim(1_000, 'source', 'source-attempt', 'builder')
+  at(2_000, 'task/submitted', { taskId: 'source', commit: 'c1' })
+  claim(3_000, 'review', 'review-attempt', 'reviewer')
+  at(4_000, 'trace/span', { taskId: 'review', attemptId: 'review-attempt', step: 'swarm_post' })
+  at(12_000, 'evidence/verified', { evidenceId: 'e1', taskId: 'source', verificationTaskId: 'review', commit: 'c1' })
+  at(12_000, 'task/accepted', { sourceTaskId: 'source', verificationTaskId: 'review', commit: 'c1' })
+  claim(13_000, 'second-review', 'second-attempt', 'reviewer')
+  at(20_000, 'task/verification-deferred', { sourceTaskId: 'source', verificationTaskId: 'second-review', commit: 'c1' })
+  // The owner reads the finished reviews afterwards: its spans name their tasks.
+  at(50_000, 'trace/span', { taskId: 'review', step: 'swarm_observe' })
+  at(60_000, 'trace/span', { taskId: 'second-review', step: 'swarm_observe' })
+  const runtime = { store, config: { maxEvents: 100 }, bounds: { stallPassTimeoutMs: 100, stallPassReleaseBoundMs: 200, attemptSilenceBoundMs: 5_000 } }
+  const report = silenceReport(runtime, 'm')
+  const of = attemptId => {
+    const { endedAt, lastDurableAt, worstReportingGapMs, silentMs, endedUnreported } = report.attempts.find(attempt => attempt.attemptId === attemptId)
+    return { endedAt, lastDurableAt, worstReportingGapMs, silentMs, endedUnreported }
+  }
+  assert.deepEqual(of('review-attempt'), { endedAt: 12_000, lastDurableAt: 12_000, worstReportingGapMs: 8_000, silentMs: 0, endedUnreported: false },
+    'the verdict ends the review it names at $.verificationTaskId, reports for it, and keeps the silent stretch before it; the owner\'s later span is not the review\'s')
+  assert.deepEqual(of('second-attempt'), { endedAt: 20_000, lastDurableAt: 20_000, worstReportingGapMs: 7_000, silentMs: 0, endedUnreported: false },
+    'a deferral is the review\'s closing report even when nothing else named it')
+  assert.deepEqual(of('source-attempt'), { endedAt: 2_000, lastDurableAt: 2_000, worstReportingGapMs: 1_000, silentMs: 0, endedUnreported: false },
+    'the source ended at its submission; the verdict and its evidence about the source come after its attempt')
+  assert.deepEqual(report.worstAttemptReportingGap, { attemptId: 'review-attempt', taskId: 'review', gapMs: 8_000 })
+  assert.equal(report.attemptsEnded, 3)
 })
 
 test('both silence notices render a span as seconds, minutes and seconds, or hours and minutes', () => {

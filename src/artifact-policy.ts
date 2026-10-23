@@ -3,8 +3,10 @@ import { posix } from 'node:path'
 import { requireHostChecks } from './admission.ts'
 import type { Artifact, Task } from './types.ts'
 
-// Known report formats retain the lightweight research path. This classifies
-// files, not arbitrary program semantics; reviewers still judge check coverage.
+// Known report formats need no host checks: their acceptance is the reviewer's
+// judgement backed by the reviewer's published review evidence
+// (`reviewEvidence`, src/task-graph.ts). This classifies files, not arbitrary
+// program semantics; reviewers still judge check coverage.
 const reportExtensions = ['.md', '.markdown', '.txt', '.rst', '.adoc', '.pdf', '.csv', '.tsv', '.png', '.jpg', '.jpeg', '.gif', '.webp']
 export function artifactNeedsChecks(artifact: Artifact): boolean {
   return !!artifact.executablePaths?.length || artifact.changedPaths.some(name => !reportExtensions.includes(posix.extname(name).toLowerCase())

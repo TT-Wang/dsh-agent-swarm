@@ -5,7 +5,7 @@
  * it awaits for without importing the sweep.
  */
 import type { AdapterView, Board, Bounds, SchedulingPass } from './board.ts'
-import type { SwarmStore } from './store.ts'
+import type { RevisedTable, SwarmStore, Tables } from './store.ts'
 import type { Mission, RuntimeConfig, Task, WorkerAdapter } from './types.ts'
 
 /**
@@ -39,6 +39,12 @@ export interface Kernel {
   readonly view: AdapterView
   boardOf(missionId: string): Board
   commit<T>(missionId: string, fn: () => T): T
+  /**
+   * CORE-06: the one write of a row by a transition that awaited after it read
+   * that row: the row as this commit reads it, re-validated by `change` (see
+   * `SwarmRuntime.revise`). Undefined when the transition was moot.
+   */
+  revise<T extends RevisedTable>(missionId: string, table: T, rowId: string, change: (current: Tables[T]) => boolean | void, effects?: (written: Tables[T]) => void): Tables[T] | undefined
   defer(fn: () => Promise<void>): void
   exclusive<T>(missionId: string, fn: () => Promise<T>): Promise<T>
   kick(missionId: string, after?: SchedulingPass): void

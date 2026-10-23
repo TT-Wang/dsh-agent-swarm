@@ -335,16 +335,15 @@ export class RuntimeGates {
     this.k.defer(async () => {
       await Promise.all(this.k.store.list('members', missionId).map(member => this.k.workers.stop(member.id)))
       if (this.k.closed) return
-      const current = this.k.mission(missionId)
-      // Re-read after the await: the pause may have been resumed or already
-      // quiesced by a concurrent stop; either way this claim writes nothing.
-      if (current.budgetPause?.id !== pauseId || current.budgetPause.quiesced) return
-      current.budgetPause.quiesced = true
-      delete current.budgetPause.stopping
-      this.k.commit(missionId, () => {
-        this.k.store.put('missions', current)
-        this.k.store.event(missionId, 'mission/budget-quiesced', 'runtime', { pauseId })
-      })
+      // CORE-06: written on the row the commit reads (`Kernel.revise`), after
+      // the await: the pause may have been resumed or already quiesced by a
+      // concurrent stop; either way this claim writes nothing.
+      const quiesced = this.k.revise(missionId, 'missions', missionId, current => {
+        if (current.budgetPause?.id !== pauseId || current.budgetPause.quiesced) return false
+        current.budgetPause.quiesced = true
+        delete current.budgetPause.stopping
+      }, () => this.k.store.event(missionId, 'mission/budget-quiesced', 'runtime', { pauseId }))
+      if (quiesced === undefined) return
       this.k.kick(missionId)
       await this.notices.flushOutbox(missionId)
     })
