@@ -311,6 +311,11 @@ export class SwarmRuntime implements Kernel {
     }
     for (const request of this.store.list('starts')) {
       const mission = request.missionId ? this.store.get('missions', request.missionId) : undefined
+      // A request names only a mission that exists (`create`). Earlier
+      // releases linked it when its launch began, so a launch refused before
+      // the mission was created left a link to none; it is dropped here.
+      const dangling = request.missionId !== undefined && mission === undefined
+      if (dangling) delete request.missionId
       if (mission && mission.status !== 'staged') {
         request.status = mission.status === 'completed' ? 'completed' : mission.status === 'stopped' ? 'stopped' : 'running'
         request.budget = { ...mission.budget }
@@ -320,7 +325,10 @@ export class SwarmRuntime implements Kernel {
         request.error = 'Host restarted before automatic launch completed. Retry the saved request to continue.'
         request.recoveryNoticePending = true
         delete request.planningDispatchPending
-      } else continue
+      } else {
+        if (dangling) this.store.transaction(() => this.store.put('starts', request))
+        continue
+      }
       request.updatedAt = this.now()
       this.store.transaction(() => this.store.put('starts', request))
     }
@@ -776,8 +784,13 @@ export class SwarmRuntime implements Kernel {
       taskIds: chain,
     }
   }
-  /** Create a mission with explicitly bounded resources and scope, recording the authorization its entry point claimed. */
-  create(actor: Actor, input: CreateMissionInput, claim: WorkspaceClaim, initial: { id?: string; status?: 'active' | 'staged' } = {}): Mission {
+  /**
+   * Create a mission with explicitly bounded resources and scope, recording
+   * the authorization its entry point claimed. A mission launched for an
+   * automatic request (`requestId`) is linked to it in the commit that creates
+   * it, so the request never names a mission that does not exist.
+   */
+  create(actor: Actor, input: CreateMissionInput, claim: WorkspaceClaim, initial: { id?: string; status?: 'active' | 'staged'; requestId?: string } = {}): Mission {
     if (this.shuttingDown) throw new PolicyError('runtime_shutting_down', 'conflict_error', 'Swarm runtime is shutting down')
     if (this.store.list('members').some(m => m.sessionId === actor.sessionId)) throw new PolicyError('worker_cannot_own_mission', 'authorization_error', 'Workers cannot create independent missions or budgets')
     requireText(input.title, 'title'); requireText(input.objective, 'objective')
@@ -791,8 +804,10 @@ export class SwarmRuntime implements Kernel {
     if (!Number.isSafeInteger(now + budget.maxDurationMs)) throw new PolicyError('mission_duration_invalid', 'validation_error', 'Mission duration exceeds the supported clock range')
     const mission: Mission = { ...input, workspaceGrantRoot: authorized.grantRoot, workspaceAuthorizationSource: authorized.source, budget, id: initial.id ?? id('mission'), ownerSessionId: actor.sessionId, status: initial.status ?? 'active', usedTokens: 0, usedSteps: 0, createdAt: now, updatedAt: now, executionTime: { usedMs: 0 }, deadline: Math.min(budget.deadlineAt ?? Number.MAX_SAFE_INTEGER, now + budget.maxDurationMs) }
     if (this.store.get('missions', mission.id)) throw new PolicyError('mission_identity_conflict', 'conflict_error', 'Mission already exists')
+    const request = initial.requestId === undefined ? undefined : this.store.get('starts', initial.requestId)
     this.commit(mission.id, () => {
       this.store.put('missions', mission)
+      if (request !== undefined) { request.missionId = mission.id; this.store.put('starts', request) }
       this.store.event(mission.id, 'mission/created', 'owner', mission)
       // The durable audit of where the authorization came from: the matched
       // root and the resolved workspace path, recorded with the mission.
@@ -2394,14 +2409,17 @@ export class SwarmRuntime implements Kernel {
         const existing = request.draftId ? this.store.get('drafts', request.draftId) : undefined
         const plan = this.automaticPlan(input, request)
         request.budget = { ...plan.budget }
+        // Saving the deterministic draft link before the draft makes a crash
+        // between these commits recoverable without an orphan or a duplicate.
+        // The request names its mission only in the commit that creates it
+        // (`create`, from `launchDraft`): a launch refused before then (a check
+        // preflight, the W8 route rule) leaves no link to a mission that does
+        // not exist, which every reader of the request would follow.
         request.draftId ??= `draft_${request.id}`
-        request.missionId ??= `mission_${request.draftId}`
         request.status = 'launching'; request.updatedAt = this.now(); delete request.error
         request.planningDeadlineAt = Math.max(request.planningDeadlineAt ?? 0, this.now() + (this.config.planningTimeoutMs ?? 600000))
         this.commit(request.id, () => this.store.put('starts', request))
         launchActor.signal!.throwIfAborted()
-        // Saving the deterministic link before the draft makes a crash between
-        // these commits recoverable without creating an orphan or a duplicate.
         const claim = recordedClaim(request.workspace, request)
         const draft = existing
           ? (JSON.stringify(existing.input) === JSON.stringify(plan) ? existing : this.updateDraft(launchActor, existing.id, existing.revision, plan, claim))
@@ -2719,7 +2737,7 @@ export class SwarmRuntime implements Kernel {
         const repairing = mission !== undefined
         if (!mission) {
           const { title, objective, workspace, scope, acceptance, budget } = input
-          mission = this.create(actor, { title, objective, workspace, scope, acceptance, budget }, recordedClaim(workspace, draft), { id: missionId, status: 'staged' })
+          mission = this.create(actor, { title, objective, workspace, scope, acceptance, budget }, recordedClaim(workspace, draft), { id: missionId, status: 'staged', ...(automatic === undefined ? {} : { requestId: automatic.id }) })
         }
         if (mission.ownerSessionId !== actor.sessionId || mission.status !== 'staged') throw new PolicyError('draft_mission_not_launchable', 'conflict_error', 'The partially assembled mission cannot be launched')
         if (repairing) await this.repairDraftAdmissions(actor, draft, input, assertCurrent)

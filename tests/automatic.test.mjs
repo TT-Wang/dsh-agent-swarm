@@ -633,6 +633,52 @@ test('failed checks and unresolved evidence challenges cannot produce automatic 
   }
 })
 
+test('a request names only a mission that exists: a launch refused before its mission links none, and the launch that creates it links it', async t => {
+  const f = await fixture(t)
+  // The W8 route rule refuses the plan's members before any effect, as the live
+  // drop3 owner's undeclared efforts were refused.
+  let refuse = true
+  f.workers.memberRoutes = (_owner, members) => members.map(() => refuse
+    ? { verdict: 'effort-unsupported', provider: 'deepseek-official', model: 'flash', effort: 'low', efforts: ['off'] } : { verdict: 'accepted' })
+  const request = f.runtime.requestStart(f.owner, f.requestInput, { grantRoot: f.requestInput.workspace, source: 'session' })
+  await assert.rejects(f.runtime.startPlan(f.owner, request.id, f.input), /member_reasoning_effort_unsupported/)
+  const refused = f.runtime.starts(f.owner)[0]
+  assert.equal(refused.status, 'failed')
+  assert.equal(refused.missionId, undefined, 'the refused request links no mission')
+  assert.deepEqual(f.runtime.list(f.owner.sessionId), [])
+  // The failure is recorded under the request, the scope it exists in.
+  assert.ok(f.runtime.store.events(request.id, 50).some(event => event.type === 'automatic/failed' && /member_reasoning_effort_unsupported/.test(event.data.reason)))
+  refuse = false
+  const snapshot = await f.runtime.startPlan(f.owner, request.id, f.input)
+  assert.equal(f.runtime.starts(f.owner)[0].missionId, snapshot.mission.id, 'the launch links the mission it created')
+  assert.equal(f.runtime.snapshot(f.owner, f.runtime.starts(f.owner)[0].missionId).mission.status, 'active')
+})
+
+test('restart drops a request\'s link to a mission that was never created, as an earlier release wrote it when a launch began', async t => {
+  const f = await fixture(t)
+  const failed = f.runtime.requestStart(f.owner, f.requestInput, { grantRoot: f.requestInput.workspace, source: 'session' })
+  const launching = f.runtime.requestStart({ sessionId: 'other-owner' }, { ...f.requestInput, commandId: 'command-2' }, { grantRoot: f.requestInput.workspace, source: 'session' })
+  f.runtime.store.transaction(() => {
+    f.runtime.store.put('starts', { ...failed, status: 'failed', error: 'Error: [check_syntax_invalid] refused', draftId: `draft_${failed.id}`, missionId: `mission_draft_${failed.id}` })
+    f.runtime.store.put('starts', { ...launching, status: 'launching', draftId: `draft_${launching.id}`, missionId: `mission_draft_${launching.id}` })
+  })
+  const updatedAt = f.runtime.store.get('starts', failed.id).updatedAt
+  await f.runtime.dispose()
+  const recovered = new SwarmRuntime(f.config, new Workers())
+  try {
+    await recovered.start()
+    const kept = recovered.store.get('starts', failed.id)
+    assert.equal(kept.missionId, undefined, 'a failed request loses its link to a mission that does not exist')
+    assert.equal(kept.status, 'failed')
+    assert.equal(kept.error, 'Error: [check_syntax_invalid] refused', 'nothing else about it changes')
+    assert.equal(kept.updatedAt, updatedAt)
+    const interrupted = recovered.store.get('starts', launching.id)
+    assert.equal(interrupted.missionId, undefined)
+    assert.equal(interrupted.status, 'failed')
+    assert.equal(interrupted.recoveryNoticePending, true)
+  } finally { await recovered.dispose() }
+})
+
 test('restart recovers interrupted planning and assembly while retaining launched mission identity', async t => {
   const f = await fixture(t)
   const planning = f.runtime.requestStart(f.owner, f.requestInput, { grantRoot: f.requestInput.workspace, source: 'session' })
