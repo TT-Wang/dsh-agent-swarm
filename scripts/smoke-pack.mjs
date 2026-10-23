@@ -48,7 +48,7 @@ try {
   await materializeTrackedTree(project, cleanCheckout)
   assert(!existsSync(join(cleanCheckout, 'lib')), 'clean checkout must start without built lib output')
   const dependencySource = join(project, 'node_modules')
-  assert(existsSync(dependencySource), 'clean-checkout pack needs the linked dependencies (run npm run link:dsh first)')
+  assert(existsSync(dependencySource), 'clean-checkout pack needs the installed dependencies (run npm ci, then npm run link:dsh)')
   await symlink(await realpath(dependencySource), join(cleanCheckout, 'node_modules'), 'dir')
   const cleanPack = join(temporary, 'clean-pack')
   await mkdir(cleanPack)
