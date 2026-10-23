@@ -115,6 +115,12 @@ interface AssignmentEnvironment { checkEnvironment?: { note: string; environment
  * durable rows name it, whatever happens to that attempt while they run.
  */
 export interface VerificationAttempt { taskId: string; attemptId: string }
+/**
+ * CORE-05: what `run` decided with: the checks of its deciding pass and which
+ * pass that was, 1, or 2 when the first failed and the retry decided. `run`
+ * runs both passes, so it is the one source of the label `recordRuns` writes.
+ */
+export interface DecidingPass { checks: CheckResult[]; pass: 1 | 2 }
 
 export class DeclaredChecks {
   constructor(private readonly k: Kernel, private readonly workspaceAdmission: WorkspaceAdmission) {}
@@ -137,7 +143,7 @@ export class DeclaredChecks {
    * Co-firing guards, named: the retry rule itself (a first pass that passes
    * never reaches here, so a single-pass verification still records exactly one
    * attempt) x `recordRuns` (which must not write this attempt twice: it writes
-   * only the deciding pass once these rows exist) x the acceptance basis in
+   * only the deciding pass, as pass 2 when `run` retried) x the acceptance basis in
    * `verify` (an acceptance's `checks` basis names only the deciding pass, so
    * these rows never back one; an acceptance with no check row is the
    * reviewer's judgement backed by the reviewer's published review evidence,
@@ -150,28 +156,6 @@ export class DeclaredChecks {
         const run: ToolRun = { id: id('run'), seq: ++seq, missionId: member.missionId, memberId: member.id, taskId: verification.taskId, attemptId: verification.attemptId, tool: 'swarm.host_verification', arguments: { command: check.command, commit: artifact.commit, attempt: 1 }, result: check, isError: check.exitCode !== 0, createdAt: this.k.now() }
         this.k.store.put('tool_runs', run)
       }
-    })
-  }
-
-  /**
-   * R16-G5a: whether the durable record holds a failed first pass of this
-   * attempt at this commit, which `recordRuns` reads to label the pass it
-   * writes 2 (a retry) instead of 1. Scoped by attempt id, so a later
-   * verification of the same commit can never pair with an earlier attempt's
-   * failure. The lookup is scoped by attempt, not by `swarm_verify` call: a
-   * second call by the same live attempt, after
-   * `[checks_changed_during_verification]` or `[check_environment_mismatch]`,
-   * also finds the first call's failed first pass, so its single clean pass is
-   * labelled 2. Only that label is off: the verdict and the rows it cites are
-   * the second call's own.
-   */
-  private firstPassRecorded(missionId: string, where: { memberId: string; taskId: string; attemptId: string; commit: string }): boolean {
-    return this.k.store.list('tool_runs', missionId).some(run => {
-      const args = run.arguments
-      if (typeof args !== 'object' || args === null) return false
-      const named = args as { attempt?: unknown; commit?: unknown }
-      return run.tool === 'swarm.host_verification' && run.isError && run.memberId === where.memberId && run.taskId === where.taskId && run.attemptId === where.attemptId
-        && named.attempt === 1 && named.commit === where.commit
     })
   }
 
@@ -194,18 +178,24 @@ export class DeclaredChecks {
    * pass is re-run once on the same artifact and the retry decides: a real
    * failure fails twice, a flake does not. The failed first pass is written
    * durably under `verification` before the retry runs (`recordFirstPass`),
-   * never discarded; the verdict records the deciding pass (`recordRuns`).
+   * never discarded; the verdict records the deciding pass (`recordRuns`),
+   * labelled with the pass this call says decided. That label is this call's
+   * own: an earlier `swarm_verify` call by the same attempt (one refused with
+   * `[checks_changed_during_verification]`, say) leaves its first pass on
+   * the record, and never makes this call's single pass a retry. No attempt
+   * outlives the process that ran its passes (a restart re-pends every
+   * running row and ends its attempt), so no later call completes a pair.
    *
    * CORE-05: `verification` is the review task and attempt the caller proved it
    * holds (`verify`'s `ownAttempt` before the checks), so the record names the
    * attempt that ran the passes even when it is fenced while they run.
    */
-  async run(member: Member, source: Task, artifact: Artifact, verification: VerificationAttempt, signal?: AbortSignal): Promise<CheckResult[]> {
+  async run(member: Member, source: Task, artifact: Artifact, verification: VerificationAttempt, signal?: AbortSignal): Promise<DecidingPass> {
     const first = await this.execute(member, source, artifact, signal)
-    if (first.every(check => check.exitCode === 0)) return first
+    if (first.every(check => check.exitCode === 0)) return { checks: first, pass: 1 }
     // R16-G5a: if the process is lost between the two passes, the record of the failure survives.
     this.recordFirstPass(member, verification, artifact, first)
-    return await this.execute(member, source, artifact, signal)
+    return { checks: await this.execute(member, source, artifact, signal), pass: 2 }
   }
 
   /**
@@ -351,21 +341,19 @@ export class DeclaredChecks {
   /**
    * One durable tool-run row per declared check of the deciding pass, in order,
    * in the same transaction as the verdict, each row naming its pass, command,
-   * exit code and output. When the retry rule fired, the failed first pass is
-   * already durable under the same attempt (`recordFirstPass` wrote it before
-   * the retry, and a lost process keeps those rows), so this writes the
-   * deciding pass as attempt 2 — never a second copy of attempt 1 — and the
-   * durable record shows the flake instead of hiding it. The returned ids are
-   * the deciding pass's rows, which is what the acceptance/rejection event
-   * names. The lookup is scoped by attempt id, so a re-verification of the same
-   * commit records its own attempt 1 instead of pairing with an older failure.
+   * exit code and output. The pass is the one `run` says decided: when the
+   * retry rule fired, the failed first pass is already durable under the same
+   * attempt (`recordFirstPass` wrote it before the retry, and a lost process
+   * keeps those rows), so this writes the deciding pass as attempt 2 — never a
+   * second copy of attempt 1 — and the durable record shows the flake instead
+   * of hiding it. Otherwise it is attempt 1, whatever an earlier call left on
+   * the record. The returned ids are the deciding pass's rows, which is what
+   * the acceptance/rejection event names.
    */
-  recordRuns(missionId: string, where: { memberId: string; taskId: string; attemptId: string; commit: string },
-    checks: ReadonlyArray<CheckResult>): string[] {
-    const attempt = this.firstPassRecorded(missionId, where) ? 2 : 1
+  recordRuns(missionId: string, where: { memberId: string; taskId: string; attemptId: string; commit: string }, deciding: DecidingPass): string[] {
     let seq = this.k.store.countToolRuns(missionId)
-    return checks.map(check => {
-      const run: ToolRun = { id: id('run'), seq: ++seq, missionId, memberId: where.memberId, taskId: where.taskId, attemptId: where.attemptId, tool: 'swarm.host_verification', arguments: { command: check.command, commit: where.commit, attempt }, result: check, isError: check.exitCode !== 0, createdAt: this.k.now() }
+    return deciding.checks.map(check => {
+      const run: ToolRun = { id: id('run'), seq: ++seq, missionId, memberId: where.memberId, taskId: where.taskId, attemptId: where.attemptId, tool: 'swarm.host_verification', arguments: { command: check.command, commit: where.commit, attempt: deciding.pass }, result: check, isError: check.exitCode !== 0, createdAt: this.k.now() }
       this.k.store.put('tool_runs', run)
       return run.id
     })

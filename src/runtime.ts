@@ -1338,7 +1338,8 @@ export class SwarmRuntime implements Kernel {
     // M1a seam 5/7: the declared-check execution path is src/declared-checks.ts.
     // CORE-05: the checks run as the attempt this caller proved it holds above,
     // so their record names it even if it is fenced while they run.
-    const checks = await this.declaredChecks.run(prepared.member, prepared.source, prepared.artifact, prepared.verification, actor.signal)
+    const deciding = await this.declaredChecks.run(prepared.member, prepared.source, prepared.artifact, prepared.verification, actor.signal)
+    const { checks } = deciding
     this.declaredChecks.recordEnvelope(missionId, input.taskId, prepared.source.id, prepared.member.id)
     return this.exclusive(missionId, async () => {
       const { task, member } = this.ownAttempt(actor, missionId, input.taskId, input.attemptId)
@@ -1371,7 +1372,7 @@ export class SwarmRuntime implements Kernel {
       // an artifact under an environment the host check cannot reproduce.
       const comparison = this.declaredChecks.reproduce({ missionId, taskId: task.id, sourceTaskId: source.id, attemptId: input.attemptId, memberId: member.id, verdict: input.verdict }, checks)
       if (passed && comparison !== undefined && comparison.blocking.length > 0) {
-        this.commit(missionId, () => { this.declaredChecks.recordRuns(missionId, { memberId: member.id, taskId: task.id, attemptId: input.attemptId, commit: artifact.commit }, checks) })
+        this.commit(missionId, () => { this.declaredChecks.recordRuns(missionId, { memberId: member.id, taskId: task.id, attemptId: input.attemptId, commit: artifact.commit }, deciding) })
         throw new CheckEnvironmentMismatchError(comparison)
       }
       // F3-A: a rejection must carry the real failure, not only the reviewer's
@@ -1381,7 +1382,7 @@ export class SwarmRuntime implements Kernel {
         const deferral = `\nReview ${task.id} deferred its verdict on the immutable source ${source.id} at ${artifact.commit}, which remains submitted: ${recoveryExit(checks)}.`
         const reason = `${excerpt(rejection, Math.max(0, this.config.maxMessageChars - deferral.length - 32))}${deferral}`
         this.commit(missionId, () => {
-          const runIds = this.declaredChecks.recordRuns(missionId, { memberId: member.id, taskId: task.id, attemptId: input.attemptId, commit: artifact.commit }, checks)
+          const runIds = this.declaredChecks.recordRuns(missionId, { memberId: member.id, taskId: task.id, attemptId: input.attemptId, commit: artifact.commit }, deciding)
           task.status = 'blocked'; task.output = this.bounded(reason)
           if (prepared.reviewArtifact !== undefined) task.reviewArtifact = prepared.reviewArtifact
           task.reviewedCommit = artifact.commit
@@ -1396,7 +1397,7 @@ export class SwarmRuntime implements Kernel {
       const runIds: string[] = []
       const released = new Set<string>()
       this.commit(missionId, () => {
-        runIds.push(...this.declaredChecks.recordRuns(missionId, { memberId: member.id, taskId: task.id, attemptId: input.attemptId, commit: artifact.commit }, checks))
+        runIds.push(...this.declaredChecks.recordRuns(missionId, { memberId: member.id, taskId: task.id, attemptId: input.attemptId, commit: artifact.commit }, deciding))
         const basis: AcceptanceBasis | undefined = !passed ? undefined
           : reviewed === undefined ? { kind: 'checks', runIds: [...runIds] } : { kind: 'review-evidence', evidenceIds: reviewed }
         source.status = passed ? 'accepted' : 'blocked'

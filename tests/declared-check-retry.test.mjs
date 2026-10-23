@@ -137,10 +137,12 @@ test('S15 pair: the repeated-failure block does not admit a second review or re-
 /**
  * R16-G5a: the retry pair used to live only in an in-memory Map, so a lost
  * process erased the record that the check failed once. The failed first pass is
- * now written durably before the retry starts; `recordRuns` completes the pair
- * from the store. This test kills the process between the two passes.
+ * now written durably before the retry starts. This test kills the process
+ * between the two passes. No attempt outlives that process: the restart
+ * re-pends the review and ends the attempt that ran the pass, so the record of
+ * its failure is all it leaves, and the next attempt records its own passes.
  */
-test('R16-G5a: the failed first pass survives a lost process and the retry completes the pair as attempt 2', async t => {
+test('R16-G5a: the failed first pass survives a lost process, and the next attempt after the restart records only its own passes', async t => {
   const f = await setup({ checks: [CHECK] })
   let revived
   try {
@@ -173,26 +175,69 @@ test('R16-G5a: the failed first pass survives a lost process and the retry compl
     const firstRunId = before[0].id
     await f.runtime.dispose()
 
-    // Phase 2: a fresh runtime on the same store, as after a host restart. The
-    // retry pass completes the pair without rewriting the durable first pass.
-    revived = new SwarmRuntime(f.runtime.config, new FakeWorkers())
-    const recorded = revived.declaredChecks.recordRuns(f.mission.id, { memberId: f.reviewer.id, taskId: review.id, attemptId, commit }, [passing()])
-    assert.equal(recorded.length, 1, 'the deciding pass is the returned run')
+    // Phase 2: a fresh runtime on the same store, as after a host restart.
+    revived = new SwarmRuntime(f.runtime.config, new FakeWorkers({ checks: [passing()] }))
+    await revived.start()
+    assert.equal(revived.store.get('tasks', review.id).status, 'pending', 'the restart re-pends the review')
+    assert.ok(events(revived, f.mission.id, 'task/restart-repended').some(event => event.data.taskId === review.id), 'and ends the attempt that ran the first pass')
+    await assert.rejects(revived.verify(f.actor(f.reviewer), f.mission.id, { taskId: review.id, attemptId, verdict: 'accept', reason: 'Independent host checks validate the submitted artifact' }),
+      { code: 'task_attempt_stale' }, 'no pass after the restart can complete that attempt\'s pair')
+    const next = await revived.claim(f.actor(f.reviewer), f.mission.id, review.id)
+    assert.notEqual(next.attempt.id, attemptId)
+    await revived.verify(f.actor(f.reviewer), f.mission.id, { taskId: review.id, attemptId: next.attempt.id, verdict: 'accept', reason: 'Independent host checks validate the submitted artifact' })
     const after = revived.store.list('tool_runs', f.mission.id).filter(run => run.taskId === review.id)
-    assert.deepEqual(after.map(run => run.arguments.attempt), [1, 2], 'the pair survives the lost process')
-    assert.deepEqual(after.map(run => run.result.exitCode), [1, 0], 'the durable failure and the deciding pass')
+    assert.deepEqual(after.map(run => [run.attemptId, run.arguments.attempt, run.result.exitCode]), [[attemptId, 1, 1], [next.attempt.id, 1, 0]],
+      'the lost attempt keeps its durable failure, and the next attempt records its own first pass, never a retry of a failure it did not observe')
     assert.equal(after[0].id, firstRunId, 'the first pass is the same durable row, never rewritten')
-    assert.equal(after[1].id, recorded[0], 'the deciding run is the one the verdict would name')
-    // Pair: a different attempt never pairs with an earlier failure — it records
-    // its own attempt 1 instead of inheriting a flake it did not observe.
-    revived.declaredChecks.recordRuns(f.mission.id, { memberId: f.reviewer.id, taskId: review.id, attemptId: 'attempt_reverified', commit }, [passing()])
-    const reverified = revived.store.list('tool_runs', f.mission.id).filter(run => run.taskId === review.id && run.attemptId === 'attempt_reverified')
-    assert.equal(reverified.length, 1)
-    assert.equal(reverified[0].arguments.attempt, 1, 'a later verification records its own first attempt')
+    assert.equal(after[1].arguments.commit, commit)
+    assert.deepEqual(events(revived, f.mission.id, 'task/accepted')[0].data.checks, [after[1].id], 'the verdict names its own deciding pass')
   } finally {
     if (revived !== undefined) await revived.dispose()
     await f.cleanup()
   }
+})
+
+/**
+ * CORE-05: which pass decided is the call's own fact. `run` runs both passes,
+ * so it says which one decided and `recordRuns` writes that label. A durable
+ * lookup scoped by attempt used to work it out again from the record instead,
+ * so a second `swarm_verify` call by the same attempt after a refusal found
+ * the first call's failed first pass and labelled its own single clean pass 2.
+ */
+test('CORE-05: a clean call after the same attempt\'s refused one records its single pass as pass 1, never as a retry', async () => {
+  const f = await setup({ checks: [CHECK] })
+  try {
+    const SECOND = 'node --test tests/second.test.mjs'
+    const task = f.propose()
+    let calls = 0
+    f.workers.verifyArtifact = async () => {
+      calls += 1
+      if (calls === 1) {
+        // The owner strengthens the submitted source's checks while the first pass runs.
+        f.runtime.controlTask(f.owner, f.mission.id, task.id, 'amend', { checks: [CHECK, SECOND] }, 'Add the second suite')
+        return [failing('deadline exceeded under load\n')]
+      }
+      if (calls === 2) return [passing('retry of the refused call\n')]
+      return [passing('single pass of the next call\n'), { command: SECOND, exitCode: 0, output: 'tests 1, pass 1, fail 0\n' }]
+    }
+    const claimed = await f.runtime.claim(f.actor(f.author), f.mission.id, task.id)
+    await f.runtime.submit(f.actor(f.author), f.mission.id, { taskId: task.id, attemptId: claimed.attempt.id, output: 'candidate' })
+    const review = f.runtime.propose(f.owner, f.mission.id, {
+      outputs: [], workstreamId: f.stream.id, title: `Review ${task.title}`, objective: 'Independent review', kind: 'verification',
+      reviewOf: task.id, scope: ['**'], acceptance: MISSION_ACCEPTANCE, assigneeId: f.reviewer.id,
+    })
+    const { attempt } = await f.runtime.claim(f.actor(f.reviewer), f.mission.id, review.id)
+    const verdict = () => f.runtime.verify(f.actor(f.reviewer), f.mission.id, { taskId: review.id, attemptId: attempt.id, verdict: 'accept', reason: 'Independent host checks validate the submitted artifact' })
+    await assert.rejects(verdict(), /\[checks_changed_during_verification\]/)
+    assert.deepEqual(runsFor(f, review).map(run => [run.arguments.attempt, run.result.output]), [[1, 'deadline exceeded under load\n']], 'the refused call leaves its failed first pass on the record')
+    assert.equal((await verdict()).status, 'accepted', 'the same attempt verifies again against the current checks')
+    assert.equal(calls, 3)
+    const rows = runsFor(f, review)
+    assert.ok(rows.every(run => run.attemptId === attempt.id), 'every row is the one attempt\'s')
+    assert.deepEqual(rows.map(run => [run.arguments.command, run.arguments.attempt, run.result.exitCode]), [[CHECK, 1, 1], [CHECK, 1, 0], [SECOND, 1, 0]],
+      'the clean call\'s single pass is its first, not a retry of the refused call\'s failure')
+    assert.deepEqual(events(f.runtime, f.mission.id, 'task/accepted')[0].data.checks, [rows[1].id, rows[2].id], 'the verdict names the pass it classified')
+  } finally { await f.cleanup() }
 })
 
 /**
