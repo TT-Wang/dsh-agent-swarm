@@ -344,8 +344,21 @@ and in the owner's run at `87025d6` with the corepack shim on `PATH`: corepack's
 `lastKnownGood.json` since 16:49. The owner's run at `87025d6` also passed `test:profile`, `test:isolation` (6/6),
 `test:load`, `test:web` (13 checks) and `test:command-web` (11 checks).
 
-The live smokes were not run at `af154be`; they need the owner's key. The owner's session re-runs
-`test:command-deepseek` on this head after this record.
+The live smokes were not run at `af154be`; they need the owner's key. The owner's session re-ran both on
+`deepseek-official` / `deepseek-v4-flash`:
+
+- At `003cfd1`, `test:deepseek` passed (24,249 tokens, 9 steps). `test:command-deepseek` ran end to end: the owner's
+  first `swarm_launch` was refused with the typed `[member_reasoning_effort_unsupported]` text naming the accepted
+  effort `off`, the owner relaunched, one implementation and its independent verification were accepted, and the
+  mission completed automatically. The smoke then failed only on its own stale assertion, from `becba81`, that an
+  accepted `integration` task must exist; the owner protocol asks for an integration only over several
+  implementation branches.
+- `a708ecd` makes the smoke assert the delivery the runtime names: `verifiedDelivery` (`src/task-graph.ts`) takes the
+  delivery from `selectAcceptedDelivery`, which completion and `deliveryTarget` use, and requires its accepted
+  independent review of the delivered commit (`tests/verified-delivery.test.mjs`). Full suite 1986/1986.
+- At `a708ecd`, both passed: `test:deepseek` (25,803 tokens, 10 steps) and `test:command-deepseek` (owner 53,794
+  tokens, workers 33,028 tokens, 17 model responses; the owner's first launch was again refused for effort `low` and
+  repaired in one relaunch). No report or log holds a credential.
 
 **Open after this batch** (not adopted here).
 
