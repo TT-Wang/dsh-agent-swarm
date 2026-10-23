@@ -444,12 +444,13 @@ first run; `test:harness` (4 scripts); `test:oracle` (12 scenarios, every log un
 
 **Not exercised.**
 
-- `test:deepseek` and `test:command-deepseek` at `1218e86`. They make real provider requests with the owner's key, so
-  no gate run includes them; the owner's session ran both at `268a2c5` (above) and re-runs them on `1218e86` after
-  this record, to confirm that budget raises during a submission no longer cost steps. CORE-01 changes what a live
-  reviewer of a source without checks must do; the prompt, the `swarm_verify` description and the refusal say so, but
-  both live sources at `268a2c5` declared `node check.cjs`, so no live model has yet been seen to publish a claim
-  before it accepts a source without checks. `test:validation-repair-web` and `test:sidebar-service` did not run either.
+- A live source without checks. The owner's session re-ran both real-provider smokes at `82d4837` (this record on
+  `1218e86`): `test:deepseek` passed (28,663 tokens, 11 steps) and `test:command-deepseek` passed (owner 83,667
+  tokens, workers 46,946, 20 model responses; one implementation and its review accepted, no revision refusal; the
+  three refused calls were the protocol's own: an output outside scope and the effort `low` at launch, and a reviewer's
+  `swarm_submit` on its verification task, each repaired once). Both live sources declared `node check.cjs`, so no
+  live model has yet been seen to publish a claim before it accepts a source without checks (CORE-01).
+  `test:validation-repair-web` and `test:sidebar-service` did not run.
 - The schema 8 upgrade ran on stores the tests rewrite into a schema 7 shape, never on a real home's store.
 - Process births were read on macOS only (`ps`); the linux reading (`/proc`) did not run on this machine. A recycled
   PID is simulated with a fabricated birth (`recycledBirth()`), not by wrapping the PID space.
