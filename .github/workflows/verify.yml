@@ -1,0 +1,39 @@
+# The gate as a fresh clone runs it. `npm run verify` is the gate manifest's
+# runner (the "gate" block of package.json, scripts/gate.mjs): it runs every
+# suite whose prerequisites this runner has, which is the hermetic tier
+# (typecheck, the build, npm test, test:packed, test:replay, test:oracle and
+# test:load), and records every other suite as skipped with the prerequisite it
+# lacks: there is no Harness checkout, provider key or secret here. The suites
+# that need the built Harness checkout, the macOS sandbox or a browser run on a
+# machine that has them, with the same command. macOS, because the gates have
+# run only there; Node is the version they ran on.
+name: verify
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.22.3
+      - run: npm ci
+      - run: npm run verify
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gate-record
+          path: artifacts/gate/
+          if-no-files-found: ignore

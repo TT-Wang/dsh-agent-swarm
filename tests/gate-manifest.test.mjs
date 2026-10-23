@@ -178,3 +178,11 @@ test('the round gate runs the commit\'s own gate, and promote takes its record o
   assert.equal(stale.code, 2)
   assert.match(stale.stderr, /the record lacks test:oracle, which the manifest lists/)
 })
+
+test('CI runs the same gate as a fresh clone: npm ci, then npm run verify, with no secrets, provider or opt-in', () => {
+  const workflow = readFileSync(join(PROJECT, '.github/workflows/verify.yml'), 'utf8')
+  const runs = [...workflow.matchAll(/^\s*(?:- )?run: (.+)$/gm)].map(match => match[1].trim())
+  assert.deepEqual(runs, ['npm ci', 'npm run verify'])
+  assert.doesNotMatch(workflow, /secrets\.|DEEPSEEK|DSH_HARNESS_ROOT|DSH_SOURCE|--with/)
+  assert.match(workflow, /permissions:\n\s+contents: read/)
+})
