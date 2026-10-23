@@ -1,10 +1,196 @@
 # Validation
 
-Current **0.7.0** working-tree checks and the historical **0.6.0** baseline are recorded separately below. The supported Harness release remains a prerelease; matching a version string alone does not establish compatibility with an arbitrary checkout or profile. Exactly one release is supported, `0.2.1-rc.2`. `0.1.5-rc.3` (`a4c74a91e06b00fe0b0937bde982170c526cc842`) and `0.1.7-rc.1` (`46a7f68b0922371ce7144b668b90e377d8e799f4`) were dropped on 2026-10-22, and `a28b116` is the last revision that supports them. Entries from round 28 until `0.2.1-rc.2` was added record checks on those two hosts (`0.1.5-rc.3` was then the default host), and the 2026-10-21 entry records checks on all three; entries before round 28 record checks against the releases supported at the time (`0.1.2-rc.1`, `0.1.3-alpha.2`, `0.1.5-rc.1`, `0.1.6-alpha.2`), which are no longer supported either.
+Current **0.7.0** working-tree checks and the historical **0.6.0** baseline are recorded separately below. The supported Harness release remains a prerelease; matching a version string alone does not establish compatibility with an arbitrary checkout or profile. Exactly one release is supported, `0.2.1-rc.2`. `0.1.5-rc.3` (`a4c74a91e06b00fe0b0937bde982170c526cc842`) and `0.1.7-rc.1` (`46a7f68b0922371ce7144b668b90e377d8e799f4`) were dropped on 2026-10-22, and `a28b116` is the last revision that supports them. Entries from round 28 until `0.2.1-rc.2` was added record checks on those two hosts (`0.1.5-rc.3` was then the default host), the 2026-10-21 entry records checks on all three, and entries from 2026-10-22 on record checks on `0.2.1-rc.2` alone; entries before round 28 record checks against the releases supported at the time (`0.1.2-rc.1`, `0.1.3-alpha.2`, `0.1.5-rc.1`, `0.1.6-alpha.2`), which are no longer supported either.
 
 | Harness release | Exact source commit |
 | --- | --- |
 | `0.2.1-rc.2` (npm `latest` and `next`) | `687f282e8625c6b8d11ff58211a90524be2e4317` |
+
+## Harness 0.2.1-rc.2 only: 0.1.5-rc.3 and 0.1.7-rc.1 dropped (2026-10-22)
+
+**Head**: `d5c7f25` and this record (documentation only), branch `dsh021/drop-01x` on `a28b116` (main), not merged.
+The owner dropped `0.1.5-rc.3` and `0.1.7-rc.1` on 2026-10-22, so `0.2.1-rc.2` is the only supported host. 41
+commits (`15d00ec` to `ea487f0`) and one review repair round (`a80d012` to `d5c7f25`, no `src` change).
+`src` against `a28b116`: +406 −281, net +125. The drop (`15d00ec` to `22383d8`) is +131 −155, net −24; the W8 route
+rule (`f3518a8` to `95e5772`) is +276 −127, net +149.
+
+**What the drop deleted, and what stands in its place.** Each item existed only because 0.1.x was supported; the
+2026-10-21 entry records most of them as bridges between hosts.
+
+- **The supported set** (`15d00ec`, `99cd363`, `f219fc7`; repair `150caf1`). `compatibility.json` keeps one row,
+  `0.2.1-rc.2`, and records the dropped releases with `a28b116` as the last revision that supports them. Every
+  `@deepseek-ai/dsh-*` peer range, `SUPPORTED_HARNESS_RELEASES` and the profile's `requires.harness` name only
+  `0.2.1-rc.2`, so a host with a peer-version gate (0.1.7-rc.1 and 0.2.x) installs and boots the plugin only on that
+  release, unless its owner exempts this plugin version. No `engines.dsh` is declared: with one release it would name
+  what the peer ranges name and change no verdict. The repair round drops `defaultHost`, which only ordered several
+  releases: `scripts/harness-target.mjs` takes the one sibling `deepseek-harness-021rc2` with no ordering, and the
+  lockstep test requires exactly one supported release and pins every `dsh-*` peer and dev dependency to it.
+- **The command-input patch** (`80bcee5`). `patches/harness-command-input.patch` corrected dsh-external#637 in
+  `claim-decor.ts` on 0.1.5-rc.3 and 0.1.7-rc.1; 0.2.1-rc.2 ships no such file (upstream replaced it with command
+  chips). The patch, `patches/README.md`, `scripts/command-input-patch.mjs`, `scripts/check-harness-command-input.mjs`
+  and `tests/command-input-patch.test.mjs` are deleted.
+- **`update-preview`'s `compat/` guard** (`f0aa2a8`). It refused a preview whose rebuilt host packages came from
+  another release, a layout only that patch produced. The rule in its place is wider: a plugin snapshot boots only on
+  the release whose `@deepseek-ai/dsh-session` it links, checked before any build, sync or preflight; a snapshot that
+  links none loads the host's own and is not checked.
+- **The persona prompt variable** (`5423297`, `4383f44`). The worker persona section held only `{{swarm_persona}}`
+  because 0.1.5-rc.3's `PromptSection` had no `interpolate` field. The worker now shadows the deployment persona
+  prefix with its persona text under `interpolate: false`, naming the host's `PERSONA_PREFIX_SECTION` and
+  `PERSONA_SUFFIX_SECTION` and taking their order from `getSectionOrder`. A `{{...}}` in a member name, role or
+  mission objective still reaches the model as written.
+- **Host shapes read in `src`** (`80efe2d`, `eea725e`, `9c457af`, `c04b26c`, `0c81145`, `a8823a8`). The owner filter
+  accepts one runtime-context source, the agent loop's `runtime-context` (the v3-to-v4 session format renames 0.1.5's
+  system-prompt `plugin` source on restore). `confinedCheckArgv` takes the host's `SandboxProvider.confine`, which
+  returns a promise, and the local types for 0.1.5's synchronous confine go. `registerWebApi` injects `connection`
+  alone. In the client a tool result fails by its tool-role message's `isError`, the transcript reads a message's
+  content as flat host blocks without descending into nested `content`, and navigation finds the session on screen
+  by its mainView retention and opens a worker through the workspace UI service's `openSession` (0.1.5's
+  `list.current` and `sessions.open` go).
+- **Test and smoke compositions** (`021db0c`, `2d3fa7f`, `0e81051`, `4c2baa2`, `21c2ede`, `a8cec16`). Gone: the
+  `toolResultBlocks` normalizer, `tests/fixtures/host-packages.mjs` and its catalog-conditional rows, the
+  `loaderPlugin()` export rule, the catalog checks behind `workingDirectoryRows()` and the API-key route, `smokeHost()`
+  and the flags it returned, the command smoke's chip-or-text assertion, and the r17 vocabulary exception for
+  `working-directory/change`. In their place: the worker tests import the host's tool packages statically; each host
+  package is imported in the shape 0.2.1 publishes; both real Loader compositions mount `dsh-fs-local`,
+  `dsh-working-directory` and `dsh-llm-deepseek-api-key` unconditionally, so a checkout without one fails by name;
+  the web smokes always wait for the default workspace's composer, and the command smoke always asserts the command
+  chip; the profile test reads `patchPaths` and the boot graph's combo reference. The working-directory service
+  stays optional in the adapter, and a composition without it keeps a test of its own.
+- **Comments and documents** (`1f60ebd`, `f17b1fd`, `71793f2`, `39ff9bc`, `e1eab40`, `89ec8c4`, `22383d8`,
+  `a1493ee`, `7563520`, `e4658cc`, `49673ba`, `3c38b4e`, `ea487f0`). Code and test comments, both READMEs, both
+  operations guides, `docs/design.md`, `docs/known-limitations.md` and the profile README describe one host.
+  "Upgrade a Harness home to 0.2.x" becomes "Move a 0.1.x Harness home to 0.2.1-rc.2": the backup, why the move is
+  one-way, and that a move back also needs a plugin revision up to `a28b116`.
+
+**W8: one rule for a member's route** (`f3518a8`, `e5d6507`, `2df3fbe`, `caacbe7`, `dc7bd01`; documents `984c25a`,
+`95e5772`, `17a3fc5`). The owner's live `test:command-deepseek` on 0.2.1-rc.2 (2026-10-22, before this branch)
+failed when the host refused a worker's reasoning effort (`low` on `deepseek-v4-flash`) at its model steps, before
+any worker request was made.
+
+- At admission: a launch (`launchDraft`, behind `swarm_launch` and the browser launch) admits every member of its
+  plan, and `swarm_add_member` one member, through the adapter's `memberRoutes`. It resolves the route the worker will
+  run (`workerRoute`: the owner session's current selection under the member's own fields) and calls the host's
+  `llm.prepareCall`, as a model step does, without dispatching it, so no provider request is made. One refusal names
+  every refused member at its field before any mission, member row, worktree or session exists:
+  `member_reasoning_effort_unsupported` with the efforts the route declares, `member_model_unsupported` for a model
+  its provider refuses on this release (`MODEL_UNSUPPORTED`, `CLIENT_UPGRADE_REQUIRED`; the code, never the host's
+  text), or `member_route_unavailable`. A draft save runs the same rule over the routes the draft names. The
+  start-time downgrade and retry in `addMember` and the web API's own route validation are deleted;
+  `member/effort-downgraded` and `member/effort-rejected` are historical and still decode.
+- At a step: `UNSUPPORTED_REASONING_EFFORT` joins `MODEL_UNSUPPORTED` and `CLIENT_UPGRADE_REQUIRED` in the `member`
+  class of `PROVIDER_FAILURE_CODES`, and the adapter reports such a failure as `routeRefused` alone, never also as the
+  member's failure. The runtime retires the member at the first refusal (`member/route-refused`, new). Each attempt it
+  holds is fenced and re-pended once its handle has stopped and its workspace is checkpointed, its recovery allowance
+  intact; unpinned pending work assigned to it loses its assignee; pinned work waits for the owner; a member that holds
+  no attempt has its handle stopped by the retirement. The owner gets one `[member_route_refused]` notice naming the
+  work and the exits (`swarm_add_member`, and a `swarm_control` amend for pinned work). The regex reading of provider
+  text in `onFailure` and `src/refusals.ts` is deleted.
+
+**User-facing changes.**
+
+- The plugin installs and runs only on Harness 0.2.1-rc.2. The 0.1.7-rc.1 plugin manager refuses it, and 0.1.5-rc.3
+  loads it with a logged unsupported-host error. A home that ran on 0.2.1-rc.2 goes back to 0.1.x only from a backup,
+  and with a plugin revision up to `a28b116`.
+- Without `DSH_HARNESS_ROOT` or `DSH_SOURCE`, the scripts look only at `~/.dsh/source/current` and the sibling
+  `deepseek-harness-021rc2`, and every entry point names `supported: 0.2.1-rc.2` when it refuses another release.
+- A launch or `swarm_add_member` whose member route the running release cannot take is refused before anything is
+  created, saying what the route accepts, instead of starting the member and failing its model steps. A route that
+  changes after admission costs one charged step: its member is retired once, and its unpinned work goes to a capable
+  live member.
+- `update-preview` refuses a preview whose snapshot links another release's SDK, which includes the attended 5202 root
+  on 0.1.7-rc.1; moving it means a new root from `start-preview` on 0.2.1-rc.2.
+
+**Oracle logs re-recorded** (`f3518a8`, `e5d6507`). The 12 logs in `scripts/replay/oracle/` changed only in their
+adapter trace lines: each member added on its own records one `memberRoutes` call before `prepareWorkspace` (92
+calls across the 12 logs), and the `bind` line names the new `routeRefused` callback. Checked line by line for this
+record: every event, row and delivery line is identical to `a28b116`'s, and with those two kinds of trace line set
+aside, so is every adapter call. The `test:replay` digest is unchanged.
+
+**Review repair round** (2026-10-23; no `src` change).
+
+- `a80d012` (tests): two branches of the step refusal had no test, and deleting either kept the targeted suite and
+  `test:harness` green. The step test adds a queued task assigned to the refused member: it loses its assignee at
+  once, the notice names it, and another member claims it. A new test has a member claim work, fail one start (the
+  work waits for her and, having run, cannot be borrowed) and then be refused while she holds no attempt: her handle
+  is stopped once, the event and the notice are recorded once, and the work is released, named and claimed by another
+  member. On the built lib, collecting only pinned pending work fails both tests (with the assignee assertion
+  removed, the other member's claim is refused `task_not_ready`), and dropping the stop of a member with nothing
+  fenced fails the new one.
+- `150caf1` (`compatibility.json`, `scripts/harness-target.mjs`, tests, documents): `defaultHost` goes (above), with
+  the default-search test's fake second release and the known-limitations clause about several listed releases.
+- `d5c7f25` (documents): known-limitations said the real-provider smokes last ran on 0.1.x; it now records the
+  2026-10-22 runs on 0.2.1-rc.2.
+- The full-suite failures of the second gate run (below) were missed timer deadlines under load, not code defects,
+  and changed nothing.
+
+**Regressions.** The full suite has 1971 tests at `ea487f0` (1972 at `a28b116`); the repair round adds one.
+
+- `tests/governance.test.mjs`: an effort the route does not accept is refused at `swarm_add_member` and on every
+  launch path, before any effect, naming the accepted efforts; a model its provider refuses is refused at the member's
+  model field; a step refusal retires the member once, fences and releases its work, keeps pinned work and tells the
+  owner the exits; a member refused with no attempt is stopped by the retirement.
+- `tests/harness-workers.test.mjs`: admission prepares each route through the real LLM service as a step does, so the
+  route adapter's own refusal of a model decides it, before any request; a composition without the working-directory
+  service writes no directory event.
+- `tests/harness-effort-admission.mjs` (new, in `test:harness`): on the real Loader with a scripted model whose route
+  declares `off` and `high`, `swarm_launch` and `swarm_add_member` are refused and then admitted on the repaired
+  effort, which the provider receives; a step the route stops taking retires the member once, its task runs on the
+  live member, and the owner's model reads the notice.
+- `tests/web-api-sanitize.test.mjs`: a route the host refuses reaches the browser as the admission refusal, never as
+  the adapter's text. `tests/harness-support.test.mjs`: `update-preview` boots a snapshot only on the release its SDK
+  links. `tests/host-version.test.mjs`: exactly one supported release, named by every list that declares it.
+
+**Gates at `ea487f0`**, with `node_modules` linked to the 0.2.1-rc.2 link farm. A full run just before the first
+(2026-10-22 19:51) failed to load `tests/r17-profile.test.mjs` with `Harness 0.2.1-rc.2 verification requires its
+declared release revision`: another system on this machine had moved the HEAD of the shared 0.2.1-rc.2 clone, whose
+files were unchanged. The second run used a dedicated clone pinned at `dsh-v0.2.1-rc.2`.
+
+| Check | First run (2026-10-22 19:52) | Second run (2026-10-23 14:57) |
+| --- | --- | --- |
+| `npm run typecheck` / `npm run build` | passed / passed | passed / passed |
+| `node --test tests/*.test.mjs` | 1971/1971 (236 s) | 1965/1971 (672 s); re-runs 37/37 and 1971/1971 (470 s) |
+| `npm run test:harness` | passed | passed |
+| `npm run test:replay` | digest unchanged | digest unchanged |
+| `npm run test:oracle` | 12/12 identical | 12/12 identical |
+| `npm run test:pack` | passed (251 archive entries, 251 published files) | passed (251, 251) |
+| `npm run test:profile` | passed | passed |
+| `npm run test:bundle` | 7/7 | 7/7 |
+| `node scripts/faults/run.mjs` | 24/24 | 24/24 |
+| `npm run test:web` | passed, 13 checks | passed, 13 checks |
+| `npm run test:command-web` | passed, 11 checks | passed, 11 checks |
+
+The replay digest is `sha256:61a921e64088b78b957cd6aeaa563d5436d4a6eae4b0130725d1f3c74c6f971e`, and each web smoke's
+`report.json` records `harnessHead` `687f282e8625c6b8d11ff58211a90524be2e4317`. The second run's full suite took 2.8
+times the first run's time on an overloaded machine: the gate run's `uptime` read load averages of 170 to 195 on 8
+CPUs while macOS daemons caught up after an overnight sleep. Six tests missed a short timer deadline: four waited past
+the mission queue's bound and were rejected with `[mission_operation_pending]` (`S5 gate src/runtime.ts:6` in
+`tests/in-memory-gates.test.mjs`, 50 ms, and three tests in `tests/review-path.test.mjs`, 300 ms), `R19-M-d` saw its
+check exit 124 past its 500 ms deadline, and in `R14-F2(a)` the 25 ms scheduler tick started the task before the
+test's own claim (`task_not_ready`). None of the four files changed in this batch. Re-run alone, the four files passed
+37/37 in 22 s, and the whole suite then passed 1971/1971 in 470 s. The repair round re-ran the four files at its head,
+37/37 in 24 s at a load average of about 15. The harness, pack and profile logs carry 3 to 9 `[agent-swarm] Error:
+[mission_operation_pending]` lines in the first run and 15 to 31 in the second: the notice those compositions trigger
+on purpose, more often under load.
+
+**Repair-round checks** (the round changes no `src`, so the built lib is the one the gates ran):
+`npm run typecheck` passed; `tests/governance.test.mjs` 10/10; `tests/harness-support.test.mjs`,
+`tests/host-version.test.mjs`, `tests/host-scripts.test.mjs` and `tests/web-smoke-runner.test.mjs` 29/29.
+
+Not exercised on 0.2.1-rc.2 since this batch: `test:deepseek` and `test:command-deepseek`, which make real provider
+requests and need the owner's key. Both changed in this batch: each reads a tool result as the host's tool-role
+message, and the command smoke's text reader takes a flat block list. Their last runs were the owner's on 2026-10-22,
+before this branch (`test:deepseek` passed; `test:command-deepseek` failed on the effort refusal W8 now decides at
+admission). `test:load`, Better Sidebar and the attended preview have not run on 0.2.1-rc.2; the attended 5202
+preview still runs 0.1.7-rc.1 with a pinned plugin.
+
+**Open after this batch** (not adopted here).
+
+- Several behavioral tests bound their waits by short timers (a 50 ms or 300 ms mission-queue bound, a 500 ms check
+  deadline, a 25 ms scheduler tick that races an explicit claim), so a heavily overloaded host fails them, as the
+  second gate run did.
+- The items the 2026-10-21 entry left open stand: no downgrade guard, cold workers resumed by other host paths, the
+  stranded-inbox drain, the API-key route's credential codes as member failures, and
+  `scripts/check-cancel-freeze.mjs` importing `isJsonValue`, which 0.2.1-rc.2 does not export.
 
 ## Harness 0.2.1-rc.2: the default host, with 0.1.5-rc.3 and 0.1.7-rc.1 kept (2026-10-21)
 
