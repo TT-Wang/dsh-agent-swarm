@@ -8,7 +8,7 @@ import { chmod, lstat, mkdir, mkdtemp, readFile, readdir, readlink, realpath, rm
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { applyDelivery, inspectDelivery } from '../lib/delivery.js'
-import { ownBirth } from '../lib/process-identity.js'
+import { NO_BIRTH, establishedBirth, recycledBirth } from './process-birth.mjs'
 
 const execute = promisify(execFile)
 async function git(cwd, ...args) {
@@ -266,7 +266,8 @@ test('CORE-04: the apply lock records its owner identity and is taken over from 
   await writeFile(path.join(worker, 'answer.txt'), 'swarm answer\n')
   const input = { source, baselineCommit: head, resultCommit: await commit(worker) }
   const lock = path.join(source, '.git', 'dsh-agent-swarm-delivery', 'apply.lock')
-  const birth = ownBirth()
+  // Linux and macOS always establish a birth, so the lock records one there; only another platform skips the takeover below.
+  const birth = establishedBirth()
   // The lock this process takes names it by the identity every lock shares, and nothing else.
   let recorded
   await atRenameBarrier(async (_from, to) => { if (to.endsWith(path.join('apply.lock', 'owner.json'))) recorded = JSON.parse(await readFile(to, 'utf8')) },
@@ -282,12 +283,11 @@ test('CORE-04: the apply lock records its owner identity and is taken over from 
     await assert.rejects(applyDelivery(input), { message: refusal })
     await rm(lock, { recursive: true, force: true })
   }
-  if (birth === undefined) { t.skip('host cannot establish process birth; the conservative refusal is covered'); return }
+  if (birth === undefined) { t.skip(NO_BIRTH); return }
   // The same live PID born at another time is a different process that was given
   // the dead owner's PID: its lock is taken over at once.
-  const reused = birth.startsWith('linux:') ? birth.replace(/:\d+$/, ':0') : birth.replace(/\d{4}$/, '1900')
   await mkdir(lock, { recursive: true })
-  await writeFile(path.join(lock, 'owner.json'), JSON.stringify({ pid: process.pid, birth: reused }))
+  await writeFile(path.join(lock, 'owner.json'), JSON.stringify({ pid: process.pid, birth: recycledBirth(birth) }))
   assert.equal((await applyDelivery(input)).status, 'applied')
   await assert.rejects(lstat(lock), { code: 'ENOENT' })
 })

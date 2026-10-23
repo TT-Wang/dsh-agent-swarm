@@ -7,11 +7,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { ownBirth, ownerAbandoned, recordedOwner } from '../lib/process-identity.js'
-
-/** A birth for this platform that is valid but not this process's: the same PID recycled by a later process. */
-function recycled(birth) {
-  return birth.startsWith('linux:') ? birth.replace(/:\d+$/, ':0') : birth.replace(/\d{4}$/, '1900')
-}
+import { NO_BIRTH, establishedBirth, recycledBirth } from './process-birth.mjs'
 
 test('a recorded owner names a signalable PID, keeps a string birth and ignores the lock\'s other fields', () => {
   for (const value of [null, 'owner', [{ pid: 1 }], {}, { pid: 0 }, { pid: -4 }, { pid: 1.5 }, { pid: '42' }, { pid: 2 ** 31 }])
@@ -31,13 +27,14 @@ test('a live PID keeps its lock unless its holder was demonstrably born at anoth
   // No identity, or one this build cannot compare, stays conservative.
   assert.equal(ownerAbandoned({ pid: process.pid }), false)
   assert.equal(ownerAbandoned({ pid: process.pid, birth: 'unrecognized-birth' }), false)
-  const birth = ownBirth()
-  if (birth === undefined) { t.skip('host cannot establish process birth; the conservative refusal is covered'); return }
+  // Linux and macOS always establish a birth; only another platform skips.
+  const birth = establishedBirth()
+  if (birth === undefined) { t.skip(NO_BIRTH); return }
   assert.equal(ownBirth(), birth, 'a process birth is read once and never changes')
   // The owner's own birth: the same process, so the lock is live.
   assert.equal(ownerAbandoned({ pid: process.pid, birth }), false)
   // The same PID with a different birth on this platform: a recycled PID.
-  assert.equal(ownerAbandoned({ pid: process.pid, birth: recycled(birth) }), true)
+  assert.equal(ownerAbandoned({ pid: process.pid, birth: recycledBirth(birth) }), true)
   // A valid birth from another platform is not comparable, so the live PID keeps the lock.
   const foreign = birth.startsWith('linux:') ? 'darwin:Thu Jan  1 00:00:00 1970' : 'linux:00000000-0000-0000-0000-000000000000:1'
   assert.equal(ownerAbandoned({ pid: process.pid, birth: foreign }), false)
