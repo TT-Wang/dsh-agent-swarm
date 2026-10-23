@@ -690,7 +690,10 @@ export class Scheduling {
    * deleted, is the floor, so a dispatch that recorded nothing else measures
    * its silence from the dispatch. Each term is a maximum over rows that are
    * never deleted and whose instants never change, so the basis only moves
-   * forward.
+   * forward. The claim's sequence bounds the attempt's lifetime in the event
+   * term only: a delivery naming the task counts whichever attempt it was
+   * written under, so after the clock steps back an earlier attempt's delivery
+   * can raise the basis. That can delay an escalation, never invent one.
    */
   private lastDurableAt(missionId: string, task: Task, attempt: Attempt): number {
     let latest = this.k.store.attemptEventAt(missionId, task.id, attempt.id) ?? 0
