@@ -5,6 +5,7 @@ import { freezeMessage, MessageId, type UserMessage } from '@deepseek-ai/dsh-llm
 import { realpath } from 'node:fs/promises'
 import { registerSwarmCommand } from './command.ts'
 import { ownerModelSelection } from './model-selection.ts'
+import { thrownText } from './policy-error.ts'
 import { wakeableAgent } from './harness-workers.ts'
 import { runProcess } from './workspaces.ts'
 import type { SwarmRuntime } from './runtime.ts'
@@ -217,7 +218,9 @@ export function registerAutomaticStart(ctx: Context, runtime: SwarmRuntime): voi
       agent.followup(planningMessage(request))
       watchIdle(agent, request)
     } catch (error) {
-      if (!disposed && !runtime.shuttingDown && !runtime.closed) runtime.failStart({ sessionId }, request.id, error instanceof Error ? error.message : String(error), request.planningEpoch ?? 1)
+      // Recorded as the failure's readable text, which the recovery notice
+      // quotes to the owner's model; never "[object Object]".
+      if (!disposed && !runtime.shuttingDown && !runtime.closed) runtime.failStart({ sessionId }, request.id, thrownText(error), request.planningEpoch ?? 1)
       throw error
     }
     return { kind: 'success', text: '已保存当前项目快照，正在自动规划协作。你可以继续编辑项目，成员和进度会显示在侧边栏。' }

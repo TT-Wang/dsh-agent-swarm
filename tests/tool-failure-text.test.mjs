@@ -10,7 +10,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { toolFailure } from '../lib/tools.js'
-import { PolicyError, thrownText } from '../lib/policy-error.js'
+import { PolicyError, recordedFailure, thrownText } from '../lib/policy-error.js'
 
 const live = () => new AbortController().signal
 
@@ -58,4 +58,19 @@ test('any other value becomes a typed [tool_failed] refusal carrying its readabl
   const controller = new AbortController()
   controller.abort(Object.freeze({ kind: 'user' }))
   assert.equal(toolFailure('swarm_observe', { kind: 'other' }, controller.signal).code, 'tool_failed')
+})
+
+/**
+ * A failed launch's durable records (the automatic request's recorded reason,
+ * the draft's launch failure) carry the same readable text: an Error as its
+ * own rendering, byte for byte, anything else as `thrownText` reads it
+ * (tests/planner.test.mjs drives both records and the recovery notice).
+ */
+test('a launch failure is recorded as its Error rendering or its readable text, never "[object Object]"', () => {
+  assert.equal(recordedFailure(new PolicyError('check_syntax_invalid', 'validation_error', '[check_syntax_invalid] refused')), 'Error: [check_syntax_invalid] refused')
+  assert.equal(recordedFailure(new TypeError('bad argument')), 'TypeError: bad argument')
+  const hostile = new Error('hostile rendering'); hostile.toString = () => { throw new Error('unrenderable') }
+  assert.equal(recordedFailure(hostile), 'hostile rendering')
+  const trap = new Proxy({}, { get() { throw new Error('trapped') }, getPrototypeOf() { throw new Error('trapped') } })
+  for (const value of [Object.freeze({ kind: 'catalog-offline' }), { message: 'carried message' }, 'a bare string', undefined, trap]) assert.equal(recordedFailure(value), thrownText(value))
 })

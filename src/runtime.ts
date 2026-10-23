@@ -3,7 +3,7 @@ import { randomUUID } from 'node:crypto'
 import { isAbsolute, join } from 'node:path'
 import { SwarmStore, WriterBusyError, StoreRecoveryError, id, stageRestore, type PendingRestore, type PostFilter, type StoreOptions } from './store.ts'
 import { Attempts, endAttempt } from './attempts.ts'
-import { PolicyError } from './policy-error.ts'
+import { PolicyError, recordedFailure } from './policy-error.ts'
 export { WorkspaceRevokedError } from './authorization.ts'
 import { recordedClaim, type WorkspaceClaim } from './authorization.ts'
 import { WorkspaceAdmission, deniedGitWrite, gitWriteDeniedMessage, TEMP_RENDEZVOUS_WINDOW_MS } from './workspace-admission.ts'
@@ -2445,7 +2445,7 @@ export class SwarmRuntime implements Kernel {
           const mission = request.missionId ? this.store.get('missions', request.missionId) : undefined
           if (mission && mission.status !== 'staged') this.commit(mission.id, () => this.syncStarts(mission))
           else if ((request.planningEpoch ?? 1) === admittedEpoch && !request.planningFenced && request.status !== 'stopped') {
-            request.status = 'failed'; request.error = String(error).slice(0, this.config.maxMessageChars); request.updatedAt = this.now()
+            request.status = 'failed'; request.error = recordedFailure(error).slice(0, this.config.maxMessageChars); request.updatedAt = this.now()
             this.commit(request.missionId ?? request.id, () => {
               this.store.put('starts', request)
               this.store.event(request.missionId ?? request.id, 'automatic/failed', 'runtime', { requestId, reason: request.error })
@@ -2768,7 +2768,7 @@ export class SwarmRuntime implements Kernel {
         this.kick(missionId)
         return this.snapshot(actor, missionId)
       } catch (error) {
-        draft.status = 'failed'; draft.error = String(error); draft.updatedAt = this.now()
+        draft.status = 'failed'; draft.error = recordedFailure(error); draft.updatedAt = this.now()
         if (!this.closed && this.store.get('drafts', draft.id)?.revision === draft.revision) this.commit(draft.id, () => this.store.put('drafts', draft))
         throw error
       }
