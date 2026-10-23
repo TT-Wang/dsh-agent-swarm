@@ -46,6 +46,23 @@ export async function probeNestedSandbox() {
   }
 }
 
+/**
+ * The gate's `sandbox` prerequisite (scripts/gate.mjs): whether the suites that
+ * confine with the platform sandbox can run here. They have run only under the
+ * macOS sandbox, so another platform lacks it unless
+ * DSH_SWARM_SKIP_SANDBOX_PREFLIGHT=1 asks for an attempt. On macOS it is the
+ * probe above, and an inconclusive probe does not withhold it, as it does not
+ * abort a smoke.
+ */
+export async function sandboxPrerequisite() {
+  const probe = await probeNestedSandbox()
+  if (sandboxPreflightDisabled()) return { present: true, detail: probe.reason }
+  if (process.platform !== 'darwin') return { present: false, reason: `the suites that need it have run only under the macOS sandbox, and this host is ${process.platform}; DSH_SWARM_SKIP_SANDBOX_PREFLIGHT=1 attempts them anyway` }
+  if (!probe.usable) return { present: false, reason: 'macOS denies a nested sandbox_apply here: this process runs inside an outer workspace-write sandbox' }
+  if (probe.skipped) return { present: false, reason: probe.reason }
+  return { present: true, detail: probe.inconclusive ? `probe inconclusive: ${probe.output.trim().split('\n')[0]}` : 'nested sandbox_apply permitted' }
+}
+
 /** Abort with the explicit prerequisite when the nested sandbox probe fails. */
 export async function assertSandboxPrerequisite(check) {
   const probe = await probeNestedSandbox()

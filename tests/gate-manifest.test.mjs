@@ -1,0 +1,144 @@
+/**
+ * T1: one gate manifest, the `gate` block of package.json, that `npm run
+ * verify`, the round gate and CI all run (scripts/gate.mjs).
+ *
+ * The 2026-10-22 self-review found the gate kept by hand in three places that
+ * had drifted apart: verify ran eight commands, round.mjs gate hard-coded its
+ * optional suites and so left out test:oracle (added in batch 15) although its
+ * own comment said the list existed so that no suite could stay outside, and
+ * promote took any record with `green: true`. test:isolation and test:load ran
+ * in none of the batch gates kept outside the repository for six weeks. Here
+ * every test:* script must be in the manifest, verify and the round gate must
+ * run its one runner, and promote must read a record against the manifest of
+ * the commit it promotes.
+ */
+import test from 'node:test'
+import assert from 'node:assert/strict'
+import { execFile, execFileSync } from 'node:child_process'
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { dirname, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
+import { withLocalImports } from './fixtures/local-imports.mjs'
+import { PREREQUISITES, gateManifest, gateVerdict, planGate, probePrerequisites, readManifest } from '../scripts/gate.mjs'
+import { TIERS, tierEnvironment } from '../scripts/test-tiers.mjs'
+
+const PROJECT = fileURLToPath(new URL('..', import.meta.url))
+const packageJson = JSON.parse(readFileSync(join(PROJECT, 'package.json'), 'utf8'))
+const manifest = readManifest()
+const OPT_IN = Object.keys(PREREQUISITES).filter(name => PREREQUISITES[name].optIn)
+
+test('the manifest lists every test:* script once, after typecheck and the hermetic tier, with prerequisites the gate defines', () => {
+  const testScripts = Object.keys(packageJson.scripts).filter(name => name.startsWith('test:'))
+  const suites = Object.keys(manifest)
+  assert.deepEqual(suites.slice(0, 2), ['typecheck', 'test'], 'typecheck, then the build and the hermetic tier that every later suite reads lib/ from')
+  assert.deepEqual([...suites.slice(2)].sort(), [...testScripts].sort(), 'every test:* script is a gate suite, and every gate suite after the first two is a test:* script')
+  for (const [suite, needs] of Object.entries(manifest)) {
+    assert.equal(new Set(needs).size, needs.length, `${suite} names a prerequisite twice`)
+    if (needs.includes('browser')) assert.ok(needs.includes('harness'), `${suite} drives the checkout's Playwright, so it needs the checkout`)
+  }
+  // The two test tiers (scripts/test-tiers.mjs) are suites of the manifest, with the tiers' own prerequisites.
+  assert.deepEqual(manifest.test, [], 'the hermetic tier needs only what npm ci installs')
+  assert.deepEqual(manifest['test:bundle'], ['harness'], 'the host tier needs the built checkout')
+  assert.equal(PREREQUISITES.harness.description, TIERS.host)
+  // Billable and third-party suites never run by default, and a complete gate does not need them.
+  assert.deepEqual(OPT_IN, ['provider', 'better-sidebar'])
+  for (const suite of ['test:deepseek', 'test:command-deepseek']) assert.ok(manifest[suite].includes('provider'), `${suite} makes billable provider requests`)
+  assert.ok(manifest['test:sidebar-service'].includes('better-sidebar'))
+  for (const suite of ['test:oracle', 'test:isolation', 'test:load']) assert.ok(suite in manifest, `${suite} is a gate suite`)
+})
+
+test('gateManifest refuses a manifest that is missing or names what does not exist', () => {
+  assert.throws(() => gateManifest({ scripts: { test: 'x' } }), /declares no gate manifest/)
+  assert.throws(() => gateManifest({ scripts: { test: 'x' }, gate: { test: [], 'test:gone': [] } }), /lists test:gone, which package\.json does not define/)
+  assert.throws(() => gateManifest({ scripts: { test: 'x' }, gate: { test: ['gpu'] } }), /names "gpu"; the prerequisites are harness, sandbox, browser, provider, better-sidebar/)
+  assert.throws(() => gateManifest({ scripts: { test: 'x' }, gate: { test: 'harness' } }), /is not a list of prerequisites/)
+})
+
+test('npm run verify is the gate runner, and a suite runs exactly when it lacks no prerequisite', async () => {
+  assert.equal(packageJson.scripts.verify, 'node scripts/gate.mjs')
+  const all = Object.fromEntries(Object.keys(PREREQUISITES).map(name => [name, { present: true }]))
+  assert.deepEqual(planGate(manifest, all).filter(suite => suite.missing.length), [], 'with every prerequisite, every suite runs')
+  const none = planGate(manifest, {})
+  assert.deepEqual(none.map(suite => suite.name), Object.keys(manifest), 'the plan keeps the manifest order')
+  for (const suite of none) assert.deepEqual(suite.missing, manifest[suite.name])
+  assert.deepEqual(none.filter(suite => !suite.missing.length).map(suite => suite.name), ['typecheck', 'test', 'test:packed', 'test:replay', 'test:oracle', 'test:load'], 'the suites a fresh clone runs')
+  // Probed as a fresh clone (the hermetic tier this file runs in): no checkout, so no browser either, and an opt-in only when named.
+  const found = await probePrerequisites(manifest)
+  assert.equal(found.harness.present, false)
+  assert.match(found.harness.reason, /hermetic test tier has no Harness checkout/)
+  assert.deepEqual(found.browser, { present: false, reason: "the browser suites drive the Harness checkout's Playwright, and there is no checkout" })
+  assert.deepEqual(found.provider, { present: false, reason: 'opt-in: run with --with provider' })
+  assert.equal((await probePrerequisites(manifest, ['provider'])).provider.present, true)
+})
+
+test('gateVerdict: a record is complete only when it lists the manifest and every suite a complete gate needs passed', () => {
+  const small = { typecheck: [], 'test:host': ['harness'], 'test:billable': ['harness', 'provider'] }
+  const record = (suites, extra = {}) => ({ commit: 'c1', dirty: false, prerequisites: { harness: { present: false, reason: 'no checkout here' }, provider: { present: false, reason: 'opt-in' } }, suites, ...extra })
+  const pass = name => ({ name, status: 'pass', exitCode: 0 })
+  const complete = record([pass('typecheck'), pass('test:host'), { name: 'test:billable', status: 'skipped', missing: ['provider'] }])
+  assert.deepEqual(gateVerdict(small, complete, { commit: 'c1' }), { complete: true, problems: [] })
+  // The record a dormant round gate wrote: green, and silent about which suites it ran.
+  assert.deepEqual(gateVerdict(small, { commit: 'c1', green: true, results: [{ name: 'typecheck', exitCode: 0 }] }).problems, ["the record lists no suites: the gate manifest's runner (scripts/gate.mjs) did not write it"])
+  assert.deepEqual(gateVerdict(small, record([pass('typecheck'), pass('test:billable')])).problems, ['the record lacks test:host, which the manifest lists'])
+  assert.deepEqual(gateVerdict(small, record([...complete.suites, pass('test:old')])).problems, ['the record has test:old, which the manifest does not list'])
+  assert.deepEqual(gateVerdict(small, record([pass('typecheck'), { name: 'test:host', status: 'skipped', missing: ['harness'] }, pass('test:billable')])).problems, ['test:host was skipped: no harness (no checkout here)'])
+  assert.deepEqual(gateVerdict(small, record([pass('typecheck'), pass('test:host'), { name: 'test:billable', status: 'skipped', missing: ['harness', 'provider'] }])).problems,
+    ['test:billable was skipped: no harness (no checkout here); no provider (opt-in)'], 'an opt-in suite that also lacked a host prerequisite is not excused')
+  assert.deepEqual(gateVerdict(small, record([{ name: 'typecheck', status: 'fail', exitCode: 2 }, { name: 'test:host', status: 'not-run' }, pass('test:billable')])).problems, ['typecheck failed (exit 2)', 'test:host did not run (not-run)'])
+  assert.deepEqual(gateVerdict(small, { ...complete, commit: 'c2', dirty: true }, { commit: 'c1' }).problems, ['the record is of commit c2, not c1', 'the record is of a tree with uncommitted changes, not of the commit alone'])
+})
+
+const git = (cwd, ...args) => execFileSync('git', ['-c', 'user.name=Gate Test', '-c', 'user.email=gate@example.invalid', '-c', 'commit.gpgsign=false', '-c', 'core.hooksPath=/dev/null', ...args], { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim()
+
+/** A scratch repository holding `entry` with its local imports and a package.json whose gate block is `gate`. */
+async function scratchRepo(t, entry, scripts, gate) {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'gate-manifest-')))
+  t.after(() => rmSync(root, { recursive: true, force: true }))
+  const source = join(root, 'source')
+  // As in the repository, node_modules is ignored: the round gate links it into its checkout.
+  const files = { ...await withLocalImports(PROJECT, entry), 'compatibility.json': readFileSync(join(PROJECT, 'compatibility.json'), 'utf8'), '.gitignore': 'node_modules\n' }
+  for (const [path, content] of Object.entries(files)) { mkdirSync(dirname(join(source, path)), { recursive: true }); writeFileSync(join(source, path), content) }
+  const commit = (scriptsNow, gateNow, message) => {
+    writeFileSync(join(source, 'package.json'), JSON.stringify({ name: 'gate-fixture', version: '0.0.0', private: true, scripts: scriptsNow, gate: gateNow }, null, 2) + '\n')
+    git(source, 'add', '-A'); git(source, 'commit', '-q', '-m', message)
+    return git(source, 'rev-parse', 'HEAD')
+  }
+  git(source, 'init', '-q', '-b', 'main')
+  return { root, source, head: commit(scripts, gate, 'baseline'), commit }
+}
+
+/** Run node as a fresh clone would (no checkout named, none searched for), whatever machine runs this file. */
+const run = (args, cwd) => new Promise(resolve => {
+  execFile(process.execPath, args, { cwd, env: tierEnvironment('hermetic'), timeout: 120_000, maxBuffer: 8 * 1024 * 1024 }, (error, stdout, stderr) => {
+    resolve({ code: error ? (typeof error.code === 'number' ? error.code : 1) : 0, stdout: String(stdout), stderr: String(stderr) })
+  })
+})
+
+const ok = 'node -e ""'
+
+test('the gate records every suite: passed, skipped with what it lacked, failed, or not run after a failure', async t => {
+  const scripts = { typecheck: ok, test: ok, 'test:host': ok, 'test:broken': 'node -e "process.exit(3)"', 'test:after': ok, 'test:billable': ok }
+  const repo = await scratchRepo(t, 'scripts/gate.mjs', scripts, { typecheck: [], test: [], 'test:host': ['harness'], 'test:broken': [], 'test:after': [], 'test:billable': ['provider'] })
+  const recordPath = join(repo.root, 'record.json')
+  const result = await run(['scripts/gate.mjs', '--record', recordPath], repo.source)
+  assert.equal(result.code, 1, `a failed suite fails the run: ${result.stderr}`)
+  const record = JSON.parse(readFileSync(recordPath, 'utf8'))
+  assert.equal(record.commit, repo.head)
+  assert.equal(record.dirty, false)
+  assert.equal(record.harness, null)
+  assert.equal(record.green, false)
+  assert.equal(record.complete, false)
+  assert.deepEqual(record.suites.map(({ name, status, missing, exitCode }) => ({ name, status, ...(missing && { missing }), ...(exitCode !== undefined && { exitCode }) })), [
+    { name: 'typecheck', status: 'pass', exitCode: 0 },
+    { name: 'test', status: 'pass', exitCode: 0 },
+    { name: 'test:host', status: 'skipped', missing: ['harness'] },
+    { name: 'test:broken', status: 'fail', exitCode: 3 },
+    { name: 'test:after', status: 'not-run' },
+    { name: 'test:billable', status: 'skipped', missing: ['provider'] },
+  ])
+  assert.match(record.prerequisites.harness.reason, /hermetic test tier has no Harness checkout/)
+  assert.match(result.stdout, /gate: 2 passed, 1 failed, 2 skipped, 1 not run/)
+  assert.match(result.stdout, /skipped for:\n {2}harness: The hermetic test tier has no Harness checkout/)
+  assert.match(result.stdout, /incomplete: test:host was skipped: no harness/)
+})
