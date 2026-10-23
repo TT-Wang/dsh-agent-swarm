@@ -272,11 +272,16 @@ test('a disproved research hypothesis remains an accepted useful result after in
   const review=f.propose(f.actorB,{kind:'verification',reviewOf:source.id,checks:[]})
   const rc=await f.runtime.claim(f.actorB,f.mission.id,review.id)
   f.workers.checks=[]
-  await assert.rejects(f.runtime.verify(f.actorB,f.mission.id,{taskId:review.id,attemptId:rc.attempt.id,verdict:'accept',reason:'unsupported agreement'}),/independent host-recorded/)
-  await f.workers.callbacks.toolRun(f.b.id,{tool:'bash',arguments:{command:'reproduce'},result:{observation:'counterexample'},isError:false})
+  await assert.rejects(f.runtime.verify(f.actorB,f.mission.id,{taskId:review.id,attemptId:rc.attempt.id,verdict:'accept',reason:'unsupported agreement'}),/review_evidence_required/)
+  // CORE-01: a recorded run alone no longer backs the acceptance of a source
+  // without checks; the reviewer's judgement rests on the claim it publishes.
+  const reproduced=await f.workers.callbacks.toolRun(f.b.id,{tool:'bash',arguments:{command:'reproduce'},result:{observation:'counterexample'},isError:false})
+  await assert.rejects(f.runtime.verify(f.actorB,f.mission.id,{taskId:review.id,attemptId:rc.attempt.id,verdict:'accept',reason:'unsupported agreement'}),/review_evidence_required/)
+  const reviewed=f.runtime.publish(f.actorB,f.mission.id,{taskId:review.id,attemptId:rc.attempt.id,claim:'The counterexample reproduces on the submitted commit',outcome:'supported',toolRunIds:[reproduced]})
   await f.runtime.verify(f.actorB,f.mission.id,{taskId:review.id,attemptId:rc.attempt.id,verdict:'accept',reason:'Counterexample independently reproduced'})
   const accepted=f.runtime.snapshot(f.owner,f.mission.id).evidence.find(e=>e.id===evidence.id)
   assert.equal(accepted.status,'verified'); assert.equal(accepted.outcome,'disproved')
+  assert.deepEqual(f.runtime.store.get('tasks',review.id).acceptanceBasis,{kind:'review-evidence',evidenceIds:[reviewed.id]})
   assert.equal(f.runtime.control(f.owner,f.mission.id,'complete','Research complete').status,'completed')
 })
 

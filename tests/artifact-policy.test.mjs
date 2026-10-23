@@ -79,9 +79,10 @@ test('a real report retains evidence plus independent review without declared co
   const source = await f.runtime.submit(f.a, f.mission.id, { taskId: task.id, attemptId: task.attempt.id, output: 'Report', deliverables: ['report.md'] })
   const review = await f.runtime.claim(f.b, f.mission.id, f.propose({ kind: 'verification', reviewOf: task.id }).id)
   assert.equal(review.attempt.sourceCommit, source.artifact.commit)
-  await assert.rejects(f.runtime.verify(f.b, f.mission.id, { taskId: review.id, attemptId: review.attempt.id, verdict: 'accept', reason: 'No supporting read' }), /independent host-recorded/)
-  await f.readEvidence(f.reviewer, f.b, review, 'report.md')
+  await assert.rejects(f.runtime.verify(f.b, f.mission.id, { taskId: review.id, attemptId: review.attempt.id, verdict: 'accept', reason: 'No supporting read' }), /review_evidence_required/)
+  const read = await f.readEvidence(f.reviewer, f.b, review, 'report.md')
   await f.runtime.verify(f.b, f.mission.id, { taskId: review.id, attemptId: review.attempt.id, verdict: 'accept', reason: 'Read the immutable report' })
+  assert.deepEqual(f.runtime.store.get('tasks', review.id).acceptanceBasis, { kind: 'review-evidence', evidenceIds: [read.id] }, 'the acceptance rests on the reviewer\'s published read')
   assert.equal(f.runtime.control(f.owner, f.mission.id, 'complete', 'Reviewed').status, 'completed')
 })
 

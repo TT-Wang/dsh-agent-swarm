@@ -137,9 +137,11 @@ export class DeclaredChecks {
    * Co-firing guards, named: the retry rule itself (a first pass that passes
    * never reaches here, so a single-pass verification still records exactly one
    * attempt) x `recordRuns` (which must not write this attempt twice: it writes
-   * only the deciding pass once these rows exist) x the accept-evidence check in
-   * `verify` (a failing check row is `isError`, so it can never satisfy
-   * "acceptance requires independent host-recorded verification evidence").
+   * only the deciding pass once these rows exist) x the acceptance basis in
+   * `verify` (an acceptance's `checks` basis names only the deciding pass, so
+   * these rows never back one; an acceptance with no check row is the
+   * reviewer's judgement backed by the reviewer's published review evidence,
+   * `reviewEvidence`, never a count of the attempt's runs).
    */
   private recordFirstPass(member: Member, verification: VerificationAttempt, artifact: Artifact, checks: ReadonlyArray<CheckResult>): void {
     this.k.commit(member.missionId, () => {

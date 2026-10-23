@@ -6,7 +6,7 @@
  * where it enters (`SwarmRuntime.task`, the admission graph check), never here.
  */
 import { canOwnReview } from './assignment.ts'
-import { criterionId, type Attempt, type Evidence, type EvidenceStatus, type FinishedAttempt, type Mission, type Task, type TaskRejection } from './types.ts'
+import { criterionId, type Attempt, type Evidence, type EvidenceStatus, type FinishedAttempt, type Mission, type Task, type TaskRejection, type ToolRun } from './types.ts'
 
 const oldest = (tasks: readonly Task[]): Task | undefined => [...tasks].sort((a, b) => a.createdAt - b.createdAt || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))[0]
 
@@ -495,6 +495,31 @@ export function judgeableClaims(task: Pick<Task, 'status' | 'kind' | 'rejections
   return currentEvidenceIds(task).flatMap(evidenceId => {
     const evidence = evidenceOf(evidenceId)
     return evidence !== undefined && judgeable(evidence, task) ? [evidence] : []
+  })
+}
+
+/**
+ * The review evidence of attempt `attemptId` of `review`: the claims its
+ * reviewer published with `swarm_publish` on that attempt that still stand,
+ * in publication order. A review's claim stands while it is current (no
+ * rework archived it) and its review is not cancelled: no verdict judges a
+ * review's own claim (`unjudgeable` answers `review-evidence`), so nothing
+ * refutes it. Publication admitted only runs of the publishing attempt
+ * (`validateRuns`, src/runtime.ts), so the runs a claim cites name its attempt.
+ *
+ * An acceptance of a source that declares no host checks is the reviewer's
+ * judgement, and these claims are what it rests on: `verify` refuses one
+ * with none ([review_evidence_required]) and records their ids as its
+ * `review-evidence` basis (`AcceptanceBasis`). A swarm_* call is never a
+ * recorded run, so a reading through `swarm_observe` backs no claim: the
+ * review checkout is the artifact, and inspecting it there is recorded.
+ */
+export function reviewEvidence(review: Pick<Task, 'status' | 'kind' | 'rejections' | 'evidenceIds'>, attemptId: string,
+  evidenceOf: (evidenceId: string) => Evidence | undefined, runOf: (runId: string) => Pick<ToolRun, 'attemptId'> | undefined): Evidence[] {
+  return currentEvidenceIds(review).flatMap(evidenceId => {
+    const evidence = evidenceOf(evidenceId)
+    return evidence !== undefined && unjudgeable(evidence, review)?.kind === 'review-evidence'
+      && evidence.toolRunIds.length > 0 && evidence.toolRunIds.every(runId => runOf(runId)?.attemptId === attemptId) ? [evidence] : []
   })
 }
 

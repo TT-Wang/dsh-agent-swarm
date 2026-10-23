@@ -27,9 +27,9 @@ import { validScope, scopeSubset } from './scope.ts'
 import { AdmissionError, assertDeclaredOutputs, assertScopeSelectors, citedCovers, dependencyAssumptions, formatDiagnostic, isNoopCheck, loadPackageScripts, normalizeReviewDependencies, normalizeScopeSelectors, normalizeTaskCeilings, reconcileTaskAdmission, requireHostChecks, taskCeilingBlock, taskGraphDefects, TaskGraphAdmissionError, memberRouteDiagnostic, type MemberRouteEntry, type TaskGraphNode } from './admission.ts'
 import { canBorrowTask, canOwnReview, strandedReview } from './assignment.ts'
 import { executionClock, executionElapsed, exhaustedDimensions } from './resource-time.ts'
-import { TERMINAL_STATES, blockCauses, currentEvidenceIds, finishedAttempt, holdsAttempt, holdsOpenAttempt, judgeableClaims, memberTask, missionSubject, openAttempt, pendingStopOwner, quiescencePending, selectAcceptedDelivery, stopPending, subjectsOfTasks, taskEdges, taskGraphIndex, taskSubject, terminal, uncoveredCriteria, unjudgeable, type BlockCause, type HeldTask, type Unjudgeable } from './task-graph.ts'
+import { TERMINAL_STATES, blockCauses, currentEvidenceIds, finishedAttempt, holdsAttempt, holdsOpenAttempt, judgeableClaims, memberTask, missionSubject, openAttempt, pendingStopOwner, quiescencePending, reviewEvidence, selectAcceptedDelivery, stopPending, subjectsOfTasks, taskEdges, taskGraphIndex, taskSubject, terminal, uncoveredCriteria, unjudgeable, type BlockCause, type HeldTask, type Unjudgeable } from './task-graph.ts'
 import { checkSyntaxDetail, declaredPlanChecks, orderedTasks, pairReviews, planAdvisories, validatePlan } from './plans.ts'
-import { OWNER_ONLY_TOOLS, UNCONFINED_HOST_TOOLS, type Actor, type AutoStart, BoardQuery, Budget, CheckAttribution, CreateMissionInput, CriticalPath, criterionId, Delivery, DraftPlan, Escalation, Evidence, EvidenceStatus, Member, Mission, nextWorkerName, ObserveQuery, MessageInput, PlanInput, Post, PostInput, PostKind, PROVIDER_OUTAGE_WINDOW_MS, MemberRouteRefusal, ProposeTaskInput, ProviderOutage, providerQuiescent, PublishInput, RecoveryFallback, RequestStartInput, RuntimeConfig, Snapshot, Task, TaskAmendment, TaskRejection, TaskCeiling, ToolRun, VerificationCleanupFailure, WorkerAdapter, WorkerActivity, Workstream } from './types.ts'
+import { OWNER_ONLY_TOOLS, UNCONFINED_HOST_TOOLS, type AcceptanceBasis, type Actor, type AutoStart, BoardQuery, Budget, CheckAttribution, CreateMissionInput, CriticalPath, criterionId, Delivery, DraftPlan, Escalation, Evidence, EvidenceStatus, Member, Mission, nextWorkerName, ObserveQuery, MessageInput, PlanInput, Post, PostInput, PostKind, PROVIDER_OUTAGE_WINDOW_MS, MemberRouteRefusal, ProposeTaskInput, ProviderOutage, providerQuiescent, PublishInput, RecoveryFallback, RequestStartInput, RuntimeConfig, Snapshot, Task, TaskAmendment, TaskRejection, TaskCeiling, ToolRun, VerificationCleanupFailure, WorkerAdapter, WorkerActivity, Workstream } from './types.ts'
 import { requireArtifactChecks } from './artifact-policy.ts'
 
 /** Release a prelaunch caller even when an adapter ignores cancellation. Its late writes remain fenced. */
@@ -1338,10 +1338,19 @@ export class SwarmRuntime implements Kernel {
       if (JSON.stringify(source.checks) !== prepared.checksRevision) throw new Error('[checks_changed_during_verification] Source checks changed during verification; retry swarm_verify on the same review to execute the current checks.')
       if (source.status !== 'submitted' || source.artifact?.commit !== artifact.commit) throw new Error('[artifact_changed_during_verification] Reviewed artifact changed during verification. Verify again with `swarm_verify` and the reviewed `taskId`.')
       if (prepared.evidenceRevision !== JSON.stringify(source.evidenceIds.map(eid => this.store.get('evidence', eid)))) throw new Error('[evidence_changed_during_verification] Evidence changed during verification; inspect the new challenge and verify again. Inspect `evidenceId` with `swarm_observe`, then verify again with `swarm_verify` and its `verdict`.')
-      const independentRuns = this.store.list('tool_runs', missionId).filter(run => run.memberId === member.id && run.taskId === task.id && run.attemptId === input.attemptId && !run.isError)
       if (input.verdict === 'accept' && source.checks.length > 0 && checks.length === 0) throw new Error('Declared host checks returned no execution evidence; retry verification of the same artifact')
-      if (input.verdict === 'accept' && checks.length === 0 && independentRuns.length === 0) throw new Error('Acceptance requires independent host-recorded verification evidence')
       const { passed, failingChecks } = this.declaredChecks.classify(input.verdict, checks)
+      // CORE-01: an acceptance records what it rests on (`AcceptanceBasis`).
+      // One the host checks classified rests on their rows. One with no check
+      // row (its source declares no checks) is the reviewer's judgement: it
+      // rests on the claims the reviewer published on this attempt
+      // (`reviewEvidence`), as a research submission rests on its own claims,
+      // and is refused without one. `reviewed` holds those claims' ids, and
+      // only for such an acceptance.
+      const reviewed = passed && checks.length === 0
+        ? reviewEvidence(task, input.attemptId, evidenceId => this.store.get('evidence', evidenceId), runId => this.store.get('tool_runs', runId)).map(evidence => evidence.id)
+        : undefined
+      if (reviewed?.length === 0) throw new PolicyError('review_evidence_required', 'validation_error', `[review_evidence_required] Source ${source.id} declares no host checks, so accepting it is your judgement as its reviewer, and that judgement must rest on review evidence you published on this review attempt; you have published none. Nothing was recorded and your attempt stays running. Inspect the artifact in your review checkout, which is the submitted commit (read its files, reproduce its results); a \`runId\` read with \`swarm_observe\` is not a run of yours and backs no claim. Publish what you found with \`swarm_publish\` and its \`toolRunIds\`, then retry \`swarm_verify\` with \`verdict\` accept.`)
       const attributionOf = (check: { command: string; exitCode: number }): { attribution?: CheckAttribution } => {
         const found = checks.find(item => item.command === check.command && item.exitCode === check.exitCode)
         return found?.attribution === undefined ? {} : { attribution: found.attribution }
@@ -1379,8 +1388,11 @@ export class SwarmRuntime implements Kernel {
       const released = new Set<string>()
       this.commit(missionId, () => {
         runIds.push(...this.declaredChecks.recordRuns(missionId, { memberId: member.id, taskId: task.id, attemptId: input.attemptId, commit: artifact.commit }, checks))
+        const basis: AcceptanceBasis | undefined = !passed ? undefined
+          : reviewed === undefined ? { kind: 'checks', runIds: [...runIds] } : { kind: 'review-evidence', evidenceIds: reviewed }
         source.status = passed ? 'accepted' : 'blocked'
         task.status = passed ? 'accepted' : 'blocked'; task.output = this.bounded(rejection); task.reviewedCommit = artifact.commit
+        if (basis !== undefined) task.acceptanceBasis = basis
         if (prepared.reviewArtifact !== undefined) task.reviewArtifact = prepared.reviewArtifact
         this.store.put('tasks', source); this.store.put('tasks', task)
         // Every other review of this source is moot: pending ones can never
@@ -1461,11 +1473,11 @@ export class SwarmRuntime implements Kernel {
           supersede(evidence, evidence)
         }
         this.store.event(missionId, passed ? 'task/accepted' : 'task/rejected', member.id, { sourceTaskId: source.id, verificationTaskId: task.id, commit: artifact.commit, reason: rejection, checks: runIds,
-          ...(passed ? {} : { checkFailures: failingChecks.slice(0, MAX_REPORTED_CHECK_FAILURES).map(check => ({ command: check.command, exitCode: check.exitCode, ...attributionOf(check), output: excerpt(check.output, 400) })) }) })
+          ...(basis !== undefined ? { basis } : { checkFailures: failingChecks.slice(0, MAX_REPORTED_CHECK_FAILURES).map(check => ({ command: check.command, exitCode: check.exitCode, ...attributionOf(check), output: excerpt(check.output, 400) })) }) })
         // The actual verdict, exact artifact and retirements commit together.
         // Deferred checks never enter this branch; accepted inconclusive claims
         // retain unverified status and therefore have no verified verdict row.
-        for (const row of verdictRows({ sourceTaskId: source.id, verificationTaskId: task.id, verdict: passed ? 'verified' : 'refuted',
+        for (const row of verdictRows({ sourceTaskId: source.id, verificationTaskId: task.id, ...(basis !== undefined ? { verdict: 'verified', basis } as const : { verdict: 'refuted' } as const),
           reason: task.output, evidence: verdictEvidence, retired })) {
           this.store.event(missionId, 'evidence/verdict', member.id, { ...row, commit: artifact.commit })
         }
@@ -2562,7 +2574,8 @@ export class SwarmRuntime implements Kernel {
    * Read-only cross-mission artifact registry (R11-14 / R10-10): for every
    * mission this session may see, each captured artifact commit with its task
    * and mission identity, the task's acceptance state and the independent
-   * review verdict. A rework keeps its history here: every rejected commit it
+   * review verdict, with what an acceptance rests on (`basis`,
+   * `AcceptanceBasis`). A rework keeps its history here: every rejected commit it
    * archived is listed (`archived: true`) with its refuting verdict, and a
    * re-opened review's archived review record with the commit it judged.
    * Per-mission artifact refs are private (A2-04), so this durable projection
@@ -2606,7 +2619,9 @@ export class SwarmRuntime implements Kernel {
           ...(task.kind !== 'verification' && task.rejections?.some(rejection => rejection.commit === captured.commit) ? { repeatsRejectedCommit: true } : {}),
           ...(review === undefined ? {} : { review: { taskId: review.id, status: review.status,
             verdict: review.status === 'accepted' ? 'verified' : refuted ? 'refuted' : 'pending',
-            ...(review.output === undefined ? {} : { reason: excerpt(review.output, 400) }) } }),
+            ...(review.output === undefined ? {} : { reason: excerpt(review.output, 400) }),
+            // What the acceptance rests on; a review accepted by a build that did not record it has none.
+            ...(review.status === 'accepted' && review.acceptanceBasis !== undefined ? { basis: review.acceptanceBasis } : {}) } }),
         })
       }
     }

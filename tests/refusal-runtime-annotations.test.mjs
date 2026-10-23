@@ -28,6 +28,8 @@ const ANNOTATED = {
     'owner_cannot_claim', 'evidence_tool_runs_required', 'supersede_foreign_evidence',
     'supersede_unrelated_evidence', 'verification_requires_verify', 'research_evidence_required', 'not_a_verification_task',
     'artifact_changed_during_verification', 'evidence_changed_during_verification',
+    // CORE-01: an acceptance without checks rests on the reviewer's published review evidence.
+    'review_evidence_required',
     // L0-L2 owner-reply receipts: every refusal names the id to pass instead.
     'reply_target_required', 'unknown_reply_target', 'reply_target_not_question', 'reply_target_not_recipient',
   ],

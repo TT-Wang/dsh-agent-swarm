@@ -565,6 +565,14 @@ export interface Task {
   evidenceIds: string[]
   reviewOf?: string
   reviewedCommit?: string
+  /**
+   * On a review that accepted its source: what that acceptance rests on
+   * (`AcceptanceBasis`), written once in the verdict's transaction. It stays,
+   * as `reviewedCommit` does, when a challenge later cancels the review. Absent
+   * on a review that never accepted, and on one accepted by a build that did
+   * not record it.
+   */
+  acceptanceBasis?: AcceptanceBasis
   /** Blocked or cancelled tasks this repair replaces; their acceptance and covers apply to it through the lineage. */
   replaces?: string[]
   /**
@@ -583,6 +591,21 @@ export interface Task {
   handoff?: string
   createdAt: number
 }
+/**
+ * What an independent acceptance rests on, recorded with the verdict on
+ * `task/accepted`, on each `evidence/verdict` row it writes and on the
+ * accepting review (`Task.acceptanceBasis`):
+ *  - `checks`: the source declares host checks, and every one passed on the
+ *    exact artifact; `runIds` are the durable host-verification rows of the
+ *    pass the verdict classified.
+ *  - `review-evidence`: the source declares none, so the acceptance is the
+ *    reviewer's judgement, backed by the claims it published with
+ *    `swarm_publish` on the accepting attempt (`reviewEvidence`,
+ *    src/task-graph.ts); `evidenceIds` is never empty.
+ */
+export type AcceptanceBasis =
+  | { kind: 'checks'; runIds: string[] }
+  | { kind: 'review-evidence'; evidenceIds: string[] }
 export interface Evidence {
   id: string
   missionId: string

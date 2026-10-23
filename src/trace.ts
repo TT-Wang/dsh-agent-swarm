@@ -35,7 +35,7 @@ import { rm } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import { taskGraphDefects, type TaskGraphDefect, type TaskGraphNode } from './admission.ts'
 import { EVENT_VOCABULARY } from './events.ts'
-import { ATTEMPT_FENCING_EVENTS, type SwarmEvent } from './types.ts'
+import { ATTEMPT_FENCING_EVENTS, type AcceptanceBasis, type SwarmEvent } from './types.ts'
 import { PolicyError } from './policy-error.ts'
 
 /** Closed operation vocabulary from the D6 contract (OTel/OpenInference analogue). */
@@ -738,15 +738,20 @@ export function assertReplayParity(expected: readonly string[], actual: readonly
   }
 }
 
-/** Verdict normalization for the client contract: `{ evidenceId, verdict, retired }`. */
-interface VerdictRow { evidenceId: string; verdict: 'verified' | 'refuted'; outcome: string; taskId: string; verificationTaskId: string; retired: string[]; reason: string }
+/**
+ * Verdict normalization for the client contract: `{ evidenceId, verdict, retired }`.
+ * A verified row carries what the acceptance rests on (`basis`,
+ * `AcceptanceBasis`); a refuted row carries none, since a rejection needs no
+ * basis and its grounds are its `task/rejected` check failures and reason.
+ */
+interface VerdictRow { evidenceId: string; verdict: 'verified' | 'refuted'; outcome: string; taskId: string; verificationTaskId: string; retired: string[]; reason: string; basis?: AcceptanceBasis }
 export function verdictRows(input: {
   sourceTaskId: string
   verificationTaskId: string
-  verdict: 'verified' | 'refuted'
   reason: string
   evidence: ReadonlyArray<{ id: string; outcome: string }>
   retired: readonly string[]
-}): VerdictRow[] {
-  return input.evidence.map(item => ({ evidenceId: item.id, verdict: input.verdict, outcome: item.outcome, taskId: input.sourceTaskId, verificationTaskId: input.verificationTaskId, retired: [...input.retired], reason: input.reason }))
+} & ({ verdict: 'verified'; basis: AcceptanceBasis } | { verdict: 'refuted' })): VerdictRow[] {
+  return input.evidence.map(item => ({ evidenceId: item.id, verdict: input.verdict, outcome: item.outcome, taskId: input.sourceTaskId, verificationTaskId: input.verificationTaskId, retired: [...input.retired], reason: input.reason,
+    ...(input.verdict === 'verified' ? { basis: input.basis } : {}) }))
 }
