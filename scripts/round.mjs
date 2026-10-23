@@ -148,7 +148,7 @@ if (command === 'gate') {
   }
   if (!existsSync(recordPath)) fail(`the gate of ${sha.slice(0, 12)} wrote no record (exit ${exitCode})`)
   const verdict = gateVerdict(manifest, JSON.parse(readFileSync(recordPath, 'utf8')), { commit: sha })
-  process.stdout.write(JSON.stringify({ command: 'gate', commit: sha, record: recordPath, complete: verdict.complete, problems: verdict.problems }, null, 2) + '\n')
+  process.stdout.write(JSON.stringify({ command: 'gate', commit: sha, record: recordPath, complete: verdict.complete, problems: verdict.problems, reasons: verdict.reasons }, null, 2) + '\n')
   process.exit(verdict.complete ? 0 : 1)
 }
 
@@ -166,7 +166,7 @@ if (command === 'promote') {
   let verdict
   try { verdict = gateVerdict(manifestAt(sha), JSON.parse(readFileSync(gateFile, 'utf8')), { commit: sha }) }
   catch (error) { fail(`the recorded gate for ${sha.slice(0, 12)} cannot be checked: ${error.message}`) }
-  if (!verdict.complete) fail(`the recorded gate for ${sha.slice(0, 12)} is not a complete gate of its manifest:\n- ${verdict.problems.join('\n- ')}\nrun: node scripts/round.mjs gate --commit ${sha.slice(0, 12)}`)
+  if (!verdict.complete) fail(`the recorded gate for ${sha.slice(0, 12)} is not a complete gate of its manifest:\n${[...verdict.problems, ...Object.entries(verdict.reasons).map(([need, reason]) => `${need}: ${reason}`)].map(line => `- ${line}`).join('\n')}\nrun: node scripts/round.mjs gate --commit ${sha.slice(0, 12)}`)
   // An integration artifact's parent may be an internal merge commit, so its
   // delta is not its content. --base names the mission baseline the artifact is
   // authoritative against; default stays the parent for simple task artifacts.

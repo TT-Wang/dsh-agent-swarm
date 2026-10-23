@@ -77,15 +77,16 @@ test('gateVerdict: a record is complete only when it lists the manifest and ever
   const record = (suites, extra = {}) => ({ commit: 'c1', dirty: false, prerequisites: { harness: { present: false, reason: 'no checkout here' }, provider: { present: false, reason: 'opt-in' } }, suites, ...extra })
   const pass = name => ({ name, status: 'pass', exitCode: 0 })
   const complete = record([pass('typecheck'), pass('test:host'), { name: 'test:billable', status: 'skipped', missing: ['provider'] }])
-  assert.deepEqual(gateVerdict(small, complete, { commit: 'c1' }), { complete: true, problems: [] })
+  assert.deepEqual(gateVerdict(small, complete, { commit: 'c1' }), { complete: true, problems: [], reasons: {} })
   // The record a dormant round gate wrote: green, and silent about which suites it ran.
   assert.deepEqual(gateVerdict(small, { commit: 'c1', green: true, results: [{ name: 'typecheck', exitCode: 0 }] }).problems, ["the record lists no suites: the gate manifest's runner (scripts/gate.mjs) did not write it"])
   assert.deepEqual(gateVerdict(small, record([pass('typecheck'), pass('test:billable')])).problems, ['the record lacks test:host, which the manifest lists'])
   assert.deepEqual(gateVerdict(small, record([...complete.suites, pass('test:old')])).problems, ['the record has test:old, which the manifest does not list'])
-  assert.deepEqual(gateVerdict(small, record([pass('typecheck'), { name: 'test:host', status: 'skipped', missing: ['harness'] }, pass('test:billable')])).problems, ['test:host was skipped: no harness (no checkout here)'])
-  assert.deepEqual(gateVerdict(small, record([pass('typecheck'), pass('test:host'), { name: 'test:billable', status: 'skipped', missing: ['harness', 'provider'] }])).problems,
-    ['test:billable was skipped: no harness (no checkout here); no provider (opt-in)'], 'an opt-in suite that also lacked a host prerequisite is not excused')
-  assert.deepEqual(gateVerdict(small, record([{ name: 'typecheck', status: 'fail', exitCode: 2 }, { name: 'test:host', status: 'not-run' }, pass('test:billable')])).problems, ['typecheck failed (exit 2)', 'test:host did not run (not-run)'])
+  const hostSkipped = gateVerdict(small, record([pass('typecheck'), { name: 'test:host', status: 'skipped', missing: ['harness'] }, pass('test:billable')]))
+  assert.deepEqual([hostSkipped.problems, hostSkipped.reasons], [['test:host was skipped: no harness'], { harness: 'no checkout here' }])
+  const bothSkipped = gateVerdict(small, record([pass('typecheck'), pass('test:host'), { name: 'test:billable', status: 'skipped', missing: ['harness', 'provider'] }]))
+  assert.deepEqual([bothSkipped.problems, bothSkipped.reasons], [['test:billable was skipped: no harness, provider'], { harness: 'no checkout here', provider: 'opt-in' }], 'an opt-in suite that also lacked a host prerequisite is not excused')
+  assert.deepEqual(gateVerdict(small, record([{ name: 'typecheck', status: 'fail', exitCode: 2 }, { name: 'test:host', status: 'not-run' }, pass('test:billable')])).problems, ['typecheck failed (exit 2)', 'test:host did not run: an earlier suite failed'])
   assert.deepEqual(gateVerdict(small, { ...complete, commit: 'c2', dirty: true }, { commit: 'c1' }).problems, ['the record is of commit c2, not c1', 'the record is of a tree with uncommitted changes, not of the commit alone'])
 })
 
@@ -140,7 +141,7 @@ test('the gate records every suite: passed, skipped with what it lacked, failed,
   assert.match(record.prerequisites.harness.reason, /hermetic test tier has no Harness checkout/)
   assert.match(result.stdout, /gate: 2 passed, 1 failed, 2 skipped, 1 not run/)
   assert.match(result.stdout, /skipped for:\n {2}harness: The hermetic test tier has no Harness checkout/)
-  assert.match(result.stdout, /incomplete: test:host was skipped: no harness/)
+  assert.match(result.stdout, /incomplete:\n {2}test:host was skipped: no harness\n {2}test:broken failed \(exit 3\)\n {2}test:after did not run: an earlier suite failed\n/)
 })
 
 test('the round gate runs the commit\'s own gate, and promote takes its record only when it is complete for that commit\'s manifest', async t => {
@@ -152,11 +153,12 @@ test('the round gate runs the commit\'s own gate, and promote takes its record o
   // A host without the checkout: the gate records the skip, and neither it nor promote calls that complete.
   const incomplete = await round('gate', '--commit', repo.head)
   assert.equal(incomplete.code, 1, incomplete.stderr)
-  assert.deepEqual(JSON.parse(incomplete.stdout.slice(incomplete.stdout.lastIndexOf('{\n  "command"'))).problems, [`test:host was skipped: no harness (${recordOf(repo.head).prerequisites.harness.reason})`])
+  const reported = JSON.parse(incomplete.stdout.slice(incomplete.stdout.lastIndexOf('{\n  "command"')))
+  assert.deepEqual([reported.problems, reported.reasons], [['test:host was skipped: no harness'], { harness: recordOf(repo.head).prerequisites.harness.reason }])
   assert.deepEqual(recordOf(repo.head).suites.map(suite => [suite.name, suite.status]), [['typecheck', 'pass'], ['test', 'pass'], ['test:host', 'skipped']], 'the record lists the commit\'s manifest, in its order')
   const refused = await round('promote', '--commit', repo.head, '--dry-run')
   assert.equal(refused.code, 2)
-  assert.match(refused.stderr, new RegExp(`the recorded gate for ${repo.head.slice(0, 12)} is not a complete gate of its manifest:\\n- test:host was skipped: no harness`))
+  assert.match(refused.stderr, new RegExp(`the recorded gate for ${repo.head.slice(0, 12)} is not a complete gate of its manifest:\\n- test:host was skipped: no harness\\n- harness: The hermetic test tier has no Harness checkout`))
 
   // The next commit gives its host suite only an opt-in prerequisite: the same host now gates it completely.
   const next = repo.commit({ typecheck: ok, test: ok, 'test:host': ok }, { typecheck: [], test: [], 'test:host': ['provider'] }, 'opt-in host suite')

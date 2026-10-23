@@ -110,11 +110,13 @@ export function planGate(manifest, found) {
  * Whether a run record is a complete gate of `manifest`: it lists exactly the
  * manifest's suites, and every suite passed, except one skipped only for
  * opt-in prerequisites the manifest gives it. With `commit`, the record must
- * also be of that commit and an unmodified tree. Returns { complete, problems }.
+ * also be of that commit and an unmodified tree. Returns { complete, problems,
+ * reasons }: `reasons` is why the record found each prerequisite a problem's
+ * skipped suite lacked.
  */
 export function gateVerdict(manifest, record, { commit } = {}) {
-  if (!Array.isArray(record?.suites)) return { complete: false, problems: ['the record lists no suites: the gate manifest\'s runner (scripts/gate.mjs) did not write it'] }
-  const problems = []
+  if (!Array.isArray(record?.suites)) return { complete: false, problems: ['the record lists no suites: the gate manifest\'s runner (scripts/gate.mjs) did not write it'], reasons: {} }
+  const problems = [], reasons = {}
   if (commit !== undefined && record.commit !== commit) problems.push(`the record is of commit ${record.commit ?? 'none'}, not ${commit}`)
   if (commit !== undefined && record.dirty !== false) problems.push('the record is of a tree with uncommitted changes, not of the commit alone')
   const expected = Object.keys(manifest)
@@ -127,11 +129,14 @@ export function gateVerdict(manifest, record, { commit } = {}) {
     if (!expected.includes(suite?.name) || suite.status === 'pass') continue
     const missing = Array.isArray(suite.missing) ? suite.missing : []
     if (suite.status === 'skipped' && missing.length && missing.every(need => PREREQUISITES[need]?.optIn && manifest[suite.name].includes(need))) continue
-    if (suite.status === 'skipped') problems.push(`${suite.name} was skipped: ${missing.map(need => `no ${need} (${record.prerequisites?.[need]?.reason ?? 'no reason recorded'})`).join('; ') || 'no prerequisite recorded'}`)
-    else if (suite.status === 'fail') problems.push(`${suite.name} failed (exit ${suite.exitCode})`)
-    else problems.push(`${suite.name} did not run (${suite.status})`)
+    if (suite.status === 'skipped') {
+      problems.push(`${suite.name} was skipped: ${missing.length ? `no ${missing.join(', ')}` : 'no missing prerequisite recorded'}`)
+      for (const need of missing) reasons[need] = record.prerequisites?.[need]?.reason ?? 'no reason recorded'
+    } else if (suite.status === 'fail') problems.push(`${suite.name} failed (exit ${suite.exitCode})`)
+    else if (suite.status === 'not-run') problems.push(`${suite.name} did not run: an earlier suite failed`)
+    else problems.push(`${suite.name} has status ${JSON.stringify(suite.status)}`)
   }
-  return { complete: problems.length === 0, problems }
+  return { complete: problems.length === 0, problems, reasons }
 }
 
 function harnessPrerequisite() {
@@ -196,7 +201,7 @@ function summary(record, verdict, recordPath) {
     '',
     `gate: ${counts('pass')} passed, ${counts('fail')} failed, ${counts('skipped')} skipped, ${counts('not-run')} not run (commit ${record.commit ?? 'unknown'}${record.dirty ? ', with uncommitted changes' : ''}; Harness ${record.harness ? `${record.harness.version} at ${record.harness.commit}` : 'none'})`,
     ...suiteTable(record.suites, record.prerequisites),
-    verdict.complete ? 'complete: every suite a complete gate needs passed' : `incomplete: ${verdict.problems.join('; ')}`,
+    ...(verdict.complete ? ['complete: every suite a complete gate needs passed'] : ['incomplete:', ...verdict.problems.map(problem => `  ${problem}`)]),
     `record: ${relative(process.cwd(), recordPath) || recordPath}`,
   ].join('\n') + '\n'
 }
