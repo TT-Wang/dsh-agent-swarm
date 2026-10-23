@@ -1,7 +1,7 @@
 /** Durable collaboration policy. Worker lifecycle and filesystem effects belong to the adapter. */
 import { randomUUID } from 'node:crypto'
 import { isAbsolute, join } from 'node:path'
-import { SwarmStore, WriterBusyError, StoreRecoveryError, id, stageRestore, type PendingRestore, type PostFilter, type StoreOptions } from './store.ts'
+import { SwarmStore, WriterBusyError, StoreRecoveryError, id, stageRestore, type PendingRestore, type PostFilter, type RevisedTable, type StoreOptions, type Tables } from './store.ts'
 import { Attempts, endAttempt } from './attempts.ts'
 import { PolicyError, recordedFailure } from './policy-error.ts'
 export { WorkspaceRevokedError } from './authorization.ts'
@@ -11,7 +11,7 @@ import { Notices, NOTICE_TEMPLATES, REJECTION_DECISION_TRIGGER, assignmentCurren
 import { RefusalRegistry, requireStrings, requireText, sameChecks, validatedBudget } from './refusals.ts'
 import { Scheduling } from './scheduling.ts'
 import { progressed, type Kernel } from './kernel.ts'
-import { ADMISSION_REFUSED, AUTOMATIC_REVIEW_PREFIX, bounds, capable, completionError, fingerprintBoard, inFlightEstimate, missionFingerprint, noticeSubjectsFor, readBoard, readinessBlocker, readMission, ready, rerouteTarget, reviewable, reviewNeed, reviewPathBlocker, reviewPathStalled, stillChosen, unreviewedSources, unschedulable, type AdapterView, type Board, type Bounds, type ReviewNeed, type SchedulingPass } from './board.ts'
+import { ADMISSION_REFUSED, AUTOMATIC_REVIEW_PREFIX, bounds, capable, completionError, fingerprintBoard, inFlightEstimate, missionFingerprint, noticeSubjectsFor, readBoard, readinessBlocker, readMission, ready, rerouteTarget, reviewable, reviewNeed, reviewPathBlocker, reviewPathStalled, sameChoice, stillChosen, unreviewedSources, unschedulable, type AdapterView, type Board, type Bounds, type ReviewNeed, type SchedulingPass } from './board.ts'
 // R17-G6/G7: the one derivation of mission derived state and its host projection.
 import { deriveMemberStatus, memberPhaseOf, memberDeliveryHealth, type MissionBoardMember } from './projection.ts'
 export { emptyUsage, addUsage } from './gates.ts'
@@ -51,6 +51,9 @@ async function abortableStart<T>(operation: Promise<T>, signal: AbortSignal): Pr
 const POST_KINDS: readonly PostKind[] = ['ASK', 'ANSWER', 'IDEA', 'ALERT', 'ARTIFACT', 'HANDOFF']
 /** Closed evidence outcome vocabulary; an unknown or missing outcome would be stored and later verified. */
 const EVIDENCE_OUTCOMES: readonly string[] = ['supported', 'disproved', 'inconclusive']
+
+/** What `SwarmRuntime.revise` throws to abandon the empty transaction of a moot transition; it never leaves `revise`. */
+const MOOT = Symbol('moot transition')
 
 /** Board delta reads are bounded to this page size unless the caller asks for less. */
 const BOARD_PAGE_MAX = 100
@@ -625,6 +628,50 @@ export class SwarmRuntime implements Kernel {
     this.scheduling.transition(missionId)
     return result
   }
+  /**
+   * CORE-06: the one shape of a write by a transition that awaited I/O after
+   * it read the row it writes (an artifact capture, a workspace preparation, a
+   * checkpoint, a worker stop, a delivery apply). The row it read is not the
+   * row it may write: writes it does not conflict with are accepted during the
+   * await (an owner's allocation raise through `swarm_budget`, a recorded tool
+   * run, a claim the worker published, a usage charge), and writing its copy
+   * would refuse the transition although nothing it rests on changed (a task
+   * row's revision moved: `StaleTaskRevisionError`) or silently revert them (a
+   * mission or member row is a whole-row put). So `revise` opens the commit and
+   * reads the row inside it, through the read face every decision reads it by
+   * (a mission's execution clock folded to now, as `mission` folds it), and
+   * hands it to `change`, which re-validates on that row the facts the
+   * transition rests on, its fence (the attempt, the epoch, the status, the
+   * choice it prepared), and sets only the fields the transition owns. The row
+   * is then written, and `effects` writes what follows from it (its events,
+   * other rows, deliveries) in the same transaction.
+   *
+   * A write that conflicts with the fence refuses the transition with that
+   * conflict's own typed reason (`change` throws; nothing is written), or makes
+   * it moot (`change` returns false, or the row is gone: nothing is written,
+   * nothing is published, and `revise` returns undefined). Every other write
+   * survives, because the row written is the row read here. Called inside an
+   * open commit, it is a write of that transaction, and a moot one leaves the
+   * rest of it to its caller. Returns the row as written.
+   */
+  revise<T extends RevisedTable>(missionId: string, table: T, rowId: string, change: (current: Tables[T]) => boolean | void, effects?: (written: Tables[T]) => void): Tables[T] | undefined {
+    const take = (): Tables[T] | undefined => {
+      const current = table === 'missions' && this.store.get('missions', rowId) !== undefined ? this.mission(rowId) as Tables[T] : this.store.get(table, rowId)
+      if (current === undefined || change(current) === false) return undefined
+      this.store.put(table, current)
+      effects?.(current)
+      return current
+    }
+    if (this.commitDepth > 0) return take()
+    try {
+      // A moot transition leaves its own transaction empty; it is abandoned,
+      // so the commit publishes no transition that never happened.
+      return this.commit(missionId, () => { const written = take(); if (written === undefined) throw MOOT; return written })
+    } catch (error) {
+      if (error === MOOT) return undefined
+      throw error
+    }
+  }
   /** Subscribe to committed state changes. */
   subscribe(listener: (missionId: string) => void): () => void { this.listeners.add(listener); return () => { this.listeners.delete(listener) } }
   /** Current `F(S)`: the board digest the owner instruments and the audit fields of the stall events carry. */
@@ -686,14 +733,22 @@ export class SwarmRuntime implements Kernel {
    * active participant (`active`) and the live owner of that running attempt,
    * whose lease has not run out, and every prerequisite of the task is still met
    * on the board. A tool path asks it before it acts on the attempt, and again
-   * after an await during which the attempt could have moved.
+   * after an await during which the attempt could have moved: on the row its
+   * commit reads (`revise`), when it writes that row (`heldAttempt`).
    */
   private ownAttempt(actor: Actor, missionId: string, taskId: string, attemptId: string): { task: Task; member: Member } {
     const { member } = this.active(actor, missionId)
     const task = this.task(missionId, taskId)
+    return { task, member: this.holder(member, missionId, task, attemptId) }
+  }
+  /** `ownAttempt` on a row the caller already holds: the row a commit reads. */
+  private heldAttempt(actor: Actor, missionId: string, task: Task, attemptId: string): Member {
+    return this.holder(this.active(actor, missionId).member, missionId, task, attemptId)
+  }
+  private holder(member: Member | undefined, missionId: string, task: Task, attemptId: string): Member {
     if (!member || !holdsAttempt(task, missionId, attemptId) || task.attempt.ownerId !== member.id || task.attempt.leaseUntil < this.now()) throw new PolicyError('task_attempt_stale', 'authorization_error', 'Stale or unauthorized task attempt; stop work and observe the current assignment')
     if (!this.boardOf(missionId).graph.dependenciesMet(task)) throw new PolicyError('task_prerequisite_revoked', 'tool_error', 'A task prerequisite is no longer accepted; stop work')
-    return { task, member }
+    return member
   }
   /**
    * An id that must name a task of this mission, refused otherwise
@@ -899,9 +954,13 @@ export class SwarmRuntime implements Kernel {
       if (!mission.baseline && this.workers.prepareBaseline) {
         const baseline = await this.workers.prepareBaseline(mission, actor.signal)
         assertAdmissionCurrent()
-        const current = this.active(actor, missionId, admittedId !== undefined).mission
-        current.baseline = baseline; mission.baseline = baseline
-        this.commit(missionId, () => { this.store.put('missions', current); this.store.event(missionId, 'workspace/snapshot', 'runtime', baseline) })
+        // CORE-06: written on the mission row the commit reads (`revise`), while
+        // this admission's caller is still an active participant.
+        this.revise(missionId, 'missions', missionId, current => {
+          this.active(actor, missionId, admittedId !== undefined)
+          current.baseline = baseline
+        }, () => this.store.event(missionId, 'workspace/snapshot', 'runtime', baseline))
+        mission.baseline = baseline
       }
       const workspace = await this.workers.prepareWorkspace(mission, memberId)
       assertAdmissionCurrent()
@@ -919,7 +978,7 @@ export class SwarmRuntime implements Kernel {
         assertAdmissionCurrent()
         if (this.shuttingDown || this.mission(missionId).status !== 'active') throw error
         member.phase = 'stopped'
-        this.commit(missionId, () => { const latest = this.store.get('members', member.id); if (latest !== undefined) { latest.phase = 'stopped'; this.store.put('members', latest) }; this.store.event(missionId, 'member/failed', 'runtime', { memberId, error: String(error) }) })
+        this.revise(missionId, 'members', member.id, latest => { latest.phase = 'stopped' }, () => this.store.event(missionId, 'member/failed', 'runtime', { memberId, error: String(error) }))
         throw error
       }
       this.kick(missionId)
@@ -1144,18 +1203,17 @@ export class SwarmRuntime implements Kernel {
     return owner ? task : memberTask(this.boardOf(missionId), task)
   }
 
+  /**
+   * Open an attempt of `task` for `member`. Its callers (a claim, the dispatch
+   * sweep) chose `task` on a board read after their preparation await, and
+   * CORE-06: the attempt opens on the row the commit reads (`revise`), while
+   * that row is still the choice they made (`sameChoice`).
+   */
   assign(task: Task, member: Member): Task {
     member = this.store.get('members', member.id) ?? member
     const mission = this.mission(task.missionId)
     const { candidate, decision, latencyMs } = this.refusals.assertAdmission(task, member)
-    if (canBorrowTask(task)) task.plannedAssigneeId = member.id
-    task.epoch++
-    task.attempt = { id: id('attempt'), epoch: task.epoch, ownerId: member.id, leaseUntil: Math.min(this.now() + this.config.leaseMs, mission.deadline) }
     const source = this.boardOf(task.missionId).graph.reviewSource(task)
-    if (source !== undefined) task.attempt.sourceCommit = source.artifact?.commit
-    // R17-G7: assigning the attempt is what makes the derived status `working`;
-    // there is no member status to write and none to fall behind the attempt.
-    task.status = 'running'; task.assigneeId = member.id
     // A recorded preparation failure outlives this successful preparation: its
     // `attempts` counter bounds transient retries across re-pends that spend
     // no recovery credit (a worker start failure), and only an owner resume
@@ -1163,13 +1221,23 @@ export class SwarmRuntime implements Kernel {
     // a block cause.
     const admitted = this.refusals.admissionRecord(candidate, decision, latencyMs)
     try {
-      return this.commit(task.missionId, () => {
-        this.store.put('tasks', task); this.store.put('members', member)
+      let assigned!: Task
+      this.revise(task.missionId, 'tasks', task.id, current => {
+        if (!sameChoice(current, task)) throw new PolicyError('task_changed_during_preparation', 'conflict_error', 'Task changed while preparing its workspace')
+        if (canBorrowTask(current)) current.plannedAssigneeId = member.id
+        current.epoch++
+        current.attempt = { id: id('attempt'), epoch: current.epoch, ownerId: member.id, leaseUntil: Math.min(this.now() + this.config.leaseMs, mission.deadline) }
+        if (source !== undefined) current.attempt.sourceCommit = source.artifact?.commit
+        // R17-G7: assigning the attempt is what makes the derived status `working`;
+        // there is no member status to write and none to fall behind the attempt.
+        current.status = 'running'; current.assigneeId = member.id
+      }, current => {
+        this.store.put('members', member)
         this.store.recordAdmission(admitted)
-        const assigned = this.declaredChecks.deliverAssignment(task, ASSIGNMENT_INSTRUCTIONS)
-        this.store.event(task.missionId, 'task/claimed', member.id, { taskId: task.id, attempt: task.attempt })
-        return assigned
+        assigned = this.declaredChecks.deliverAssignment(current, ASSIGNMENT_INSTRUCTIONS)
+        this.store.event(current.missionId, 'task/claimed', member.id, { taskId: current.id, attempt: current.attempt })
       })
+      return assigned
     } catch (error) {
       // A classified writer conflict is an admission refusal, not a task failure:
       // nothing was committed, the task stays pending, and the next tick retries.
@@ -1245,53 +1313,79 @@ export class SwarmRuntime implements Kernel {
       // Only a claim the verdict can still judge supports the submission: a
       // refuted claim, or one a rework archived, supports nothing.
       const evidenceOf = (evidenceId: string) => this.store.get('evidence', evidenceId)
-      const liveClaim = judgeableClaims(task, evidenceOf).length > 0
-      if (task.kind === 'research' && !liveClaim) throw new Error('[research_evidence_required] Research submission requires host-backed evidence. Supply host-backed evidence with `swarm_publish` and its `toolRunIds`, then retry with `swarm_submit` and its `taskId`.')
+      if (task.kind === 'research' && judgeableClaims(task, evidenceOf).length === 0) throw new Error('[research_evidence_required] Research submission requires host-backed evidence. Supply host-backed evidence with `swarm_publish` and its `toolRunIds`, then retry with `swarm_submit` and its `taskId`.')
       this.attempts.fenceAttempt(this.mission(missionId), task, this.config.leaseMs)
       // A declared output that is not written is refused at capture with
       // [output_missing] before any commit, while the attempt is still running.
       const artifact = await this.workers.captureArtifact(member, task, input.deliverables, { requireOutputs: true })
-      try { this.ownAttempt(actor, missionId, task.id, input.attemptId) }
-      catch (error) {
-        // The artifact commit is durable even when the attempt lost its lease
-        // during capture. F6: branch on the current status so the worker is told
-        // what actually happened — an owner-cancelled task is terminal and can
-        // never be reassigned, so "submit again after reassignment" misdirects.
-        const stale = `Artifact ${artifact.commit} was captured but the attempt is no longer current`
-        const detail = error instanceof Error ? error.message : String(error)
-        const current = this.store.get('tasks', task.id)
-        if (current?.status === 'cancelled') throw new Error(`${stale}; the mission owner cancelled this task while the artifact was captured. It is terminal: stop working on it and do not resubmit. (${detail})`)
-        if (current !== undefined && current.status === 'blocked' && stopPending(current)) throw new Error(`${stale}; the task is being reassigned after a stop. Observe the current assignment and submit again after reassignment. (${detail})`)
-        throw new Error(`${stale}; observe the task and submit again after reassignment (${detail})`)
-      }
-      // A resubmission must change what its review judged: the commit, or the
-      // claims. A no-edit capture reproduces a rejected commit, so one with no
-      // live claim of this round is refused. One that brings new claims (an
-      // evidence-only rework, as every research rework is: its commit may
-      // never change) is submitted, and marked as a repeat of that rejected
-      // commit on its durable submission and in the artifact registry.
-      const repeated = task.rejections?.find(rejection => rejection.commit === artifact.commit)
-      if (repeated !== undefined && !liveClaim) throw new PolicyError('rework_unchanged', 'conflict_error', `[rework_unchanged] The captured commit ${artifact.commit} is the commit review ${repeated.reviewTaskId} rejected (rejections[${task.rejections!.indexOf(repeated)}]), and this rework has published no new claim, so nothing that review judged has changed. Nothing was submitted and your attempt stays running. Change the work inside the task scope and retry \`swarm_submit\` with the same \`taskId\`, or publish the host-backed evidence the rejection asked for with \`swarm_publish\` and its \`toolRunIds\` first; if you hold the rejection to be wrong, call \`swarm_escalate\` with this \`taskId\` instead.`)
-      requireArtifactChecks(task, artifact)
-      task.artifact = artifact; task.output = input.output; task.status = 'submitted'
-      // F2: decide the review path before committing, so the missing-review
-      // record lands atomically with the submission and can never be lost. The
-      // dedicated task/review-missing event follows on the scheduler tick once
-      // the grace period proves no review is being proposed for this artifact.
-      const missingReview = this.missingReviewPath(task)
-      this.commit(missionId, () => {
-        this.store.put('tasks', task)
+      // CORE-06: the capture awaited I/O, and writes this submission does not
+      // conflict with were accepted meanwhile: the owner's allocation raise on
+      // this task (`swarm_budget`), a lease renewal, a claim this worker
+      // published. The submission is decided and written on the row its commit
+      // reads (`revise`), so each of them survives it, while a write that took
+      // the attempt refuses it with its own reason (`submissionFence`). While
+      // the attempt holds, its claims only grow (a verdict, a supersession or a
+      // rework that retires one ends the attempt first), so a research task
+      // that had a claim before the capture still has one.
+      let repeated: TaskRejection | undefined, missingReview: string | undefined
+      const submitted = this.revise(missionId, 'tasks', task.id, current => {
+        this.submissionFence(actor, missionId, current, input.attemptId, artifact.commit)
+        // Only a claim the verdict can still judge supports the submission: a
+        // refuted claim, or one a rework archived, supports nothing.
+        const liveClaim = judgeableClaims(current, evidenceOf).length > 0
+        // A resubmission must change what its review judged: the commit, or the
+        // claims. A no-edit capture reproduces a rejected commit, so one with no
+        // live claim of this round is refused. One that brings new claims (an
+        // evidence-only rework, as every research rework is: its commit may
+        // never change) is submitted, and marked as a repeat of that rejected
+        // commit on its durable submission and in the artifact registry.
+        repeated = current.rejections?.find(rejection => rejection.commit === artifact.commit)
+        if (repeated !== undefined && !liveClaim) throw new PolicyError('rework_unchanged', 'conflict_error', `[rework_unchanged] The captured commit ${artifact.commit} is the commit review ${repeated.reviewTaskId} rejected (rejections[${current.rejections!.indexOf(repeated)}]), and this rework has published no new claim, so nothing that review judged has changed. Nothing was submitted and your attempt stays running. Change the work inside the task scope and retry \`swarm_submit\` with the same \`taskId\`, or publish the host-backed evidence the rejection asked for with \`swarm_publish\` and its \`toolRunIds\` first; if you hold the rejection to be wrong, call \`swarm_escalate\` with this \`taskId\` instead.`)
+        requireArtifactChecks(current, artifact)
+        current.artifact = artifact; current.output = input.output; current.status = 'submitted'
+        // F2: decide the review path inside the submission's commit, so the
+        // missing-review record lands atomically with the submission and can
+        // never be lost. The dedicated task/review-missing event follows on the
+        // scheduler tick once the grace period proves no review is being
+        // proposed for this artifact.
+        missingReview = this.missingReviewPath(current)
+      }, current => {
         // The claims the verdict will judge are pinned to this artifact; a
         // refuted or archived one stays pinned to the artifact it was judged on (F3-B).
-        for (const evidence of judgeableClaims(task, evidenceOf)) { evidence.artifact = artifact; this.store.put('evidence', evidence) }
+        for (const evidence of judgeableClaims(current, evidenceOf)) { evidence.artifact = artifact; this.store.put('evidence', evidence) }
         // Submission is routine progress: the durable event reaches the UI; the reviewer receives its assignment.
-        this.store.event(missionId, 'task/submitted', member.id, { taskId: task.id, artifact,
-          ...(repeated === undefined ? {} : { repeatsRejection: { commit: repeated.commit, reviewTaskId: repeated.reviewTaskId, rejection: task.rejections!.indexOf(repeated) } }),
+        this.store.event(missionId, 'task/submitted', member.id, { taskId: current.id, artifact,
+          ...(repeated === undefined ? {} : { repeatsRejection: { commit: repeated.commit, reviewTaskId: repeated.reviewTaskId, rejection: current.rejections!.indexOf(repeated) } }),
           ...(missingReview === undefined ? {} : { reviewPath: { missing: true, reason: missingReview } }) })
-      })
+      })!
       this.kick(missionId)
-      return memberTask(this.boardOf(missionId), task)
+      return memberTask(this.boardOf(missionId), submitted)
     })
+  }
+  /**
+   * CORE-06: a submission's fence, on the row its commit reads after the
+   * artifact capture: the caller still holds the attempt it captured for
+   * (`heldAttempt`). The artifact commit is durable even when a write took
+   * the attempt during the capture, and the refusal names that write, so the
+   * worker is told what actually happened. F6: an owner cancel is terminal and
+   * the task can never be reassigned, so "submit again after reassignment"
+   * would misdirect (`task_cancelled`); a fence that owes a stop (an owner's
+   * structural amendment, a pause, a handoff, a challenged prerequisite)
+   * re-pends the task for reassignment (`task_attempt_fenced`); an attempt that
+   * lapsed or moved otherwise is stale (`task_attempt_stale`). Any other check
+   * (a budget pause, an exhausted duration, a revoked prerequisite) refuses
+   * with its own typed refusal.
+   */
+  private submissionFence(actor: Actor, missionId: string, current: Task, attemptId: string, commit: string): void {
+    try { this.heldAttempt(actor, missionId, current, attemptId) }
+    catch (error) {
+      const stale = `Artifact ${commit} was captured but the attempt is no longer current`
+      const detail = error instanceof Error ? error.message : String(error)
+      if (current.status === 'cancelled') throw new PolicyError('task_cancelled', 'lease_error', `[task_cancelled] ${stale}; the mission owner cancelled this task while the artifact was captured. It is terminal: stop working on it and do not resubmit; observe your next assignment with \`swarm_observe\` and its \`taskId\`. (${detail})`)
+      if (current.status === 'blocked' && stopPending(current)) throw new PolicyError('task_attempt_fenced', 'lease_error', `[task_attempt_fenced] ${stale}; the task is being reassigned after a stop. Observe the current assignment with \`swarm_observe\` and its \`taskId\`, and submit again after reassignment. (${detail})`)
+      if (error instanceof PolicyError && error.code === 'task_attempt_stale') throw new PolicyError('task_attempt_stale', 'authorization_error', `[task_attempt_stale] ${stale}; observe the task with \`swarm_observe\` and its \`taskId\`, and submit again after reassignment (${detail})`)
+      throw error
+    }
   }
   /**
    * Run host-controlled checks against the exact source artifact and accept or
@@ -1342,12 +1436,20 @@ export class SwarmRuntime implements Kernel {
     const { checks } = deciding
     this.declaredChecks.recordEnvelope(missionId, input.taskId, prepared.source.id, prepared.member.id)
     return this.exclusive(missionId, async () => {
-      const { task, member } = this.ownAttempt(actor, missionId, input.taskId, input.attemptId)
-      const source = this.task(missionId, prepared.source.id)
       const artifact = prepared.artifact
-      if (JSON.stringify(source.checks) !== prepared.checksRevision) throw new Error('[checks_changed_during_verification] Source checks changed during verification; retry swarm_verify on the same review to execute the current checks.')
-      if (source.status !== 'submitted' || source.artifact?.commit !== artifact.commit) throw new Error('[artifact_changed_during_verification] Reviewed artifact changed during verification. Verify again with `swarm_verify` and the reviewed `taskId`.')
-      if (prepared.evidenceRevision !== JSON.stringify(source.evidenceIds.map(eid => this.store.get('evidence', eid)))) throw new Error('[evidence_changed_during_verification] Evidence changed during verification; inspect the new challenge and verify again. Inspect `evidenceId` with `swarm_observe`, then verify again with `swarm_verify` and its `verdict`.')
+      // CORE-06: the facts the checks ran against, on the source as it stands:
+      // its checks, its submitted artifact and its claims. The verdict is
+      // decided on them here, and written on the rows its commit reads
+      // (`revise`), where the reviewer's attempt and these facts are asked again.
+      const currentSource = (): Task => {
+        const source = this.task(missionId, prepared.source.id)
+        if (JSON.stringify(source.checks) !== prepared.checksRevision) throw new Error('[checks_changed_during_verification] Source checks changed during verification; retry swarm_verify on the same review to execute the current checks.')
+        if (source.status !== 'submitted' || source.artifact?.commit !== artifact.commit) throw new Error('[artifact_changed_during_verification] Reviewed artifact changed during verification. Verify again with `swarm_verify` and the reviewed `taskId`.')
+        if (prepared.evidenceRevision !== JSON.stringify(source.evidenceIds.map(eid => this.store.get('evidence', eid)))) throw new Error('[evidence_changed_during_verification] Evidence changed during verification; inspect the new challenge and verify again. Inspect `evidenceId` with `swarm_observe`, then verify again with `swarm_verify` and its `verdict`.')
+        return source
+      }
+      const owned = this.ownAttempt(actor, missionId, input.taskId, input.attemptId), { member } = owned
+      let task = owned.task, source = currentSource()
       if (input.verdict === 'accept' && source.checks.length > 0 && checks.length === 0) throw new Error('Declared host checks returned no execution evidence; retry verification of the same artifact')
       const { passed, failingChecks } = this.declaredChecks.classify(input.verdict, checks)
       // CORE-01: an acceptance records what it rests on (`AcceptanceBasis`).
@@ -1381,13 +1483,15 @@ export class SwarmRuntime implements Kernel {
       if (this.declaredChecks.recoveryRequired(checks)) {
         const deferral = `\nReview ${task.id} deferred its verdict on the immutable source ${source.id} at ${artifact.commit}, which remains submitted: ${recoveryExit(checks)}.`
         const reason = `${excerpt(rejection, Math.max(0, this.config.maxMessageChars - deferral.length - 32))}${deferral}`
-        this.commit(missionId, () => {
-          const runIds = this.declaredChecks.recordRuns(missionId, { memberId: member.id, taskId: task.id, attemptId: input.attemptId, commit: artifact.commit }, deciding)
+        let runIds: string[] = []
+        this.revise(missionId, 'tasks', task.id, review => {
+          this.heldAttempt(actor, missionId, review, input.attemptId); source = currentSource(); task = review
+          runIds = this.declaredChecks.recordRuns(missionId, { memberId: member.id, taskId: task.id, attemptId: input.attemptId, commit: artifact.commit }, deciding)
           task.status = 'blocked'; task.output = this.bounded(reason)
           if (prepared.reviewArtifact !== undefined) task.reviewArtifact = prepared.reviewArtifact
           task.reviewedCommit = artifact.commit
           task.verificationRecovery = { sourceTaskId: source.id, commit: artifact.commit, reason, at: this.now(), toolRunIds: runIds }
-          this.store.put('tasks', task)
+        }, () => {
           this.store.event(missionId, 'task/verification-deferred', member.id, { sourceTaskId: source.id, verificationTaskId: task.id, commit: artifact.commit, reason, checks: runIds })
           this.notices.notify(missionId, reason, subjectsOfTasks([source, task], { id: missionId }), { from: member.id, trigger: 'task/verification-deferred', reason })
         })
@@ -1396,15 +1500,18 @@ export class SwarmRuntime implements Kernel {
       }
       const runIds: string[] = []
       const released = new Set<string>()
-      this.commit(missionId, () => {
+      let basis: AcceptanceBasis | undefined
+      this.revise(missionId, 'tasks', task.id, review => {
+        this.heldAttempt(actor, missionId, review, input.attemptId); source = currentSource(); task = review
         runIds.push(...this.declaredChecks.recordRuns(missionId, { memberId: member.id, taskId: task.id, attemptId: input.attemptId, commit: artifact.commit }, deciding))
-        const basis: AcceptanceBasis | undefined = !passed ? undefined
+        basis = !passed ? undefined
           : reviewed === undefined ? { kind: 'checks', runIds: [...runIds] } : { kind: 'review-evidence', evidenceIds: reviewed }
         source.status = passed ? 'accepted' : 'blocked'
         task.status = passed ? 'accepted' : 'blocked'; task.output = this.bounded(rejection); task.reviewedCommit = artifact.commit
         if (basis !== undefined) task.acceptanceBasis = basis
         if (prepared.reviewArtifact !== undefined) task.reviewArtifact = prepared.reviewArtifact
-        this.store.put('tasks', source); this.store.put('tasks', task)
+        this.store.put('tasks', source)
+      }, () => {
         // Every other review of this source is moot: pending ones can never
         // start, running ones would burn tokens until lease expiry, and parked
         // ones would re-pend against a source that is no longer submitted.
@@ -1488,7 +1595,7 @@ export class SwarmRuntime implements Kernel {
         // Deferred checks never enter this branch; accepted inconclusive claims
         // retain unverified status and therefore have no verified verdict row.
         for (const row of verdictRows({ sourceTaskId: source.id, verificationTaskId: task.id, ...(basis !== undefined ? { verdict: 'verified', basis } as const : { verdict: 'refuted' } as const),
-          reason: task.output, evidence: verdictEvidence, retired })) {
+          reason: task.output!, evidence: verdictEvidence, retired })) {
           this.store.event(missionId, 'evidence/verdict', member.id, { ...row, commit: artifact.commit })
         }
         // Acceptance is routine progress; a rejection blocks work and needs a repair decision.
@@ -2760,31 +2867,32 @@ export class SwarmRuntime implements Kernel {
       await abortableStart(this.workers.stop(member.id), signal)
       assertStaged()
       this.workerStarts.delete(member.id)
-      const latest = this.store.get('members', member.id)!
-      const previousSessionId = latest.sessionId
-      if (next) {
-        Object.assign(latest, { name: next.name, role: next.role, provider: next.provider, model: next.model,
-          reasoningEffort: next.reasoningEffort, maxOutputTokens: next.maxOutputTokens, phase: 'active' })
-        if (changed) latest.sessionId = id('swarm-session')
-      } else latest.phase = 'stopped'
+      const previousSessionId = this.store.get('members', member.id)!.sessionId
+      const sessionId = next && changed ? id('swarm-session') : previousSessionId
       // WS-1: a rotated sessionId is a new worker identity. The adapter's
       // persisted composition is keyed to the old one and only an ABSENT file is
       // composed afresh, so the stale metadata must be dropped here — after the
       // old handle has stopped and before the next start — or this member can
       // never start again, even if the owner reverts the edit.
-      if (latest.sessionId !== previousSessionId) await this.workers.invalidateComposition(mission.id, latest.id)
-      assertStaged()
-      this.commit(mission.id, () => {
-        this.store.put('members', latest)
-        this.store.event(mission!.id, 'member/plan-repaired', 'owner', { memberId: latest.id, revision: draft.revision, previousSessionId, sessionId: latest.sessionId, retired: !next })
-      })
+      if (sessionId !== previousSessionId) await this.workers.invalidateComposition(mission.id, member.id)
+      // CORE-06: the stop and the invalidation awaited the adapter, and writes
+      // to this member were accepted meanwhile (a late usage reconciliation);
+      // the repair is written on the row the commit reads (`revise`), while the
+      // plan is still this staged revision, and only on the fields it repairs.
+      this.revise(mission.id, 'members', member.id, latest => {
+        assertStaged()
+        if (next) {
+          Object.assign(latest, { name: next.name, role: next.role, provider: next.provider, model: next.model,
+            reasoningEffort: next.reasoningEffort, maxOutputTokens: next.maxOutputTokens, phase: 'active' })
+          if (changed) latest.sessionId = sessionId
+        } else latest.phase = 'stopped'
+      }, latest => this.store.event(mission!.id, 'member/plan-repaired', 'owner', { memberId: latest.id, revision: draft.revision, previousSessionId, sessionId: latest.sessionId, retired: !next }))
     }
-    assertStaged()
-    mission = this.mission(mission.id)
     const tasks = new Map(input.tasks.map(task => [`task_${draft.id}_${task.key}`, task]))
-    this.commit(mission.id, () => {
-      Object.assign(mission!, { title: input.title, objective: input.objective, scope: [...input.scope], budget: { ...input.budget }, updatedAt: this.now() })
-      this.store.put('missions', mission!)
+    this.revise(mission.id, 'missions', mission.id, current => {
+      assertStaged()
+      Object.assign(current, { title: input.title, objective: input.objective, scope: [...input.scope], budget: { ...input.budget }, updatedAt: this.now() })
+    }, () => {
       for (const stream of input.workstreams) {
         const previous = this.store.get('workstreams', `stream_${draft.id}_${stream.key}`)
         if (previous) { previous.title = stream.title; previous.objective = stream.objective; this.store.put('workstreams', previous) }
@@ -2886,16 +2994,18 @@ export class SwarmRuntime implements Kernel {
           dependencies: task.dependencies?.map(key => `task_${draft.id}_${key}`),
           reviewOf: task.reviewOf ? `task_${draft.id}_${task.reviewOf}` : undefined,
         }, `task_${draft.id}_${task.key}`)
-        mission = this.active(actor, missionId, true).mission
-        // Re-read the durable generation after every admission commit; a lost
-        // abort handle cannot revive a cancelled or superseded assembly.
-        assertCurrent()
-        if (mission.status !== 'staged') throw new PolicyError('plan_assembly_interrupted', 'conflict_error', 'Plan assembly was interrupted')
-        mission.status = 'active'; mission.updatedAt = this.now(); executionClock(mission, false, this.now())
-        draft.status = 'launched'; draft.updatedAt = this.now()
-        this.commit(missionId, () => {
-          this.store.put('missions', mission!); this.store.put('drafts', draft)
-          this.syncStarts(mission!)
+        // CORE-06: the activation is written on the mission row its commit
+        // reads (`revise`). Re-read the durable generation after every admission
+        // commit; a lost abort handle cannot revive a cancelled or superseded assembly.
+        this.revise(missionId, 'missions', missionId, current => {
+          this.active(actor, missionId, true)
+          assertCurrent()
+          if (current.status !== 'staged') throw new PolicyError('plan_assembly_interrupted', 'conflict_error', 'Plan assembly was interrupted')
+          current.status = 'active'; current.updatedAt = this.now(); executionClock(current, false, this.now())
+          draft.status = 'launched'; draft.updatedAt = this.now()
+        }, current => {
+          this.store.put('drafts', draft)
+          this.syncStarts(current)
           this.store.event(missionId, 'plan/launched', 'owner', { draftId, revision: draft.revision, advisories: draft.advisories })
         })
         this.kick(missionId)
@@ -3141,15 +3251,17 @@ export class SwarmRuntime implements Kernel {
       const { mission, task } = this.deliveryTarget(actor, missionId)
       await this.workspaceAdmission.assertWorkspaceAuthorized(mission)
       const result = await this.workers.applyDelivery(mission, task.artifact!.commit, actor.signal)
-      this.commit(missionId, () => {
+      // CORE-06: the apply awaited the source checkout, and writes to the
+      // completed mission were accepted meanwhile (a late usage reconciliation,
+      // an outbox record); the outcome is written on the row the commit reads
+      // (`revise`), so none of them is reverted.
+      this.revise(missionId, 'missions', missionId, current => {
         // The projection states what is currently in effect, so a conflicts result
         // clears any earlier marker instead of leaving a stale "applied" claim for
         // the same target (I2 hand-off 4, reconciled at integration).
-        if (result.status === 'applied') mission.appliedDelivery = { resultCommit: task.artifact!.commit, appliedAt: this.now() }
-        else delete mission.appliedDelivery
-        this.store.put('missions', mission)
-        this.store.event(missionId, `delivery/${result.status}`, 'owner', { resultCommit: task.artifact!.commit, ...result })
-      })
+        if (result.status === 'applied') current.appliedDelivery = { resultCommit: task.artifact!.commit, appliedAt: this.now() }
+        else delete current.appliedDelivery
+      }, () => this.store.event(missionId, `delivery/${result.status}`, 'owner', { resultCommit: task.artifact!.commit, ...result }))
       return result
     })
   }
@@ -3450,13 +3562,11 @@ export class SwarmRuntime implements Kernel {
         if (this.mission(missionId).status === 'active') return
         await this.workers.stop(member.id)
         if (this.closed || !terminal(this.mission(missionId))) return
-        const current = this.store.get('members', member.id)
-        if (!current || memberPhaseOf(current) === 'stopped') return
-        current.phase = 'stopped'
-        this.commit(missionId, () => {
-          this.store.put('members', current)
-          this.store.event(missionId, 'member/stopped', 'runtime', { memberId: current.id })
-        })
+        // CORE-06: the membership ends on the row the commit reads (`revise`).
+        this.revise(missionId, 'members', member.id, current => {
+          if (memberPhaseOf(current) === 'stopped') return false
+          current.phase = 'stopped'
+        }, current => this.store.event(missionId, 'member/stopped', 'runtime', { memberId: current.id }))
       }))
     })
     else this.kick(missionId)

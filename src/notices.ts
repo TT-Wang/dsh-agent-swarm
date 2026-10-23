@@ -1378,15 +1378,16 @@ export class Notices {
           }
           // Only acknowledge the failure this retry observed. New lifecycle,
           // budget, receipt and starvation decisions may have landed while the
-          // adapter awaited persistence; none may be replaced by the old rows.
-          const latest = this.k.mission(missionId)
+          // adapter awaited persistence; none may be replaced by the old rows
+          // (CORE-06: the acknowledgement is written on the row this commit
+          // reads, `Kernel.revise`).
           const previous = mission.outboxStarved
-          const starvation = latest.outboxStarved
-          if (previous?.deliveryId === delivery.id && starvation?.deliveryId === delivery.id
-            && starvation.attempts === previous.attempts && starvation.at === previous.at) {
+          this.k.revise(missionId, 'missions', missionId, latest => {
+            const starvation = latest.outboxStarved
+            if (previous?.deliveryId !== delivery.id || starvation?.deliveryId !== delivery.id
+              || starvation.attempts !== previous.attempts || starvation.at !== previous.at) return false
             delete latest.outboxStarved
-            this.k.store.put('missions', latest)
-          }
+          })
         })
       } catch (error) {
         // A host failure did not deliver this message. Keep its identity queued

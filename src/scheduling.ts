@@ -12,7 +12,7 @@
  */
 import { id } from './store.ts'
 import { finishedAttempt, holdsOpenAttempt, openAttempt, pendingStopOwner, quiescencePending, subjectsOfTasks, taskSubject, terminal, TERMINAL_STATES, turnEnded, type HeldTask } from './task-graph.ts'
-import { asksHandle, eligible, isolationViolation, noticeSubjectsFor, overdueStop, passState, pastBound, startBlocker, stillDispatchable, takesWork, unschedulable, wedgeVerdict, type Board, type PassVerdict, type SchedulingPass } from './board.ts'
+import { asksHandle, eligible, isolationViolation, noticeSubjectsFor, overdueStop, passState, pastBound, sameChoice, startBlocker, stillDispatchable, takesWork, unschedulable, wedgeVerdict, type Board, type PassVerdict, type SchedulingPass } from './board.ts'
 import { factKey, guardTerminalNotice, silenceNotice, type Notice, type Notices, type SilentAttempt } from './notices.ts'
 import { AdmissionRefusedError } from './scheduler.ts'
 import { awaited, progressed, type Kernel } from './kernel.ts'
@@ -378,11 +378,16 @@ export class Scheduling {
             if (fresh === undefined) continue
             // The failed row, its events and the notice a block owes are one
             // transaction: a blocked row is never committed without its notice.
-            const failure = preparationFailure(fresh, error, this.k.now, this.k.config), failed = failure.task
-            this.k.commit(missionId, () => {
-              this.k.store.put('tasks', failed)
+            // CORE-06: the failure is recorded on the row that commit reads
+            // (`Kernel.revise`), while it is still the choice the sweep made.
+            let failure: PreparationFailure | undefined
+            this.k.revise(missionId, 'tasks', task.id, current => {
+              if (!sameChoice(current, fresh)) return false
+              failure = preparationFailure(current, error, this.k.now, this.k.config)
+              Object.assign(current, failure.task)
+            }, failed => {
               this.k.store.event(missionId, 'task/preparation-failed', 'runtime', { taskId: failed.id, epoch: failed.epoch, ...failed.preparationFailure, status: failed.status })
-              if (failure.notice === undefined) return
+              if (failure?.notice === undefined) return
               this.k.store.event(missionId, 'task/blocked', 'runtime', { taskId: failed.id, reason: failed.output })
               this.notices.notify(missionId, failure.notice.content, failure.notice.subjects, failure.notice.options)
             })

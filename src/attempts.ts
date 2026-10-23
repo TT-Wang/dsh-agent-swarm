@@ -146,17 +146,21 @@ export class Attempts {
         if (candidates.length === 0) throw new Error(`The recorded stop owner is missing: ${state.memberId ?? 'this mission'} has no member row, so its workspace checkpoint can never be confirmed`)
         for (const candidate of candidates) await this.k.workers.checkpointTask(candidate, stoppedTask, state.memberId === undefined ? { ifOwned: true } : undefined)
         await this.k.exclusive(missionId, async () => {
-          const mission = this.k.mission(missionId)
-          const fresh = this.k.task(missionId, task.id)
-          if (fresh.epoch !== state.epoch || fresh.resumeAfterStop?.epoch !== state.epoch || fresh.resumeAfterStop.memberId !== state.memberId) return
-          const reason = fresh.resumeAfterStop.reason
-          const causes = blockCauses(fresh, evidenceId => this.k.store.get('evidence', evidenceId)?.status, this.k.config.maxTasksPerMember)
-          const { blocked: exhausted, recoveryLimit: recoveryExhausted } = stopOutcome(causes, reason)
-          const released = ownerIds.map(memberId => this.k.store.get('members', memberId)).filter((member): member is Member => member !== undefined)
-          if (reason === 'worker-closeout' && state.memberId !== undefined && (released.length === 0 || released[0]!.status === 'stopped')) delete fresh.assigneeId
-          if (!TERMINAL_STATES.has(fresh.status)) fresh.status = exhausted ? 'blocked' : 'pending'
-          delete fresh.resumeAfterStop
-          this.k.commit(missionId, () => {
+          // CORE-06: the stop and the checkpoint awaited the adapter; the
+          // barrier is released on the row its commit reads (`Kernel.revise`),
+          // while that row still owes this stop.
+          let mission: Mission | undefined, reason: StopReason | undefined, exhausted = false, recoveryExhausted = false, released: Member[] = []
+          const fresh = this.k.revise(missionId, 'tasks', task.id, fresh => {
+            if (fresh.epoch !== state.epoch || fresh.resumeAfterStop?.epoch !== state.epoch || fresh.resumeAfterStop.memberId !== state.memberId) return false
+            mission = this.k.mission(missionId)
+            reason = fresh.resumeAfterStop.reason
+            const causes = blockCauses(fresh, evidenceId => this.k.store.get('evidence', evidenceId)?.status, this.k.config.maxTasksPerMember)
+            ;({ blocked: exhausted, recoveryLimit: recoveryExhausted } = stopOutcome(causes, reason))
+            released = ownerIds.map(memberId => this.k.store.get('members', memberId)).filter((member): member is Member => member !== undefined)
+            if (reason === 'worker-closeout' && state.memberId !== undefined && (released.length === 0 || released[0]!.status === 'stopped')) delete fresh.assigneeId
+            if (!TERMINAL_STATES.has(fresh.status)) fresh.status = exhausted ? 'blocked' : 'pending'
+            delete fresh.resumeAfterStop
+          }, fresh => {
             for (const member of released) if (memberPhaseOf(member) !== 'stopped') {
               // R20: the barrier no longer decides a member's phase. `parked` is
               // the member's own `swarm_wait` intent and nothing else, so there is
@@ -165,15 +169,14 @@ export class Attempts {
               // the barrier is in flight, which is the whole window the park used
               // to cover. A terminal mission still ends the membership here,
               // because that is the barrier's own decision, not a released flag.
-              if (terminal(mission)) member.phase = 'stopped'
+              if (terminal(mission!)) member.phase = 'stopped'
               this.k.store.put('members', member)
             }
-            this.k.store.put('tasks', fresh)
             this.k.store.event(missionId, reason === 'worker-closeout' ? (exhausted ? 'task/closeout-exhausted' : 'task/closeout-ready') : reason === 'handoff' ? 'task/handoff-ready' : 'task/quiescence-recovered', 'runtime', {
               taskId: fresh.id, ...(state.memberId === undefined ? { memberIds: ownerIds } : { memberId: state.memberId }), reason, retries: state.retries,
             })
           })
-          if (recoveryExhausted && mission.status === 'active' && fresh.status !== 'cancelled') this.notices.record(missionId, guardTerminalNotice(this.k.boardOf(missionId), 'attempt_lease', { taskId: fresh.id, memberId: state.memberId, localKey: `recovery-exhausted:${taskSubject(fresh)}`, detail: `${reason === 'lease-expired' ? 'lease expiry exhausted' : 'idle close-out reached'} the recovery limit (${fresh.recoveryCount ?? 0}/${fresh.maxRecoveryAttempts ?? this.k.config.maxTasksPerMember}) and left the task blocked` }))
+          if (fresh !== undefined && recoveryExhausted && mission!.status === 'active' && fresh.status !== 'cancelled') this.notices.record(missionId, guardTerminalNotice(this.k.boardOf(missionId), 'attempt_lease', { taskId: fresh.id, memberId: state.memberId, localKey: `recovery-exhausted:${taskSubject(fresh)}`, detail: `${reason === 'lease-expired' ? 'lease expiry exhausted' : 'idle close-out reached'} the recovery limit (${fresh.recoveryCount ?? 0}/${fresh.maxRecoveryAttempts ?? this.k.config.maxTasksPerMember}) and left the task blocked` }))
         })
         if (this.stopRetries.get(task.id) === state) this.stopRetries.delete(task.id)
         if (state.memberId === undefined) for (const peer of this.k.store.list('tasks', missionId)) if (peer.id !== task.id && stopPending(peer)) this.resumeStoppedAttempt(missionId, peer)
@@ -182,23 +185,25 @@ export class Attempts {
         state.retries++
         state.retryAt = this.k.now() + Math.min(30_000, 1000 * 2 ** Math.min(state.retries - 1, 5))
         if (this.k.shuttingDown) return
-        const fresh = this.k.store.get('tasks', task.id)
-        const mission = this.k.store.get('missions', missionId)
-        if (fresh === undefined || fresh.epoch !== state.epoch || fresh.resumeAfterStop?.epoch !== state.epoch || fresh.resumeAfterStop.memberId !== state.memberId || mission === undefined) return
         const message = error instanceof Error ? error.message : String(error)
         const code = error instanceof Error && 'code' in error ? String(error.code) : ''
         const deterministic = stopConfirmed && (code === 'WORKSPACE_OWNERSHIP_CONFLICT'
           || /Cannot checkpoint a workspace owned by another task|recorded stop owner is missing/.test(message))
-        const previousFailure = fresh.resumeAfterStop!.failure
-        if (previousFailure?.message !== message || previousFailure.deterministic !== deterministic) {
-          fresh.resumeAfterStop!.failure = { message, deterministic }
-          this.k.commit(missionId, () => {
-            this.k.store.put('tasks', fresh)
-            this.k.store.event(missionId, 'mission/stalled', 'runtime', { cause: 'worker-stop-failed', taskId: task.id, epoch: state.epoch,
-              memberId: state.memberId, deterministic, ...(deterministic ? {} : { retryAt: state.retryAt }), reason: message })
-          })
-        }
-        this.reportStopFailure(missionId, fresh)
+        // CORE-06: the failure is recorded on the row the commit reads
+        // (`Kernel.revise`), while that row still owes this stop; one already
+        // recording this failure is reported as it stands.
+        let owed: Task | undefined
+        this.k.revise(missionId, 'tasks', task.id, fresh => {
+          if (fresh.epoch !== state.epoch || fresh.resumeAfterStop?.epoch !== state.epoch || fresh.resumeAfterStop.memberId !== state.memberId || this.k.store.get('missions', missionId) === undefined) return false
+          owed = fresh
+          const previousFailure = fresh.resumeAfterStop.failure
+          if (previousFailure?.message === message && previousFailure.deterministic === deterministic) return false
+          fresh.resumeAfterStop.failure = { message, deterministic }
+        }, () => {
+          this.k.store.event(missionId, 'mission/stalled', 'runtime', { cause: 'worker-stop-failed', taskId: task.id, epoch: state.epoch,
+            memberId: state.memberId, deterministic, ...(deterministic ? {} : { retryAt: state.retryAt }), reason: message })
+        })
+        if (owed !== undefined) this.reportStopFailure(missionId, owed)
       } finally { state.inFlight = false }
     })
   }
@@ -220,13 +225,23 @@ export class Attempts {
   /**
    * Extend the current attempt's lease before a long host operation. Bounded by
    * the mission deadline so a stored lease can never outlive the mission.
+   *
+   * CORE-06: a caller may hold `task` across an await (a review's artifact
+   * inspection), so the lease is extended on the row the commit reads
+   * (`Kernel.revise`), while that row still holds the caller's attempt: a
+   * write it does not conflict with (an owner's allocation raise) is kept. A
+   * row whose attempt moved is left as it stands, for the caller's own
+   * re-validation of its attempt to refuse.
    */
   fenceAttempt(mission: Mission, task: Task, windowMs: number): void {
     if (!task.attempt) throw new PolicyError('task_attempt_missing', 'lease_error', 'Task has no active attempt')
+    const attemptId = task.attempt.id
     const leaseUntil = Math.min(mission.deadline, this.k.now() + Math.max(this.k.config.leaseMs, windowMs))
     if (!Number.isSafeInteger(leaseUntil)) throw new PolicyError('attempt_lease_out_of_range', 'lease_error', 'Attempt lease exceeds the supported clock range')
-    task.attempt.leaseUntil = leaseUntil
-    this.k.commit(mission.id, () => this.k.store.put('tasks', task))
+    this.k.revise(mission.id, 'tasks', task.id, current => {
+      if (!holdsAttempt(current, mission.id, attemptId)) return false
+      current.attempt.leaseUntil = leaseUntil
+    })
   }
   /**
    * The one write that fences the attempt a row holds, whatever decided to
@@ -459,17 +474,20 @@ export class Attempts {
       })
       return
     }
+    // CORE-06: the capture awaited the adapter; its outcome is written on the
+    // row the commit reads (`Kernel.revise`), while that row still holds this
+    // attempt. The attempt may have finished while the checkpoint committed;
+    // terminal work is never mutated.
     let checkpoint: Artifact
     try { checkpoint = await awaited(pass, this.k.workers.captureArtifact(member, task), this.k.now) }
     catch (error) {
-      const failed = this.k.task(mission.id, task.id)
-      if (!holdsAttempt(failed, mission.id, attemptId)) return
-      failed.output = `Worker ended its turn without submitting (${task.id}) and its workspace could not be checkpointed: ${error instanceof Error ? error.message : String(error)}. Inspect the member workspace before proposing a replacement.`
-      this.k.commit(mission.id, () => {
+      const output = `Worker ended its turn without submitting (${task.id}) and its workspace could not be checkpointed: ${error instanceof Error ? error.message : String(error)}. Inspect the member workspace before proposing a replacement.`
+      const failed = this.k.revise(mission.id, 'tasks', task.id, failed => {
+        if (!holdsAttempt(failed, mission.id, attemptId)) return false
+        failed.output = output
         this.fenceForStop(failed, { status: 'blocked', reason: 'invalidated', cause: 'closeout-failed' })
-        this.k.store.put('tasks', failed)
-        this.k.store.event(mission.id, 'task/closeout-failed', 'runtime', { taskId: failed.id, ownerId: member.id, reason: failed.output })
-      })
+      }, failed => this.k.store.event(mission.id, 'task/closeout-failed', 'runtime', { taskId: failed.id, ownerId: member.id, reason: failed.output }))
+      if (failed === undefined) return
       // S4b: the terminal element of the attempt/lease chain. The workspace
       // checkpoint guard (a dirty or unprovisioned worktree) and the close-out
       // guard co-fire here, so the owner gets the shared coded decision request
@@ -478,20 +496,17 @@ export class Attempts {
       this.resumeStoppedAttempt(mission.id, failed)
       return
     }
-    const current = this.k.task(mission.id, task.id)
-    // The attempt may have finished while the checkpoint committed; never mutate terminal work.
-    if (!holdsAttempt(current, mission.id, attemptId)) return
-    current.checkpoint = { commit: checkpoint.commit, at: this.k.now() }
-    current.recoveryCount = (current.recoveryCount ?? 0) + 1
-    // Prefer the same member: its next attempt resumes the checkpointed workspace
-    // instead of a different member starting from the mission baseline.
-    current.assigneeId = member.id
-    current.plannedAssigneeId ??= member.id
-    this.k.commit(mission.id, () => {
+    const current = this.k.revise(mission.id, 'tasks', task.id, current => {
+      if (!holdsAttempt(current, mission.id, attemptId)) return false
+      current.checkpoint = { commit: checkpoint.commit, at: this.k.now() }
+      current.recoveryCount = (current.recoveryCount ?? 0) + 1
+      // Prefer the same member: its next attempt resumes the checkpointed workspace
+      // instead of a different member starting from the mission baseline.
+      current.assigneeId = member.id
+      current.plannedAssigneeId ??= member.id
       this.fenceForStop(current, { status: 'blocked', reason: 'worker-closeout', cause: 'closeout-abandoned' })
-      this.k.store.put('tasks', current)
-      this.k.store.event(mission.id, 'task/closeout-abandoned', 'runtime', { taskId: current.id, ownerId: member.id, commit: checkpoint.commit, recoveryCount: current.recoveryCount })
-    })
+    }, current => this.k.store.event(mission.id, 'task/closeout-abandoned', 'runtime', { taskId: current.id, ownerId: member.id, commit: checkpoint.commit, recoveryCount: current.recoveryCount }))
+    if (current === undefined) return
     // S4b (owner finding, measured: 7 of 8 silent): an abandoned close-out is a
     // stuck transition the owner was never told about. It emits the shared coded
     // escalation, naming the task and the attempt, while the durable checkpoint
@@ -548,13 +563,13 @@ export class Attempts {
             if (owner !== undefined && owner.status !== 'stopped') {
               try {
                 const checkpoint = await awaited(pass, this.k.workers.captureArtifact(owner, task), this.k.now)
-                const current = this.k.task(missionId, task.id)
-                if (holdsAttempt(current, missionId, attemptId)) {
-                  // S1 (P0): commit the row re-read after the await, never the
-                  // pre-await object, so a concurrent transition is not reverted.
+                // S1 (P0), CORE-06: the checkpoint is written on the row the
+                // commit reads (`Kernel.revise`), never the pre-await object, so a
+                // concurrent transition is not reverted.
+                this.k.revise(missionId, 'tasks', task.id, current => {
+                  if (!holdsAttempt(current, missionId, attemptId)) return false
                   current.checkpoint = { commit: checkpoint.commit, at: this.k.now() }
-                  this.k.commit(missionId, () => { this.k.store.put('tasks', current); this.k.store.event(missionId, 'task/checkpointed', 'runtime', { taskId: current.id, commit: checkpoint.commit, reason: 'lease-expired' }) })
-                }
+                }, current => this.k.store.event(missionId, 'task/checkpointed', 'runtime', { taskId: current.id, commit: checkpoint.commit, reason: 'lease-expired' }))
               } catch (error) {
                 // Auditable and non-fatal: the workspace stays untouched and
                 // prepareTask refuses a dirty workspace rather than losing it.
@@ -575,25 +590,24 @@ export class Attempts {
           }
           // The checkpoint awaited external work. An owner cancel (or any other
           // fencing transition) committed during it must win over lease recovery:
-          // re-read and only transition the record that still owns this attempt.
-          const expiring = this.k.task(missionId, task.id)
-          if (!holdsAttempt(expiring, missionId, attemptId)) continue
-          // A lease that expired while the task was budget-paused is host policy, not
-          // a recovery failure, and the plan's intended owner must survive it. The
-          // pause is the mission's, read after the checkpoint await above, which
-          // it can land during. A lease that expired while its owner was parked is
-          // the same class of host-induced stop (R10-15): the park, not the
-          // worker, caused the stall, so it must not spend a recovery credit.
-          const pauseInduced = this.k.mission(missionId).budgetPause !== undefined || parked
-          if (!pauseInduced) expiring.recoveryCount = (expiring.recoveryCount ?? 0) + 1
-          const planned = expiring.plannedAssigneeId === undefined ? undefined : this.k.store.get('members', expiring.plannedAssigneeId)
-          if (planned !== undefined && planned.status !== 'stopped') expiring.assigneeId = planned.id
-          else delete expiring.assigneeId
-          this.k.commit(missionId, () => {
+          // the expiry is written on the row the commit reads (`Kernel.revise`),
+          // only while that row still owns this attempt.
+          const expiring = this.k.revise(missionId, 'tasks', task.id, expiring => {
+            if (!holdsAttempt(expiring, missionId, attemptId)) return false
+            // A lease that expired while the task was budget-paused is host policy, not
+            // a recovery failure, and the plan's intended owner must survive it. The
+            // pause is the mission's, read after the checkpoint await above, which
+            // it can land during. A lease that expired while its owner was parked is
+            // the same class of host-induced stop (R10-15): the park, not the
+            // worker, caused the stall, so it must not spend a recovery credit.
+            const pauseInduced = this.k.mission(missionId).budgetPause !== undefined || parked
+            if (!pauseInduced) expiring.recoveryCount = (expiring.recoveryCount ?? 0) + 1
+            const planned = expiring.plannedAssigneeId === undefined ? undefined : this.k.store.get('members', expiring.plannedAssigneeId)
+            if (planned !== undefined && planned.status !== 'stopped') expiring.assigneeId = planned.id
+            else delete expiring.assigneeId
             this.fenceForStop(expiring, { status: 'blocked', reason: 'lease-expired', cause: 'lease-expired' })
-            this.k.store.put('tasks', expiring)
-            this.k.store.event(missionId, 'task/lease-expired', 'runtime', { taskId: expiring.id, oldOwner })
-          })
+          }, expiring => this.k.store.event(missionId, 'task/lease-expired', 'runtime', { taskId: expiring.id, oldOwner }))
+          if (expiring === undefined) continue
           this.resumeStoppedAttempt(missionId, expiring)
         }
     return true

@@ -32,6 +32,8 @@ const ANNOTATED = {
     'review_evidence_required',
     // L0-L2 owner-reply receipts: every refusal names the id to pass instead.
     'reply_target_required', 'unknown_reply_target', 'reply_target_not_question', 'reply_target_not_recipient',
+    // CORE-06: a submission refused after its capture names the write that took its attempt.
+    'task_cancelled', 'task_attempt_fenced',
   ],
   'src/workspaces.ts': [
     'workspace_not_repository_root', 'workspace_not_owned', 'verification_source_required', 'review_source_not_verification',

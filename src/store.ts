@@ -23,7 +23,8 @@ import { deriveMemberStatus, memberPhaseOf } from './projection.ts'
 /** A fresh row id: the row kind, then a random UUID (`task_<uuid>`). */
 export const id = (prefix: string): string => `${prefix}_${randomUUID()}`
 
-interface Tables {
+/** The record type each table holds. */
+export interface Tables {
   missions: Mission
   members: Member
   workstreams: Workstream
@@ -37,6 +38,11 @@ interface Tables {
   limits: LimitRule
 }
 type Table = keyof Tables
+/**
+ * CORE-06: the tables whose rows a transition writes after an await, and so
+ * only through `SwarmRuntime.revise`, on the row its commit reads.
+ */
+export type RevisedTable = 'tasks' | 'members' | 'missions'
 /**
  * A store written before the scheduling pass guard moved into memory also holds
  * a `passes` table; nothing reads it, and it is left in place untouched.
@@ -162,6 +168,14 @@ export function isSqliteBusy(error: unknown): boolean {
  * names the durable revision, not the caller's stale one, so the caller can
  * re-read and decide again; `code` is stable so callers branch on it, never on
  * message text.
+ *
+ * CORE-06: it is the backstop, not a transition's refusal. A transition that
+ * awaited I/O after reading its row writes through `SwarmRuntime.revise`, on
+ * the row its commit reads, so it never presents a revision another write
+ * moved past: a write it does not conflict with is kept, and one it conflicts
+ * with is refused by the transition's own fence, with that conflict's reason.
+ * This error reaches a caller only when a whole-row write of a copy read
+ * before another accepted write bypassed that shape.
  */
 export class StaleTaskRevisionError extends Error {
   readonly code = 'stale_task_revision' as const

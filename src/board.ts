@@ -310,8 +310,17 @@ export function eligible(board: Board, task: Task, member: Member): boolean { re
  */
 export function stillChosen(board: Board, chosen: Task): Task | undefined {
   const fresh = board.tasks.find(task => task.id === chosen.id)
-  return fresh !== undefined && fresh.epoch === chosen.epoch && fresh.assigneeId === chosen.assigneeId
-    && fresh.plannedAssigneeId === chosen.plannedAssigneeId && fresh.assignmentMode === chosen.assignmentMode ? fresh : undefined
+  return fresh !== undefined && sameChoice(fresh, chosen) ? fresh : undefined
+}
+
+/**
+ * The row half of `stillChosen`: `fresh` is still the choice `chosen` was,
+ * its epoch and its assignment unchanged. An assignment asks it again on the
+ * row its commit reads (`SwarmRuntime.assign`, CORE-06).
+ */
+export function sameChoice(fresh: Task, chosen: Task): boolean {
+  return fresh.epoch === chosen.epoch && fresh.assigneeId === chosen.assigneeId
+    && fresh.plannedAssigneeId === chosen.plannedAssigneeId && fresh.assignmentMode === chosen.assignmentMode
 }
 
 /**
