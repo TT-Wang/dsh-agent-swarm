@@ -25,10 +25,12 @@ test('the two tiers split tests/*.test.mjs: a file is in the host tier only by b
   assert.throws(() => tierFiles('everything'), /Unknown test tier "everything"; the tiers are hermetic, host/)
 })
 
-test('the hermetic tier runs as a fresh clone would: no checkout is named and the search is off', () => {
+test('the hermetic tier runs as a fresh clone would: no checkout is named and the search is off; the host tier never inherits that', () => {
   const env = tierEnvironment('hermetic', { PATH: '/bin', DSH_HARNESS_ROOT: '/harness', DSH_SOURCE: '/source', DSH_HOME: '/home/dsh' })
   assert.deepEqual(env, { PATH: '/bin', DSH_HOME: '/home/dsh', [TIER_ENV]: 'hermetic' })
   assert.deepEqual(tierEnvironment('host', { DSH_HARNESS_ROOT: '/harness' }), { DSH_HARNESS_ROOT: '/harness' })
+  // A host-tier run started from a hermetic one, or by an operator who exported the variable, still searches for its checkout.
+  assert.deepEqual(tierEnvironment('host', { PATH: '/bin', [TIER_ENV]: 'hermetic' }), { PATH: '/bin' })
 })
 
 test('npm test runs the hermetic tier after the build, and test:bundle runs the host tier', () => {

@@ -13,7 +13,8 @@
  * `tests/*.test.mjs` is hermetic. The hermetic tier runs as a fresh clone would:
  * DSH_HARNESS_ROOT and DSH_SOURCE are removed from its environment and
  * DSH_SWARM_TEST_TIER=hermetic stops harness-target's search for a checkout,
- * so a hermetic file that reaches for one fails on every machine.
+ * so a hermetic file that reaches for one fails on every machine. The host
+ * tier's environment never carries that marker.
  *
  *   node scripts/test-tiers.mjs <hermetic|host> [node --test options]
  *   node scripts/test-tiers.mjs <hermetic|host> --list
@@ -37,7 +38,7 @@ export const HOST_TIER = ['tests/r17-profile.test.mjs']
 /** The environment variable that tells harness-target the hermetic tier is running. */
 export const TIER_ENV = 'DSH_SWARM_TEST_TIER'
 
-/** The tier's files, relative to the project, in the order a shell glob lists them. */
+/** The tier's files, relative to the project: the host tier's as HOST_TIER lists them, the hermetic tier's sorted by name. */
 export function tierFiles(tier, project = PROJECT) {
   if (!Object.hasOwn(TIERS, tier)) throw new Error(`Unknown test tier ${JSON.stringify(tier)}; the tiers are ${Object.keys(TIERS).join(', ')}`)
   for (const file of HOST_TIER) if (!existsSync(join(project, file))) throw new Error(`The host tier lists ${file}, which does not exist`)
@@ -46,13 +47,21 @@ export function tierFiles(tier, project = PROJECT) {
     .map(name => `tests/${name}`).filter(file => !HOST_TIER.includes(file))
 }
 
-/** The environment a tier's run gets: the hermetic tier has no Harness checkout to find. */
+/**
+ * The environment a tier's run gets. The tier marker is set by the tier, never
+ * inherited: the hermetic tier has no Harness checkout to find, and the host
+ * tier searches for its checkout even when started from a hermetic run or by an
+ * operator who exported the marker.
+ */
 export function tierEnvironment(tier, env = process.env) {
-  if (tier !== 'hermetic') return { ...env }
-  const hermetic = { ...env, [TIER_ENV]: 'hermetic' }
-  delete hermetic.DSH_HARNESS_ROOT
-  delete hermetic.DSH_SOURCE
-  return hermetic
+  const environment = { ...env }
+  delete environment[TIER_ENV]
+  if (tier === 'hermetic') {
+    delete environment.DSH_HARNESS_ROOT
+    delete environment.DSH_SOURCE
+    environment[TIER_ENV] = 'hermetic'
+  }
+  return environment
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
