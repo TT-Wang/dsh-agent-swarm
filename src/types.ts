@@ -872,14 +872,16 @@ export const UNCONFINED_HOST_TOOLS: readonly string[] = [
  *  - the replay decoder (`src/trace.ts`) opens one attempt per `task/claimed`
  *    and refuses the whole log with `ReplayTruncationError` when one never
  *    closes;
- *  - the scheduling board model (`src/scheduling.ts`) ends the attempt interval
+ *  - the silence instrument (`tests/instruments.mjs`, R16-D; the scheduling
+ *    board model's until nothing in src/ read it) ends the attempt interval
  *    with the same set.
  *
  * The two readers used to carry hand-mirrored copies. They drifted: neither had
  * `task/restart-repended` (emitted when a host restart re-pends a running task,
  * `src/runtime.ts`) nor `task/ceiling-exhausted` (emitted when a task blocks at
  * its own ceiling, `src/runtime.ts`), so a log containing either made the replay
- * refuse its own mission as truncated. One list, both readers.
+ * refuse its own mission as truncated. One list, both readers; which task's
+ * attempt such an event closes is one rule too (`tasksClosedBy`).
  */
 export const ATTEMPT_FENCING_EVENTS: readonly EventKind[] = [
   // `attempt/fenced` is the uniform closer every fence writes through
@@ -893,6 +895,30 @@ export const ATTEMPT_FENCING_EVENTS: readonly EventKind[] = [
   'task/handoff-started', 'task/invalidated', 'task/review-retired',
   'task/closeout-abandoned', 'task/closeout-failed', 'task/accepted', 'task/rejected',
 ]
+/**
+ * The payload fields at which a fencing event names a task whose attempt it
+ * closes: the task it fences (`taskId`), the source a verdict, a deferral or an
+ * invalidation is about (`sourceTaskId`), and the review that reached the
+ * verdict or deferred it (`verificationTaskId`). A verdict names its review at
+ * the last field only.
+ */
+const ATTEMPT_CLOSING_FIELDS = ['taskId', 'sourceTaskId', 'verificationTaskId'] as const
+/**
+ * The tasks whose open attempt one durable event closes: none unless it is a
+ * fencing event (`ATTEMPT_FENCING_EVENTS`), else each task it names at an
+ * `ATTEMPT_CLOSING_FIELDS` field. The closing rule of both readers of the set.
+ * It is not the rule for progress: which events report for an attempt is the
+ * store's named-path attribution (`ATTEMPT_PATHS` in `src/store.ts`).
+ */
+export function tasksClosedBy(event: Pick<SwarmEvent, 'type' | 'data'>): string[] {
+  if (!(ATTEMPT_FENCING_EVENTS as readonly string[]).includes(event.type)) return []
+  const data = event.data
+  if (data === null || typeof data !== 'object') return []
+  return ATTEMPT_CLOSING_FIELDS.flatMap(field => {
+    const taskId = (data as Record<string, unknown>)[field]
+    return typeof taskId === 'string' && taskId ? [taskId] : []
+  })
+}
 
 export interface SwarmEvent {
   seq: number

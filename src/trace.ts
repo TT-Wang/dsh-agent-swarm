@@ -35,7 +35,7 @@ import { rm } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import { taskGraphDefects, type TaskGraphDefect, type TaskGraphNode } from './admission.ts'
 import { EVENT_VOCABULARY } from './events.ts'
-import { ATTEMPT_FENCING_EVENTS, type AcceptanceBasis, type SwarmEvent } from './types.ts'
+import { ATTEMPT_FENCING_EVENTS, tasksClosedBy, type AcceptanceBasis, type SwarmEvent } from './types.ts'
 import { PolicyError } from './policy-error.ts'
 
 /** Closed operation vocabulary from the D6 contract (OTel/OpenInference analogue). */
@@ -708,9 +708,7 @@ export function orchestratorCommands(events: readonly SwarmEvent[]): ReplayResul
       open.set(attemptId, { taskId, memberId })
       continue
     }
-    const closesTask = typeof data.taskId === 'string' && data.taskId ? data.taskId : undefined
-    const closesSource = typeof data.sourceTaskId === 'string' && data.sourceTaskId ? data.sourceTaskId : undefined
-    const closesVerification = typeof data.verificationTaskId === 'string' && data.verificationTaskId ? data.verificationTaskId : undefined
+    const closes = tasksClosedBy(event)
     if (event.type === 'task/accepted' || event.type === 'task/rejected') {
       commands.push({ kind: 'verify', seq: event.seq, sourceTaskId: required(data, 'sourceTaskId', event.seq), verdict: event.type === 'task/accepted' ? 'accepted' : 'rejected' })
     }
@@ -718,7 +716,7 @@ export function orchestratorCommands(events: readonly SwarmEvent[]): ReplayResul
     if (event.type === 'task/review-retired' && typeof data.ownerId === 'string' && data.ownerId) commands.push({ kind: 'stop', seq: event.seq, memberId: data.ownerId })
     if (event.type === 'task/checkpointed') commands.push({ kind: 'checkpoint', seq: event.seq, taskId: required(data, 'taskId', event.seq), commit: typeof data.commit === 'string' ? data.commit : '' })
     for (const [attemptId, record] of [...open]) {
-      if (record.taskId === closesTask || record.taskId === closesSource || record.taskId === closesVerification) open.delete(attemptId)
+      if (closes.includes(record.taskId)) open.delete(attemptId)
     }
   }
   const unresolved = [...open.entries()].map(([attemptId, record]) => `${record.taskId}#${attemptId}`)

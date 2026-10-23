@@ -504,6 +504,50 @@ test('CORE-03: SwarmStore.attemptEventAt reads the whole log by named paths, fro
   } finally { db.close() }
 })
 
+/**
+ * The silence instrument keeps two rules apart. Progress is the store's
+ * named-path rule, the one the live bound reads. An attempt ends at the closer
+ * the replay decoder ends it at (`tasksClosedBy`), and that closer is its last
+ * element. A verdict names its review only at `$.verificationTaskId`, which no
+ * progress path reads, so a closer read through the progress rule left the
+ * review open past its verdict: the silent stretch up to the verdict was lost,
+ * and a later row naming the review's task was charged to the finished attempt.
+ */
+test('CORE-03: the silence instrument ends a review attempt at its verdict, whatever names the review afterwards', t => {
+  const directory = mkdtempSync(join(tmpdir(), 'silence-closer-'))
+  t.after(() => rmSync(directory, { recursive: true, force: true }))
+  let now = 0
+  const store = new SwarmStore(join(directory, 'state.sqlite'), { snapshotIntervalMs: 0, now: () => now })
+  t.after(() => store.close())
+  const at = (instant, type, data) => { now = instant; store.transaction(() => store.event('m', type, 'runtime', data)) }
+  const claim = (instant, taskId, attemptId, ownerId) => at(instant, 'task/claimed', { taskId, attempt: { id: attemptId, epoch: 1, ownerId } })
+  claim(1_000, 'source', 'source-attempt', 'builder')
+  at(2_000, 'task/submitted', { taskId: 'source', commit: 'c1' })
+  claim(3_000, 'review', 'review-attempt', 'reviewer')
+  at(4_000, 'trace/span', { taskId: 'review', attemptId: 'review-attempt', step: 'swarm_post' })
+  at(12_000, 'evidence/verified', { evidenceId: 'e1', taskId: 'source', verificationTaskId: 'review', commit: 'c1' })
+  at(12_000, 'task/accepted', { sourceTaskId: 'source', verificationTaskId: 'review', commit: 'c1' })
+  claim(13_000, 'second-review', 'second-attempt', 'reviewer')
+  at(20_000, 'task/verification-deferred', { sourceTaskId: 'source', verificationTaskId: 'second-review', commit: 'c1' })
+  // The owner reads the finished reviews afterwards: its spans name their tasks.
+  at(50_000, 'trace/span', { taskId: 'review', step: 'swarm_observe' })
+  at(60_000, 'trace/span', { taskId: 'second-review', step: 'swarm_observe' })
+  const runtime = { store, config: { maxEvents: 100 }, bounds: { stallPassTimeoutMs: 100, stallPassReleaseBoundMs: 200, attemptSilenceBoundMs: 5_000 } }
+  const report = silenceReport(runtime, 'm')
+  const of = attemptId => {
+    const { endedAt, lastDurableAt, worstReportingGapMs, silentMs, endedUnreported } = report.attempts.find(attempt => attempt.attemptId === attemptId)
+    return { endedAt, lastDurableAt, worstReportingGapMs, silentMs, endedUnreported }
+  }
+  assert.deepEqual(of('review-attempt'), { endedAt: 12_000, lastDurableAt: 12_000, worstReportingGapMs: 8_000, silentMs: 0, endedUnreported: false },
+    'the verdict ends the review it names at $.verificationTaskId, reports for it, and keeps the silent stretch before it; the owner\'s later span is not the review\'s')
+  assert.deepEqual(of('second-attempt'), { endedAt: 20_000, lastDurableAt: 20_000, worstReportingGapMs: 7_000, silentMs: 0, endedUnreported: false },
+    'a deferral is the review\'s closing report even when nothing else named it')
+  assert.deepEqual(of('source-attempt'), { endedAt: 2_000, lastDurableAt: 2_000, worstReportingGapMs: 1_000, silentMs: 0, endedUnreported: false },
+    'the source ended at its submission; the verdict and its evidence about the source come after its attempt')
+  assert.deepEqual(report.worstAttemptReportingGap, { attemptId: 'review-attempt', taskId: 'review', gapMs: 8_000 })
+  assert.equal(report.attemptsEnded, 3)
+})
+
 test('both silence notices render a span as seconds, minutes and seconds, or hours and minutes', () => {
   for (const [ms, text] of [[-1_500, '0s'], [59_499, '59s'], [59_500, '1m 0s'], [60_000, '1m 0s'], [3_599_000, '59m 59s'],
     [3_599_500, '1h 0m'], [3_600_000, '1h 0m'], [3_661_000, '1h 1m'], [90_061_000, '25h 1m']]) assert.equal(formatSpan(ms), text, `${ms}ms`)

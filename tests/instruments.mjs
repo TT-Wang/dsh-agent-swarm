@@ -8,7 +8,7 @@
 import { NO_LIVE_PATH_FAMILIES, noticeFamily, taskFromSubject } from '../lib/notices.js'
 import { stallRoots, waitsLegitimately } from '../lib/board.js'
 import { TERMINAL_STATES, taskSubject } from '../lib/task-graph.js'
-import { ATTEMPT_FENCING_EVENTS } from '../lib/types.js'
+import { tasksClosedBy } from '../lib/types.js'
 import { ATTEMPT_PATHS, ATTEMPT_TASK_PATH } from '../lib/store.js'
 
 
@@ -75,16 +75,14 @@ export function wakePrecision(runtime, missionId) {
   }
 }
 
-/** Mirrors `isAttemptCloser` in its old src/scheduling.ts form: the shared fencing vocabulary. */
-const isAttemptCloser = type => ATTEMPT_FENCING_EVENTS.some(kind => kind === type)
-
 /** The value at one `$.a.b` attribution path of an event payload. */
 const atPath = (data, path) => path.slice(2).split('.').reduce((value, key) => value !== null && typeof value === 'object' ? value[key] : undefined, data)
 /**
  * Whether an event names attempt `attemptId`, or its task, at a named path: the
  * store's attribution rule (`ATTEMPT_PATHS`, `ATTEMPT_TASK_PATH`), which
  * `SwarmStore.attemptEventAt` runs in SQL for the live bound. The caller holds
- * the task path to the attempt's lifetime.
+ * the task path to the attempt's lifetime. It decides progress only: which
+ * attempt a closer ends is the replay decoder's rule (`tasksClosedBy`).
  */
 const namesAttempt = (data, taskId, attemptId) => ATTEMPT_PATHS.some(path => atPath(data, path) === attemptId) || atPath(data, ATTEMPT_TASK_PATH) === taskId
 
@@ -104,8 +102,12 @@ const namesAttempt = (data, taskId, attemptId) => ATTEMPT_PATHS.some(path => atP
  * Definitions, stated so a reader can falsify them:
  *  - an attempt's durable elements are its `task/claimed` dispatch (and the
  *    assignment delivery written with it), every durable event naming its task
- *    or attempt at a named path while it was current (`namesAttempt`), every
- *    delivery naming them, and every recorded tool run of the attempt;
+ *    or attempt at a named path while it was current (`namesAttempt`), the
+ *    event that closed it, every delivery naming them, and every recorded tool
+ *    run of the attempt;
+ *  - it ends at the first event that closes it by the replay decoder's rule
+ *    (`tasksClosedBy`: a fencing event naming its task at `taskId`,
+ *    `sourceTaskId` or `verificationTaskId`), or at its task's next dispatch;
  *  - its reporting gap is the longest interval between consecutive elements,
  *    closed at its end (or at read time while it is live);
  *  - it ended unreported when it is no longer the task's current attempt and no
@@ -115,10 +117,10 @@ const namesAttempt = (data, taskId, attemptId) => ATTEMPT_PATHS.some(path => atP
  * Limits: the attempt intervals come from the retained event window
  * (`maxEvents`); an attempt that ended with no closing event is dated at its
  * last durable element; the attempt bound quoted is the bound in force at read
- * time. Attribution is the store's named-path rule, the one the live
- * attempt-silence bound reads; a verdict names its review at
- * `$.verificationTaskId`, which no path reads, so a review attempt that ended
- * in a verdict is dated at its last durable element.
+ * time. Progress is the store's named-path rule, the one the live
+ * attempt-silence bound reads; the end is the closing rule, which a verdict
+ * meets by naming its review at `$.verificationTaskId`, a field no progress
+ * path reads.
  */
 export function silenceReport(runtime, missionId) {
   const now = Date.now()
@@ -143,15 +145,19 @@ export function silenceReport(runtime, missionId) {
   }
   for (const event of events) {
     if (event.type === 'task/claimed') { claimStart(event); continue }
-    // The event is attributed to the open attempt of each task it names; a
-    // closer ends that attempt at this instant and takes it out of the open set.
-    let closedTask
-    for (const [taskId, interval] of open) {
-      if (!namesAttempt(event.data, taskId, interval.attemptId)) continue
+    // Two rules, kept apart. The event is an element of the open attempt of
+    // each task it names at a named path (progress); a closer is the last
+    // element of each open attempt it closes (the replay decoder's rule), which
+    // ends at this instant and leaves the open set.
+    const closes = tasksClosedBy(event)
+    for (const [taskId, interval] of [...open]) {
+      const closing = closes.includes(taskId)
+      if (!closing && !namesAttempt(event.data, taskId, interval.attemptId)) continue
       interval.elements.push({ at: event.createdAt, kind: 'event', isClaim: false })
-      if (isAttemptCloser(event.type)) { interval.endedAt = Math.min(interval.endedAt ?? event.createdAt, event.createdAt); closedTask = taskId }
+      if (!closing) continue
+      interval.endedAt = Math.min(interval.endedAt ?? event.createdAt, event.createdAt)
+      open.delete(taskId)
     }
-    if (closedTask !== undefined) open.delete(closedTask)
   }
   for (const run of runtime.store.toolRuns(missionId)) {
     const interval = byAttempt.get(run.attemptId)
