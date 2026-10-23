@@ -1911,7 +1911,7 @@ export class SwarmRuntime implements Kernel {
         because = `belongs to task ${owning.id}, which is cancelled and so supports no result`
         break
       case 'superseded': {
-        because = `is refuted and superseded by evidence ${why.by}, which a verdict verified`
+        because = `is refuted and superseded by evidence ${why.by}`
         const by = this.store.get('evidence', why.by)
         disputed = by === undefined ? undefined : graph.byId.get(by.taskId)
         break

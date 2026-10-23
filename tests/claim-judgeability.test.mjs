@@ -168,7 +168,7 @@ test('(b1) a claim superseded within its task is refuted, never verified, by the
   assert.deepEqual([f.evidence(first).status, f.evidence(first).refutedBy, f.evidence(revised).status], ['refuted', revised.id, 'verified'])
   assert.equal((await f.claim(f.reviewer, dependent)).status, 'running')
 
-  await f.refused(f.owner, first, `is refuted and superseded by evidence ${revised.id}, which a verdict verified`,
+  await f.refused(f.owner, first, `is refuted and superseded by evidence ${revised.id}`,
     `Use \`swarm_challenge\` with the \`evidenceId\` of a claim of task ${source.id} a verdict can still judge instead: ${revised.id}.`)
   assert.deepEqual([f.current(source).status, f.current(review).status, f.current(dependent).status], ['accepted', 'accepted', 'running'],
     'the accepted source is not re-opened, its review is not cancelled, and its dependent keeps running')

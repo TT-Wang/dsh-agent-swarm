@@ -484,7 +484,9 @@ export function currentEvidenceIds(task: Pick<Task, 'evidenceIds' | 'rejections'
  * Why no verdict can judge a claim any more (`unjudgeable`):
  *  - `archived`: a rework archived it with the rejection that closed its round;
  *  - `cancelled`: its task is cancelled, so it supports no result;
- *  - `superseded`: a claim that supersedes it (`by`) was verified, which refuted it;
+ *  - `superseded`: a claim that supersedes it (`by`) refuted it when an
+ *    acceptance verified that claim, or a claim superseding `by` in turn (an
+ *    acceptance refutes a chain link by link, so `by` may itself be refuted);
  *  - `refuted`: an independent rejection of its task refuted it;
  *  - `review-evidence`: a review's own claim, the evidence for that review's
  *    verdict. A verdict judges the claims of the work it reviews (`verify`)

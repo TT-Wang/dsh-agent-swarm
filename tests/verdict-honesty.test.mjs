@@ -288,6 +288,20 @@ test('a chain of claims one acceptance supersedes is refuted link by link, and o
   const row = claim => f.runtime.store.get('evidence', claim.id)
   assert.deepEqual([first, second, third].map(claim => [row(claim).status, row(claim).refutedBy]), [['refuted', second.id], ['refuted', third.id], ['verified', undefined]])
   assertBoardIsConsistent(f, 'after the chain was resolved')
+  // A challenge of a link names the claim that refuted it, which a verdict
+  // never verified for every link but the last, and moves the dispute to the
+  // claim the acceptance did verify.
+  const refusal = claim => {
+    try { f.runtime.challenge(f.owner, f.mission.id, { evidenceId: claim.id, reason: 'Dispute a superseded link', toolRunIds: [] }) } catch (error) { return error }
+    assert.fail(`a challenge of ${claim.id} is refused`)
+  }
+  for (const [link, by] of [[first, second], [second, third]]) {
+    const { code, message } = refusal(link)
+    assert.equal(code, 'evidence_not_judgeable')
+    assert.ok(message.startsWith(`[evidence_not_judgeable] Evidence ${link.id} is refuted and superseded by evidence ${by.id}, so no verdict can judge it again`), message)
+    assert.ok(!message.includes('verified'), `the refusal claims no verification of ${by.id}: ${message}`)
+    assert.ok(message.endsWith(`a claim of task ${source.id} a verdict can still judge instead: ${third.id}.`), message)
+  }
 })
 
 test('an inconclusive claim supersedes nothing: the claim it names is verified with it', async t => {
