@@ -16,6 +16,9 @@ only), branch `dsh021/drop-01x` on `a28b116` (main), not merged. The owner dropp
 `src` against `a28b116`: +617 −338, net +279. The drop (`15d00ec` to `22383d8`) is +131 −155, net −24; the W8 route
 rule (`f3518a8` to `95e5772`) is +276 −127, net +149; the live-smoke repair round is +222 −68, net +154.
 
+**Merged** as `9ddbdb5` (2026-10-23) on `a28b116`, after the smoke delivery rule (`a708ecd`) and both live smokes
+passing there (`e2ba280`, below). Main had not moved, so the merged tree is `e2ba280`'s.
+
 **What the drop deleted, and what stands in its place.** Each item existed only because 0.1.x was supported; the
 2026-10-21 entry records most of them as bridges between hosts.
 
