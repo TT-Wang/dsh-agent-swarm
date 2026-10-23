@@ -1,5 +1,5 @@
 import type { LiveState, LiveUpdate } from '../live-types.ts'
-import { readSnapshot } from './projection.ts'
+import { readBudget, readDraft, readSnapshot, readStart } from './projection.ts'
 interface MonitorState {
   ownerSessionId?: string
   data?: LiveState
@@ -105,9 +105,17 @@ export class SwarmMonitor {
 
 class InvalidSwarmStateError extends Error {}
 
-function validateState(data: LiveState, owner: string): void {
+/**
+ * The owner's state, as the initial read and a snapshot or delta update
+ * receive it: every item the panel renders passes its
+ * reader (projection.ts), so a malformed one refuses the whole state, the last
+ * good view stays, and the error is shown instead of a render failure.
+ */
+export function validateState(data: LiveState, owner: string): void {
   if (!data || data.ownerSessionId !== owner || !Array.isArray(data.snapshots) || !Array.isArray(data.drafts)
-    || data.snapshots.some(snapshot => !readSnapshot(snapshot))
+    || (data.starts !== undefined && !Array.isArray(data.starts))
+    || data.snapshots.some(snapshot => !readSnapshot(snapshot)) || data.drafts.some(draft => !readDraft(draft))
+    || data.starts?.some(start => !readStart(start)) || !readBudget(data.defaultBudget)
     || (data.revision !== undefined && (!Number.isSafeInteger(data.revision) || data.revision < 0))) throw new InvalidSwarmStateError('Invalid swarm state from host')
 }
 
@@ -123,7 +131,7 @@ export function mergeUpdate(previous: LiveState | undefined, update: LiveUpdate,
   if (update.kind === 'heartbeat') {
     if ((update.ownerLive !== undefined && typeof update.ownerLive !== 'boolean') || (update.writable !== undefined && typeof update.writable !== 'boolean')) throw new InvalidSwarmStateError('Invalid swarm connection metadata')
     if (update.workspace !== undefined && typeof update.workspace !== 'string') throw new InvalidSwarmStateError('Invalid swarm workspace metadata')
-    if (update.defaultBudget !== undefined && (!update.defaultBudget || ['maxTokens', 'maxSteps', 'maxWorkers', 'maxDurationMs', 'maxTasks', 'maxExperiments'].some(key => !Number.isSafeInteger(update.defaultBudget![key as keyof typeof update.defaultBudget])))) throw new InvalidSwarmStateError('Invalid swarm budget metadata')
+    if (update.defaultBudget !== undefined && !readBudget(update.defaultBudget)) throw new InvalidSwarmStateError('Invalid swarm budget metadata')
     return { ...previous, revision: update.revision,
       ...(update.ownerLive === undefined ? {} : { ownerLive: update.ownerLive }),
       ...(update.writable === undefined ? {} : { writable: update.writable }),

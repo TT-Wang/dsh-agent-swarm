@@ -2,8 +2,9 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import React from 'react'
 import { SwarmMonitor } from '../lib/types/client/monitor.js'
-import { readSnapshot } from '../lib/types/client/projection.js'
+import { readBudget, readDraft, readSnapshot, readStart } from '../lib/types/client/projection.js'
 import { ActivityPanel } from '../lib/types/client/ActivityPanel.js'
+import { newPlan } from '../lib/types/client/DraftEditor.js'
 import { registerWebApi } from '../lib/web-api.js'
 import { uiSnapshot } from './fixtures/ui-snapshot.mjs'
 import { makeRuntimeStub } from './faults/harness.mjs'
@@ -105,6 +106,119 @@ test('M4-F5: optional progress, recovery and usage fields validate without requi
   ]) {
     const snapshot = structuredClone(good); mutate(snapshot)
     assert.equal(readSnapshot(snapshot), undefined, label)
+  }
+})
+
+// F2: a saved draft, a saved request and a budget as the server sends them,
+// with every optional field the panel reads present.
+const draftItem = () => {
+  const input = { ...newPlan('/repo', uiSnapshot().mission.budget), title: 'Paginate the API', objective: 'Add cursor pagination' }
+  Object.assign(input.members[0], { provider: 'deepseek', model: 'deepseek-v4', reasoningEffort: 'high' })
+  Object.assign(input.tasks[0], { outputs: ['src/api.ts'], priority: 60, experiment: false })
+  return { id: 'draft-1', ownerSessionId: 'owner', revision: 2, status: 'failed', input, advisories: ['A preflight note'], error: 'Launch failed', createdAt: 1, updatedAt: 2 }
+}
+const startItem = () => ({ id: 'start-1', ownerSessionId: 'owner', commandId: 'command-1', goal: 'Paginate the API', workspace: '/repo', status: 'planning',
+  planningEpoch: 1, draftId: 'draft-1', createdAt: 1, updatedAt: 2,
+  baseline: { sourceHead: 'a'.repeat(40), snapshotCommit: 'b'.repeat(40), planningWorkspace: '/planning', changedPaths: ['src/api.ts'], createdAt: 1 } })
+
+test('F2: the draft, start and budget readers admit what the panel renders and refuse what would break it', () => {
+  assert.equal(readDraft(draftItem()) !== undefined, true)
+  assert.equal(readStart(startItem()) !== undefined, true)
+  const bare = draftItem(); delete bare.advisories; delete bare.error
+  assert.ok(readDraft(bare), 'a draft without notes or an error is readable')
+  const legacy = startItem(); delete legacy.planningEpoch; delete legacy.draftId; delete legacy.baseline
+  assert.ok(readStart(legacy), 'a legacy request without an epoch, a draft or a snapshot is readable')
+  const value = draftItem()
+  assert.equal(readDraft(value), value, 'a reader returns the item itself')
+  for (const [label, mutate] of [
+    ['draft without input', d => { delete d.input }],
+    ['tasks not a list', d => { d.input.tasks = { deliver: d.input.tasks[0] } }],
+    ['task scope', d => { d.input.tasks[0].scope = 'src/' }],
+    ['task acceptance', d => { delete d.input.tasks[1].acceptance }],
+    ['task covers', d => { d.input.tasks[0].covers = [1] }],
+    ['task checks', d => { d.input.tasks[0].checks = 'npm test' }],
+    ['task outputs', d => { d.input.tasks[0].outputs = {} }],
+    ['task dependencies', d => { d.input.tasks[0].dependencies = 'review' }],
+    ['task title', d => { d.input.tasks[0].title = { text: 'Deliver' } }],
+    ['task workstream', d => { delete d.input.tasks[0].workstreamKey }],
+    ['task review source', d => { d.input.tasks[1].reviewOf = 5 }],
+    ['task priority', d => { d.input.tasks[0].priority = 'high' }],
+    ['task experiment', d => { d.input.tasks[0].experiment = 'yes' }],
+    ['members not a list', d => { d.input.members = null }],
+    ['member name', d => { d.input.members[0].name = {} }],
+    ['member model', d => { d.input.members[0].model = 4 }],
+    ['workstream objective', d => { d.input.workstreams[0].objective = null }],
+    ['plan scope', d => { d.input.scope = 'src/' }],
+    ['plan criteria', d => { d.input.acceptance = [{ text: 'Done' }] }],
+    ['plan title', d => { d.input.title = 5 }],
+    ['plan budget', d => { delete d.input.budget }],
+    ['plan budget limit', d => { d.input.budget.maxTasks = '20' }],
+    ['revision', d => { d.revision = 'r2' }],
+    ['status', d => { delete d.status }],
+    ['error', d => { d.error = { message: 'failed' } }],
+    ['advisories', d => { d.advisories = 'A preflight note' }],
+    ['mission link', d => { d.missionId = 5 }],
+  ]) {
+    const draft = draftItem(); mutate(draft)
+    assert.equal(readDraft(draft), undefined, label)
+  }
+  for (const [label, mutate] of [
+    ['goal', s => { delete s.goal }],
+    ['status', s => { s.status = 5 }],
+    ['created time', s => { s.createdAt = 'now' }],
+    ['updated time', s => { delete s.updatedAt }],
+    ['planning epoch', s => { s.planningEpoch = 'one' }],
+    ['draft link', s => { s.draftId = 5 }],
+    ['mission link', s => { s.missionId = {} }],
+    ['error', s => { s.error = { message: 'failed' } }],
+    ['baseline', s => { s.baseline = 'b'.repeat(40) }],
+    ['baseline commit', s => { delete s.baseline.snapshotCommit }],
+    ['baseline changed paths', s => { s.baseline.changedPaths = 'src/api.ts' }],
+  ]) {
+    const start = startItem(); mutate(start)
+    assert.equal(readStart(start), undefined, label)
+  }
+  const budget = uiSnapshot().mission.budget
+  assert.ok(readBudget({ ...budget, deadlineAt: Date.UTC(2026, 9, 30) }))
+  assert.ok(readBudget({ ...budget, maxTokens: 1.5 }), 'admission keeps render safe; integer limits are the runtime\'s policy')
+  for (const [label, value] of [['absent', undefined], ['null', null], ['empty', {}], ['infinite limit', { ...budget, maxSteps: Infinity }],
+    ['string limit', { ...budget, maxWorkers: '5' }], ['string deadline', { ...budget, deadlineAt: 'tomorrow' }]]) {
+    assert.equal(readBudget(value), undefined, label)
+  }
+  const snapshot = uiSnapshot(); snapshot.mission.budget.deadlineAt = 'tomorrow'
+  assert.equal(readSnapshot(snapshot), undefined, 'a mission budget is read by the same budget rule')
+})
+
+test('F2: the monitor refuses a state whose draft, start or budget would break render, and keeps the last good view', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+  const good = { ...live(), drafts: [draftItem()], starts: [startItem()] }
+  const admitted = new SwarmMonitor(async endpoint => endpoint === 'state' ? good : await new Promise(() => {}))
+  t.after(() => admitted.dispose())
+  admitted.select('owner'); await flush()
+  assert.equal(admitted.getSnapshot().data, good, 'a state of well-formed items is admitted as sent')
+  for (const [label, mutate] of [
+    ['a draft without input', state => { delete state.drafts[0].input }],
+    ['a draft whose tasks are not a list', state => { state.drafts[0].input.tasks = {} }],
+    ['a start with a malformed baseline', state => { state.starts[0].baseline.changedPaths = undefined }],
+    ['starts that are not a list', state => { state.starts = { 'start-1': state.starts[0] } }],
+    ['no initial budget', state => { delete state.defaultBudget }],
+  ]) {
+    const broken = { ...live(2), drafts: [draftItem()], starts: [startItem()] }; mutate(broken)
+    const calls = []
+    const monitor = new SwarmMonitor(async endpoint => {
+      calls.push(endpoint)
+      if (calls.length === 1) return good
+      return endpoint === 'watch' ? { kind: 'snapshot', ownerSessionId: 'owner', revision: 2, state: broken, missionIds: ['mission-demo'] } : broken
+    })
+    monitor.select('owner'); await flush()
+    t.mock.timers.tick(40); await flush()
+    assert.equal(monitor.getSnapshot().data, good, `${label}: the last good view stays`)
+    assert.equal(monitor.getSnapshot().connection, 'reconnecting', label)
+    assert.match(monitor.getSnapshot().error, /Invalid swarm state from host/, label)
+    t.mock.timers.tick(1000); await flush()
+    assert.deepEqual(calls, ['state', 'watch', 'state'], `${label}: the refused update is retried as a full read`)
+    assert.equal(monitor.getSnapshot().data, good, `${label}: a refused full read is not admitted either`)
+    monitor.dispose()
   }
 })
 

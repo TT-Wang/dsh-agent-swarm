@@ -1,4 +1,4 @@
-import type { Member, Snapshot, SwarmEvent, Task, Evidence } from '../types.ts'
+import type { AutoStart, Budget, DraftPlan, Member, Snapshot, SwarmEvent, Task, Evidence } from '../types.ts'
 import { TERMINAL_STATES, completionExempt, taskGraphIndex, selectAcceptedDelivery } from '../task-graph.ts'
 import { assignmentAllows, canOwnReview } from '../assignment.ts'
 
@@ -78,6 +78,9 @@ function strings(value: unknown): value is string[] { return Array.isArray(value
 function finite(value: unknown): value is number { return typeof value === 'number' && Number.isFinite(value) }
 function nonnegative(value: unknown): value is number { return finite(value) && value >= 0 }
 function optionalCount(value: unknown): boolean { return value === undefined || nonnegative(value) }
+function optionalFinite(value: unknown): boolean { return value === undefined || finite(value) }
+function optionalString(value: unknown): boolean { return value === undefined || typeof value === 'string' }
+function optionalStrings(value: unknown): boolean { return value === undefined || strings(value) }
 function usage(value: unknown): boolean {
   return value === undefined || (record(value) && ['uncachedInputTokens', 'cacheReadTokens', 'cacheWriteTokens', 'outputTokens', 'reasoningTokens', 'requests'].every(key => nonnegative(value[key])))
 }
@@ -126,23 +129,52 @@ export function readAppliedDelivery(snapshot: Snapshot): AppliedDeliveryProjecti
     ? { resultCommit: value.resultCommit, ...(value.appliedAt === undefined ? {} : { appliedAt: value.appliedAt as number }) } : undefined
 }
 
+/*
+ * Transport admission. Every item of the owner's state the panel renders
+ * enters through one reader in this section, which checks the fields its
+ * renderers and the client's own merges dereference and returns undefined for
+ * anything else: a mission snapshot (readSnapshot), a saved draft (readDraft),
+ * a saved automatic request (readStart) and a budget (readBudget). The
+ * monitor's reads and updates (monitor.ts) go through them, so a malformed or
+ * version-skewed item is refused with a visible error before it reaches state.
+ * The pane has no error boundary of its own: on Harness 0.2.1 the host wraps
+ * the tab body in its slot error boundary, which retires the tab for every
+ * conversation until a page reload, so admission is the panel's defence and a
+ * render error is a bug.
+ */
+const BUDGET_LIMITS = ['maxTokens', 'maxSteps', 'maxWorkers', 'maxDurationMs', 'maxTasks', 'maxExperiments'] as const
+/** The host-created project snapshot, on a mission or on a saved request. */
+function baseline(value: unknown): boolean {
+  return record(value) && typeof value.snapshotCommit === 'string' && typeof value.sourceHead === 'string'
+    && typeof value.planningWorkspace === 'string' && strings(value.changedPaths) && finite(value.createdAt)
+}
+
+/**
+ * The one budget rule, for a mission's budget, the configured default a new
+ * draft starts from (initial state and heartbeat alike) and a saved draft's:
+ * every limit the budget metrics and the editor's fields read is a finite
+ * number, and a fixed deadline, when set, is one. Positive safe integers are the
+ * runtime's policy (`validatedBudget`, `validatePlan`), which refuses a save
+ * that breaks it; admission only keeps render safe.
+ */
+export function readBudget(value: unknown): Budget | undefined {
+  return record(value) && BUDGET_LIMITS.every(key => finite(value[key])) && optionalFinite(value.deadlineAt)
+    ? value as unknown as Budget : undefined
+}
+
 /** Treat historical payloads as untrusted, including malformed or incompatible versions. */
 export function readSnapshot(value: unknown): Snapshot | undefined {
   const candidate = record(value) && 'swarmSnapshot' in value ? value.swarmSnapshot
     : record(value) && 'snapshot' in value ? value.snapshot : value
   if (!record(candidate) || !record(candidate.mission)) return undefined
   const mission = candidate.mission
-  if (mission.baseline !== undefined && (!record(mission.baseline)
-    || typeof mission.baseline.snapshotCommit !== 'string' || typeof mission.baseline.sourceHead !== 'string'
-    || typeof mission.baseline.planningWorkspace !== 'string' || !strings(mission.baseline.changedPaths)
-    || !finite(mission.baseline.createdAt))) return undefined
+  if (mission.baseline !== undefined && !baseline(mission.baseline)) return undefined
   if (typeof mission.id !== 'string' || typeof mission.title !== 'string'
     || typeof mission.objective !== 'string' || typeof mission.status !== 'string'
     || (mission.reason !== undefined && typeof mission.reason !== 'string')
     || !finite(mission.updatedAt) || !finite(mission.createdAt) || !finite(mission.deadline)
     || !finite(mission.usedSteps) || !finite(mission.usedTokens)
-    || !record(mission.budget) || !strings(mission.scope) || !strings(mission.acceptance)) return undefined
-  if (!['maxTokens', 'maxSteps', 'maxWorkers', 'maxDurationMs', 'maxTasks', 'maxExperiments'].every(key => finite((mission.budget as Record<string, unknown>)[key]))) return undefined
+    || readBudget(mission.budget) === undefined || !strings(mission.scope) || !strings(mission.acceptance)) return undefined
   // Optional fields keep pre-accounting and pre-recovery snapshots readable,
   // but any values present must be safe for the progress and usage renderers.
   if (!usage(mission.workerUsage) || !usage(mission.ownerUsage)) return undefined
@@ -205,6 +237,53 @@ export function readSnapshot(value: unknown): Snapshot | undefined {
   if (!(candidate.events as unknown[]).every(event => record(event) && typeof event.seq === 'number'
     && typeof event.type === 'string' && typeof event.createdAt === 'number')) return undefined
   return candidate as unknown as Snapshot
+}
+
+function planMember(value: unknown): boolean {
+  return record(value) && typeof value.key === 'string' && typeof value.name === 'string' && typeof value.role === 'string'
+    && optionalString(value.provider) && optionalString(value.model) && optionalString(value.reasoningEffort)
+}
+function planWorkstream(value: unknown): boolean {
+  return record(value) && typeof value.key === 'string' && typeof value.title === 'string' && typeof value.objective === 'string'
+}
+function planTask(value: unknown): boolean {
+  return record(value) && typeof value.key === 'string' && typeof value.workstreamKey === 'string'
+    && typeof value.title === 'string' && typeof value.objective === 'string' && typeof value.kind === 'string'
+    && strings(value.scope) && strings(value.acceptance)
+    && optionalStrings(value.outputs) && optionalStrings(value.checks) && optionalStrings(value.covers) && optionalStrings(value.dependencies)
+    && optionalString(value.assigneeKey) && optionalString(value.reviewOf)
+    && optionalFinite(value.priority) && (value.experiment === undefined || typeof value.experiment === 'boolean')
+}
+/**
+ * A saved draft as the mission picker, the start guide and the draft editor
+ * read it: its identity, revision and status, its error and preflight notes,
+ * and every plan field the editor shows or edits (title, objective, scope,
+ * criteria and budget; each member's name, role and model choice; each
+ * workstream; each task's fields, criteria, covers, checks, outputs and links).
+ */
+export function readDraft(value: unknown): DraftPlan | undefined {
+  if (!record(value) || typeof value.id !== 'string' || typeof value.status !== 'string' || !finite(value.revision)
+    || !optionalString(value.missionId) || !optionalString(value.error) || !optionalStrings(value.advisories)) return undefined
+  const input = value.input
+  return record(input) && typeof input.title === 'string' && typeof input.objective === 'string'
+    && strings(input.scope) && strings(input.acceptance) && readBudget(input.budget) !== undefined
+    && Array.isArray(input.members) && input.members.every(planMember)
+    && Array.isArray(input.workstreams) && input.workstreams.every(planWorkstream)
+    && Array.isArray(input.tasks) && input.tasks.every(planTask)
+    ? value as unknown as DraftPlan : undefined
+}
+
+/**
+ * A saved automatic request as the start section, the mission picker and the
+ * selection read it: its identity, goal, status, times and planning epoch, the
+ * draft and mission it led to, its error, and its project snapshot.
+ */
+export function readStart(value: unknown): AutoStart | undefined {
+  return record(value) && typeof value.id === 'string' && typeof value.status === 'string' && typeof value.goal === 'string'
+    && finite(value.createdAt) && finite(value.updatedAt) && optionalFinite(value.planningEpoch)
+    && optionalString(value.draftId) && optionalString(value.missionId) && optionalString(value.error)
+    && (value.baseline === undefined || baseline(value.baseline))
+    ? value as unknown as AutoStart : undefined
 }
 
 /** UI-only native tool metadata takes precedence; text JSON remains a compatibility path. */
