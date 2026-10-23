@@ -33,9 +33,8 @@ const SHARED_CLIENT_MODULES = ['react', 'react-dom', '@deepseek-ai/cordis']
 /**
  * Load a native client bundle as the web host does: its factory takes the
  * host module table's `require`. Beyond the identities this test shares, the
- * table carries more of the host's modules (0.2.1 adds `zod` and
- * `@tanstack/react-virtual`); those resolve from the native package's own
- * directory.
+ * table carries more of the host's modules (`zod`, `@tanstack/react-virtual`);
+ * those resolve from the native package's own directory.
  */
 async function nativeClient(packageName) {
   const testRequire = createRequire(import.meta.url)
@@ -84,9 +83,8 @@ test('board separates queued, blocked and cancelled work and clamps budget', () 
 test('UI reads native private metadata and rejects incompatible historical payloads', () => {
   const snapshot = uiSnapshot()
   assert.deepEqual(snapshotFromResult({ swarmSnapshot: snapshot }, []), snapshot)
-  assert.deepEqual(snapshotFromResult(undefined, [{ type: 'tool-result', content: [{ type: 'text', text: JSON.stringify({ snapshot }) }] }]), snapshot)
+  assert.deepEqual(snapshotFromResult(undefined, [{ type: 'text', text: JSON.stringify({ snapshot }) }]), snapshot)
   assert.equal(snapshotFromResult({ swarmSnapshot: { mission: { id: 'broken' } } }, []), undefined)
-  assert.equal(snapshotFromResult(undefined, [{ type: 'tool-result', isError: true, content: [{ type: 'text', text: JSON.stringify(snapshot) }] }]), undefined)
 })
 
 test('board keeps borrowable work ready when its preference stops and validates assignment policy', () => {
@@ -109,14 +107,13 @@ test('native conversation fold presents only successful explicit swarm observati
   assert.deepEqual(swarmCardDefinition.match(start.event), { id: 'call-1', role: 'start' })
   assert.equal(swarmCardDefinition.match({ ...start.event, data: { ...start.event.data, name: 'other_tool' } }), null)
   const context = { state: {}, start, id: 'call-1', key: 'key' }
-  const result = { event: { type: 'tool/result', data: { meta: { swarmSnapshot: snapshot }, message: { source: { kind: 'tool', callId: 'call-1' }, content: [] } } } }
+  const result = { event: { type: 'tool/result', data: { meta: { swarmSnapshot: snapshot }, message: { role: 'tool', source: { kind: 'tool', callId: 'call-1' }, toolCallId: 'call-1', content: [] } } } }
   context.state = swarmCardDefinition.update(context, result)
   assert.equal(swarmCardDefinition.buildViewNode(context).data.mission.id, snapshot.mission.id)
   assert.deepEqual(swarmCardDefinition.update({ ...context, state: {} }, { event: { ...result.event, data: { ...result.event.data, error: { name: 'Error' } } } }), {})
-  // A failed tool result: 0.1.7 flags the tool-role message, 0.1.5 its nested tool-result block.
+  // A failed call's tool-role message carries isError itself.
   const failedResult = message => ({ event: { ...result.event, data: { ...result.event.data, message: { ...result.event.data.message, ...message } } } })
-  assert.deepEqual(swarmCardDefinition.update({ ...context, state: {} }, failedResult({ role: 'tool', toolCallId: 'call-1', isError: true })), {})
-  assert.deepEqual(swarmCardDefinition.update({ ...context, state: {} }, failedResult({ content: [{ type: 'tool-result', toolCallId: 'call-1', isError: true, content: [] }] })), {})
+  assert.deepEqual(swarmCardDefinition.update({ ...context, state: {} }, failedResult({ isError: true })), {})
 })
 
 test('current native Conversation assembler rebuilds swarm cards from durable tool events', async () => {
@@ -246,30 +243,23 @@ test('live monitor fences switched-session responses and aborts all work on disp
 })
 
 test('worker navigation opens its independent native session and rejects missing list entries', async () => {
-  const opened = []
-  const list = { getSnapshot: () => ({ byId: { worker: { id: 'worker' } } }) }
-  // 0.1.5: the sessions face navigates.
-  const legacy = { sessions: { list, open: sessionId => opened.push(sessionId) }, get: () => undefined }
-  assert.equal(openWorker(legacy, 'worker'), true)
-  assert.deepEqual(opened, ['worker'])
-  assert.equal(openWorker(legacy, 'missing'), false, 'missing live row delegates to read-only native history')
-  assert.equal(opened.length, 1)
-  // 0.1.7: no sessions.open; navigation belongs to the workspace UI service.
   const navigated = []
-  const modern = { sessions: { list }, get: name => name === 'uiWorkspace' ? { openSession: target => navigated.push(target) } : undefined }
-  assert.equal(openWorker(modern, 'worker'), true)
+  const list = { getSnapshot: () => ({ ids: ['worker'], byId: { worker: { id: 'worker', retainedBy: {} } } }) }
+  const ctx = { sessions: { list }, get: name => name === 'uiWorkspace' ? { openSession: target => navigated.push(target) } : undefined }
+  assert.equal(openWorker(ctx, 'worker'), true, 'a listed worker opens through the workspace UI service')
   assert.deepEqual(navigated, ['worker'])
+  assert.equal(openWorker(ctx, 'missing'), false, 'missing live row delegates to read-only native history')
+  assert.equal(navigated.length, 1)
   assert.equal(openWorker({ sessions: { list }, get: () => undefined }, 'worker'), false, 'no navigation service: fall back to persisted history')
 })
 
-test('session selection supports 0.1.5 current and the retained 0.1.7 main view', () => {
+test('the session on screen is the one the main conversation view retains', () => {
   const background = { retainedBy: { worker: 1, mainView: 0 } }
   const displayed = { retainedBy: { mainView: 1 } }
   const sessions = snapshot => ({ list: { getSnapshot: () => snapshot } })
-  assert.equal(currentSessionId(sessions({ current: 'legacy', byId: { displayed } })), 'legacy')
   assert.equal(currentSessionId(sessions({ ids: ['background', 'displayed'], byId: { background, displayed } })), 'displayed')
-  assert.equal(currentSessionId(sessions({ byId: { background, displayed } })), 'displayed')
   assert.equal(currentSessionId(sessions({ ids: ['background'], byId: { background } })), undefined)
+  assert.equal(currentSessionId(sessions({ ids: [], byId: {} })), undefined)
   assert.equal(currentSessionId(undefined), undefined)
 })
 
@@ -374,11 +364,11 @@ test('cold worker history paginates native events, renders inert tool results, a
     return new Promise(resolve => pending.push(resolve))
   })
   history.open('worker-a', 'Builder')
-  pending[0]({ events: [{ event: { seq: 8, type: 'tool/result', data: { message: { content: [{ type: 'tool-result', isError: true, content: [{ type: 'text', text: '<script>untrusted()</script> command output' }] }] } } } }], hasMore: true })
+  pending[0]({ events: [{ event: { seq: 8, type: 'tool/result', data: { message: { role: 'tool', isError: true, content: [{ type: 'text', text: '<script>untrusted()</script> command output' }] } } } }], hasMore: true })
   await new Promise(resolve => setImmediate(resolve))
   const html = renderToStaticMarkup(React.createElement(WorkerTranscript, { history }))
   assert.match(html, /Read-only worker transcript/)
-  assert.match(html, /Tool error/, 'native nested tool-result failure is labelled correctly')
+  assert.match(html, /Tool error/, 'a failed tool-role message is labelled correctly')
   assert.match(html, /&lt;script&gt;untrusted\(\)&lt;\/script&gt;/)
   assert.doesNotMatch(html, /<script>/)
   const older = history.load()
@@ -388,8 +378,10 @@ test('cold worker history paginates native events, renders inert tool results, a
   assert.deepEqual(history.getSnapshot().entries.map(entry => entry.event.seq), [2, 8])
   assert.equal(transcriptEntry(history.getSnapshot().entries[0]).text, 'Assignment')
   const toolMessage = isError => ({ event: { seq: 9, type: 'tool/result', data: { message: { role: 'tool', toolCallId: 'call-9', isError, content: [{ type: 'text', text: 'output' }] } } } })
-  assert.deepEqual(transcriptEntry(toolMessage(true)), { role: 'Tool error', text: 'output' }, 'a 0.1.7 tool-role failure is labelled correctly')
+  assert.deepEqual(transcriptEntry(toolMessage(true)), { role: 'Tool error', text: 'output' }, 'a tool-role failure is labelled correctly')
   assert.deepEqual(transcriptEntry(toolMessage(false)), { role: 'Tool result', text: 'output' })
+  const withImage = { event: { seq: 10, type: 'user/message', data: { role: 'user', content: [{ type: 'text', text: 'See the screenshot' }, { type: 'image', attachment: { id: 'attachment-1' } }] } } }
+  assert.deepEqual(transcriptEntry(withImage), { role: 'Input', text: 'See the screenshot\n[image]' }, 'each block of the flat content list is read in order')
   history.open('worker-b', 'Reviewer')
   history.close()
   pending[2]({ events: [{ event: { seq: 1, type: 'user/message', data: { content: 'late' } } }], hasMore: false })
@@ -654,7 +646,7 @@ test('right sidebar adapter: passive tab registration, its body seat, and explic
 
 test('right sidebar adapter: an explicit refused reveal stays native until its session surface exists', async t => {
   t.mock.timers.enable({ apis: ['setInterval'] })
-  // The 0.1.5 host answers a write with no mounted session surface by throwing
+  // The host answers a write with no mounted session surface by throwing
   // (`sidebarRight: no session surface is mounted`). Only explicit intent creates
   // a retry request; registration and ordinary session signals remain passive.
   // Native ownership covers a pending request so it cannot open a second surface.
@@ -665,7 +657,7 @@ test('right sidebar adapter: an explicit refused reveal stays native until its s
     inject(name, factory) { const release = factory(); return () => release?.() },
     register(options) { return () => {} },
   }
-  const sessions = { listeners: [], subscribe(listener) { this.listeners.push(listener); return () => {} }, getSnapshot: () => ({ current: 's1' }) }
+  const sessions = { listeners: [], subscribe(listener) { this.listeners.push(listener); return () => {} }, getSnapshot: () => ({ ids: ['s1'], byId: { s1: { retainedBy: { mainView: 1 } } } }) }
   const ctx = {
     inject(names, factory) {
       const available = { slots, sidebarRightTabs: registry, sidebarRight: ctx.get('sidebarRight'), layout: ctx.get('layout') }

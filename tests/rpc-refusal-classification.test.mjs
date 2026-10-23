@@ -119,8 +119,9 @@ test('the RPC boundary decides visibility by type: no message allowlist, one scr
   visit(tree)
   assert.ok(calls.length >= 10, 'the collaborator calls are wrapped')
   for (const call of calls) assert.ok(call.flag === undefined || call.flag === 'true', `${file}:${call.line} passes only the boolean scrub-exempt flag`)
-  // Only the two validators that echo the caller's own input are scrub-exempt.
-  assert.deepEqual(calls.filter(call => call.flag === 'true').map(call => /validatePlan|workerModelSelection/.exec(call.operation)?.[0]).sort(), ['validatePlan', 'workerModelSelection'])
+  // Only the plan validator, which echoes the caller's own input, is scrub-exempt;
+  // a route refusal is the runtime's own typed refusal (`admitMemberRoutes`).
+  assert.deepEqual(calls.filter(call => call.flag === 'true').map(call => /validatePlan/.exec(call.operation)?.[0]), ['validatePlan'])
 })
 
 test('typed refusal sites retain authored codes, categories, and messages independently of legacy prose', () => {

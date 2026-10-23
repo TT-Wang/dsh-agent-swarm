@@ -4,7 +4,7 @@ import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 /** The releases compatibility.json, the dsh-* peer ranges and the profile's requires.harness name (tests pin them together). */
-export const SUPPORTED_HARNESS_RELEASES: readonly string[] = ['0.1.5-rc.3', '0.1.7-rc.1', '0.2.1-rc.2']
+export const SUPPORTED_HARNESS_RELEASES: readonly string[] = ['0.2.1-rc.2']
 
 /** A Harness package every host provides and this plugin imports at runtime. */
 const PROBE = '@deepseek-ai/dsh-session'
@@ -34,10 +34,13 @@ export function loadedHarnessVersion(resolve: (specifier: string) => string = sp
 interface VersionLogger { error(message: string): void, warn(message: string): void }
 
 /**
- * Log, never throw, when the host is not a supported release. 0.1.7 and 0.2.1
- * refuse a plugin whose dsh-* peer ranges exclude them, but 0.1.5-rc.3 has no
- * peer-version gate and no host reads the profile's requires.harness, so on a
- * host without such a gate this is the only runtime notice.
+ * Log, never throw, when the host is not a supported release. A host with a
+ * peer-version gate (0.1.7-rc.1, 0.2.x) refuses to install, and skips at boot,
+ * a plugin whose dsh-* peer ranges exclude it, unless its owner exempted this
+ * exact plugin version on that release. A host without one (0.1.6-alpha.2,
+ * 0.1.5-rc.3 and earlier) applies the plugin anyway, where it is not expected
+ * to work, and no host reads the profile's requires.harness, so there this is
+ * the only runtime notice.
  * @param read - the version source; undefined from it means unreadable.
  * @returns what was found, for the caller and the tests.
  */

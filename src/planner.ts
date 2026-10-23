@@ -2,10 +2,11 @@
 import type { Context } from '@deepseek-ai/cordis'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import { freezeMessage, MessageId, type UserMessage } from '@deepseek-ai/dsh-llm'
-import { SessionId } from '@deepseek-ai/dsh-session'
 import { realpath } from 'node:fs/promises'
 import { registerSwarmCommand } from './command.ts'
 import { ownerModelSelection } from './model-selection.ts'
+import { thrownText } from './policy-error.ts'
+import { wakeableAgent } from './harness-workers.ts'
 import { runProcess } from './workspaces.ts'
 import type { SwarmRuntime } from './runtime.ts'
 import type { AutoStart } from './types.ts'
@@ -93,12 +94,15 @@ export function registerAutomaticStart(ctx: Context, runtime: SwarmRuntime): voi
   const deliver = async (request: AutoStart, kind: 'planning' | 'failure' | 'warning', signal: AbortSignal) => {
     const epoch = request.planningEpoch ?? 1
     const actor = { sessionId: request.ownerSessionId, signal }
-    const agent = ctx.agents.get(SessionId(request.ownerSessionId))
+    // Only an owner that can still take a wake (`wakeableAgent`): an owner
+    // being disposed, whose planning turn the disposal cancelled, leaves the
+    // notice pending for the session's next agent.
+    const agent = wakeableAgent(ctx, request.ownerSessionId)
     if (agent === undefined) return
     if (kind === 'planning') await runtime.prepareStart(actor, request.id, epoch)
     signal.throwIfAborted()
     const current = pending(request.id, epoch, kind)
-    if (current === undefined || ctx.agents.get(agent.id) !== agent) return
+    if (current === undefined || wakeableAgent(ctx, request.ownerSessionId) !== agent) return
     if (kind === 'warning' && current.planningWarning?.deadline !== request.planningWarning?.deadline) return
     const message = kind === 'planning' ? planningMessage(current) : kind === 'warning' ? planningWarningMessage(current) : recoveryMessage(current)
     const seen = agent.session.snapshotEvents().some(event => (event.type === 'user/message' && event.data.id === message.id)
@@ -161,7 +165,7 @@ export function registerAutomaticStart(ctx: Context, runtime: SwarmRuntime): voi
         const kind = request.status === 'planning' && request.planningDispatchPending ? 'planning'
           : request.status === 'failed' && request.recoveryNoticePending ? 'failure'
             : ['planning', 'launching'].includes(request.status) && request.planningWarning !== undefined && request.planningWarning.deadline === request.planningDeadlineAt && request.planningWarning?.deliveredAt === undefined ? 'warning' : undefined
-        if (kind === undefined || ctx.agents.get(SessionId(request.ownerSessionId)) === undefined) continue
+        if (kind === undefined || wakeableAgent(ctx, request.ownerSessionId) === undefined) continue
         const key = `${request.id}:${request.planningEpoch ?? 1}:${kind}${kind === 'warning' ? `:${request.planningWarning?.deadline}` : ''}`
         if (inFlight.has(key)) continue
         inFlight.add(key)
@@ -208,13 +212,19 @@ export function registerAutomaticStart(ctx: Context, runtime: SwarmRuntime): voi
     try {
       request = await runtime.prepareStart({ sessionId, signal }, request.id, request.planningEpoch ?? 1)
       signal.throwIfAborted()
-      if (disposed || ctx.agents.get(agent.id) !== agent) throw new Error('当前对话已关闭，请重新打开后重试。')
+      // The planning message wakes the owner, so it asks what every waking
+      // delivery asks (`wakeableAgent`): an owner whose disposal began while
+      // the snapshot was prepared is not woken, and the failure recorded below
+      // waits for the session's next agent.
+      if (disposed || wakeableAgent(ctx, sessionId) !== agent) throw new Error('当前对话已关闭，请重新打开后重试。')
       const current = runtime.store.get('starts', request.id)
       if (current?.status !== 'planning' || current.planningFenced || (current.planningEpoch ?? 1) !== (request.planningEpoch ?? 1)) throw new Error('Planning request was stopped or superseded')
       agent.followup(planningMessage(request))
       watchIdle(agent, request)
     } catch (error) {
-      if (!disposed && !runtime.shuttingDown && !runtime.closed) runtime.failStart({ sessionId }, request.id, error instanceof Error ? error.message : String(error), request.planningEpoch ?? 1)
+      // Recorded as the failure's readable text, which the recovery notice
+      // quotes to the owner's model; never "[object Object]".
+      if (!disposed && !runtime.shuttingDown && !runtime.closed) runtime.failStart({ sessionId }, request.id, thrownText(error), request.planningEpoch ?? 1)
       throw error
     }
     return { kind: 'success', text: '已保存当前项目快照，正在自动规划协作。你可以继续编辑项目，成员和进度会显示在侧边栏。' }

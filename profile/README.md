@@ -19,7 +19,7 @@ dependency on the platform it mounts; it exports no runtime API.
 | --- | --- | --- |
 | `dsh.bundle.patch` | `./cordis.patch.yml` | the package's runtime content |
 | `dsh.bundle.requires.bundles` | `@deepseek-ai/dsh-base`, `@deepseek-ai/dsh-web-app` | host layers that must precede this bundle in `dsh.profile.bundles` |
-| `dsh.bundle.requires.harness` | the exact supported Harness releases | mirrors [`../compatibility.json`](../compatibility.json) |
+| `dsh.bundle.requires.harness` | the supported Harness release | mirrors [`../compatibility.json`](../compatibility.json) |
 | `dsh.bundle.conflicts.bundles` | `@dsh-external/dsh-agent-swarm` | the plugin package's own bundle patch inserts the same row id, so mounting both layers duplicates it — mount either this bundle or the bare plugin, never both |
 | `dependencies` | `@dsh-external/dsh-agent-swarm` (`file:..`) | the platform payload, resolved as the sibling package in this checkout |
 

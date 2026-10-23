@@ -22,7 +22,7 @@
  * registration path) and refuses to decode a stored log containing an unknown
  * type unless its envelope carries `ignorable: true` — which `Session.append()`
  * cannot set. The result was a log only its writer could not read back:
- * `test:harness`, `test:profile` and `test:pack` refused on every supported host
+ * `test:harness`, `test:profile` and `test:pack` refused on every host then supported
  * with `SessionFormatUnsupportedError … "swarm/mission" … not marked ignorable`.
  * The projection is derived state, the durable truth already lives in
  * `swarm.sqlite`, and the derivation was already the fallback read face, so the

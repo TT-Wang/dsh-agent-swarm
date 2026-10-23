@@ -134,7 +134,7 @@ export function installHostTelemetry(ctx: Context, runtime: unknown): Fiber {
 
 /** Register the host service and all consumers under one disposable plugin fiber. */
 export async function apply(ctx: Context, config: Config): Promise<void> {
-  // An unsupported host is logged, not refused: 0.1.5-rc.3 enforces no peer range.
+  // An unsupported host is logged, not refused: refusing is the host's peer-range gate, where it has one.
   reportHarnessSupport(ctx.logger)
   if (!isAbsolute(config.statePath) || !isAbsolute(config.workspacesRoot)) throw new Error('Swarm statePath and workspacesRoot must be absolute')
   // Human authorization is read exactly once here, from plugin configuration.
@@ -177,6 +177,6 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
   const ownerReplies = new OwnerReplyGuard(ctx, runtime, { maxNudges: config.maxOwnerReplyNudges })
   ctx.effect(() => () => ownerReplies.dispose(), 'swarm.owner-reply-guard')
   ctx.inject(['commands'], commands => registerAutomaticStart(commands, runtime))
-  ctx.inject(['connection', 'webServer'], browser => registerWebApi(browser, runtime, { defaultBudget: config.defaultBudget, maxPayloadBytes: 1048576 }))
+  ctx.inject(['connection'], browser => registerWebApi(browser, runtime, { defaultBudget: config.defaultBudget, maxPayloadBytes: 1048576 }))
   await runtime.start()
 }

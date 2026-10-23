@@ -104,6 +104,32 @@ export interface ProviderOutage {
 }
 /** The last classified outage observed for a member, used to avoid spending recovery credit. */
 export interface MemberProviderOutage extends ProviderOutage { at: number }
+/**
+ * A model step the member's own route refused (`PROVIDER_FAILURE_CODES` class
+ * `member` in `scheduler.ts`): the Harness failure code and the host's text. A
+ * member's route is fixed for its session, so no wait, retry or recovery of
+ * that member runs it again.
+ */
+export interface MemberRouteRefusal { code: string; message: string }
+/** The route fields one member admission names; each one it omits is inherited from the owner's conversation. */
+export type MemberRouteInput = Pick<PlanMember, 'provider' | 'model' | 'reasoningEffort'>
+/**
+ * The host's answer for one member's route, resolved as its worker will run it
+ * and prepared as its model step prepares it (`memberRoutes`,
+ * src/model-selection.ts). Accepted; refused for its reasoning effort, with the
+ * efforts the route declares (none when its model declares no reasoning);
+ * model-refused, the route refusing its model with a `member`-class code
+ * (`MemberRouteRefusal`) other than the effort's, as the DeepSeek account
+ * catalog does with MODEL_UNSUPPORTED and CLIENT_UPGRADE_REQUIRED; or
+ * unavailable, a route the host does not resolve at all. `provider` and `model`
+ * are the route the worker would run, inherited ones included; the host's own
+ * text is never carried.
+ */
+export type MemberRoute =
+  | { verdict: 'accepted' }
+  | { verdict: 'effort-unsupported'; provider: string; model: string; effort: string; efforts: string[] }
+  | { verdict: 'model-refused'; provider: string; model: string; code: string }
+  | { verdict: 'unavailable'; provider: string; model: string }
 /** R11-01: how long a classified provider outage keeps a member's route quiescent. */
 export const PROVIDER_OUTAGE_WINDOW_MS = 5 * 60_000
 /**
@@ -751,23 +777,20 @@ export interface Delivery {
  * The host's shared browser-transport channel and this plugin's endpoint prefix
  * inside it.
  *
- * Every supported release mounts the connection plugin's `/api` route and offers
- * `ctx.connection.rpc.intercept('/api', …)` for plugin endpoints. A plugin-owned
- * channel (`rpc.handle('/agent-swarm', …)`) is unusable on 0.1.5: the connection
- * service resolves `webServer` on its own context, which
- * injects `credentials` alone, and Cordis refuses that property access
- * (`cannot get property "webServer" without inject`), so the channel route is
- * never registered. The client posts to `<channel>/<endpoint>`, so both halves
- * agree on `SWARM_RPC_CHANNEL` plus `SWARM_RPC_PREFIX` in front of the endpoint.
+ * The connection plugin owns the sole `/api` route of the Web carrier, and the
+ * plugin's endpoints are exact routes under it (`registerWebApi`, which says why
+ * neither the channel's interceptor nor a plugin-owned channel serves them). The
+ * client posts to `<channel>/<endpoint>`, so both halves agree on
+ * `SWARM_RPC_CHANNEL` plus `SWARM_RPC_PREFIX` in front of the endpoint.
  */
 export const SWARM_RPC_CHANNEL = '/api'
 export const SWARM_RPC_PREFIX = 'agent-swarm/'
 
 /**
  * Every endpoint the panel may call, and therefore every exact route the host is
- * asked for. 0.1.5 admits one interceptor per shared channel, so the plugin
- * registers one route per endpoint instead; the list, the handler's dispatch and
- * the naming manifest are pinned together by tests.
+ * asked for: the shared channel admits one interceptor, which the API gateway
+ * holds, so the plugin registers one route per endpoint instead. The list, the
+ * handler's dispatch and the naming manifest are pinned together by tests.
  */
 export const SWARM_WEB_ENDPOINTS: readonly string[] = [
   'state', 'watch', 'models', 'control', 'cancel', 'delivery', 'apply-delivery', 'worker-history',
@@ -794,7 +817,7 @@ export const OWNER_ONLY_TOOLS: readonly string[] = [
  * enforcement points as `OWNER_ONLY_TOOLS`: the worker projection hides each
  * one the host registers (`src/tools.ts`), and the runtime guard refuses every
  * one of them (`src/runtime.ts`). A name a host does not register costs nothing
- * to deny. The 0.2.x hosts register them:
+ * to deny. Harness registers them where a profile mounts them:
  *  - `working_directory` moves the session's durable working directory, which
  *    bash, file tools and the model's directory context follow, out of the
  *    worktree (the base bundle mounts it for every session);
@@ -1104,6 +1127,12 @@ export interface WorkerCallbacks {
    * attempt alive and never spends recovery credit on the pause.
    */
   providerOutage(memberId: string, outage: ProviderOutage): void
+  /**
+   * A model step the member's own route refused (`MemberRouteRefusal`). The
+   * adapter classifies, and this is the error's one report (never also a
+   * `failure`); the runtime retires the member and releases its work.
+   */
+  routeRefused(memberId: string, refusal: MemberRouteRefusal): void
 }
 /** One declared check `/bin/sh` could not parse: its position in the probed list and the parser's own diagnostic. */
 export interface CheckSyntaxIssue { index: number; message: string }
@@ -1139,6 +1168,15 @@ export interface WorkerAdapter {
    * `checks`; a command that parses has no entry, so callers pair by `index`.
    */
   checkSyntaxPreflight(checks: readonly string[], cwd: string, signal?: AbortSignal): Promise<CheckSyntaxIssue[]>
+  /**
+   * Resolve each member's model route as its worker will run it, the owner
+   * session's current selection under the member's own route fields, and ask
+   * the host whether that route takes its model and reasoning effort, the
+   * question its model step asks, without a model request. One answer per
+   * member, in input order; no worker, worktree or session is touched.
+   * Admission decides on the answers.
+   */
+  memberRoutes(ownerSessionId: string, members: readonly MemberRouteInput[], signal?: AbortSignal): Promise<MemberRoute[]>
   /**
    * Whether the member's handle could take an assignment now. A question:
    * asking it changes nothing, so a decision may ask it any number of times. An

@@ -185,8 +185,8 @@ export function runNode(args, options = {}) {
  * runtime gave before these methods were required: `inspectArtifact` keeps the
  * stored artifact, `checkpointTask`, `compactAtBoundary`,
  * `invalidateComposition` and `drainStrandedInbox` (no handle here holds input)
- * do nothing, `checkSyntaxPreflight` finds no issue and
- * the delivery pair refuses with `delivery_unsupported`. They answer
+ * do nothing, `checkSyntaxPreflight` finds no issue, `memberRoutes` accepts
+ * every route and the delivery pair refuses with `delivery_unsupported`. They answer
  * synchronously, so each awaited call takes a single microtask. (A stop whose
  * recorded owner has no member row is refused as unconfirmable, as it is for the
  * Harness adapter; the store never deletes a member.)
@@ -247,6 +247,7 @@ export class FakeWorkers {
   compactAtBoundary() {}
   invalidateComposition() {}
   checkSyntaxPreflight() { return [] }
+  memberRoutes(_ownerSessionId, members) { return members.map(() => ({ verdict: 'accepted' })) }
   inspectDelivery() { throw new PolicyError('delivery_unsupported', 'tool_error', 'This worker adapter does not support delivery inspection') }
   applyDelivery() { throw new PolicyError('delivery_unsupported', 'tool_error', 'This worker adapter does not support applying results') }
   async dispose() {}

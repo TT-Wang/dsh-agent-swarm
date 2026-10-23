@@ -11,7 +11,7 @@ import assert from 'node:assert/strict'
 import { mkdir, rm } from 'node:fs/promises'
 import { join } from 'node:path'
 import { bootFaultHarness, resolveHarnessRoot, FAULT_OWNER } from './loader.mjs'
-import { importHarness, toolResultBlocks } from '../fixtures/built-harness.mjs'
+import { importHarness } from '../fixtures/built-harness.mjs'
 import { makeRepo, eventually, events, budget as defaultBudget, runScenario } from './harness.mjs'
 import { requests, faults, setScript } from './scripted-provider.mjs'
 
@@ -54,10 +54,10 @@ export async function providerFixture({ leaseMs = 60_000, fault }) {
     if (session.header.id !== author.sessionId) return
     if (event.type === 'tool/call') sessionEvents.push({ type: 'call', name: event.data.name, arguments: event.data.arguments })
     if (event.type === 'tool/result') {
-      const results = event.data.message === undefined ? [] : toolResultBlocks([event.data.message])
+      const { message } = event.data
       sessionEvents.push({
-        type: 'result', isError: results.some(block => block.isError),
-        text: results.flatMap(block => (block.content ?? []).filter(part => part.type === 'text').map(part => part.text)).join('\n'),
+        type: 'result', isError: message.isError === true,
+        text: message.content.filter(part => part.type === 'text').map(part => part.text).join('\n'),
       })
     }
   })

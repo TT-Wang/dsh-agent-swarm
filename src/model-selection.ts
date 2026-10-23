@@ -2,11 +2,13 @@
 import type { Context } from '@deepseek-ai/cordis'
 import type { Agent, ModelSelection } from '@deepseek-ai/dsh-agent'
 import { ReasoningEffortId } from '@deepseek-ai/dsh-llm'
+import { SessionId } from '@deepseek-ai/dsh-session'
 import type {} from '@deepseek-ai/dsh-api-session-controller/types'
 import type {} from '@deepseek-ai/dsh-session-projection'
 import type {} from '@deepseek-ai/dsh-agent-default-model'
-import type { PlanMember } from './types.js'
-import { PolicyError } from './policy-error.js'
+import type { MemberRoute, MemberRouteInput } from './types.js'
+import { PolicyError, thrownText } from './policy-error.js'
+import { memberRouteRefusal } from './scheduler.js'
 
 function sameSelection(left: ModelSelection, right: ModelSelection): boolean {
   return left.provider === right.provider && left.model === right.model && left.reasoningEffort === right.reasoningEffort
@@ -45,10 +47,90 @@ export async function ownerModelSelection(ctx: Context, owner: Agent, signal?: A
 }
 
 /** A newly selected route restores provider defaults unless effort is explicit. */
-export function workerModelSelection(owner: ModelSelection | undefined, member: Pick<PlanMember, 'provider' | 'model' | 'reasoningEffort'>): ModelSelection {
+function workerModelSelection(owner: ModelSelection | undefined, member: MemberRouteInput): ModelSelection {
   const provider = member.provider ?? owner?.provider
   const model = member.model ?? owner?.model
   if (!provider || !model) throw new PolicyError('model_selection_required', 'authorization_error', 'Choose an explicit provider and model or open an owner session with a model selection')
   const effort = member.reasoningEffort ?? (member.provider === undefined && member.model === undefined ? owner?.reasoningEffort : undefined)
   return { provider, model, ...(effort === undefined ? {} : { reasoningEffort: ReasoningEffortId(effort) }) }
+}
+
+/**
+ * The route a worker is created on: the owner's selection (`inherited`) under
+ * the member's own route fields, or none when neither names one, and the
+ * worker runs its preset's defaults. Worker composition and admission
+ * (`memberRoutes`) both read it, so admission checks the route a worker runs.
+ */
+export function workerRoute(inherited: ModelSelection | undefined, member: MemberRouteInput): ModelSelection | undefined {
+  return inherited === undefined && member.provider === undefined && member.model === undefined && member.reasoningEffort === undefined
+    ? undefined : workerModelSelection(inherited, member)
+}
+
+/**
+ * Each member's route as its worker will run it (`workerRoute` under the owner
+ * session's current selection), prepared as its model step prepares it: the
+ * agent loop calls `llm.prepareCall` before every request, and so does
+ * admission, so the route's adapter admits the model (the DeepSeek account
+ * catalog refuses one this Harness release does not run) and the host
+ * validates the effort, both before any provider request. The prepared call is
+ * never dispatched. A refusal is read by the table that reads a step's refusal
+ * (`memberRouteRefusal`, src/scheduler.ts), so admission and a step refuse on
+ * one rule: a refused effort is answered with the efforts that model declares
+ * (`llm.resolveModelInfo`), another `member`-class code is the route refusing
+ * its model, and any other failure, a failed lookup of those efforts included,
+ * is an unavailable route (`resolvedRoute`). The host's text can
+ * carry host paths or internal route codes (SURFACE-R3-01), so it is logged and
+ * never returned. A worker that runs no route of its own has nothing to resolve.
+ */
+export async function memberRoutes(ctx: Context, ownerSessionId: string, members: readonly MemberRouteInput[], signal?: AbortSignal): Promise<MemberRoute[]> {
+  const owner = ctx.agents.get(SessionId(ownerSessionId))
+  const inherited = owner === undefined ? undefined : await ownerModelSelection(ctx, owner, signal)
+  const routes: MemberRoute[] = []
+  for (const member of members) {
+    const route = workerRoute(inherited, member)
+    routes.push(route === undefined ? { verdict: 'accepted' } : await resolvedRoute(ctx, route, signal))
+  }
+  return routes
+}
+
+/**
+ * One member route's verdict. Every host failure on the way, the prepared
+ * call's or the declared efforts' lookup's (`routeAnswer`), is read here by one
+ * rule and logged, never returned.
+ */
+async function resolvedRoute(ctx: Context, route: ModelSelection, signal?: AbortSignal): Promise<MemberRoute> {
+  const { provider, model } = route
+  try {
+    return await routeAnswer(ctx, route, signal)
+  } catch (error) {
+    signal?.throwIfAborted()
+    const refusal = memberRouteRefusal(error)
+    const detail = error instanceof Error ? `${error.name}: ${error.message}` : thrownText(error)
+    try { ctx.logger.warn('agent-swarm: model route %s/%s refused at admission: %s', provider, model, detail) } catch { /* Logging must never mask the answer. */ }
+    // A refused effort reaches here only unanswered by the efforts its model
+    // declares (`routeAnswer`): the route is unavailable.
+    return refusal === undefined || refusal.code === 'UNSUPPORTED_REASONING_EFFORT'
+      ? { verdict: 'unavailable', provider, model }
+      : { verdict: 'model-refused', provider, model, code: refusal.code }
+  }
+}
+
+/**
+ * The route as the host answers it: accepted, or its named effort refused and
+ * answered with the efforts its model declares. Any other failure, and a
+ * failed lookup of the declared efforts, is thrown to `resolvedRoute`.
+ */
+async function routeAnswer(ctx: Context, route: ModelSelection, signal?: AbortSignal): Promise<MemberRoute> {
+  const { provider, model, reasoningEffort } = route
+  try {
+    await ctx.llm.prepareCall(route, signal)
+    return { verdict: 'accepted' }
+  } catch (error) {
+    // A route that names no effort runs its model's default, which the host
+    // requires to be one the model declares, so its effort is never refused.
+    if (reasoningEffort === undefined || memberRouteRefusal(error)?.code !== 'UNSUPPORTED_REASONING_EFFORT') throw error
+  }
+  signal?.throwIfAborted()
+  const declared = (await ctx.llm.resolveModelInfo(provider, model, signal)).reasoning?.efforts ?? []
+  return { verdict: 'effort-unsupported', provider, model, effort: reasoningEffort, efforts: declared.map(effort => effort.id) }
 }

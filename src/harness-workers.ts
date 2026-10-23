@@ -5,9 +5,9 @@ import { freezeMessage, MessageId, ReasoningEffortId, type UserMessage } from '@
 import { SessionId, type Session } from '@deepseek-ai/dsh-session'
 import { scrubbedParentEnv } from '@deepseek-ai/dsh-subprocess'
 import type {} from '@deepseek-ai/dsh-tools'
-import type {} from '@deepseek-ai/dsh-system-prompt'
+import { PERSONA_PREFIX_SECTION, PERSONA_SUFFIX_SECTION } from '@deepseek-ai/dsh-system-prompt'
 import type {} from '@deepseek-ai/dsh-session-persistence'
-import type {} from '@deepseek-ai/dsh-sandbox'
+import type { SandboxProvider } from '@deepseek-ai/dsh-sandbox'
 import type {} from '@deepseek-ai/dsh-sandbox-policy'
 import type {} from '@deepseek-ai/dsh-user-approval'
 import { readFile, mkdir, rm } from 'node:fs/promises'
@@ -16,11 +16,11 @@ import { randomUUID } from 'node:crypto'
 import path from 'node:path'
 import { SWARM_SCRATCH_DIRNAME, Workspaces, writePrivateJson } from './workspaces.js'
 import { inspectDelivery, applyDelivery } from './delivery.js'
-import { ownerModelSelection, workerModelSelection } from './model-selection.js'
+import { memberRoutes, ownerModelSelection, workerRoute } from './model-selection.js'
 import { persistedSessionHeader } from './session-metadata.js'
 import { hiddenToolsFor, WORKER_PROMPT } from './tools.js'
-import { classifyProviderOutage } from './scheduler.js'
-import type { Artifact, CheckEnvelope, CheckSyntaxIssue, Delivery, FinishedAttempt, Member, Mission, Task, UsageBuckets, WorkerAdapter, WorkerCallbacks, WorkerSpec, WorkerActivity } from './types.js'
+import { classifyProviderOutage, memberRouteRefusal } from './scheduler.js'
+import type { Artifact, CheckEnvelope, CheckSyntaxIssue, Delivery, FinishedAttempt, Member, MemberRoute, MemberRouteInput, Mission, Task, UsageBuckets, WorkerAdapter, WorkerCallbacks, WorkerSpec, WorkerActivity } from './types.js'
 
 declare module '@deepseek-ai/dsh-llm' {
   interface MessageSourceMap {
@@ -31,20 +31,21 @@ declare module '@deepseek-ai/dsh-llm' {
 declare module '@deepseek-ai/dsh-session/types' {
   interface SessionEventMap {
     /**
-     * A session's effective working directory: the durable state of the 0.2.x
+     * A session's effective working directory: the durable state of the
      * `workingDirectory` service (`@deepseek-ai/dsh-working-directory`), whose
-     * projection replays the last one. Declared here because 0.1.x hosts have
-     * no such service; this adapter writes it only where the host provides one.
+     * projection replays the last one. The service's package declares the
+     * event; this plugin reads the service as an optional one, takes no
+     * dependency on the package, and so declares the one event it writes.
      */
     'working-directory/change': { cwd: string }
   }
 }
 
 /**
- * The `agentPresets` service, declared structurally: 0.1.5 provides it from
- * `@deepseek-ai/dsh-agent-presets`, 0.1.7 and 0.2.x from
- * `@deepseek-ai/dsh-agent-preset-registry`, with the same two methods this
- * adapter uses.
+ * The `agentPresets` service of `@deepseek-ai/dsh-agent-preset-registry`,
+ * declared structurally with the two methods this adapter uses. Only the Web
+ * bundle mounts the registry, so the service is optional and the plugin takes
+ * no dependency on its package.
  */
 interface AgentPresets {
   composedPreset(agentCtx: Context): string | undefined
@@ -52,25 +53,35 @@ interface AgentPresets {
 }
 
 /**
- * The 0.2.x session working-directory service, declared structurally: 0.1.x
- * hosts have none. `get` reads what the session's projection replays: the last
- * recorded `working-directory/change`, else the session header's cwd.
+ * The session working-directory service, declared structurally (see the
+ * `working-directory/change` declaration above). `get` reads what the
+ * session's projection replays: the last recorded `working-directory/change`,
+ * else the session header's cwd, else the service's default directory.
  */
 interface WorkingDirectory {
   get(session: Session): string
 }
 
 /**
- * Re-anchor a worker session's working directory to its member worktree. Where
- * the host provides the working-directory service, the directory is durable
- * session state that bash, file tools and the model's directory context follow,
- * so a recorded change outlives its turn, a resume and the attempt. The anchor
- * is written as the host's own event, the way the service's `ensure()` records a
- * session's first directory and the way activation forces the sandbox and
- * approval policy. Not `set()`: it also queues a notice in the worker's inbox,
- * which this adapter holds as input and wakes as a model turn of its own
- * (R15-A5). The next request's required directory context names the worktree.
- * A session already there, and a host without the service, get no write.
+ * Re-anchor a worker session's working directory to its member worktree. The
+ * directory is durable session state of the working-directory service that
+ * bash, file tools and the model's directory context follow, so a recorded
+ * change outlives its turn, a resume and the attempt. The anchor is written as
+ * the service's own event, the way its `ensure()` records a session's first
+ * directory and the way activation forces the sandbox and approval policy. Not
+ * `set()`: it also queues a notice in the worker's inbox, which this adapter
+ * holds as input and wakes as a model turn of its own (R15-A5). The next
+ * request's required directory context names the worktree. A session already
+ * there gets no write.
+ *
+ * The service stays optional, read at each activation. Every shipped profile
+ * mounts it (`dsh-base`, under the acp, web, headless and sdk profiles, and
+ * `dsh-sdk-minimal`). Every host tool that reads or moves a session's
+ * directory (bash, pwsh, the file and search tools, `working_directory`,
+ * subagents) injects it, and `run_code` refuses an agent's call without it. A
+ * composition without it therefore records no directory and has no tool that
+ * could leave the worktree, so there is nothing to re-anchor, while an inject
+ * would hold the whole swarm runtime pending there.
  */
 function anchorWorkingDirectory(ctx: Context, agent: Agent, workspace: string): void {
   const directory = ctx.get('workingDirectory') as WorkingDirectory | undefined
@@ -78,9 +89,34 @@ function anchorWorkingDirectory(ctx: Context, agent: Agent, workspace: string): 
   agent.session.append('working-directory/change', { cwd: workspace })
 }
 
-/** The host's regenerated runtime context: `runtime-context` on 0.1.7 and 0.2.x, a system-prompt `plugin` source on 0.1.5. */
-export function isRuntimeContext(source: { kind: string; plugin?: unknown }): boolean {
-  return source.kind === 'runtime-context' || (source.kind === 'plugin' && source.plugin === '@deepseek-ai/dsh-system-prompt')
+/**
+ * The agent loop's regenerated runtime-context snapshot. `@deepseek-ai/dsh-agent-loop`
+ * declares that message source kind, and this plugin does not depend on the
+ * package, so the kind is read structurally.
+ */
+export function isRuntimeContext(source: { kind: string }): boolean {
+  return source.kind === 'runtime-context'
+}
+
+/**
+ * The agent registered for `sessionId` while it can still take waking input,
+ * or undefined. The Harness disposes an agent by cancelling it with cause
+ * `disposed`, awaiting its quiescence, unwinding its scope and only then
+ * leaving the registry; input sent in between is the sender's defect: a wake
+ * opens a turn whose first step meets the unwound scope (`INACTIVE_EFFECT`,
+ * from the working-directory service the system prompt asks first). The
+ * registry alone cannot tell, so a wakeable agent is also one whose scope is
+ * live and whose last turn did not end on that cancel: its session's
+ * `turn/end`, read from this session object's own lifecycle, since the
+ * session's next agent resumes the same log and is live. Every waking delivery
+ * to an owner (planning notices, mission notices) asks here; one it skips
+ * stays pending for the session's next agent.
+ */
+export function wakeableAgent(ctx: Context, sessionId: string): Agent | undefined {
+  const agent = ctx.agents.get(SessionId(sessionId))
+  if (agent === undefined || agent.ctx.fiber.uid === null) return undefined
+  const boundary = agent.session.snapshotEvents(agent.session.firstLifecycleSeq).findLast(event => event.type === 'turn/start' || event.type === 'turn/end')
+  return boundary?.type === 'turn/end' && boundary.data.reason.kind === 'aborted' && boundary.data.reason.reason.kind === 'disposed' ? undefined : agent
 }
 
 /**
@@ -105,7 +141,7 @@ export function installOwnerDeliveryFilter(ctx: Context, project: (sessionId: st
     const onlyStale = messages.length > 0 && messages.every(message => stale(agent, message))
     // A turn whose opening input all went stale has nothing to run. An emptied
     // opening spends no model call only while no listener outside this one adds
-    // to it, and the host's time context (mounted by the 0.2.x Web presets)
+    // to it, and the host's time context (mounted by the Web presets)
     // wraps every other listener and appends its reading to any decision it
     // gets back. A rejection it passes through: the loop then ends the turn
     // before any step, exactly as it ends an emptied opening, and drops the
@@ -163,12 +199,6 @@ interface HarnessWorkerOptions {
    */
   checkConcurrency?: number
 }
-/** The confinement surface a declared verification check must pass through. */
-interface VerificationSandbox {
-  /** 0.1.5 returns the confinement synchronously; 0.1.7 resolves it (the backend probe became async). Both are accepted. */
-  confine(argv: readonly string[], policy: { mode: 'workspace-write'; workspaceRoot: string }): ConfinedCheck | Promise<ConfinedCheck>
-}
-interface ConfinedCheck { argv: string[]; enforcement: 'full' | 'partial' }
 /**
  * F-29: run a declared check only under FULL host enforcement. A partial
  * backend (Windows ACL, an older Landlock ABI) does not govern every promised
@@ -178,7 +208,7 @@ interface ConfinedCheck { argv: string[]; enforcement: 'full' | 'partial' }
  * refusal as that command's infrastructure row (exit 125), so the review is
  * deferred for the host to repair, never rejected as an assertion failure.
  */
-export async function confinedCheckArgv(sandbox: VerificationSandbox, argv: string[], cwd: string): Promise<string[]> {
+export async function confinedCheckArgv(sandbox: Pick<SandboxProvider, 'confine'>, argv: string[], cwd: string): Promise<string[]> {
   const confined = await sandbox.confine(argv, { mode: 'workspace-write', workspaceRoot: cwd })
   if (confined.enforcement !== 'full') throw new Error(`Artifact verification requires full sandbox enforcement: the host provider reports ${JSON.stringify(confined.enforcement)} enforcement for workspace-write, so a declared check could write outside the verification checkout. Refusing to run it.`)
   return confined.argv
@@ -212,19 +242,6 @@ interface Composition {
 // Teardown has a host-operation bound, separate from any model/task budget.
 // A timeout reports incomplete cleanup; stop() itself never claims success early.
 const DISPOSAL_TIMEOUT_MS = 5000
-
-/**
- * The prompt variable that carries a worker's persona. The persona is free text
- * (the member's name and role, the mission objective, the scratch path), and
- * every supported host interpolates section text strictly: a `{{...}}` in it
- * names a malformed or unknown variable (0.2.x registers no `{{cwd}}` any more),
- * and prompt assembly fails for every request of that worker. No host scans a
- * substituted value again, so the persona section holds only this reference and
- * the text reaches the model as written. 0.1.7 and 0.2.1 also take
- * `interpolate: false` on a section, but 0.1.5-rc.3's PromptSection has no such
- * field and its renderer no escape syntax.
- */
-const PERSONA_VARIABLE = 'swarm_persona'
 
 interface Resident {
   spec: WorkerSpec
@@ -555,10 +572,15 @@ export class HarnessWorkers implements WorkerAdapter {
     if (this.closing) return
     // R11-01: classify at the boundary where the provider error is still
     // structured. A classified outage is the route's, not the member's failure,
-    // so it is reported as that outage alone; anything else is the failure.
+    // so it is reported as that outage alone; a refusal of the member's own
+    // route is reported as that refusal alone; anything else is the failure.
     const outage = classifyProviderOutage(error)
-    try { if (outage === undefined) this.observer().failure(memberId, errorText(error)); else this.observer().providerOutage(memberId, outage) }
-    catch (callbackError) { this.ctx.logger.error(`Swarm failure observer failed: ${errorText(callbackError)}`) }
+    const refusal = outage === undefined ? memberRouteRefusal(error) : undefined
+    try {
+      if (outage !== undefined) this.observer().providerOutage(memberId, outage)
+      else if (refusal !== undefined) this.observer().routeRefused(memberId, refusal)
+      else this.observer().failure(memberId, errorText(error))
+    } catch (callbackError) { this.ctx.logger.error(`Swarm failure observer failed: ${errorText(callbackError)}`) }
   }
   private observe(resident: Resident, operation: () => Promise<void>): void {
     if (this.closing) return
@@ -708,9 +730,7 @@ export class HarnessWorkers implements WorkerAdapter {
     const owner = this.ctx.agents.get(SessionId(spec.ownerSessionId))
     if (owner === undefined) throw new Error('First worker creation requires its owner session to seed a durable composition')
     const preset = (this.ctx.get('agentPresets') as AgentPresets | undefined)?.composedPreset(owner.ctx)
-    const inherited = await ownerModelSelection(this.ctx, owner, signal)
-    const selection = inherited === undefined && spec.member.provider === undefined && spec.member.model === undefined && spec.member.reasoningEffort === undefined
-      ? undefined : workerModelSelection(inherited, spec.member)
+    const selection = workerRoute(await ownerModelSelection(this.ctx, owner, signal), spec.member)
     const value: Composition = {
       version: 1, sessionId: spec.member.sessionId, missionId: spec.mission.id, memberId: spec.member.id, workspace: spec.member.workspace,
       ...(preset === undefined ? {} : { preset }),
@@ -781,10 +801,14 @@ export class HarnessWorkers implements WorkerAdapter {
       anchorWorkingDirectory(this.ctx, agent, composition.workspace)
       // Shadow the deployment persona's prefix and suffix so workers retain only
       // their own role, including after resuming an older composition. The
-      // persona is free text, so it reaches the section as a variable's value.
-      agentCtx.systemPrompt.variable(PERSONA_VARIABLE, () => composition.persona)
-      agentCtx.systemPrompt.section({ name: 'deployment:persona-prefix', order: 0, text: `{{${PERSONA_VARIABLE}}}` })
-      agentCtx.systemPrompt.section({ name: 'deployment:persona-suffix', order: 10200, text: '' })
+      // persona is free text (the member's name and role, the mission objective,
+      // the scratch path). In a section the host interpolates, a malformed or
+      // unknown reference in it (`{{Not A Name}}`, `{{cwd}}`) would fail prompt
+      // assembly for every request of this worker, and a registered one
+      // (`{{model}}`, `{{provider}}`) would be silently substituted. Its section
+      // is literal, so the text reaches the model as written.
+      agentCtx.systemPrompt.section({ name: PERSONA_PREFIX_SECTION, order: agentCtx.systemPrompt.getSectionOrder('DEPLOYMENT_PERSONA_PREFIX'), text: composition.persona, interpolate: false })
+      agentCtx.systemPrompt.section({ name: PERSONA_SUFFIX_SECTION, order: agentCtx.systemPrompt.getSectionOrder('DEPLOYMENT_PERSONA_SUFFIX'), text: '' })
       // Source metadata is preserved in the host log, but provider serializers
       // need not expose it to the model. Refresh identity on every activation,
       // including saved compositions created before this section existed.
@@ -859,7 +883,7 @@ export class HarnessWorkers implements WorkerAdapter {
         return undefined
       })
       agentCtx.on('session/event', (session, event) => {
-        // Retry events are an optional public session extension in every supported release.
+        // Retry events belong to the optional `@deepseek-ai/dsh-llm-retry` package, hence the structural read.
         const type: string = event.type
         const retryData: unknown = event.data
         if (type === 'llm/retry' && isRecord(retryData) && typeof retryData.delayMs === 'number' && Number.isSafeInteger(retryData.delayMs) && retryData.delayMs >= 0 && typeof retryData.retry === 'number') {
@@ -946,6 +970,10 @@ export class HarnessWorkers implements WorkerAdapter {
     resident.compactionRequested = true
     this.compactIfRequested(resident)
   }
+  /** Admission's question about each member's route, answered as `composition` will create the worker. */
+  async memberRoutes(ownerSessionId: string, members: readonly MemberRouteInput[], signal?: AbortSignal): Promise<MemberRoute[]> {
+    return await memberRoutes(this.ctx, ownerSessionId, members, signal)
+  }
   /**
    * WS-1: the durable member identity changed (a staged-plan repair rotated its
    * sessionId), so the persisted composition for this member belongs to the
@@ -994,12 +1022,13 @@ export class HarnessWorkers implements WorkerAdapter {
     })
   }
   /**
-   * The compaction engine this member's own composition uses. Every supported
-   * web profile disables the host-plane `compaction-basic` row and mounts it in
-   * each agent preset's isolated `compaction` realm, where `ctx.get` from this
-   * plugin cannot see it; the realm's public handle is the `/compact` command it
-   * registers for the agents on that preset. That command runs the engine's
-   * idle-only `compactNow` and reports an expected failure as an error result.
+   * The compaction engine this member's own composition uses. The Web bundle
+   * disables the host-plane `compaction-basic` row and each of its agent
+   * presets mounts the engine in its isolated `compaction` realm, where
+   * `ctx.get` from this plugin cannot see it; the realm's public handle is the
+   * `/compact` command it registers for the agents on that preset. That
+   * command runs the engine's idle-only `compactNow` and reports an expected
+   * failure as an error result.
    * A composition that mounts the engine on the host plane without the command
    * is reached through the service. Resolves to a refusal text, or undefined.
    */
@@ -1021,7 +1050,7 @@ export class HarnessWorkers implements WorkerAdapter {
     if (delivery.to !== member.id || delivery.missionId !== member.missionId) throw new Error('Delivery recipient or mission mismatch')
     if (member.id === 'owner') {
       if (this.closing) throw new Error('Worker adapter is disposed')
-      const owner = this.ctx.agents.get(SessionId(member.sessionId))
+      const owner = wakeableAgent(this.ctx, member.sessionId)
       if (owner === undefined) throw new Error('Mission owner is offline; notification remains in the durable outbox')
       const message = this.deliveryMessage(delivery)
       const seen = owner.session.snapshotEvents().some(event => (event.type === 'user/message' && event.data.id === message.id)

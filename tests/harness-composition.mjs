@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { promisify } from 'node:util'
-import { bootHarness, importHarness, toolResultBlocks } from './fixtures/built-harness.mjs'
+import { bootHarness, importHarness } from './fixtures/built-harness.mjs'
 import { requests, setResponder } from './fixtures/scripted-llm.mjs'
 
 const execute = promisify(execFile)
@@ -49,18 +49,19 @@ let workerMode = 'complete'
 const tool = (name, args) => ({ kind: 'tool', name, args })
 const answer = text => ({ kind: 'text', text })
 const texts = message => message.content.filter(block => block.type === 'text').map(block => block.text)
-const toolBlocks = toolResultBlocks
-function jsonResult(block) {
-  const rendered = texts(block).join('\n')
-  assert(!block.isError, `Harness tool failed: ${rendered}`)
+/** The tool-role messages of a message list: each answers one call and carries its own error flag. */
+const toolResults = messages => messages.filter(message => message.role === 'tool')
+function jsonResult(result) {
+  const rendered = texts(result).join('\n')
+  assert(!result.isError, `Harness tool failed: ${rendered}`)
   return JSON.parse(rendered)
 }
 function latestObservation(messages) {
   const observations = []
-  for (const block of toolBlocks(messages)) {
-    if (block.isError) continue
+  for (const result of toolResults(messages)) {
+    if (result.isError) continue
     let body
-    try { body = JSON.parse(texts(block).join('\n')) } catch { continue }
+    try { body = JSON.parse(texts(result).join('\n')) } catch { continue }
     if (body.result?.member !== undefined || body.result?.delta === true) observations.push(body)
   }
   if (observations.length === 0) return undefined
@@ -96,7 +97,7 @@ function mergeObservationWindows(observations) {
 
 setResponder(options => {
   try {
-    const previous = toolBlocks(options.messages).at(-1)
+    const previous = toolResults(options.messages).at(-1)
     if (previous?.isError) throw new Error(`model observed tool error: ${texts(previous).join('\n')}`)
     if (options.sessionId === ownerId) {
       const command = options.messages.flatMap(texts).findLast(text => text.startsWith('SMOKE_OWNER '))
@@ -150,7 +151,7 @@ setResponder(options => {
       const supporting = runs.filter(run => run.taskId === task.id && run.tool === 'bash' && !run.isError)
       assert(supporting.length > 0, 'real bash result must be available as evidence')
       // The bash result itself already carried the citable run id; observation must agree with it.
-      const bashResult = toolBlocks(options.messages).toReversed().find(block => texts(block).join('\n').includes('[swarm toolRunId: '))
+      const bashResult = toolResults(options.messages).toReversed().find(result => texts(result).join('\n').includes('[swarm toolRunId: '))
       assert(bashResult, 'each recorded tool result must end with its host run id')
       const citedInResult = texts(bashResult).join('\n').match(/\[swarm toolRunId: (run_[^\]]+)\]/)[1]
       assert(supporting.some(run => run.id === citedInResult), 'the run id appended to the tool result must be the recorded run')
@@ -239,7 +240,7 @@ async function ownerCall(name, args) {
   const events = ownerHandle.agent.session.snapshotEvents().slice(firstSeq)
   const call = events.find(event => event.type === 'tool/call' && event.data.name === name)
   assert(call, `${name} must execute through the owner’s actual model/tool loop`)
-  const results = events.filter(event => event.type === 'tool/result').flatMap(event => toolBlocks([event.data.message]))
+  const results = events.filter(event => event.type === 'tool/result').map(event => event.data.message)
   assert(results.length > 0, `${name} must be logged with its model-facing result`)
   return jsonResult(results[0])
 }
@@ -252,9 +253,9 @@ function attachTranscript(context) {
     if (event.type === 'tool/call') transcript.push({ sessionId: session.header.id, name: event.data.name, args: event.data.arguments })
     if (event.type === 'tool/call') recentTools.push({ type: event.type, time: event.time, sessionId: session.header.id, name: event.data.name })
     if (event.type === 'tool/result') {
-      const failed = toolBlocks([event.data.message]).filter(block => block.isError)
+      const { message } = event.data
       recentTools.push({ type: event.type, time: event.time, sessionId: session.header.id, error: event.data.error,
-        failures: failed.map(block => texts(block).join('\n')) })
+        failures: message.isError ? [texts(message).join('\n')] : [] })
     }
     if (recentTools.length > 64) recentTools.splice(0, recentTools.length - 64)
   })
@@ -328,12 +329,12 @@ try {
   // review it proposed), and the snapshot below pins it for every assignment.
   const checklistOf = task => task.id === implementation.id || task.reviewOf === implementation.id ? ['value is two', 'node check.cjs passes'] : ['value is two']
   const workerRequests = requests.filter(request => request.sessionId !== ownerId)
-  const workerTasks = workerRequests.flatMap(request => toolBlocks(request.messages))
-    .flatMap(block => { try { return [JSON.parse(texts(block).join('\n')).result] } catch { return [] } }).filter(result => result?.workstreamId !== undefined && Array.isArray(result.acceptance))
+  const workerTasks = workerRequests.flatMap(request => toolResults(request.messages))
+    .flatMap(message => { try { return [JSON.parse(texts(message).join('\n')).result] } catch { return [] } }).filter(result => result?.workstreamId !== undefined && Array.isArray(result.acceptance))
   for (const [kind, status] of [['implementation', 'submitted'], ['integration', 'submitted'], ['verification', 'accepted'], ['verification', 'pending']]) assert(workerTasks.some(task => task.kind === kind && task.status === status), `a worker must read its ${status} ${kind} result`)
   for (const task of workerTasks) assert.deepEqual(task.acceptance, checklistOf(task), `the ${task.kind} task a worker's call returned must list its checklist as text`)
   // No id reaches a worker anywhere: not in a delivery, not in any tool result, as a key or inside an excerpt of one.
-  const workerFacing = workerRequests.flatMap(request => [...request.messages.filter(message => message.source?.kind === 'swarm'), ...toolBlocks(request.messages)]).map(item => texts(item).join('\n'))
+  const workerFacing = workerRequests.flatMap(request => [...request.messages.filter(message => message.source?.kind === 'swarm'), ...toolResults(request.messages)]).map(item => texts(item).join('\n'))
   assert(workerFacing.length > 0 && workerFacing.some(text => text.includes('"acceptance"')), 'workers must have read tasks')
   for (const text of workerFacing) assert.doesNotMatch(text, /"covers\\?"/, 'no worker-facing delivery or tool result may carry covers')
   for (const request of requests) {

@@ -12,10 +12,9 @@ import { AdmissionError, TaskGraphAdmissionError, type AdmissionDiagnostic } fro
 import { PolicyError } from './policy-error.ts'
 import type { SwarmRuntime } from './runtime.ts'
 import { validatePlan } from './plans.ts'
-import { ownerModelSelection, workerModelSelection } from './model-selection.js'
 import { persistedSessionHeader } from './session-metadata.js'
 import { SWARM_RPC_CHANNEL, SWARM_RPC_PREFIX, SWARM_WEB_ENDPOINTS } from './types.ts'
-import type { Actor, Budget, PlanInput, PlanMember, RuntimeConfig, TaskAmendment } from './types.ts'
+import type { Actor, Budget, PlanInput, TaskAmendment } from './types.ts'
 import type { LiveState, LiveUpdate } from './live-types.ts'
 import { waitForStateChange } from './watch.ts'
 
@@ -133,37 +132,19 @@ async function sessionHeader(ctx: Context, id: SessionId, signal: AbortSignal): 
  * model tool boundary: the workspace must be the calling session's cwd or
  * resolve inside a configured authorized root. The refusal is a field-level
  * diagnostic naming the authorization requirement, never a bare cwd-equality error.
+ * A save also runs the route rule (`admitMemberRoutes`) over the routes the
+ * plan names, so the editor hears of a refused one before launch; a member
+ * that names none runs the owner's selection at launch, where the launch
+ * admits every member's route.
  */
-async function planInput(ctx: Context, body: Record<string, unknown>, header: SessionHeader, signal: AbortSignal, config: Pick<RuntimeConfig, 'grants' | 'verificationDependencyDirs'>): Promise<[plan: PlanInput, authorization: WorkspaceAuthorized]> {
+async function planInput(runtime: SwarmRuntime, body: Record<string, unknown>, header: SessionHeader, signal: AbortSignal): Promise<[plan: PlanInput, authorization: WorkspaceAuthorized]> {
   const input = object(body.input)
-  const authorization = await authorizeWorkspace(text(input, 'workspace'), header.cwd, config.grants)
+  const authorization = await authorizeWorkspace(text(input, 'workspace'), header.cwd, runtime.config.grants)
   if (!authorization.ok) throw new RequestError(authorization.diagnostic)
-  const plan = await exposed(() => validatePlan({ ...input, workspace: authorization.workspace }, { dependencyDirs: config.verificationDependencyDirs }), true)
-  await validateModels(ctx, header.id, plan.members, signal, false)
+  const plan = await exposed(() => validatePlan({ ...input, workspace: authorization.workspace }, { dependencyDirs: runtime.config.verificationDependencyDirs }), true)
+  const named = plan.members.filter(member => member.provider !== undefined || member.model !== undefined || member.reasoningEffort !== undefined)
+  await exposed(() => runtime.admitMemberRoutes(header.id, named.map(member => ({ location: `members[${member.key}]`, member })), 'save the plan again', signal))
   return [plan, authorization]
-}
-
-async function validateModels(ctx: Context, ownerId: SessionId, members: Pick<PlanMember, 'provider' | 'model' | 'reasoningEffort'>[], signal: AbortSignal, launching: boolean): Promise<void> {
-  const owner = ctx.agents.get(ownerId)
-  const defaults = owner === undefined ? undefined : await ownerModelSelection(ctx, owner, signal)
-  const providers = new Set(ctx.llm.listProviders().map(provider => provider.id))
-  for (const member of members) {
-    signal.throwIfAborted()
-    if (!launching && member.provider === undefined && member.model === undefined && member.reasoningEffort === undefined) continue
-    const selected = await exposed(() => workerModelSelection(defaults, member), true)
-    if (!providers.has(selected.provider)) throw new RequestError(`Unknown model provider: ${selected.provider}`)
-    // Exact route resolution is authoritative. A provider may route models not
-    // present in its advisory picker catalog; those remain valid selections.
-    // A resolution failure is reported as a stable selection error: the
-    // adapter's own message can carry host paths or internal route codes
-    // (SURFACE-R3-01), so it is logged host-side and never echoed.
-    try { await ctx.llm.resolveCallConfig(selected, signal) } catch (error) {
-      if (signal.aborted) throw error
-      const detail = error instanceof Error ? `${error.name}: ${error.message}` : String(error)
-      try { ctx.logger.warn('agent-swarm: model route %s/%s failed to resolve: %s', selected.provider, selected.model, detail) } catch { /* Logging must never mask the response. */ }
-      throw new RequestError(`Model route is unavailable: ${selected.provider}/${selected.model}`)
-    }
-  }
 }
 
 /**
@@ -188,7 +169,7 @@ export function registerWebApi(ctx: Context, runtime: SwarmRuntime, options: Web
       writable, ownerLive: writable && ctx.agents.get(SessionId(actor.sessionId)) !== undefined, revision: runtime.store.revision(),
     } }
   }
-  // The routes below call this directly; 0.1.7's ConnectionRpcHandler adds a peer argument no route needs.
+  // The exact routes below call this directly: only an owner Peer reaches them, so no Peer is passed.
   const handler = async (endpoint: string, payload: unknown, signal: AbortSignal): Promise<ConnectionRpcResult<unknown>> => {
     try {
       signal.throwIfAborted()
@@ -287,9 +268,9 @@ export function registerWebApi(ctx: Context, runtime: SwarmRuntime, options: Web
           return { ok: true, value: update }
         }
         case 'create-draft':
-          return { ok: true, value: { draft: await exposed(async () => runtime.createDraft(actor, ...await planInput(ctx, body, header, signal, runtime.config))) } }
+          return { ok: true, value: { draft: await exposed(async () => runtime.createDraft(actor, ...await planInput(runtime, body, header, signal))) } }
         case 'update-draft':
-          return { ok: true, value: { draft: await exposed(async () => runtime.updateDraft(actor, text(body, 'draftId'), revision(body), ...await planInput(ctx, body, header, signal, runtime.config))) } }
+          return { ok: true, value: { draft: await exposed(async () => runtime.updateDraft(actor, text(body, 'draftId'), revision(body), ...await planInput(runtime, body, header, signal))) } }
         case 'discard-draft': {
           const draft = await exposed(() => runtime.discardDraft(actor, text(body, 'draftId'), revision(body)))
           return { ok: true, value: { draft } }
@@ -297,7 +278,6 @@ export function registerWebApi(ctx: Context, runtime: SwarmRuntime, options: Web
         case 'launch-draft': {
           const draft = runtime.drafts(actor).find(candidate => candidate.id === text(body, 'draftId'))
           if (draft?.status !== 'launched' && ctx.agents.get(sessionId) === undefined) throw new RequestError('Open the owner session before launching its workers')
-          if (draft !== undefined && draft.status !== 'launched') await validateModels(ctx, header.id, draft.input.members, signal, true)
           return { ok: true, value: { snapshot: await exposed(() => runtime.launchDraft(actor, text(body, 'draftId'), revision(body))) } }
         }
         case 'control': {
@@ -339,7 +319,6 @@ export function registerWebApi(ctx: Context, runtime: SwarmRuntime, options: Web
           if (input.maxOutputTokens !== undefined && (!Number.isSafeInteger(input.maxOutputTokens) || Number(input.maxOutputTokens) < 1)) throw new RequestError('maxOutputTokens must be a positive safe integer')
           // M9(c): a bare string would turn topic matching into substring semantics.
           if (input.subscriptions !== undefined) stringArray(input, 'subscriptions')
-          await validateModels(ctx, sessionId, [input as Pick<PlanMember, 'provider' | 'model' | 'reasoningEffort'>], signal, true)
           const member = await exposed(() => runtime.addMember(actor, missionId, input as Parameters<SwarmRuntime['addMember']>[2]))
           return { ok: true, value: { member, snapshot: runtime.snapshot(actor, missionId) } }
         }
@@ -371,16 +350,15 @@ export function registerWebApi(ctx: Context, runtime: SwarmRuntime, options: Web
       return { ok: false, error: { code: 'internal-error', message: 'Swarm request failed unexpectedly; the original error was logged on the host.', details: { issues: [] } } }
     }
   }
-  // One route shape on every supported host. A plugin-owned channel
-  // (`rpc.handle('/agent-swarm', …)`) is unusable on 0.1.5: `rpc.handle`
-  // registers the route under the CONNECTION plugin's own fiber, which injects
-  // `credentials` alone, so Cordis refuses its `webServer` access and the route
-  // is never registered — silently, because the failure lands in a child fiber.
-  // The shared `/api` interceptor is not an option either — that channel admits
-  // exactly one interceptor and another plugin holds it. What is left is what the
-  // host itself documents for plugin endpoints: one exact route per endpoint on
-  // the shared channel, consulted before the interceptor, inheriting its Host,
-  // Origin and browser-authentication fence. The client posts the standard
+  // One exact route per endpoint on the shared `/api` channel. Connection
+  // consults the exact routes before the channel's interceptor; they inherit its
+  // Host, Origin and browser-authentication fence, and only an owner Peer
+  // reaches them (any other principal is answered 403 before the route runs).
+  // The shared interceptor is not an option: the channel admits exactly one,
+  // and the API gateway holds it for the generated Remote endpoints. A
+  // plugin-owned channel (`rpc.handle('/agent-swarm', …)`) would hand this
+  // handler every authenticated Peer whatever its principal, so the owner rule
+  // would become this plugin's to enforce. The client posts the standard
   // envelope to `/api/agent-swarm/<endpoint>`.
   const releases: Array<() => Promise<void>> = []
   ctx.effect(() => async () => {

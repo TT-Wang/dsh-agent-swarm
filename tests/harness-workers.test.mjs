@@ -13,33 +13,32 @@ import SessionStore, { Session, SessionId } from '@deepseek-ai/dsh-session'
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
 import SessionProjection from '@deepseek-ai/dsh-session-projection'
 import ToolRuntime, { defineContentToolFixture } from '@deepseek-ai/dsh-tools'
-import * as JsonlPersistenceModule from '@deepseek-ai/dsh-session-persistence-jsonl'
+import * as JsonlPersistence from '@deepseek-ai/dsh-session-persistence-jsonl'
 import SandboxPolicy from '@deepseek-ai/dsh-sandbox-policy'
 import Approval from '@deepseek-ai/dsh-user-approval'
 import UserQuestionService from '@deepseek-ai/dsh-user-questions'
 import AgentDefaultModel from '@deepseek-ai/dsh-agent-default-model'
+import LocalFileSystem from '@deepseek-ai/dsh-fs-local'
+import WorkingDirectoryService from '@deepseek-ai/dsh-working-directory'
+import * as ToolWorkingDirectory from '@deepseek-ai/dsh-tool-working-directory'
+import * as ToolWorktree from '@deepseek-ai/dsh-experimental-tool-worktree'
+import * as ToolSchedule from '@deepseek-ai/dsh-tool-schedule'
 import { HarnessWorkers, isRuntimeContext } from '../lib/harness-workers.js'
 import { registerTools } from '../lib/tools.js'
 import { UNCONFINED_HOST_TOOLS } from '../lib/types.js'
 import { runProcess } from '../lib/workspaces.js'
 import { subprocessSeam, SubprocessLocal } from './subprocess-seam.mjs'
 import { eventually, makeRuntime } from './faults/harness.mjs'
-import { loaderPlugin, toolResultBlocks } from './fixtures/built-harness.mjs'
-import { hostPackage } from './fixtures/host-packages.mjs'
-
-const JsonlPersistence = loaderPlugin(JsonlPersistenceModule)
 
 /**
- * The session working-directory service as the host's base bundle composes it,
- * where the installed host ships it (0.2.x): an `fs` provider and the service,
- * both defaulting to the source checkout. Resolves the service, or undefined on
- * a host without one (0.1.x).
+ * The session working-directory service as the host's base bundle composes it:
+ * an `fs` provider and the service, both defaulting to the source checkout.
+ * Resolves the service.
  */
 async function mountWorkingDirectory(ctx, source) {
-  const service = await hostPackage('@deepseek-ai/dsh-working-directory')
-  if (service === undefined) return undefined
-  await ctx.plugin(loaderPlugin(await import('@deepseek-ai/dsh-fs-local')), { cwd: source })
-  await ctx.plugin(loaderPlugin(service), { defaultDirectory: source })
+  await ctx.plugin(LocalFileSystem, { cwd: source })
+  await ctx.plugin(WorkingDirectoryService, { defaultDirectory: source })
+  assert.ok(ctx.workingDirectory, 'the working-directory service is active')
   return ctx.workingDirectory
 }
 
@@ -70,10 +69,9 @@ async function appendStoredEvents(persistence, id, events) {
   finally { await handle.close() }
 }
 
-test('the owner filter recognizes regenerated runtime context on every supported host', () => {
-  assert.equal(isRuntimeContext({ kind: 'runtime-context', form: 'snapshot', sections: [] }), true, '0.1.7 and 0.2.x name their own producer kind')
-  assert.equal(isRuntimeContext({ kind: 'plugin', plugin: '@deepseek-ai/dsh-system-prompt' }), true, '0.1.5 attributes it to the system-prompt plugin')
-  assert.equal(isRuntimeContext({ kind: 'plugin', plugin: '@deepseek-ai/dsh-other' }), false)
+test('the owner filter recognizes the agent loop\'s regenerated runtime context', () => {
+  assert.equal(isRuntimeContext({ kind: 'runtime-context', form: 'snapshot', sections: [] }), true, 'the agent loop names its own producer kind')
+  assert.equal(isRuntimeContext({ kind: 'system-prompt', form: 'snapshot', sections: [] }), false, 'the system prompt is not runtime context')
   assert.equal(isRuntimeContext({ kind: 'user' }), false)
   assert.equal(isRuntimeContext({ kind: 'swarm', deliveryId: 'd1' }), false)
 })
@@ -111,6 +109,9 @@ async function fixture(t, responder = () => ({ kind: 'text', text: 'done' }), co
   const requests = []
   class Scripted extends LlmAdapter {
     async resolveModel(provider, model) { return { provider, id: model, name: model, ...config.modelInfo?.(model) } }
+    // An adapter's own admission of a model, run when a call is prepared and
+    // not by `resolveModel`, as the DeepSeek account catalog's is.
+    async prepareCall(provider, model, signal) { config.admit?.(model); return await super.prepareCall(provider, model, signal) }
     async *stream(options) {
       requests.push(options)
       const action = await responder(options, requests.length)
@@ -159,7 +160,7 @@ async function fixture(t, responder = () => ({ kind: 'text', text: 'done' }), co
     await workerOwnerScope
   }
   adapter = new HarnessWorkers(adapterContext, options)
-  const observations = { idle: [], steps: [], usage: [], tools: [], failures: [], activities: [] }
+  const observations = { idle: [], steps: [], usage: [], tools: [], failures: [], refusals: [], activities: [] }
   const callbacks = {
     idle: id => { observations.idle.push(id) },
     activity: (id, activity) => { observations.activities.push({ id, activity }) },
@@ -168,6 +169,7 @@ async function fixture(t, responder = () => ({ kind: 'text', text: 'done' }), co
     toolRun: async (id, run) => { observations.tools.push({ id, run }) },
     guard: () => undefined,
     failure: (id, error) => { observations.failures.push({ id, error }) },
+    routeRefused: (id, refusal) => { observations.refusals.push({ id, refusal }) },
   }
   adapter.bind(callbacks)
   const mission = { id: 'mission-test', workspace: source, objective: 'Test durable collaboration', ...config.mission }
@@ -203,7 +205,7 @@ test('cancelled native startup cannot publish a late worker and can be retried a
 })
 
 test('a native dispose that rejected has still released the worker, so the member starts again and unload completes', async t => {
-  // Every supported host memoizes a handle's dispose and runs registry, scope
+  // The host memoizes a handle's dispose and runs registry, scope
   // and ownership cleanup to quiescence before it rejects: a settled dispose is a
   // released handle, never one to retry (review M-15).
   const f = await fixture(t, undefined, { start: false })
@@ -428,6 +430,77 @@ test('explicit worker reasoning effort reaches real requests and survives owner-
   } finally { await resumed.dispose() }
 })
 
+test('admission prepares each member route as its model step does, so the adapter\'s own refusal of a model decides it too, before any request', async t => {
+  const refusals = new Map([
+    ['retired-model', new LlmError('DeepSeek model "retired-model" is not supported by DeepSeek Harness; current version is 0.2.1-rc.2', 'MODEL_UNSUPPORTED')],
+    ['next-model', new LlmError('DeepSeek model "next-model" requires DeepSeek Harness 0.3.0 or later; current version is 0.2.1-rc.2', 'CLIENT_UPGRADE_REQUIRED')],
+  ])
+  const f = await fixture(t, undefined, { start: false, modelInfo: reasoningModel, admit: model => { const refusal = refusals.get(model); if (refusal !== undefined) throw refusal } })
+  // The host's standalone call-config query skips the adapter's admission; the call a step prepares runs it.
+  await f.ctx.llm.resolveCallConfig({ provider: 'other-provider', model: 'retired-model' })
+  await assert.rejects(f.ctx.llm.prepareCall({ provider: 'other-provider', model: 'retired-model' }), { code: 'MODEL_UNSUPPORTED' })
+  const routes = await f.adapter.memberRoutes('owner-session', [
+    { provider: 'other-provider', model: 'retired-model' },
+    // The adapter admits the model before the host validates the effort.
+    { provider: 'other-provider', model: 'next-model', reasoningEffort: 'low' },
+    { provider: 'other-provider', model: 'reasoning-model', reasoningEffort: 'low' },
+    { provider: 'other-provider', model: 'plain-model', reasoningEffort: 'high' },
+    { provider: 'other-provider', model: 'reasoning-model', reasoningEffort: 'high' },
+    { provider: 'unregistered', model: 'reasoning-model' },
+    {},
+  ])
+  assert.deepEqual(routes, [
+    { verdict: 'model-refused', provider: 'other-provider', model: 'retired-model', code: 'MODEL_UNSUPPORTED' },
+    { verdict: 'model-refused', provider: 'other-provider', model: 'next-model', code: 'CLIENT_UPGRADE_REQUIRED' },
+    { verdict: 'effort-unsupported', provider: 'other-provider', model: 'reasoning-model', effort: 'low', efforts: ['off', 'high'] },
+    { verdict: 'effort-unsupported', provider: 'other-provider', model: 'plain-model', effort: 'high', efforts: [] },
+    { verdict: 'accepted' },
+    { verdict: 'unavailable', provider: 'unregistered', model: 'reasoning-model' },
+    { verdict: 'accepted' },
+  ])
+  assert.equal(f.requests.length, 0, 'admission sends no provider request')
+  assert.equal(f.ctx.agents.get(SessionId(f.member.sessionId)), undefined, 'admission opens no worker session')
+})
+
+/**
+ * A refused effort is answered with the efforts its model declares, which
+ * admission asks the host for after the prepared call refused it. A failed
+ * lookup is the route's host failure like any other: an unavailable route,
+ * its host detail logged and never returned (SURFACE-R3-01). It used to escape
+ * admission as the raw host value.
+ */
+test('admission answers a refused effort whose declared efforts cannot be read as an unavailable route, logging the host detail', async t => {
+  const reads = new Map()
+  const lookupFailures = new Map([
+    ['catalog-object', Object.freeze({ kind: 'catalog-offline' })],
+    ['catalog-error', new Error('catalog unreadable at /private/host/catalog.json')],
+  ])
+  // The prepared call reads the model and refuses its effort; the lookup of the
+  // declared efforts reads it again, and fails.
+  const f = await fixture(t, undefined, { start: false, modelInfo: model => {
+    const read = (reads.get(model) ?? 0) + 1
+    reads.set(model, read)
+    if (read > 1 && lookupFailures.has(model)) throw lookupFailures.get(model)
+    return reasoningModel(model)
+  } })
+  const warnings = []
+  f.ctx.logger.exporter({ levels: { default: 3 }, export: message => { if (message.type === 'warn') warnings.push(message.args.slice(1)) } })
+  const routes = await f.adapter.memberRoutes('owner-session', [
+    { provider: 'other-provider', model: 'catalog-object', reasoningEffort: 'low' },
+    { provider: 'other-provider', model: 'catalog-error', reasoningEffort: 'low' },
+  ])
+  assert.deepEqual(routes, [
+    { verdict: 'unavailable', provider: 'other-provider', model: 'catalog-object' },
+    { verdict: 'unavailable', provider: 'other-provider', model: 'catalog-error' },
+  ])
+  assert.deepEqual(warnings, [
+    ['other-provider', 'catalog-object', '{"kind":"catalog-offline"}'],
+    ['other-provider', 'catalog-error', 'Error: catalog unreadable at /private/host/catalog.json'],
+  ])
+  assert.deepEqual([...reads.values()], [2, 2], 'each route was refused by its prepared call, then its lookup failed')
+  assert.equal(f.requests.length, 0, 'admission sends no provider request')
+})
+
 test('workers inherit a native model and effort switch before the owner sends another request', async t => {
   const f = await fixture(t, undefined, { modelInfo: reasoningModel, configureOwner: async ({ ctx, owner }) => {
     owner.agent.session.append('model/selection', {
@@ -555,28 +628,31 @@ test('a provider error the adapter classifies as an outage is reported as that o
   assert.deepEqual(f.observations.failures, [], 'the outage is not reported a second time as a member failure')
 })
 
-// The DeepSeek account route's codes (0.2.x), raised inside a worker turn: the
-// agent loop rebuilds the provider failure on every host, and its code still
-// decides whether the route or the member failed.
+// The DeepSeek account route's codes, and the host's refusal of a reasoning
+// effort, raised inside a worker turn: the agent loop rebuilds the provider
+// failure, and its code still decides whether the route is out, the member's
+// own route refused it, or the member failed.
 for (const [error, expected] of [
   [new LlmError('Your DeepSeek account tokens are used up for this period.', 'ACCOUNT_QUOTA'), { outage: ['quota', undefined] }],
   [new LlmError('Sign in to DeepSeek to use the account provider. The request destination must allow account authentication.', 'ACCOUNT_SIGN_IN_REQUIRED'), { outage: ['credential', undefined] }],
   [new LlmError('Authentication Fails', 'ACCOUNT_TOKEN_INVALID', { status: 401 }), { outage: ['credential', 401] }],
-  [new LlmError('DeepSeek model "scripted" is not supported by DeepSeek Harness; current version is 0.2.1-rc.2', 'MODEL_UNSUPPORTED'), { failure: /not supported by DeepSeek Harness/ }],
-]) test(`a worker turn that fails with ${error.code} is reported as ${expected.outage === undefined ? 'the member\'s failure' : `a ${expected.outage[0]} outage of its route`}`, async t => {
+  [new LlmError('DeepSeek model "scripted" is not supported by DeepSeek Harness; current version is 0.2.1-rc.2', 'MODEL_UNSUPPORTED'), { refusal: /not supported by DeepSeek Harness/ }],
+  [new LlmError('provider "swarm-test" model "scripted" does not support reasoning effort "low"', 'UNSUPPORTED_REASONING_EFFORT'), { refusal: /does not support reasoning effort "low"/ }],
+]) test(`a worker turn that fails with ${error.code} is reported as ${expected.outage === undefined ? 'a refusal of the member\'s own route' : `a ${expected.outage[0]} outage of its route`}`, async t => {
   const f = await fixture(t, () => { throw error })
   const outages = []
   f.callbacks.providerOutage = (id, outage) => { outages.push({ id, outage }) }
   await f.adapter.deliver(f.member, message(f.member))
   await f.ctx.agents.get(SessionId(f.member.sessionId)).whenIdle()
   assert.equal(f.requests.length, 1)
+  assert.deepEqual(f.observations.failures, [], 'a classified failure is reported once, as its class')
   if (expected.outage !== undefined) {
     assert.deepEqual(outages.map(({ id, outage }) => [id, outage.class, outage.status]), [['worker-test', ...expected.outage]])
-    assert.deepEqual(f.observations.failures, [])
+    assert.deepEqual(f.observations.refusals, [])
   } else {
-    assert.deepEqual(outages, [], 'no route is paused for a refusal of the member\'s own model')
-    assert.equal(f.observations.failures.length, 1)
-    assert.match(f.observations.failures[0].error, expected.failure)
+    assert.deepEqual(outages, [], 'no route is paused for a refusal of the member\'s own route')
+    assert.deepEqual(f.observations.refusals.map(({ id, refusal }) => [id, refusal.code]), [['worker-test', error.code]])
+    assert.match(f.observations.refusals[0].refusal.message, expected.refusal)
   }
 })
 
@@ -987,10 +1063,11 @@ for (const nativeOwnerDisposal of [false, true]) test(`${nativeOwnerDisposal ? '
 })
 
 test('a worker persona reaches the model as written, whatever braces its free text carries', async t => {
-  // The member's name and role and the mission objective are free text. On
-  // 0.1.x the agent loop registers {{cwd}} and {{model}}, so a strict section
-  // would have substituted them; on 0.2.x {{cwd}} is gone and would fail every
-  // request. A malformed group fails on every host.
+  // The member's name and role and the mission objective are free text. In a
+  // section the host interpolates, a malformed or unknown reference
+  // ({{Not A Name}}, {{}}, {{cwd}}) would fail every request of the worker, and
+  // a registered one ({{model}}) would be silently substituted. Either way the
+  // text would not reach the model as written.
   const objective = 'Render {{cwd}} and {{model}} placeholders, keep {{Not A Name}} and a lone {{ brace'
   const f = await fixture(t, undefined, { mission: { objective }, member: { name: 'Templater {{name}}', role: 'implementer of {{role}} {{}}' } })
   await f.adapter.deliver(f.member, message(f.member))
@@ -1016,13 +1093,11 @@ test('worker persona shadows both legacy and prefix/suffix deployment personas',
 })
 
 test('a worker neither sees nor runs the host tools that would move it out of its worktree or past its attempt', async t => {
-  // Each tool is composed from the package the installed host ships, the way
-  // its bundles mount it; a host that ships none registers none, and the worker
-  // still tries every name. The services behind the tools are doubles that fail
-  // the run if any call reaches them.
+  // Each tool is composed from its host package, the way the host's bundles
+  // mount it. The services behind the tools are doubles that fail the run if
+  // any call reaches them.
   const reached = []
   const unreachable = service => new Proxy({}, { get: (_target, method) => async () => { reached.push(`${service}.${String(method)}`); throw new Error(`${service}.${String(method)} reached`) } })
-  const registered = []
   let directory
   const attempts = [
     ['working_directory', source => ({ cd: source })],
@@ -1039,26 +1114,14 @@ test('a worker neither sees nor runs the host tools that would move it out of it
     : { kind: 'text', text: 'done' }, { start: false, hostPlugins: async ({ ctx, source: checkout }) => {
     source = checkout
     directory = await mountWorkingDirectory(ctx, checkout)
-    const directoryTool = await hostPackage('@deepseek-ai/dsh-tool-working-directory')
-    if (directory !== undefined && directoryTool !== undefined) {
-      await ctx.plugin(loaderPlugin(directoryTool))
-      registered.push('working_directory')
-    }
-    const worktreeTool = await hostPackage('@deepseek-ai/dsh-experimental-tool-worktree')
-    if (worktreeTool !== undefined) {
-      ctx.provide('worktrees', unreachable('worktrees'))
-      await ctx.plugin(loaderPlugin(worktreeTool))
-      registered.push('create_worktree')
-    }
-    const scheduleTools = await hostPackage('@deepseek-ai/dsh-tool-schedule')
-    if (scheduleTools !== undefined) {
-      ctx.provide('schedule', unreachable('schedule'))
-      await ctx.plugin(loaderPlugin(scheduleTools))
-      registered.push('schedule_create', 'schedule_list', 'schedule_update', 'schedule_delete')
-    }
+    await ctx.plugin(ToolWorkingDirectory)
+    ctx.provide('worktrees', unreachable('worktrees'))
+    await ctx.plugin(ToolWorktree)
+    ctx.provide('schedule', unreachable('schedule'))
+    await ctx.plugin(ToolSchedule)
   } })
   const ownerTools = new Set(f.ctx.tools.schemas(f.owner.agent).map(schema => schema.name))
-  assert.deepEqual(UNCONFINED_HOST_TOOLS.filter(name => ownerTools.has(name)).sort(), registered.sort(), 'an ordinary session sees exactly the unconfined tools this host registered')
+  assert.deepEqual(UNCONFINED_HOST_TOOLS.filter(name => ownerTools.has(name)), UNCONFINED_HOST_TOOLS, 'an ordinary session sees every unconfined tool')
   await f.adapter.start(f.spec)
   const worker = f.ctx.agents.get(SessionId(f.member.sessionId))
   assert.deepEqual(f.ctx.tools.schemas(worker).map(schema => schema.name).filter(name => UNCONFINED_HOST_TOOLS.includes(name)), [], 'the worker sees none of them')
@@ -1070,43 +1133,33 @@ test('a worker neither sees nor runs the host tools that would move it out of it
   }
   const results = worker.session.snapshotEvents().filter(event => event.type === 'tool/result')
   assert.equal(results.length, attempts.length)
-  assert.ok(results.every(event => toolResultBlocks([event.data.message]).every(block => block.isError)), 'every call failed without running')
+  assert.ok(results.every(event => event.data.message.isError === true), 'every call failed without running')
   assert.deepEqual(reached, [], 'no call reached the service behind the tool')
-  if (directory !== undefined) {
-    assert.equal(directory.get(worker.session), f.member.workspace, 'the session directory is still the member worktree')
-    assert.deepEqual(recordedDirectories(worker.session), [], 'and nothing was recorded')
-  }
+  assert.equal(directory.get(worker.session), f.member.workspace, 'the session directory is still the member worktree')
+  assert.deepEqual(recordedDirectories(worker.session), [], 'and nothing was recorded')
   assert.deepEqual(f.observations.failures, [])
 })
 
 test('a worker whose log recorded a working-directory change starts its next activation in its worktree', async t => {
-  // Where the host provides the working-directory service the directory is
-  // durable session state: its projection replays the last recorded change on
-  // every resume. A host without the service never sees the event, so no
-  // activation may write it there.
+  // The working-directory service keeps the directory as durable session
+  // state: its projection replays the last recorded change on every resume.
   let directory
   const f = await fixture(t, undefined, { hostPlugins: async ({ ctx, source }) => { directory = await mountWorkingDirectory(ctx, source) } })
   const id = SessionId(f.member.sessionId)
   assert.deepEqual(recordedDirectories(f.ctx.agents.get(id).session), [], 'a fresh worker already starts in its worktree, so nothing is written')
   await f.adapter.dispose()
   const elsewhere = f.mission.workspace
-  if (directory !== undefined) {
-    // A cd the worker made before its tools were hidden, or in a turn the
-    // adapter did not set up: the public persistence API appends it to the log.
-    const stored = await readStoredSession(f.ctx.sessionPersistence, id)
-    const staged = Session.fromRestore(id, stored.events, stored.meta, stored.inheritedEventCount)
-    staged.append('working-directory/change', { cwd: elsewhere })
-    await appendStoredEvents(f.ctx.sessionPersistence, id, staged.snapshotEvents(stored.events.length))
-  }
+  // A cd the worker made before its tools were hidden, or in a turn the
+  // adapter did not set up: the public persistence API appends it to the log.
+  const stored = await readStoredSession(f.ctx.sessionPersistence, id)
+  const staged = Session.fromRestore(id, stored.events, stored.meta, stored.inheritedEventCount)
+  staged.append('working-directory/change', { cwd: elsewhere })
+  await appendStoredEvents(f.ctx.sessionPersistence, id, staged.snapshotEvents(stored.events.length))
   const resumed = new HarnessWorkers(f.ctx, f.options)
   resumed.bind(f.callbacks)
   try {
     await resumed.start(f.spec)
     const worker = f.ctx.agents.get(id)
-    if (directory === undefined) {
-      assert.deepEqual(recordedDirectories(worker.session), [], 'a resumed activation writes no event this host cannot read')
-      return
-    }
     assert.equal(directory.get(worker.session), f.member.workspace, 'the activation re-anchored the session directory')
     assert.deepEqual(recordedDirectories(worker.session), [elsewhere, f.member.workspace], 'as one durable change after the recorded one')
     assert.equal(worker.inbox.hasPending, false, 'the anchor queues no notice, so the worker holds no input of its own making')
@@ -1119,6 +1172,23 @@ test('a worker whose log recorded a working-directory change starts its next act
     await resumed.stop(f.member.id)
     await resumed.start(f.spec)
     assert.deepEqual(recordedDirectories(f.ctx.agents.get(id).session), [elsewhere, f.member.workspace], 'a session already in its worktree is not written again')
+    assert.deepEqual(f.observations.failures, [])
+  } finally { await resumed.dispose() }
+})
+
+test('a composition without the working-directory service gets no directory event from any activation', async t => {
+  // The adapter reads the service as an optional one: a composition that does
+  // not mount it records no directory, so there is nothing to re-anchor.
+  const f = await fixture(t)
+  const id = SessionId(f.member.sessionId)
+  assert.equal(f.ctx.get('workingDirectory'), undefined)
+  assert.deepEqual(recordedDirectories(f.ctx.agents.get(id).session), [], 'a fresh activation writes none')
+  await f.adapter.dispose()
+  const resumed = new HarnessWorkers(f.ctx, f.options)
+  resumed.bind(f.callbacks)
+  try {
+    await resumed.start(f.spec)
+    assert.deepEqual(recordedDirectories(f.ctx.agents.get(id).session), [], 'nor does a resumed one')
     assert.deepEqual(f.observations.failures, [])
   } finally { await resumed.dispose() }
 })

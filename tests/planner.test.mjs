@@ -37,6 +37,14 @@ function fakeInbox(session) {
 import { SubprocessLocal } from './subprocess-seam.mjs'
 import { FakeClock, FakeWorkers, eventually as poll, makeRuntime, makeWorkspaces } from './faults/harness.mjs'
 const eventually = read => poll(read, 'Expected native planner recovery transition did not occur', 3000)
+/** A valid plan for the native request saved in `root`. */
+const nativePlan = root => ({ title: 'Native request', objective: 'Deliver verified code', workspace: root, scope: ['src/'], acceptance: ['works'],
+  budget: { maxTokens: 100000, maxSteps: 100, maxWorkers: 2, maxDurationMs: 3600000, maxTasks: 6, maxExperiments: 0 },
+  members: [{ key: 'builder', role: 'implementation', maxOutputTokens: 4096 }, { key: 'reviewer', role: 'verification', maxOutputTokens: 2048 }],
+  workstreams: [{ key: 'main', title: 'Delivery', objective: 'Complete the change' }],
+  tasks: [{ key: 'code', workstreamKey: 'main', title: 'Code', objective: 'Implement the change', kind: 'implementation', outputs: [], scope: ['src/'], acceptance: ['works'], covers: ['c1'], assigneeKey: 'builder', checks: ['test -d .'], maxRecoveryAttempts: 1, checkTimeoutMs: 1000 }] })
+/** The reason line of the owner's recovery notice, as its model reads it. */
+const recordedReason = message => message.content[0].text.split('\n').find(line => line.startsWith('Recorded reason'))
 async function fixture(t, options = {}) {
   // Registered before makeRuntime's own cleanup, so the plugin, the idle gates,
   // the runtime and then the context are released in that order.
@@ -61,7 +69,8 @@ async function fixture(t, options = {}) {
   idleGates.push(pending)
   const messages = []
   const inbox = fakeInbox(session)
-  const agent = { id: session.id, session, inbox, options: { provider: 'current', model: 'current-model' },
+  // `ctx` is the agent's scope: a waking delivery asks that it is still live (`wakeableAgent`).
+  const agent = { id: session.id, session, inbox, ctx, options: { provider: 'current', model: 'current-model' },
     send(message, target) { inbox.append(target, message); messages.push(message) },
     followup(message) { this.send(message, 'next-turn') }, whenIdle() { return idleGates.at(-1).promise },
   }
@@ -135,6 +144,29 @@ test('cancellation while resolving owner model cannot enqueue planning', async t
   await reached.promise; controller.abort(new Error('cancelled before planning')); release.resolve()
   await assert.rejects(started, /cancelled before planning/)
   assert.equal(f.messages.length, 0); assert.equal(f.runtime.starts({ sessionId: f.agent.id }).length, 0)
+})
+/**
+ * Every waking delivery to the owner asks `wakeableAgent`, the command's own
+ * planning message included. The Harness unwinds an idle owner's scope before
+ * the owner leaves the registry; an owner whose scope was unwound while its
+ * snapshot was prepared is neither sent the planning message nor the recovery
+ * notice, which stays pending until the session has a live agent again.
+ */
+test('an owner whose scope is unwound while its snapshot is prepared is not woken, and its recovery notice waits for a live scope', async t => {
+  const unwound = { fiber: { uid: null } }
+  let f
+  f = await fixture(t, { async beforeSnapshot() { f.agent.ctx = unwound } })
+  await assert.rejects(f.execute('/agent-swarm plan while the owner is disposed'), /当前对话已关闭/)
+  const [request] = f.runtime.starts({ sessionId: f.agent.id })
+  assert.equal(request.status, 'failed')
+  assert.equal(request.recoveryNoticePending, true)
+  await new Promise(resolve => setImmediate(resolve))
+  assert.deepEqual(f.messages, [], 'neither the planning message nor the recovery notice reaches the unwound scope')
+  f.agent.ctx = f.ctx
+  f.runtime.commit(request.id, () => {})
+  await eventually(() => !f.runtime.store.get('starts', request.id).recoveryNoticePending)
+  assert.deepEqual(f.messages.map(message => message.source.phase), ['failure'])
+  assert.equal(recordedReason(f.messages[0]), `Recorded reason (JSON string): ${JSON.stringify('当前对话已关闭，请重新打开后重试。')}`)
 })
 test('unloading removes native command and late idle callback cannot touch disposed runtime', async t => {
   const f = await fixture(t)
@@ -230,7 +262,7 @@ test('one owner with a hung flush cannot block another owner recovery notice', a
   const session = await f.ctx.sessions.create(SessionId('other-planner-owner'), { meta: { cwd: f.root } })
   const inbox = fakeInbox(session)
   const received = []
-  const other = { id: session.id, session, inbox, send(message, target) { inbox.append(target, message); received.push(message) } }
+  const other = { id: session.id, session, inbox, ctx: f.ctx, send(message, target) { inbox.append(target, message); received.push(message) } }
   f.agents.set(other.id, other)
   const actor = { sessionId: other.id }
   const second = f.runtime.requestStart(actor, { commandId: 'other-command', goal: 'other owner goal', workspace: f.root }, { grantRoot: f.root, source: 'session' })
@@ -278,6 +310,46 @@ test('an unrepaired validation failure becomes one fenced recovery notice when p
   assert.equal(f.messages.filter(message => message.source.phase === 'failure').length, 1)
 })
 
+/**
+ * A failed launch's durable records carry the failure's readable text
+ * (`recordedFailure`, `thrownText`), and the recovery notice quotes it to the
+ * owner's model. A value that is not an Error, thrown as a host or an adapter
+ * can throw one, used to be recorded, and quoted, as "[object Object]".
+ */
+test('a launch failure that is not an Error is recorded in the request and its draft, and quoted to the owner, as its readable text', async t => {
+  const f = await fixture(t)
+  await f.execute('/agent-swarm deliver the change')
+  const actor = { sessionId: f.agent.id }
+  const [request] = f.runtime.starts(actor)
+  // Thrown inside the assembly, once the draft is launching and its mission staged.
+  const thrown = Object.freeze({ kind: 'worktree-offline' })
+  f.runtime.workers.prepareWorkspace = async () => { throw thrown }
+  await assert.rejects(f.runtime.startPlan(actor, request.id, nativePlan(f.root), 1), error => error === thrown)
+  const failed = f.runtime.store.get('starts', request.id)
+  assert.equal(failed.status, 'failed')
+  assert.equal(failed.error, '{"kind":"worktree-offline"}')
+  assert.equal(f.runtime.store.get('drafts', failed.draftId).error, '{"kind":"worktree-offline"}', 'the draft records the same text')
+  f.pending.resolve()
+  await eventually(() => f.runtime.store.get('starts', request.id).planningFenced)
+  await eventually(() => !f.runtime.store.get('starts', request.id).recoveryNoticePending)
+  const notices = f.messages.filter(message => message.source.phase === 'failure')
+  assert.equal(notices.length, 1)
+  assert.equal(recordedReason(notices[0]), `Recorded reason (JSON string): ${JSON.stringify('{"kind":"worktree-offline"}')}`)
+})
+
+test('a command whose snapshot fails with a value that is not an Error records, and quotes to the owner, its readable text', async t => {
+  const thrown = Object.freeze({ kind: 'snapshot-offline' })
+  const f = await fixture(t, { async beforeSnapshot() { throw thrown } })
+  await assert.rejects(f.execute('/agent-swarm snapshot the project'))
+  const [request] = f.runtime.starts({ sessionId: f.agent.id })
+  assert.equal(request.status, 'failed')
+  assert.equal(request.error, '{"kind":"snapshot-offline"}')
+  await eventually(() => !f.runtime.store.get('starts', request.id).recoveryNoticePending)
+  const notices = f.messages.filter(message => message.source.phase === 'failure')
+  assert.equal(notices.length, 1)
+  assert.equal(recordedReason(notices[0]), `Recorded reason (JSON string): ${JSON.stringify('{"kind":"snapshot-offline"}')}`)
+})
+
 test('retry snapshot preparation uses the planning deadline rather than the shorter outbox timeout', async t => {
   // Order, not speed. The preparation holds on a timer armed after the dispatch
   // started, and longer than the outbox timeout, so under the old rule that
@@ -315,12 +387,7 @@ test('a native request launches its validated plan with the session authorizatio
   assert.equal((await f.execute('/agent-swarm deliver the change')).result.kind, 'success')
   const [request] = f.runtime.starts({ sessionId: f.agent.id })
   assert.deepEqual([request.workspaceAuthorizationSource, request.workspaceGrantRoot], ['session', f.root])
-  const plan = { title: 'Native request', objective: 'Deliver verified code', workspace: f.root, scope: ['src/'], acceptance: ['works'],
-    budget: { maxTokens: 100000, maxSteps: 100, maxWorkers: 2, maxDurationMs: 3600000, maxTasks: 6, maxExperiments: 0 },
-    members: [{ key: 'builder', role: 'implementation', maxOutputTokens: 4096 }, { key: 'reviewer', role: 'verification', maxOutputTokens: 2048 }],
-    workstreams: [{ key: 'main', title: 'Delivery', objective: 'Complete the change' }],
-    tasks: [{ key: 'code', workstreamKey: 'main', title: 'Code', objective: 'Implement the change', kind: 'implementation', outputs: [], scope: ['src/'], acceptance: ['works'], covers: ['c1'], assigneeKey: 'builder', checks: ['test -d .'], maxRecoveryAttempts: 1, checkTimeoutMs: 1000 }] }
-  const { mission } = await f.runtime.startPlan({ sessionId: f.agent.id }, request.id, plan, request.planningEpoch)
+  const { mission } = await f.runtime.startPlan({ sessionId: f.agent.id }, request.id, nativePlan(f.root), request.planningEpoch)
   assert.equal(mission.status, 'active', 'the validated plan launched')
   assert.deepEqual([mission.workspaceAuthorizationSource, mission.workspaceGrantRoot], ['session', f.root], 'the mission records the request authorization')
   const draft = f.runtime.store.get('drafts', f.runtime.store.get('starts', request.id).draftId)

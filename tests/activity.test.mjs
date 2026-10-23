@@ -12,14 +12,11 @@ import SessionStore, { SessionId } from '@deepseek-ai/dsh-session'
 import SessionProjection from '@deepseek-ai/dsh-session-projection'
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
 import ToolRuntime, { defineContentToolFixture } from '@deepseek-ai/dsh-tools'
-import * as JsonlPersistenceModule from '@deepseek-ai/dsh-session-persistence-jsonl'
+import * as JsonlPersistence from '@deepseek-ai/dsh-session-persistence-jsonl'
 import SandboxPolicy from '@deepseek-ai/dsh-sandbox-policy'
 import Approval from '@deepseek-ai/dsh-user-approval'
 import { SubprocessLocal } from './subprocess-seam.mjs'
 import { FakeClock, FakeWorkers, SwarmRuntime, eventually, makeRepo, makeRuntime } from './faults/harness.mjs'
-import { loaderPlugin } from './fixtures/built-harness.mjs'
-
-const JsonlPersistence = loaderPlugin(JsonlPersistenceModule)
 
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
 const gate = () => { let resolve; const promise = new Promise(done => { resolve = done }); return { promise, resolve } }

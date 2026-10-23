@@ -114,11 +114,11 @@ export function ActivityPanel({ sessions, modelDirectories, monitor, history, on
   const start = selectedStart && (['planning', 'launching', 'failed'].includes(selectedStart.status) || (selectedStart.status === 'stopped' && !snapshot)) ? selectedStart : undefined
   useEffect(() => { setStartUnconfirmed(false) }, [state.updatedAt, context])
   const directory = useMemo(() => {
-    // A selected subagent address (0.1.5 `currentAddress`) has no model directory of its own; 0.1.7 panes always name their session.
-    const currentAddress = (sessionState as { currentAddress?: unknown }).currentAddress
-    if (!owner || (!sessionId && currentAddress)) return undefined
+    if (!owner) return undefined
+    // directoryFor refuses a session the client has not bound yet; retaining
+    // one changes the session list, so a list change retries the refusal.
     try { return modelDirectories.directoryFor(owner) } catch { return undefined }
-  }, [owner, sessionId, modelDirectories, sessionState])
+  }, [owner, modelDirectories, sessionState])
   const choose = (value: string) => { history.close(); setSelection(value); setError(''); setStopArmed(false); setEditorOpen(false); setEditorMounted(false) }
   const control = async (action: 'pause' | 'resume' | 'stop' | 'complete') => {
     if (!owner || !snapshot || !data?.writable || connection !== 'connected') return

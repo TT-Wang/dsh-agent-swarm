@@ -19,7 +19,7 @@
  * `scripts/load/README.md` and `src/store.ts`.
  */
 import { errorChain, isQuotaExceededError } from '@deepseek-ai/dsh-llm'
-import type { ProviderOutage, ProviderOutageClass } from './types.ts'
+import type { MemberRouteRefusal, ProviderOutage, ProviderOutageClass } from './types.ts'
 const ADMISSION_REASONS = ['admitted', 'queue_full', 'budget_exceeded', 'lease_conflict', 'writer_busy'] as const
 export type AdmissionReason = (typeof ADMISSION_REASONS)[number]
 
@@ -30,12 +30,17 @@ export type AdmissionReason = (typeof ADMISSION_REASONS)[number]
  * the attempt is preserved, no recovery credit is spent and the member is never
  * retired for it. `member` is a refusal of the member's own route that neither
  * waiting nor the owner's sign-in or top-up ends, since a member's route is
- * fixed for its session: it is the member's failure, and the owner replaces the
- * member. A code not listed here is decided by the HTTP status, then by provider
- * wording (`classifyProviderOutage`).
+ * fixed for its session (`memberRouteRefusal`). Admission prepares each
+ * member's route as a model step prepares it and refuses a route this table
+ * reads as `member` (`memberRoutes`, src/model-selection.ts), so at a step it
+ * is a route that changed after admission: the step retires the member at once
+ * and releases its work, and the owner admits a replacement (a worker start,
+ * which makes no model request, counts it like any other start failure). A code
+ * not listed here is decided by the HTTP status, then by provider wording
+ * (`classifyProviderOutage`).
  */
 export const PROVIDER_FAILURE_CODES = {
-  // An exhausted balance the owner tops up. The DeepSeek account route (0.2.x)
+  // An exhausted balance the owner tops up. The DeepSeek account route
   // rewrites QUOTA as ACCOUNT_QUOTA and keeps the request's HTTP status.
   QUOTA: 'quota',
   ACCOUNT_QUOTA: 'quota',
@@ -44,16 +49,19 @@ export const PROVIDER_FAILURE_CODES = {
   TIMEOUT: 'unavailable',
   TRANSPORT: 'unavailable',
   PROVIDER_UNAVAILABLE: 'unavailable',
-  // The DeepSeek account route (0.2.x) holds no account token (signed out), or
+  // The DeepSeek account route holds no account token (signed out), or
   // the provider refused its token with HTTP 401 and the host discarded it, so
   // the route's next request is ACCOUNT_SIGN_IN_REQUIRED: one condition of the
   // route that ends when the owner signs in again.
   ACCOUNT_SIGN_IN_REQUIRED: 'credential',
   ACCOUNT_TOKEN_INVALID: 'credential',
   // The DeepSeek account catalog refuses the member's model on this Harness
-  // release (0.2.x): only another model or another Harness release runs it.
+  // release (the adapter's own admission in `prepareCall`): only another model
+  // or another Harness release runs it.
   MODEL_UNSUPPORTED: 'member',
   CLIENT_UPGRADE_REQUIRED: 'member',
+  // The route's model does not take the member's reasoning effort.
+  UNSUPPORTED_REASONING_EFFORT: 'member',
 } as const satisfies Readonly<Record<string, ProviderOutageClass | 'member'>>
 
 /** The table's own key for `code`, or undefined when the table does not decide it. */
@@ -95,6 +103,19 @@ export function classifyProviderOutage(error: unknown): ProviderOutage | undefin
     return outage('unavailable')
   }
   return undefined
+}
+
+/**
+ * A refusal of the member's own route: a failure whose Harness code the table
+ * decides as `member` (`PROVIDER_FAILURE_CODES`), with that code and the host's
+ * text. Undefined for every other failure, outages included.
+ */
+export function memberRouteRefusal(error: unknown): MemberRouteRefusal | undefined {
+  const code = error !== null && typeof error === 'object' ? (error as { code?: unknown }).code : undefined
+  const decided = decidedCode(typeof code === 'string' ? code : undefined)
+  if (decided === undefined || PROVIDER_FAILURE_CODES[decided] !== 'member') return undefined
+  const message = errorChain(error)
+  return { code: decided, message: message.length > 500 ? `${message.slice(0, 500)}…` : message }
 }
 
 /** Broadest to narrowest: a candidate must have a free slot at every level. */

@@ -450,10 +450,11 @@ const GATE_TESTS = {
         'the launch honours the durable cancellation instead of the lost abort handle')
       assert.equal(f.runtime.store.get('starts', request.id).status, 'failed', 'the request stays failed')
       // The cancellation is attributable from the durable record: `failStart`
-      // wrote this event with the reason before the launch noticed. The event is
-      // recorded under the launch's mission id (the request names it already).
+      // wrote this event with the reason before the launch noticed, under the
+      // launch's mission when the request names one (it names only a mission
+      // that exists), else under the request itself.
       const cancelledMissionId = f.runtime.store.get('starts', request.id).missionId
-      const cancelEvent = events(f.runtime, cancelledMissionId, 'automatic/failed')
+      const cancelEvent = events(f.runtime, cancelledMissionId ?? request.id, 'automatic/failed')
         .find(event => /cancel the in-flight launch/.test(String(event.data.reason)))
       assert.ok(cancelEvent !== undefined, 'the durable failure event names the cancellation reason')
       const cancelledMission = cancelledMissionId === undefined ? undefined : f.runtime.store.get('missions', cancelledMissionId)

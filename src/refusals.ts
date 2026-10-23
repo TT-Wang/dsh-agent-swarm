@@ -40,20 +40,6 @@ export function validatedBudget(input: Budget): Budget {
   return budget
 }
 
-/**
- * A provider rejection of an explicit reasoning effort. The Harness LLM layer
- * raises `UNSUPPORTED_REASONING_EFFORT` for a route whose model declares no such
- * effort; the same text can also reach the runtime as a plain string from the
- * worker adapter's failure callback, so both shapes are recognized.
- */
-export function unsupportedEffort(error: unknown): { requested?: string; message: string } | undefined {
-  const message = error instanceof Error ? error.message : String(error)
-  const code = error !== null && typeof error === 'object' && 'code' in error ? (error as { code?: unknown }).code : undefined
-  if (code !== 'UNSUPPORTED_REASONING_EFFORT' && !/does not support reasoning effort/i.test(message)) return undefined
-  const requested = /reasoning effort "([^"]+)"/i.exec(message)?.[1]
-  return { ...(requested === undefined ? {} : { requested }), message }
-}
-
 /** One write a busy writer refused: an admission decision, or a guard terminal's request. */
 type WriterBusyRecovery = { at: number; attempts: number; detail: string } & (
   { candidate: AdmissionCandidate }

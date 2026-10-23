@@ -95,11 +95,28 @@ test('R03: a host append rejection is never an acknowledgement, even one naming 
   const f = await fixture(t), ctx = new Context()
   const delivery = { id: 'exact', missionId: f.mission.id, from: 'runtime', to: 'owner', kind: 'control', content: 'old decision', createdAt: Date.now(), subjects: ['task@1'], notice: { class: 'decision', dedupKey: 'fallthrough:fact' } }
   const refusal = Object.assign(new Error('invariant violated by "@dsh-external/dsh-agent-swarm": refusing an owner-facing fallthrough decision'), { name: 'InvariantError', code: 'INVARIANT' })
-  ctx.provide('agents', { get: () => ({ session: { snapshotEvents: () => [] }, send: () => { throw refusal } }) })
+  ctx.provide('agents', { get: () => ({ ctx, session: { snapshotEvents: () => [] }, send: () => { throw refusal } }) })
   ctx.provide('sessions', { flush: async () => {} })
   const adapter = new HarnessWorkers(ctx, { workspacesRoot: f.root, checkTimeoutMs: 1000, maxCheckOutputBytes: 1024 })
   t.after(() => adapter.dispose())
   await assert.rejects(adapter.deliver({ id: 'owner', missionId: f.mission.id, sessionId: 'owner' }, delivery), error => error === refusal)
+})
+
+test('a mission notice is not delivered into an owner whose scope is unwound, and reaches it once the scope is live', async t => {
+  // The Harness unwinds an idle owner's scope before the owner leaves the
+  // registry; the outbox asks what every waking delivery asks (`wakeableAgent`).
+  const f = await fixture(t), ctx = new Context(), sent = []
+  const delivery = { id: 'unwound', missionId: f.mission.id, from: 'runtime', to: 'owner', kind: 'control', content: 'Choose a route', createdAt: Date.now() }
+  const owner = { ctx: { fiber: { uid: null } }, session: { snapshotEvents: () => [] }, send: message => { sent.push(message) } }
+  ctx.provide('agents', { get: () => owner })
+  ctx.provide('sessions', { flush: async () => {} })
+  const adapter = new HarnessWorkers(ctx, { workspacesRoot: f.root, checkTimeoutMs: 1000, maxCheckOutputBytes: 1024 })
+  t.after(() => adapter.dispose())
+  await assert.rejects(adapter.deliver({ id: 'owner', missionId: f.mission.id, sessionId: 'owner' }, delivery), /owner is offline; notification remains in the durable outbox/)
+  assert.deepEqual(sent, [])
+  owner.ctx = ctx
+  await adapter.deliver({ id: 'owner', missionId: f.mission.id, sessionId: 'owner' }, delivery)
+  assert.deepEqual(sent.map(message => message.id), ['swarm:unwound'])
 })
 
 test('R03: unrelated host invariant retains outbox identity and one durable failure until retry succeeds', async t => {
@@ -382,7 +399,8 @@ function plannerFixture(t) {
   const request = { id: 'start', ownerSessionId: 'owner', commandId: 'command', status: 'planning', planningEpoch: 3, planningDeadlineAt: Date.now() + 60000, updatedAt: Date.now(), goal: 'Plan work', workspace: '/project' }
   request.planningWarning = { deadline: request.planningDeadlineAt, threshold: 30000 }
   requests.set(request.id, request)
-  const agent = { id: 'owner', session: { snapshotEvents: () => events }, send(message) { sent.push(message); events.push({ type: 'user/message', data: message }) } }
+  // `ctx.fiber` is the agent's live scope (`wakeableAgent`).
+  const agent = { id: 'owner', ctx: { fiber: { uid: 1 } }, session: { snapshotEvents: () => events }, send(message) { sent.push(message); events.push({ type: 'user/message', data: message }) } }
   const ctx = { agents: { get: () => agent }, sessions: { async flush() { if (failFlush) throw new Error('persistence offline') } },
     on: () => () => {}, effect: factory => disposers.push(factory()), inject() {}, commands: { register: () => () => {} } }
   const runtime = makeRuntimeStub({ config: { tickMs: 60000 }, bounds: { stallPassTimeoutMs: 1000 }, store: { list: () => [...requests.values()], get: (_table, id) => structuredClone(requests.get(id)), put: (_table, row) => requests.set(row.id, structuredClone(row)) },

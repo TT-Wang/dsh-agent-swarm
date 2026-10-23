@@ -8,7 +8,7 @@ import { Context } from '@deepseek-ai/cordis'
 import WebServer from '@deepseek-ai/dsh-host-webserver'
 import * as Connection from '@deepseek-ai/dsh-client-connection'
 import SessionStore, { SessionId } from '@deepseek-ai/dsh-session'
-import * as JsonlPersistenceModule from '@deepseek-ai/dsh-session-persistence-jsonl'
+import * as JsonlPersistence from '@deepseek-ai/dsh-session-persistence-jsonl'
 import SessionQueryEngine from '@deepseek-ai/dsh-session-query'
 import SessionController from '@deepseek-ai/dsh-api-session-controller'
 import AgentRegistry from '@deepseek-ai/dsh-agent'
@@ -24,10 +24,8 @@ import { loadWorkspaceGrants } from '../lib/authorization.js'
 import { PolicyError } from '../lib/policy-error.js'
 import { errorTypeFor } from '../lib/trace.js'
 import { AdmissionError, TaskGraphAdmissionError } from '../lib/admission.js'
+import { memberRoutes } from '../lib/model-selection.js'
 import { FakeWorkers, NO_GRANTS, budget as defaultBudget, makeRuntime } from './faults/harness.mjs'
-import { loaderPlugin } from './fixtures/built-harness.mjs'
-
-const JsonlPersistence = loaderPlugin(JsonlPersistenceModule)
 
 const budget = { ...defaultBudget, maxTokens: 100000, maxSteps: 100, maxTasks: 10, maxExperiments: 2 }
 /** Records the members it started and the workspaces it prepared. */
@@ -57,11 +55,7 @@ async function fixture(t, { grants = NO_GRANTS } = {}) {
     modifyRecord: async (_key, mutate) => (credentialRecord = await mutate(credentialRecord)),
     deleteRecord: async () => { credentialRecord = undefined },
   })
-  // 0.1.5's connection registers its RPC route on the context the service was provided from,
-  // and that context must itself inject webServer; compose it inside such a scope.
-  await new Promise((resolve, reject) => ctx.inject(['webServer'], scope => {
-    scope.plugin(Connection, { trustedHosts: ['lan.example'], maxRequestBodyBytes: 1048576 }).then(() => resolve(), reject)
-  }))
+  await ctx.plugin(Connection, { trustedHosts: ['lan.example'], maxRequestBodyBytes: 1048576 })
   await ctx.plugin(SessionStore)
   await ctx.plugin(SessionProjection)
   await ctx.plugin(JsonlPersistence, { root: path.join(directory, 'sessions'), compression: 'none', writeBatchMaxDelayMs: 1 })
@@ -93,6 +87,8 @@ async function fixture(t, { grants = NO_GRANTS } = {}) {
   }
   const catalog = new Catalog()
   ctx.llm.registerAdapter(['public-provider'], catalog)
+  // Admission asks the routes of this composition, as the Harness adapter does in the plugin.
+  workers.memberRoutes = (ownerSessionId, members, signal) => memberRoutes(ctx, ownerSessionId, members, signal)
   runtime = made.runtime
   const ownerId = 'web-owner'
   const ownerFiber = ctx.plugin({ name: 'test-web-owner', inject: ['agents'], async apply(scope) {
@@ -103,7 +99,7 @@ async function fixture(t, { grants = NO_GRANTS } = {}) {
   } })
   await ownerFiber
   ctx.sessions.create(SessionId('other-owner'), { meta: { cwd: workspace } })
-  const bridge = ctx.plugin({ name: 'test-swarm-web', inject: ['connection', 'webServer', 'sessions', 'sessionPersistence', 'agents', 'llm'], apply(scope) { registerWebApi(scope, runtime, { defaultBudget: budget, maxPayloadBytes: 8192 }) } })
+  const bridge = ctx.plugin({ name: 'test-swarm-web', inject: ['connection', 'sessions', 'sessionPersistence', 'agents', 'llm'], apply(scope) { registerWebApi(scope, runtime, { defaultBudget: budget, maxPayloadBytes: 8192 }) } })
   await bridge
   const port = ctx.webServer.port
   const authority = `127.0.0.1:${port}`
@@ -382,7 +378,7 @@ test('model validation rejects unknown routes before saving but accepts routable
   const withModel = (provider, model) => ({ ...f.input, members: [{ ...f.input.members[0], provider, model }] })
   const unknown = await f.rpc('create-draft', { sessionId: f.ownerId, input: withModel('unknown-provider', 'model-one') })
   assert.equal(unknown.result.ok, false)
-  assert.match(unknown.result.error.message, /Unknown model provider/)
+  assert.match(unknown.result.error.message, /^\[member_route_unavailable\] members\[builder\]: provider "unknown-provider" model "model-one" does not resolve on this host\./)
   const invalid = await f.rpc('create-draft', { sessionId: f.ownerId, input: withModel('public-provider', 'unroutable') })
   assert.equal(invalid.result.ok, false)
   assert.deepEqual(f.runtime.drafts({ sessionId: f.ownerId }), [])
@@ -413,7 +409,8 @@ test('launch revalidates current model routing before side effects and activates
   f.catalog.unavailable = true
   const invalid = await f.rpc('launch-draft', { sessionId: f.ownerId, draftId: draft.id, revision: draft.revision })
   assert.equal(invalid.result.ok, false)
-  assert.match(invalid.result.error.message, /Model route is unavailable/)
+  // The draft's member names no route: the launch admits the owner's, which it inherits.
+  assert.match(invalid.result.error.message, /^\[member_route_unavailable\] members\[builder\]: provider "public-provider" model "model-one" does not resolve on this host\./)
   assert.deepEqual(f.workers.workspaces, [], 'no workspace is prepared before route admission')
   assert.deepEqual(f.workers.starts, [], 'no worker is started before route admission')
   f.catalog.unavailable = false

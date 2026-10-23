@@ -56,7 +56,7 @@ export async function bootFaultHarness({ runRoot, workspace, harnessRoot, swarmC
     ['approval', '@deepseek-ai/dsh-user-approval', { policy: 'never' }],
     ['shell', '@deepseek-ai/dsh-bash-local', { cwd: workspace, timeoutMs: 10_000, graceMs: 50 }],
     ['shell-env', '@deepseek-ai/dsh-shell-env', { dshHome: join(runRoot, 'dsh-home') }],
-    ...await workingDirectoryRows(harnessRoot, workspace),
+    ...workingDirectoryRows(workspace),
     ['tool-bash', '@deepseek-ai/dsh-tool-bash', { enableRunInBackground: false }],
     ['agent-loop', '@deepseek-ai/dsh-agent-loop', { agents: [] }],
   ]

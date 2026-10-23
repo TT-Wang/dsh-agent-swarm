@@ -3,12 +3,12 @@ import { randomUUID } from 'node:crypto'
 import { isAbsolute, join } from 'node:path'
 import { SwarmStore, WriterBusyError, StoreRecoveryError, id, stageRestore, type PendingRestore, type PostFilter, type StoreOptions } from './store.ts'
 import { Attempts, endAttempt } from './attempts.ts'
-import { PolicyError } from './policy-error.ts'
+import { PolicyError, recordedFailure } from './policy-error.ts'
 export { WorkspaceRevokedError } from './authorization.ts'
 import { recordedClaim, type WorkspaceClaim } from './authorization.ts'
 import { WorkspaceAdmission, deniedGitWrite, gitWriteDeniedMessage, TEMP_RENDEZVOUS_WINDOW_MS } from './workspace-admission.ts'
 import { Notices, NOTICE_TEMPLATES, REJECTION_DECISION_TRIGGER, assignmentCurrent, guardTerminalNotice, integrationGap, renderNotice, reviewBlocked } from './notices.ts'
-import { RefusalRegistry, requireStrings, requireText, sameChecks, unsupportedEffort, validatedBudget } from './refusals.ts'
+import { RefusalRegistry, requireStrings, requireText, sameChecks, validatedBudget } from './refusals.ts'
 import { Scheduling } from './scheduling.ts'
 import { progressed, type Kernel } from './kernel.ts'
 import { ADMISSION_REFUSED, AUTOMATIC_REVIEW_PREFIX, bounds, capable, completionError, fingerprintBoard, inFlightEstimate, missionFingerprint, noticeSubjectsFor, readBoard, readinessBlocker, readMission, ready, rerouteTarget, reviewable, reviewNeed, reviewPathBlocker, reviewPathStalled, stillChosen, unreviewedSources, unschedulable, type AdapterView, type Board, type Bounds, type ReviewNeed, type SchedulingPass } from './board.ts'
@@ -24,12 +24,12 @@ export { TEMP_RENDEZVOUS_WINDOW_MS, sharedTempPaths, tempRendezvousDecision, typ
 import { awaitsDelivery } from './arena.ts'
 import { AdmissionRefusedError, classifyProviderOutage, LIMIT_LEVELS, TASK_CLASSES, type AdmissionReason, type AdmissionRecord, type LimitLevel, type LimitRule } from './scheduler.ts'
 import { validScope, scopeSubset } from './scope.ts'
-import { AdmissionError, assertDeclaredOutputs, assertScopeSelectors, citedCovers, dependencyAssumptions, formatDiagnostic, isNoopCheck, loadPackageScripts, normalizeReviewDependencies, normalizeScopeSelectors, normalizeTaskCeilings, reconcileTaskAdmission, requireHostChecks, taskCeilingBlock, taskGraphDefects, TaskGraphAdmissionError, type TaskGraphNode } from './admission.ts'
+import { AdmissionError, assertDeclaredOutputs, assertScopeSelectors, citedCovers, dependencyAssumptions, formatDiagnostic, isNoopCheck, loadPackageScripts, normalizeReviewDependencies, normalizeScopeSelectors, normalizeTaskCeilings, reconcileTaskAdmission, requireHostChecks, taskCeilingBlock, taskGraphDefects, TaskGraphAdmissionError, memberRouteDiagnostic, type MemberRouteEntry, type TaskGraphNode } from './admission.ts'
 import { canBorrowTask, canOwnReview, strandedReview } from './assignment.ts'
 import { executionClock, executionElapsed, exhaustedDimensions } from './resource-time.ts'
 import { TERMINAL_STATES, blockCauses, currentEvidenceIds, finishedAttempt, holdsAttempt, holdsOpenAttempt, memberTask, missionSubject, openAttempt, pendingStopOwner, quiescencePending, selectAcceptedDelivery, stopPending, subjectsOfTasks, taskEdges, taskGraphIndex, taskSubject, terminal, uncoveredCriteria, type BlockCause, type HeldTask } from './task-graph.ts'
 import { checkSyntaxDetail, declaredPlanChecks, orderedTasks, pairReviews, planAdvisories, validatePlan } from './plans.ts'
-import { OWNER_ONLY_TOOLS, UNCONFINED_HOST_TOOLS, type Actor, type AutoStart, BoardQuery, Budget, CheckAttribution, CreateMissionInput, CriticalPath, criterionId, Delivery, DraftPlan, Escalation, Evidence, EvidenceStatus, Member, Mission, nextWorkerName, ObserveQuery, MessageInput, PlanInput, Post, PostInput, PostKind, PROVIDER_OUTAGE_WINDOW_MS, ProposeTaskInput, ProviderOutage, providerQuiescent, PublishInput, RecoveryFallback, RequestStartInput, RuntimeConfig, Snapshot, Task, TaskAmendment, TaskRejection, TaskCeiling, ToolRun, VerificationCleanupFailure, WorkerAdapter, WorkerActivity, Workstream } from './types.ts'
+import { OWNER_ONLY_TOOLS, UNCONFINED_HOST_TOOLS, type Actor, type AutoStart, BoardQuery, Budget, CheckAttribution, CreateMissionInput, CriticalPath, criterionId, Delivery, DraftPlan, Escalation, Evidence, EvidenceStatus, Member, Mission, nextWorkerName, ObserveQuery, MessageInput, PlanInput, Post, PostInput, PostKind, PROVIDER_OUTAGE_WINDOW_MS, MemberRouteRefusal, ProposeTaskInput, ProviderOutage, providerQuiescent, PublishInput, RecoveryFallback, RequestStartInput, RuntimeConfig, Snapshot, Task, TaskAmendment, TaskRejection, TaskCeiling, ToolRun, VerificationCleanupFailure, WorkerAdapter, WorkerActivity, Workstream } from './types.ts'
 import { requireArtifactChecks } from './artifact-policy.ts'
 
 /** Release a prelaunch caller even when an adapter ignores cancellation. Its late writes remain fenced. */
@@ -283,6 +283,7 @@ export class SwarmRuntime implements Kernel {
       guard: (memberId, tool) => this.guard(memberId, tool),
       failure: (memberId, error) => this.onFailure(memberId, error),
       providerOutage: (memberId, outage) => this.onProviderOutage(memberId, outage),
+      routeRefused: (memberId, refusal) => this.onRouteRefused(memberId, refusal),
       recoveryFallback: info => this.onRecoveryFallback(info),
       verificationCleanupFailure: info => this.onVerificationCleanupFailure(info),
     })
@@ -310,6 +311,11 @@ export class SwarmRuntime implements Kernel {
     }
     for (const request of this.store.list('starts')) {
       const mission = request.missionId ? this.store.get('missions', request.missionId) : undefined
+      // A request names only a mission that exists (`create`). Earlier
+      // releases linked it when its launch began, so a launch refused before
+      // the mission was created left a link to none; it is dropped here.
+      const dangling = request.missionId !== undefined && mission === undefined
+      if (dangling) delete request.missionId
       if (mission && mission.status !== 'staged') {
         request.status = mission.status === 'completed' ? 'completed' : mission.status === 'stopped' ? 'stopped' : 'running'
         request.budget = { ...mission.budget }
@@ -319,7 +325,10 @@ export class SwarmRuntime implements Kernel {
         request.error = 'Host restarted before automatic launch completed. Retry the saved request to continue.'
         request.recoveryNoticePending = true
         delete request.planningDispatchPending
-      } else continue
+      } else {
+        if (dangling) this.store.transaction(() => this.store.put('starts', request))
+        continue
+      }
       request.updatedAt = this.now()
       this.store.transaction(() => this.store.put('starts', request))
     }
@@ -775,8 +784,13 @@ export class SwarmRuntime implements Kernel {
       taskIds: chain,
     }
   }
-  /** Create a mission with explicitly bounded resources and scope, recording the authorization its entry point claimed. */
-  create(actor: Actor, input: CreateMissionInput, claim: WorkspaceClaim, initial: { id?: string; status?: 'active' | 'staged' } = {}): Mission {
+  /**
+   * Create a mission with explicitly bounded resources and scope, recording
+   * the authorization its entry point claimed. A mission launched for an
+   * automatic request (`requestId`) is linked to it in the commit that creates
+   * it, so the request never names a mission that does not exist.
+   */
+  create(actor: Actor, input: CreateMissionInput, claim: WorkspaceClaim, initial: { id?: string; status?: 'active' | 'staged'; requestId?: string } = {}): Mission {
     if (this.shuttingDown) throw new PolicyError('runtime_shutting_down', 'conflict_error', 'Swarm runtime is shutting down')
     if (this.store.list('members').some(m => m.sessionId === actor.sessionId)) throw new PolicyError('worker_cannot_own_mission', 'authorization_error', 'Workers cannot create independent missions or budgets')
     requireText(input.title, 'title'); requireText(input.objective, 'objective')
@@ -790,14 +804,34 @@ export class SwarmRuntime implements Kernel {
     if (!Number.isSafeInteger(now + budget.maxDurationMs)) throw new PolicyError('mission_duration_invalid', 'validation_error', 'Mission duration exceeds the supported clock range')
     const mission: Mission = { ...input, workspaceGrantRoot: authorized.grantRoot, workspaceAuthorizationSource: authorized.source, budget, id: initial.id ?? id('mission'), ownerSessionId: actor.sessionId, status: initial.status ?? 'active', usedTokens: 0, usedSteps: 0, createdAt: now, updatedAt: now, executionTime: { usedMs: 0 }, deadline: Math.min(budget.deadlineAt ?? Number.MAX_SAFE_INTEGER, now + budget.maxDurationMs) }
     if (this.store.get('missions', mission.id)) throw new PolicyError('mission_identity_conflict', 'conflict_error', 'Mission already exists')
+    const request = initial.requestId === undefined ? undefined : this.store.get('starts', initial.requestId)
     this.commit(mission.id, () => {
       this.store.put('missions', mission)
+      if (request !== undefined) { request.missionId = mission.id; this.store.put('starts', request) }
       this.store.event(mission.id, 'mission/created', 'owner', mission)
       // The durable audit of where the authorization came from: the matched
       // root and the resolved workspace path, recorded with the mission.
       this.store.event(mission.id, 'mission/workspace-bound', 'owner', { workspace: mission.workspace, grantRoot: mission.workspaceGrantRoot, source: mission.workspaceAuthorizationSource })
     })
     return mission
+  }
+  /**
+   * W8, the one route rule (`memberRouteDiagnostic`, src/admission.ts) on the
+   * adapter's answer for each member: the route its worker will run, the owner
+   * session's current selection under the member's own route fields. A launch
+   * admits its plan's members together (`launchDraft`), a member added on its
+   * own alone (`addMember`), and a browser draft save checks the routes it
+   * names; each refuses every refused member at once, before any effect of its own.
+   */
+  async admitMemberRoutes(ownerSessionId: string, entries: readonly MemberRouteEntry[], retry: string, signal?: AbortSignal): Promise<void> {
+    signal?.throwIfAborted()
+    if (entries.length === 0) return
+    // The adapter is asked about the route fields alone, never the rest of an admission.
+    const routes = await this.workers.memberRoutes(ownerSessionId, entries.map(({ member: { provider, model, reasoningEffort } }) => ({
+      ...(provider === undefined ? {} : { provider }), ...(model === undefined ? {} : { model }), ...(reasoningEffort === undefined ? {} : { reasoningEffort }) })), signal)
+    const refused = entries.flatMap((entry, index) => memberRouteDiagnostic(entry, routes[index]!, retry) ?? [])
+    // One refusal naming every refused member, so a plan is repaired in one retry.
+    if (refused.length) throw new AdmissionError(new Set(refused.map(diagnostic => diagnostic.code)).size === 1 ? refused[0]!.code : 'plan_invalid', 'validation_error', refused.map(formatDiagnostic).join('\n'), refused[0]!.location, refused)
   }
   /**
    * Owner-only membership admission keeps authority and aggregate capacity bounded.
@@ -845,6 +879,10 @@ export class SwarmRuntime implements Kernel {
       const name = input.name ?? nextWorkerName(members.map(member => member.name))
       if (name === undefined) throw new PolicyError('worker_name_pool_exhausted', 'budget_error', '[worker_name_pool_exhausted] The fixed worker-name pool has no unused name left Supply an explicit `name` with `swarm_add_member` and retry, or admit this worker into a new mission.')
       if (members.some(m => m.name === name)) throw new PolicyError('worker_name_conflict', 'conflict_error', 'Worker name already exists')
+      // W8: a member added on its own is admitted on the route rule a launch
+      // applies to its plan's members together (`launchDraft`), before the
+      // first effect of the admission.
+      if (admittedId === undefined) await this.admitMemberRoutes(mission.ownerSessionId, [{ location: 'member', member: input }], 'add the member again', actor.signal)
       const memberId = admittedId ?? id('member')
       // Re-validate before the first filesystem effect of this mission.
       await this.workspaceAdmission.assertWorkspaceAuthorized(mission)
@@ -871,49 +909,6 @@ export class SwarmRuntime implements Kernel {
       catch (error) {
         assertAdmissionCurrent()
         if (this.shuttingDown || this.mission(missionId).status !== 'active') throw error
-        // W8: a provider that rejects the requested reasoning effort must not
-        // leave a stopped member behind with an untyped provider error. Retry
-        // once on the provider default and record the downgrade; if the route is
-        // still rejected, refuse admission with the requested value and the exit.
-        const rejection = unsupportedEffort(error)
-        if (rejection !== undefined && member.reasoningEffort !== undefined) {
-          const requested = member.reasoningEffort
-          const fallback: Member = { ...member }
-          delete fallback.reasoningEffort
-          try {
-            // A rejected option is a completed native attempt; this explicit fallback is a new one.
-            this.workerStarts.delete(member.id)
-            await this.startWorker(mission, fallback, { admission: true, signal: actor.signal })
-            assertAdmissionCurrent()
-            delete member.reasoningEffort
-            this.commit(missionId, () => {
-              const latest = this.store.get('members', member.id)
-              if (latest === undefined) throw new Error('Worker admission disappeared')
-              delete latest.reasoningEffort
-              this.store.put('members', latest)
-              this.store.event(missionId, 'member/effort-downgraded', 'runtime', { memberId, requested, rejected: rejection.requested ?? requested, reason: rejection.message })
-            })
-            this.kick(missionId)
-            return member
-          } catch (retryError) {
-            assertAdmissionCurrent()
-            if (this.shuttingDown || this.mission(missionId).status !== 'active') throw retryError
-            const retryMessage = retryError instanceof Error ? retryError.message : String(retryError)
-            member.phase = 'stopped'
-            this.commit(missionId, () => {
-              const latest = this.store.get('members', member.id)
-              if (latest !== undefined) { latest.phase = 'stopped'; this.store.put('members', latest) }
-              this.store.event(missionId, 'member/failed', 'runtime', { memberId, error: rejection.message })
-              this.store.event(missionId, 'member/effort-rejected', 'runtime', { memberId, requested, rejected: rejection.requested ?? requested, error: rejection.message, retryError: retryMessage })
-            })
-            // The adapter's rejection text can name gateway hosts and internal
-            // route codes, so it stays in the durable events above. The refusal
-            // is built from the route this runtime holds, in the adapter's
-            // canonical shape, so a canonical rejection renders the same bytes.
-            const route = (field: string, value: string | undefined) => `${field} ${value === undefined ? '(inherited)' : `"${value}"`}`
-            throw new PolicyError('member_reasoning_effort_unsupported', 'tool_error', `Member ${name} cannot start: ${route('provider', member.provider)} ${route('model', member.model)} does not support reasoning effort "${rejection.requested ?? requested}". Clearing reasoningEffort did not help; admit a replacement member without reasoningEffort, or with an effort this provider/model supports.`)
-          }
-        }
         member.phase = 'stopped'
         this.commit(missionId, () => { const latest = this.store.get('members', member.id); if (latest !== undefined) { latest.phase = 'stopped'; this.store.put('members', latest) }; this.store.event(missionId, 'member/failed', 'runtime', { memberId, error: String(error) }) })
         throw error
@@ -2414,14 +2409,17 @@ export class SwarmRuntime implements Kernel {
         const existing = request.draftId ? this.store.get('drafts', request.draftId) : undefined
         const plan = this.automaticPlan(input, request)
         request.budget = { ...plan.budget }
+        // Saving the deterministic draft link before the draft makes a crash
+        // between these commits recoverable without an orphan or a duplicate.
+        // The request names its mission only in the commit that creates it
+        // (`create`, from `launchDraft`): a launch refused before then (a check
+        // preflight, the W8 route rule) leaves no link to a mission that does
+        // not exist, which every reader of the request would follow.
         request.draftId ??= `draft_${request.id}`
-        request.missionId ??= `mission_${request.draftId}`
         request.status = 'launching'; request.updatedAt = this.now(); delete request.error
         request.planningDeadlineAt = Math.max(request.planningDeadlineAt ?? 0, this.now() + (this.config.planningTimeoutMs ?? 600000))
         this.commit(request.id, () => this.store.put('starts', request))
         launchActor.signal!.throwIfAborted()
-        // Saving the deterministic link before the draft makes a crash between
-        // these commits recoverable without creating an orphan or a duplicate.
         const claim = recordedClaim(request.workspace, request)
         const draft = existing
           ? (JSON.stringify(existing.input) === JSON.stringify(plan) ? existing : this.updateDraft(launchActor, existing.id, existing.revision, plan, claim))
@@ -2447,7 +2445,7 @@ export class SwarmRuntime implements Kernel {
           const mission = request.missionId ? this.store.get('missions', request.missionId) : undefined
           if (mission && mission.status !== 'staged') this.commit(mission.id, () => this.syncStarts(mission))
           else if ((request.planningEpoch ?? 1) === admittedEpoch && !request.planningFenced && request.status !== 'stopped') {
-            request.status = 'failed'; request.error = String(error).slice(0, this.config.maxMessageChars); request.updatedAt = this.now()
+            request.status = 'failed'; request.error = recordedFailure(error).slice(0, this.config.maxMessageChars); request.updatedAt = this.now()
             this.commit(request.missionId ?? request.id, () => {
               this.store.put('starts', request)
               this.store.event(request.missionId ?? request.id, 'automatic/failed', 'runtime', { requestId, reason: request.error })
@@ -2725,6 +2723,10 @@ export class SwarmRuntime implements Kernel {
         // internal-error and the host logs the refusal.
         if (issues.length) throw new PolicyError('check_syntax_invalid', 'validation_error', '[check_syntax_invalid] ' + checkSyntaxDetail(declaredChecks, issues) + '\nPrefer the existing repository check commands; repair every command in the `checks` array and relaunch the complete plan.')
       }
+      // W8: the plan's members are admitted on the route rule together, at the
+      // same boundary on every launch path and before any effect, so a refusal
+      // names every member to repair (`addMember` admits a lone member alike).
+      await this.admitMemberRoutes(actor.sessionId, input.members.map(member => ({ location: `members[${member.key}]`, member })), 'relaunch the complete plan', actor.signal)
       assertCurrent()
       draft.status = 'launching'; draft.revision++; draft.updatedAt = this.now(); delete draft.error
       draft.missionId ??= `mission_${draft.id}`
@@ -2735,7 +2737,7 @@ export class SwarmRuntime implements Kernel {
         const repairing = mission !== undefined
         if (!mission) {
           const { title, objective, workspace, scope, acceptance, budget } = input
-          mission = this.create(actor, { title, objective, workspace, scope, acceptance, budget }, recordedClaim(workspace, draft), { id: missionId, status: 'staged' })
+          mission = this.create(actor, { title, objective, workspace, scope, acceptance, budget }, recordedClaim(workspace, draft), { id: missionId, status: 'staged', ...(automatic === undefined ? {} : { requestId: automatic.id }) })
         }
         if (mission.ownerSessionId !== actor.sessionId || mission.status !== 'staged') throw new PolicyError('draft_mission_not_launchable', 'conflict_error', 'The partially assembled mission cannot be launched')
         if (repairing) await this.repairDraftAdmissions(actor, draft, input, assertCurrent)
@@ -2766,7 +2768,7 @@ export class SwarmRuntime implements Kernel {
         this.kick(missionId)
         return this.snapshot(actor, missionId)
       } catch (error) {
-        draft.status = 'failed'; draft.error = String(error); draft.updatedAt = this.now()
+        draft.status = 'failed'; draft.error = recordedFailure(error); draft.updatedAt = this.now()
         if (!this.closed && this.store.get('drafts', draft.id)?.revision === draft.revision) this.commit(draft.id, () => this.store.put('drafts', draft))
         throw error
       }
@@ -3545,19 +3547,59 @@ export class SwarmRuntime implements Kernel {
     if (this.closed || this.shuttingDown) return
     const member = this.store.get('members', memberId)
     if (!member) return
-    // W8: a rejected reasoning effort also surfaces asynchronously on the first
-    // worker request. Keep the durable event shape, but wake the owner with the
-    // supported exit instead of the raw provider text.
-    const rejection = unsupportedEffort(error)
-    const message = rejection !== undefined && member.reasoningEffort !== undefined
-      ? `${member.name} cannot run: ${rejection.message}. Its route is fixed for this session; admit a replacement member without reasoningEffort (or with an effort this provider/model supports) and reassign its work.`
-      : `${member.name} failed: ${error}`
     this.commit(member.missionId, () => {
       this.store.event(member.missionId, 'member/failure', memberId, { error })
       // R15-A1: it names the member's unfinished work, else the mission root. The fact
       // is the member on that work; the provider's text (per-request data) is the body.
-      this.notices.notify(member.missionId, message, noticeSubjectsFor(this.boardOf(member.missionId), { memberId: member.id }), { trigger: 'member/failure', reason: member.id })
+      this.notices.notify(member.missionId, `${member.name} failed: ${error}`, noticeSubjectsFor(this.boardOf(member.missionId), { memberId: member.id }), { trigger: 'member/failure', reason: member.id })
     })
+  }
+  /**
+   * W8 at a step: the member's own route refused it (`MemberRouteRefusal`: a
+   * model, or a reasoning effort, the route no longer takes). Admission refuses
+   * a route the host does not take (`admitMemberRoutes`), so this is a route
+   * that changed after the member was admitted. A member's route is fixed for
+   * its session, so no wait, retry or recovery of it can run again: the member
+   * is retired at the first refusal, which is therefore reported once. Each
+   * attempt it holds is fenced and, once its handle has stopped and its
+   * workspace is checkpointed, re-pended with its recovery allowance intact;
+   * unpinned work is released to capable live members, and pinned work waits
+   * for the owner to move it. The owner is told once, with the exits. The
+   * host's text stays in the durable event; the notice names the route the
+   * member row holds.
+   */
+  private onRouteRefused(memberId: string, refusal: MemberRouteRefusal): void {
+    if (this.closed || this.shuttingDown) return
+    const member = this.store.get('members', memberId)
+    if (member === undefined || memberPhaseOf(member) === 'stopped') return
+    const missionId = member.missionId
+    const mission = this.store.get('missions', missionId)
+    if (mission === undefined || terminal(mission)) return
+    const fenced: Task[] = [], pinned: Task[] = [], released: Task[] = []
+    // R15-A1: the fact is the member on the work it held, read before it is released.
+    const subjects = noticeSubjectsFor(this.boardOf(missionId), { memberId })
+    member.phase = 'stopped'
+    delete member.activity
+    this.commit(missionId, () => {
+      this.store.put('members', member)
+      this.store.event(missionId, 'member/route-refused', 'runtime', { memberId, code: refusal.code, error: refusal.message })
+      for (const task of this.store.list('tasks', missionId)) {
+        const holds = holdsOpenAttempt(task) && task.attempt.ownerId === memberId
+        if (!holds && !(task.status === 'pending' && task.assigneeId === memberId)) continue
+        if (task.assignmentMode === 'pinned') pinned.push(task)
+        else { delete task.assigneeId; released.push(task) }
+        if (holds) { this.attempts.fenceForStop(task, { status: 'blocked', reason: 'handoff', cause: 'member-route-refused' }); fenced.push(task) }
+        this.store.put('tasks', task)
+      }
+      const route = [member.provider === undefined ? undefined : `provider ${JSON.stringify(member.provider)}`, member.model === undefined ? undefined : `model ${JSON.stringify(member.model)}`,
+        member.reasoningEffort === undefined ? undefined : `reasoning effort ${JSON.stringify(member.reasoningEffort)}`].filter(Boolean).join(' ') || 'the route inherited from the owner conversation'
+      const named = (tasks: Task[]) => tasks.map(task => `${task.id} (${task.title})`).join(', ')
+      this.notices.notify(missionId, `[member_route_refused] ${member.name} (${member.id}) was stopped: its route (${route}) refused a model step with ${refusal.code}, and a member's route is fixed for its session, so it cannot run again. ${released.length ? `Its unpinned work returns to the board for a capable live member: ${named(released)}. ` : ''}${pinned.length ? `Its pinned work waits for a new assignee: ${named(pinned)}; move it with \`swarm_control\` using \`taskId\`, \`action: "amend"\` and \`changes.assigneeId\`. ` : ''}Admit a replacement with \`swarm_add_member\` on a route that takes it: admission names the \`reasoningEffort\` values a route accepts.`,
+        subjects, { trigger: 'member/route-refused', reason: memberId })
+    })
+    for (const task of fenced) this.attempts.resumeStoppedAttempt(missionId, task)
+    if (fenced.length === 0) this.defer(() => this.workers.stop(memberId))
+    this.kick(missionId)
   }
   /**
    * H-3: a cross-owner recovery could not capture the previous owner's workspace
@@ -3798,8 +3840,7 @@ export class SwarmRuntime implements Kernel {
         const owed = this.refusals.stopOwed(mission.id, member.id)
         if (owed !== undefined) throw owed
         try {
-          const selected = options.admission ? { ...latest, provider: member.provider, model: member.model, reasoningEffort: member.reasoningEffort } : latest
-          const native = Promise.resolve(this.workers.start({ mission: current!, member: selected, ownerSessionId: current!.ownerSessionId }, controller.signal))
+          const native = Promise.resolve(this.workers.start({ mission: current!, member: latest, ownerSessionId: current!.ownerSessionId }, controller.signal))
           const entry = this.workerStarts.get(member.id)!
           entry.nativePending = true
           void native.then(() => { entry.nativePending = false }, () => { entry.nativePending = false })
@@ -3814,8 +3855,9 @@ export class SwarmRuntime implements Kernel {
         } catch (error) {
           failed = true
           controller.abort(error)
-          // The admission caller owns its option fallback/rollback. Shared
-          // recovery/dispatch waiters record one actual native failure only.
+          // An admission caller records its own failure (`addMember` stops the
+          // new member, a launch fails its draft). Shared recovery/dispatch
+          // waiters record one actual native failure only.
           if (!options.admission && !options.signal?.aborted && this.workerStarts.get(member.id)?.controller === controller) this.onStartFailure(mission, member, error)
           throw error
         }

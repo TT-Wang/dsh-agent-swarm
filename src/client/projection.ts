@@ -214,10 +214,6 @@ export function snapshotFromResult(meta: unknown, content: unknown): Snapshot | 
   if (!Array.isArray(content)) return undefined
   for (const block of content) {
     if (!record(block)) continue
-    if (block.type === 'tool-result' && block.isError !== true) {
-      const nested = snapshotFromResult(undefined, block.content)
-      if (nested) return nested
-    }
     if (block.type === 'text' && typeof block.text === 'string') {
       try { const snapshot = readSnapshot(JSON.parse(block.text)); if (snapshot) return snapshot } catch { /* Ordinary prose. */ }
     }

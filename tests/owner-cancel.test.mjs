@@ -163,7 +163,7 @@ test('swarm_cancel is registered as an owner-only tool with a schema and a worke
   assert.ok(definition, 'swarm_cancel is registered')
   assert.deepEqual(definition.parameters.required, ['missionId', 'taskId', 'reason'])
   const result = await definition.execute({ missionId: f.mission.id, taskId: 'task-1', reason: 'withdraw' },
-    { signal: { throwIfAborted() {} }, agent: { id: 'owner-session' } })
+    { signal: new AbortController().signal, agent: { id: 'owner-session' } })
   assert.equal(calls[0][0].sessionId, 'owner-session')
   assert.equal(calls[0][1], f.mission.id)
   assert.deepEqual(calls[0][2], { taskId: 'task-1', reason: 'withdraw' })
