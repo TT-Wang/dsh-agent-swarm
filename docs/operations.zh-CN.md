@@ -50,7 +50,7 @@ node "$DSH_HARNESS_ROOT/apps/cli/lib/bin.js" plugin --profile web add "link:$PWD
 node "$DSH_HARNESS_ROOT/apps/cli/lib/bin.js" plugin --profile web add "file:$PWD/profile"
 ```
 
-[Bundle profile](../profile/README.md) 将插件和 Web 客户端一起安装，在必需的 `@deepseek-ai/dsh-base`、`@deepseek-ai/dsh-web-app` 层之后挂载。它显式声明可移植的存储根目录：优先使用 `$DSH_AGENT_SWARM_ROOT`，否则使用 `$DSH_HOME/agent-swarm`。可以通过该变量覆盖路径，或使用针对 `dsh-external-agent-swarm` 行的 `--patch` 覆盖层。
+[Bundle profile](../profile/README.md) 将插件和 Web 客户端一起安装，在必需的 `@deepseek-ai/dsh-base`、`@deepseek-ai/dsh-web-app` 层之后挂载。它和直接挂载一样，以空配置插入插件行，所以两种挂载打开的是同一个存储：插件在启动时按[存储根目录规则](#storage-roots)自行确定根目录。要使用其他根目录，可以设置 `DSH_AGENT_SWARM_ROOT`，或使用针对 `dsh-external-agent-swarm` 行的 `--patch` 覆盖层。
 
 **不要同时使用两种方式。** 两者会插入相同的 Loader 行，bundle 元数据已声明此冲突。
 
@@ -73,7 +73,7 @@ node "$DSH_HARNESS_ROOT/apps/cli/lib/bin.js" --profile web
 
 插件只在 0.2.1-rc.2 上运行。在 0.1.5-rc.3 或 0.1.7-rc.1 上用过的 Harness 主目录（`DSH_HOME`）和插件状态需要一次性迁过来，不需要额外的迁移步骤：0.2.1-rc.2 能读取已有的会话日志，宿主版本的变化也不会触及插件的存储（`swarm.sqlite`，schema 8）。但迁过去之后就回不来了，所以首次在 0.2.1-rc.2 上启动前：
 
-1. **停止宿主并备份主目录。** 把 `$DSH_HOME/sessions` 和插件状态一起复制：`statePath`（默认是 `~/.dsh/agent-swarm/swarm.sqlite` 及同目录的 `-wal`、`-shm` 文件；这个默认值不随 `DSH_HOME` 变化）和 `workspacesRoot`。回到 0.1.x 的唯一办法是恢复这份备份，在 0.2.1-rc.2 上完成的一切都会丢弃；同时还要换回不晚于 `a28b116` 的插件版本：0.1.7-rc.1 会拒绝安装当前插件并跳过已挂载的插件；0.1.5-rc.3 没有这项检查，当前插件会记录一条宿主不受支持的错误日志，在那里也不应指望它能正常工作。
+1. **停止宿主并备份主目录。** 把 `$DSH_HOME/sessions` 和插件状态一起复制：`statePath`（默认是 `$DSH_HOME/agent-swarm/swarm.sqlite` 及同目录的 `-wal`、`-shm` 文件）和 `workspacesRoot`。不晚于 `ba9a758` 的直接挂载不管 `DSH_HOME` 是什么，都把它们放在 `~/.dsh/agent-swarm`，见[存储根目录](#storage-roots)。回到 0.1.x 的唯一办法是恢复这份备份，在 0.2.1-rc.2 上完成的一切都会丢弃；同时还要换回不晚于 `a28b116` 的插件版本：0.1.7-rc.1 会拒绝安装当前插件并跳过已挂载的插件；0.1.5-rc.3 没有这项检查，当前插件会记录一条宿主不受支持的错误日志，在那里也不应指望它能正常工作。
 2. **检查共享的 agent 指令文件。** 0.2.1-rc.2 除了 `$DSH_HOME/AGENTS.md`，还会读取共享 agents 目录（`$DSH_AGENTS_HOME`，默认 `~/.agents`）中的 `AGENTS.md`。worker 挂载其 owner 的 agent 预设，因此在 Standard、Creator 和 PTC 预设下，这个文件会进入每个 owner 和 worker 的提示词；Minimal 预设不加载指令文件。
 3. **仍有进行中任务的主目录不要迁回 0.1.x。**
 
@@ -129,8 +129,8 @@ node "$DSH_HARNESS_ROOT/apps/cli/lib/bin.js" --profile web
 
 | 配置项 | 默认值 | 用途 |
 | --- | --- | --- |
-| `statePath` | `~/.dsh/agent-swarm/swarm.sqlite` | 持久协调状态；每个文件只允许一个活跃运行时。 |
-| `workspacesRoot` | `~/.dsh/agent-swarm/workspaces` | 快照、成员 worktree 和验证检出，必须位于源仓库之外。 |
+| `statePath` | `<root>/swarm.sqlite`，按[根目录规则](#storage-roots)确定 | 持久协调状态；每个文件只允许一个活跃运行时。 |
+| `workspacesRoot` | `<root>/workspaces`，按[根目录规则](#storage-roots)确定 | 快照、成员 worktree 和验证检出，必须位于源仓库之外。 |
 | `verificationDependencyDirs` | `["node_modules", ".venv", "venv", "vendor", ".tox"]` | 提供给干净验证检出的已安装依赖目录。 |
 | `verificationDependencyMode` | `"link"` | 未启用下方显式链接读取许可时，实际生效模式是 `copy`。 |
 | `allowDependencyLinkReads` | `false` | 允许配置的 `link` 模式，包括沿链接读取源项目工具链。 |
@@ -144,9 +144,23 @@ node "$DSH_HARNESS_ROOT/apps/cli/lib/bin.js" --profile web
 | `leaseMs` | `120000` | attempt 租约，在观察到真实操作时续租。 |
 | `tickMs` | `1000` | 调度器 tick 间隔。 |
 
-**仅修改 `DSH_HOME` 不会隔离插件的默认存储。** 多个独立 Harness 进程应通过 profile 覆盖层各自设置绝对路径的 `statePath` 和 `workspacesRoot`，或使用 bundle 的显式根目录。数据库 owner 锁会拒绝第二个活跃运行时，并指出持有进程。已退出进程遗留的锁可以回收；不要通过删除协调状态来解决活跃进程之间的所有权冲突。
-
 这些基础设施配置不替代主 agent 对具体任务预算和策略的决策。保留的 worktree 和 Git refs 需要显式清理。
+
+<a id="storage-roots"></a>
+
+### 存储根目录
+
+两种挂载都以空配置插入插件行，插件在启动时为 `statePath` 和 `workspacesRoot` 各自取下列第一个给出它的来源（`src/state-roots.ts`）：
+
+1. 插件行自己的 `statePath` 或 `workspacesRoot`，必须是绝对路径；
+2. `$DSH_AGENT_SWARM_ROOT`，即 `<root>/swarm.sqlite` 和 `<root>/workspaces`；
+3. Harness 主目录下的 `agent-swarm` 目录：`$DSH_HOME`，未设置时为 `~/.dsh`。
+
+主目录按宿主自己的方式解析：空白的 `DSH_HOME` 视为未设置，开头的 `~` 会展开，相对路径按宿主启动时的目录解析。`DSH_AGENT_SWARM_ROOT` 按同一规则读取。和所有 `DSH_*` 变量一样，它只能来自启动宿主的环境：Harness 拒绝在 `.env` 文件里设置它，Desktop 保留它被启动时的值，而不是登录 shell 里的值。因此主目录不同的宿主无需额外配置就各自使用独立的存储。workspaces 根目录必须是规范路径，所以位于符号链接之下的主目录要用真实路径给出（macOS 上的 `/tmp` 和 `/var` 都是链接），否则第一个任务会被 `workspacesRoot must be canonical, without symlinks` 拒绝。数据库 owner 锁会拒绝同一存储上的第二个活跃运行时，并指出持有进程。已退出进程遗留的锁可以回收；不要通过删除协调状态来解决活跃进程之间的所有权冲突。
+
+插件启动时会记录它打开的根目录以及各自的来源，例如 `agent-swarm: store /srv/dsh/agent-swarm/swarm.sqlite ($DSH_HOME), workspaces /srv/dsh/agent-swarm/workspaces ($DSH_HOME)`。如果它按第 2 或第 3 步打开的是一个新存储，而更低一步的根目录（`$DSH_HOME/agent-swarm` 或 `~/.dsh/agent-swarm`）里已经有存储，它还会发出一次警告，写明两个存储的路径，以及沿用旧存储所需的 `DSH_AGENT_SWARM_ROOT` 值。它不会移动或接管那个存储：在隔离的主目录下，那个存储属于另一个宿主。显式配置的 `statePath` 是调用方的选择，不会触发警告。0.2.1-rc.2 的 Web 和 Desktop profile 都没有挂载日志导出器，所以只有在 profile 挂载了导出器（例如 `@deepseek-ai/cordis-plugin-logger-console`）时才能看到这些日志；Cordis 把警告排在 info 之后，所以要看到警告，导出器的阈值需要设为 2（`levels: { default: 2 }`）。
+
+**升级曾在其他主目录下运行的直接挂载。** 不晚于 `ba9a758` 的直接挂载会忽略 `DSH_HOME` 和 `DSH_AGENT_SWARM_ROOT`：只要插件行没有配置根目录，它就把存储放在 `~/.dsh/agent-swarm`；而 bundle 挂载当时已经使用 `$DSH_AGENT_SWARM_ROOT`，未设置时使用 `$DSH_HOME/agent-swarm`。设置了 `DSH_HOME` 或 `DSH_AGENT_SWARM_ROOT` 运行过的直接挂载，现在会在那个根目录下打开一个新的空存储。要保留它的任务，请停止宿主，再以指向旧根目录（`~/.dsh/agent-swarm`）的 `DSH_AGENT_SWARM_ROOT` 重新启动，或者在 profile 覆盖层里配置两个根目录（从 Dock 启动的 Desktop 不会从登录 shell 取得任何 `DSH_*` 值）。不要改为移动文件：成员 worktree 是以绝对路径注册到 Git 的。只有当那个存储确实属于这个宿主时才这样做：如果默认主目录上的宿主也在使用 `~/.dsh/agent-swarm`，那它就是那个宿主的存储，其 owner 锁会拒绝第二个活跃运行时。profile 已经配置了两个根目录的安装不受影响。
 
 ### 授权其他工作区
 

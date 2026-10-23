@@ -50,7 +50,7 @@ The plugin package itself becomes a profile bundle layer. Keep the linked direct
 node "$DSH_HARNESS_ROOT/apps/cli/lib/bin.js" plugin --profile web add "file:$PWD/profile"
 ```
 
-The [bundle profile](../profile/README.md) installs the plugin and its Web client together, after the required `@deepseek-ai/dsh-base` and `@deepseek-ai/dsh-web-app` layers. It declares portable storage roots: `$DSH_AGENT_SWARM_ROOT`, otherwise `$DSH_HOME/agent-swarm`. Override that variable or use a `--patch` overlay targeting the `dsh-external-agent-swarm` row.
+The [bundle profile](../profile/README.md) installs the plugin and its Web client together, after the required `@deepseek-ai/dsh-base` and `@deepseek-ai/dsh-web-app` layers. Like the direct mount, it inserts the plugin row with an empty config, so both mounts open the same store: the plugin chooses its roots at start by the [storage root rule](#storage-roots). To choose other roots, set `DSH_AGENT_SWARM_ROOT` or use a `--patch` overlay targeting the `dsh-external-agent-swarm` row.
 
 **Do not mount both alternatives.** Both insert the same Loader row, and the bundle declares that conflict in its metadata.
 
@@ -71,7 +71,7 @@ If several Harness checkouts run on the same machine, use a separate linked plug
 
 The plugin runs only on 0.2.1-rc.2. A Harness home (`DSH_HOME`) and plugin state that ran on 0.1.5-rc.3 or 0.1.7-rc.1 move to it once, without a migration step: 0.2.1-rc.2 reads the existing session logs, and the host change does not touch the plugin's store (`swarm.sqlite`, schema 8). The way back is closed, so before the first start on 0.2.1-rc.2:
 
-1. **Stop the host and back up the home.** Copy `$DSH_HOME/sessions` together with the plugin's state: `statePath` (by default `~/.dsh/agent-swarm/swarm.sqlite` with its `-wal` and `-shm` files; this default ignores `DSH_HOME`) and `workspacesRoot`. Going back to 0.1.x means restoring that backup, which discards everything done on 0.2.1-rc.2, and running a plugin revision up to `a28b116`: 0.1.7-rc.1 refuses to install the current plugin and skips a mounted one, and 0.1.5-rc.3 has no such gate: the current plugin logs that the host is unsupported and is not expected to work there.
+1. **Stop the host and back up the home.** Copy `$DSH_HOME/sessions` together with the plugin's state: `statePath` (by default `$DSH_HOME/agent-swarm/swarm.sqlite`, with its `-wal` and `-shm` files) and `workspacesRoot`. A direct mount up to `ba9a758` kept them in `~/.dsh/agent-swarm` whatever `DSH_HOME` was; see [storage roots](#storage-roots). Going back to 0.1.x means restoring that backup, which discards everything done on 0.2.1-rc.2, and running a plugin revision up to `a28b116`: 0.1.7-rc.1 refuses to install the current plugin and skips a mounted one, and 0.1.5-rc.3 has no such gate: the current plugin logs that the host is unsupported and is not expected to work there.
 2. **Review the shared agent instructions.** 0.2.1-rc.2 also loads `AGENTS.md` from the shared agents directory (`$DSH_AGENTS_HOME`, by default `~/.agents`), beside `$DSH_HOME/AGENTS.md`. Workers mount their owner's agent preset, so under the Standard, Creator and PTC presets that file reaches every owner and worker prompt. The Minimal preset loads no instruction files.
 3. **Do not move a home with live missions back to 0.1.x.**
 
@@ -125,8 +125,8 @@ Settings belong to Loader row `dsh-external-agent-swarm`. The full schema is in 
 
 | Setting | Default | Purpose |
 | --- | --- | --- |
-| `statePath` | `~/.dsh/agent-swarm/swarm.sqlite` | Durable coordination state; one live runtime per file. |
-| `workspacesRoot` | `~/.dsh/agent-swarm/workspaces` | Snapshots, member worktrees and verification checkouts. Must be outside the source repository. |
+| `statePath` | `<root>/swarm.sqlite`, by the [root rule](#storage-roots) | Durable coordination state; one live runtime per file. |
+| `workspacesRoot` | `<root>/workspaces`, by the [root rule](#storage-roots) | Snapshots, member worktrees and verification checkouts. Must be outside the source repository. |
 | `verificationDependencyDirs` | `["node_modules", ".venv", "venv", "vendor", ".tox"]` | Installed dependency directories made available to clean verification checkouts. |
 | `verificationDependencyMode` | `"link"` | Effective mode is `copy` unless the explicit link-read opt-in below is enabled. |
 | `allowDependencyLinkReads` | `false` | Allows configured `link` mode, including read-through access to the source toolchain. |
@@ -140,9 +140,21 @@ Settings belong to Loader row `dsh-external-agent-swarm`. The full schema is in 
 | `leaseMs` | `120000` | Attempt lease, renewed while a real operation is observed. |
 | `tickMs` | `1000` | Scheduler tick interval (minimum 10), and the unit of the tick-derived windows: the review grace of an unreviewed submission (one tick, at least 1 s), and the preparation back-off bound and failed-start retry (one tick each). |
 
-**Changing `DSH_HOME` alone does not isolate the plugin's default storage.** For independent Harness processes, give each its own absolute `statePath` and `workspacesRoot` through a profile overlay, or use the bundle's explicit roots. A database owner lock rejects a second live runtime and identifies the holding process. A lock left by a dead process can be reclaimed; do not delete coordination state to resolve a live ownership conflict.
-
 These infrastructure settings do not replace the primary agent's task-specific budgets and policies. Retained worktrees and Git refs require explicit cleanup.
+
+### Storage roots
+
+Both mounts insert the plugin row with an empty config, and the plugin chooses each of `statePath` and `workspacesRoot` at start, from the first of these that names it (`src/state-roots.ts`):
+
+1. the row's own `statePath` or `workspacesRoot`, which must be absolute;
+2. `$DSH_AGENT_SWARM_ROOT`, as `<root>/swarm.sqlite` and `<root>/workspaces`;
+3. the Harness home's `agent-swarm` directory: `$DSH_HOME`, else `~/.dsh`.
+
+The home is resolved the way the host resolves it: a blank `DSH_HOME` is unset, a leading `~` is expanded, and a relative path is resolved against the directory the host started in. `DSH_AGENT_SWARM_ROOT` is read by the same rule. Like every `DSH_*` name it comes only from the environment that launches the host: Harness refuses it in a `.env` file, and Desktop keeps the value it was launched with, not the login shell's. Hosts with separate homes therefore keep separate stores with no further configuration. The workspaces root must be canonical, so give a home under a symbolic link by its real path (on macOS `/tmp` and `/var` are links): otherwise the first mission is refused with `workspacesRoot must be canonical, without symlinks`. A database owner lock rejects a second live runtime on one store and identifies the holding process. A lock left by a dead process can be reclaimed; do not delete coordination state to resolve a live ownership conflict.
+
+At start the plugin logs the roots it opened and the step that chose each, for example `agent-swarm: store /srv/dsh/agent-swarm/swarm.sqlite ($DSH_HOME), workspaces /srv/dsh/agent-swarm/workspaces ($DSH_HOME)`. When it opens a new store chosen by step 2 or 3 while a lower step's root already holds one (`$DSH_HOME/agent-swarm`, or `~/.dsh/agent-swarm`), it also warns once, naming both stores and the `DSH_AGENT_SWARM_ROOT` value that keeps the old one. It never moves or adopts that store: under an isolated home it belongs to another host. A configured `statePath` is the caller's choice and is never warned about. The 0.2.1-rc.2 Web and Desktop profiles mount no log exporter, so these lines appear only where a profile mounts one, such as `@deepseek-ai/cordis-plugin-logger-console`; Cordis ranks a warning below info, so the warning needs that exporter's threshold at 2 (`levels: { default: 2 }`).
+
+**Upgrading a direct mount that ran under another home.** Up to `ba9a758` the direct mount ignored `DSH_HOME` and `DSH_AGENT_SWARM_ROOT`: without roots in the row's config it kept its store in `~/.dsh/agent-swarm`, while the bundle mount already followed `$DSH_AGENT_SWARM_ROOT`, else `$DSH_HOME/agent-swarm`. A direct mount that ran with `DSH_HOME` or `DSH_AGENT_SWARM_ROOT` set now opens a new, empty store under that root. To keep its missions, stop the host and start it again with `DSH_AGENT_SWARM_ROOT` set to the old root (`~/.dsh/agent-swarm`), or put both roots in a profile overlay (a Desktop started from the Dock takes no `DSH_*` value from the login shell). Do not move the files instead: member worktrees are registered with Git under their absolute paths. Do this only when that store is this host's own: if a host on the default home also uses `~/.dsh/agent-swarm`, it is that host's store, and its owner lock refuses a second live runtime. An install whose profile configures both roots is unaffected.
 
 ### Authorize another workspace
 
