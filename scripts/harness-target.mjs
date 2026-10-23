@@ -5,6 +5,7 @@ import { homedir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { execFileSync } from 'node:child_process'
+import { TIER_ENV } from './test-tiers.mjs'
 
 const project = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 /**
@@ -14,10 +15,13 @@ const project = resolve(dirname(fileURLToPath(import.meta.url)), '..')
  * (0.2.1-rc.2 is `deepseek-harness-021rc2`).
  * A candidate is taken only when it is a supported release and built (its CLI
  * entry exists), so an unbuilt checkout never shadows a built sibling.
+ * The hermetic test tier (scripts/test-tiers.mjs) searches nowhere: it runs as
+ * a fresh clone would, where no checkout exists.
  */
 export function resolveHarnessRoot(explicit) {
   const supplied = explicit ?? process.env.DSH_HARNESS_ROOT ?? process.env.DSH_SOURCE
   if (supplied) return realpathSync(resolve(supplied))
+  if (process.env[TIER_ENV] === 'hermetic') throw new Error('The hermetic test tier has no Harness checkout; a test that needs one belongs to the host tier (HOST_TIER in scripts/test-tiers.mjs)')
   const supported = new Set(JSON.parse(readFileSync(join(project, 'compatibility.json'), 'utf8')).supportedHosts.map(host => host.version))
   const siblings = [...supported].map(version => join(project, `../deepseek-harness-${version.replace(/[.-]/g, '')}`))
   for (const candidate of [join(homedir(), '.dsh/source/current'), ...siblings]) {

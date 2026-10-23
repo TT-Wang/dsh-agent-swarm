@@ -17,6 +17,7 @@ import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { resolveHarnessRoot as resolveFaultHarness } from './faults/loader.mjs'
 import { withLocalImports } from './fixtures/local-imports.mjs'
+import { TIER_ENV } from '../scripts/test-tiers.mjs'
 
 const project = fileURLToPath(new URL('../', import.meta.url))
 const compatibility = JSON.parse(readFileSync(join(project, 'compatibility.json'), 'utf8'))
@@ -172,12 +173,11 @@ test('the fault loader keeps the real cause for a supplied root it cannot use, a
   assert.equal(await resolve(undefined, {}), 'The fault suite needs a built Harness checkout; set DSH_HARNESS_ROOT (see compatibility.json)')
 })
 
-test('the default search takes a built checkout of the supported release and skips an unbuilt one or one of another release', async t => {
+test('the default search takes a built checkout of the supported release and skips an unbuilt one or one of another release; the hermetic test tier searches nowhere', async t => {
   const s = scene(t)
   // harness-target resolves its siblings from its own project, so a copy puts them in the scratch root.
   const copy = join(s.root, 'project')
-  mkdirSync(join(copy, 'scripts'), { recursive: true })
-  copyFileSync(join(project, 'scripts/harness-target.mjs'), join(copy, 'scripts/harness-target.mjs'))
+  for (const [path, source] of Object.entries(await withLocalImports(project, 'scripts/harness-target.mjs'))) { mkdirSync(dirname(join(copy, path)), { recursive: true }); writeFileSync(join(copy, path), source) }
   copyFileSync(join(project, 'compatibility.json'), join(copy, 'compatibility.json'))
   const [{ version: release }] = compatibility.supportedHosts
   const checkout = (dir, built, version = release) => {
@@ -190,7 +190,7 @@ test('the default search takes a built checkout of the supported release and ski
   mkdirSync(join(s.root, 'home/.dsh/source'), { recursive: true })
   symlinkSync(unbuilt, join(s.root, 'home/.dsh/source/current'))
   const probe = `import(${JSON.stringify(join(copy, 'scripts/harness-target.mjs'))}).then(({ resolveHarnessRoot }) => { try { console.log(resolveHarnessRoot()) } catch (error) { console.log(error.message) } })`
-  const resolve = () => new Promise(done => execFile(process.execPath, ['-e', probe], { env: { PATH: process.env.PATH, HOME: join(s.root, 'home') } }, (error, stdout, stderr) => { assert.equal(error, null, stderr); done(stdout.trim()) }))
+  const resolve = (env = {}) => new Promise(done => execFile(process.execPath, ['-e', probe], { env: { PATH: process.env.PATH, HOME: join(s.root, 'home'), ...env } }, (error, stdout, stderr) => { assert.equal(error, null, stderr); done(stdout.trim()) }))
   const none = 'Set DSH_HARNESS_ROOT to a built supported Harness checkout; see compatibility.json'
   assert.equal(await resolve(), none, 'an unbuilt checkout alone is no candidate')
   // The supported release's sibling, built from a release that is no longer supported.
@@ -199,4 +199,8 @@ test('the default search takes a built checkout of the supported release and ski
   assert.equal(await resolve(), none, 'a built checkout of an unsupported release is no candidate, whatever its directory name')
   const built = checkout(sibling, true)
   assert.equal(await resolve(), built, 'the built sibling, not the unbuilt ~/.dsh/source/current ahead of it')
+  // The hermetic tier runs as a fresh clone would: the built sibling is not found, and the
+  // message names the tier, not a variable whose value the tier's runner removes.
+  assert.equal(await resolve({ [TIER_ENV]: 'hermetic' }), 'The hermetic test tier has no Harness checkout; a test that needs one belongs to the host tier (HOST_TIER in scripts/test-tiers.mjs)')
+  assert.equal(await resolve({ [TIER_ENV]: 'hermetic', DSH_HARNESS_ROOT: built }), built, 'a checkout the test supplies itself is taken as given')
 })
