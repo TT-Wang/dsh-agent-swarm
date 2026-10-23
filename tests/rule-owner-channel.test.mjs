@@ -102,6 +102,23 @@ test('R03: a host append rejection is never an acknowledgement, even one naming 
   await assert.rejects(adapter.deliver({ id: 'owner', missionId: f.mission.id, sessionId: 'owner' }, delivery), error => error === refusal)
 })
 
+test('a mission notice is not delivered into an owner whose scope is unwound, and reaches it once the scope is live', async t => {
+  // The Harness unwinds an idle owner's scope before the owner leaves the
+  // registry; the outbox asks what every waking delivery asks (`wakeableAgent`).
+  const f = await fixture(t), ctx = new Context(), sent = []
+  const delivery = { id: 'unwound', missionId: f.mission.id, from: 'runtime', to: 'owner', kind: 'control', content: 'Choose a route', createdAt: Date.now() }
+  const owner = { ctx: { fiber: { uid: null } }, session: { snapshotEvents: () => [] }, send: message => { sent.push(message) } }
+  ctx.provide('agents', { get: () => owner })
+  ctx.provide('sessions', { flush: async () => {} })
+  const adapter = new HarnessWorkers(ctx, { workspacesRoot: f.root, checkTimeoutMs: 1000, maxCheckOutputBytes: 1024 })
+  t.after(() => adapter.dispose())
+  await assert.rejects(adapter.deliver({ id: 'owner', missionId: f.mission.id, sessionId: 'owner' }, delivery), /owner is offline; notification remains in the durable outbox/)
+  assert.deepEqual(sent, [])
+  owner.ctx = ctx
+  await adapter.deliver({ id: 'owner', missionId: f.mission.id, sessionId: 'owner' }, delivery)
+  assert.deepEqual(sent.map(message => message.id), ['swarm:unwound'])
+})
+
 test('R03: unrelated host invariant retains outbox identity and one durable failure until retry succeeds', async t => {
   const f = await fixture(t)
   f.runtime.notices.notify(f.mission.id, 'Choose a recoverable route', [`mission:${f.mission.id}`], { dedupKey: 'route-decision' })

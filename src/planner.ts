@@ -212,7 +212,11 @@ export function registerAutomaticStart(ctx: Context, runtime: SwarmRuntime): voi
     try {
       request = await runtime.prepareStart({ sessionId, signal }, request.id, request.planningEpoch ?? 1)
       signal.throwIfAborted()
-      if (disposed || ctx.agents.get(agent.id) !== agent) throw new Error('当前对话已关闭，请重新打开后重试。')
+      // The planning message wakes the owner, so it asks what every waking
+      // delivery asks (`wakeableAgent`): an owner whose disposal began while
+      // the snapshot was prepared is not woken, and the failure recorded below
+      // waits for the session's next agent.
+      if (disposed || wakeableAgent(ctx, sessionId) !== agent) throw new Error('当前对话已关闭，请重新打开后重试。')
       const current = runtime.store.get('starts', request.id)
       if (current?.status !== 'planning' || current.planningFenced || (current.planningEpoch ?? 1) !== (request.planningEpoch ?? 1)) throw new Error('Planning request was stopped or superseded')
       agent.followup(planningMessage(request))

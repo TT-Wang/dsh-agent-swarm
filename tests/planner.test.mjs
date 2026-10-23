@@ -145,6 +145,29 @@ test('cancellation while resolving owner model cannot enqueue planning', async t
   await assert.rejects(started, /cancelled before planning/)
   assert.equal(f.messages.length, 0); assert.equal(f.runtime.starts({ sessionId: f.agent.id }).length, 0)
 })
+/**
+ * Every waking delivery to the owner asks `wakeableAgent`, the command's own
+ * planning message included. The Harness unwinds an idle owner's scope before
+ * the owner leaves the registry; an owner whose scope was unwound while its
+ * snapshot was prepared is neither sent the planning message nor the recovery
+ * notice, which stays pending until the session has a live agent again.
+ */
+test('an owner whose scope is unwound while its snapshot is prepared is not woken, and its recovery notice waits for a live scope', async t => {
+  const unwound = { fiber: { uid: null } }
+  let f
+  f = await fixture(t, { async beforeSnapshot() { f.agent.ctx = unwound } })
+  await assert.rejects(f.execute('/agent-swarm plan while the owner is disposed'), /当前对话已关闭/)
+  const [request] = f.runtime.starts({ sessionId: f.agent.id })
+  assert.equal(request.status, 'failed')
+  assert.equal(request.recoveryNoticePending, true)
+  await new Promise(resolve => setImmediate(resolve))
+  assert.deepEqual(f.messages, [], 'neither the planning message nor the recovery notice reaches the unwound scope')
+  f.agent.ctx = f.ctx
+  f.runtime.commit(request.id, () => {})
+  await eventually(() => !f.runtime.store.get('starts', request.id).recoveryNoticePending)
+  assert.deepEqual(f.messages.map(message => message.source.phase), ['failure'])
+  assert.equal(recordedReason(f.messages[0]), `Recorded reason (JSON string): ${JSON.stringify('当前对话已关闭，请重新打开后重试。')}`)
+})
 test('unloading removes native command and late idle callback cannot touch disposed runtime', async t => {
   const f = await fixture(t)
   await f.execute('/agent-swarm make change')
