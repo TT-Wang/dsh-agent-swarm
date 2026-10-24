@@ -268,7 +268,7 @@ GitHub Actions 工作流（`.github/workflows/verify.yml`）在每次推送到 `
 | `npm run test:sidebar-service` | `better-sidebar`（需显式选择） | 已安装的 Better Sidebar 服务契约与 swarm 侧栏适配器。 |
 | `npm run test:deepseek` / `test:command-deepseek` | `harness`、`provider`（需显式选择） | 在真实 DeepSeek 供应商上运行一次 mission 和 `/agent-swarm` 命令；会计费。 |
 
-`src/`、`tests/` 或 `scripts/` 导入的包必须是精确版本的 devDependency；`src/` 导入的包还必须是 peer dependency。`tests/declared-dependencies.test.mjs` 检查这一点，并检查 `package-lock.json` 与 `package.json` 一致。
+`src/`、`tests/` 或 `scripts/` 导入的包必须是精确版本的 devDependency；`src/` 导入的包还必须是 peer dependency。`tests/declared-dependencies.test.mjs` 检查这一点，并检查 `package-lock.json` 与 `package.json` 一致。它还检查类型检查读取声明的每个包都由 `npm ci` 安装在导入它的包能找到的位置。0.2.1-rc.2 客户端包的声明会导入仅属于它们自身 devDependencies 的包，npm 不会随之安装；在 `skipLibCheck` 下，这样的导入解析为空且不报错，从而改变插件据以检查的类型。因此 `package.json` 把这些包（27 个 Harness 包、`lexical` 和 `@types/mdast`）声明为发布所用版本的 devDependencies，尽管插件本身一个也不导入。
 
 这些测试使用临时 profile 和 Git 工作区，供应商回复由脚本提供。它们验证集成行为，不代表模型规划成功率。`npm run test:deepseek` 和 `npm run test:command-deepseek` 会发起真实供应商请求，可能产生费用，所以 `verify` 只在加上 `--with provider` 时运行它们。已完成的运行及其边界记录在[验证文档](validation.md)。
 
