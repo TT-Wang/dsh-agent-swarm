@@ -8,6 +8,397 @@ Current **0.7.0** working-tree checks and the historical **0.6.0** baseline are 
 
 Where entries say the owner runs a suite "in the round gate" or "in the gate" (the round-4 baselines of 2026-09-09), they describe the practice of that time. `scripts/round.mjs gate` last ran on 2026-09-10, and its own suite list never had `test:oracle`. The batches after it, up to batch A of 2026-10-24, were merged with a plain `git merge` on gate runs kept outside the repository, each with a suite list kept by hand. `test:isolation` was in none of them until the 0.1.x drop's gates of 2026-10-23, and `test:load` in none between 2026-09-24 and then. Since the gate manifest (2026-10-24), `npm run verify`, the round gate and CI run the suites one manifest lists, and each run records every suite as passed, failed, or skipped with the prerequisite it lacked; see [Reproduce](#reproduce).
 
+## Self-review batch B: F3, T2, T1 and F2 (2026-10-24)
+
+**Head**: `24c02ea`, where the final gates ran, and this record's revision (documentation only), branch
+`swarm/batch-b-plumbing` on `ba9a758` (main), not merged. Batch B (single-host plumbing: storage roots, dependencies,
+gates, client admission) of the follow-ups from the owner's 2026-10-22 self-review, in the order its verification set:
+F3 (`aa21247` to `045e403`), T2 (`3f9279b` to `a576dfe`), T1 (`6931cba` to `c01fc0e`) and F2 (`4965ede` to `bf4f298`).
+The F3 and T2 slice reviews were repaired within their slices (`1242fe1` to `045e403`, `9c72c73` to `a576dfe`). Then
+came a first gate run at `bf4f298`, one review repair round over the batch (`ef3d05f` to `24c02ea`), the final gate
+run at `24c02ea`, three `npm run verify` runs there (the third a complete gate), and this record. The verification
+read `a28b116`; every anchor was re-located on `ba9a758`, after the 0.1.x drop, the W8 route rule and batch A. `src`
+against `ba9a758` at `24c02ea`: +277 −39, net +238. By slice: F3 +148 −10 (net +138), T2 +4 (two client type imports),
+T1 none, F2 +150 −29 (+121), and the repair round +18 −43 (−25). `scripts/` is +582 −109 (net +473) and `tests/` +1230
+−73, and the batch adds `package-lock.json` and `.github/workflows/verify.yml`.
+
+**What each slice leaves at the head.**
+
+- **F3: one rule chooses the store and workspaces roots, for both mounts** (`aa21247`; documents `05c13b1`; slice
+  repair `1242fe1`, `4b33ad6`, `045e403`; batch repair `66813a8`, `24c02ea`). `statePath` and `workspacesRoot` had two
+  resolvers. The `Config` schema defaulted them at module load to `join(homedir(), '.dsh/agent-swarm/…')`, which the
+  direct mount (row `config: {}`) used, so it ignored both `DSH_HOME` and `DSH_AGENT_SWARM_ROOT`. Under an isolated
+  home it opened the default home's store: when that home's host was live its owner lock refused the trial's
+  `apply()`, and otherwise the trial's `start()` recovered the other home's missions. The bundle mount carried a
+  second copy of the rule as a `!!js` expression, which differed from the host's own on a blank, `~` or relative
+  `DSH_HOME`. Now `swarmRoots(config, env)` (`src/state-roots.ts`), called in `apply()`, is the only resolver. Each
+  root comes from the row's config (absolute), else `$DSH_AGENT_SWARM_ROOT`, else the host's own `resolveDshHome()` +
+  `/agent-swarm` (`@deepseek-ai/dsh-home-paths`, a new `0.2.1-rc.2` peer), and the plugin's variable is read by the
+  same blank, `~` and resolve rule. The load-time defaults are gone and both mounts' rows are `config: {}`, so the two
+  mounts can no longer open different stores. `reportSwarmRoots` logs one info line per start, after a pending restore
+  is applied: the two roots, the step that chose each, and whether the store is new. Nothing is adopted.
+  - The slice review's two medium findings. (1) The upgrade note named the affected installs by mount. Up to `ba9a758`
+    any root the composed row did not configure was `~/.dsh/agent-swarm/…`: always on the direct mount, and on the
+    bundle mount when a later layer targeting the row by id (an overlay adding `authorizedWorkspaces`, for one)
+    replaced its whole config without both roots, so those bundle operators were told they were unaffected. The note,
+    the 0.1.x backup step, known-limitations and both READMEs now state the condition by the roots resolved, with the
+    bundle expression's blank, `~` and relative cases (`4b33ad6`). (2) A warning logged beside the info line was
+    dropped by a log exporter at its default threshold, because Cordis ranks a warning below info (ERROR 0, INFO 1,
+    WARN 2); the report became one info line (`1242fe1`). Of the low findings, the report's comment overstated what it
+    probed (`1242fe1`) and the suite table still said "portable roots" (`045e403`); the third, canonical derived
+    roots, is open (below).
+  - The batch repair departs from the slice (`66813a8`). The line probed the lower steps' stores, always including
+    `~/.dsh/agent-swarm`, and beside a new store advised a restart with `DSH_AGENT_SWARM_ROOT=~/.dsh/agent-swarm`.
+    Under an isolated home on a machine whose default home is in use, that store is the other host's, as the
+    operations guide already said, so the line gave advice the guide calls wrong. The approved fix was the roots
+    logged once and an upgrade note, and the verification had called "print the roots and warn when the old default
+    exists" a patch. `swarmRoots` now returns the two roots and their steps only, and the line names the roots this
+    start opened and nothing else. Whether an older store is this host's to keep is the storage-roots upgrade note's
+    call (`24c02ea`).
+- **T2: the hermetic tier has one dependency source, the lockfile** (`3f9279b`, `0582a89`, `b7dd1a6`; documents
+  `fa066e6`; slice repair `9c72c73`, `86286e1`, `a576dfe`; batch repair `ef3d05f`, `b9f9df9`). No `package-lock.json`
+  was committed, so `npm ci` failed before any test, and the manifest named only part of what the code imports; the
+  link farm supplied the rest from the whole checkout.
+  - `package-lock.json` is committed, and every package `src/`, `tests/` or `scripts/` imports, for a value or a type,
+    is a devDependency at an exact version (`3f9279b`). That adds the twelve Harness packages the tests imported
+    undeclared (`dsh-agent-loop`, `dsh-experimental-tool-worktree`, `dsh-fs-local`, `dsh-host-webserver`,
+    `dsh-llm-retry`, `dsh-sandbox-local`, `dsh-session-persistence-jsonl`, `dsh-time-context`, `dsh-tool-schedule`,
+    `dsh-tool-working-directory`, `dsh-user-questions`, `dsh-working-directory`), `dsh-client-ui-workspace`, jsdom
+    29.1.1 (the release's own version), and `dsh-client-ui-session`, whose types two client files read and which is
+    now also an optional peer. `cordis` and `schemastery` are pinned to 4.0.5 and 3.18.5, the versions the release
+    vendors. The three jsdom UI tests import jsdom instead of borrowing it through
+    `createRequire(resolveHarnessRoot())`. `lib/` built from the npm packages was byte-identical to `lib/` built from
+    the pinned checkout.
+  - Two tiers in one list, `scripts/test-tiers.mjs` (`0582a89`). The host tier is `HOST_TIER`, today
+    `tests/r17-profile.test.mjs`, which boots a real host from the checkout; every other `tests/*.test.mjs` is
+    hermetic. `npm test` runs the hermetic tier after the build and `test:bundle` the host tier. The hermetic tier
+    runs as a fresh clone would on every machine: its runner removes `DSH_HARNESS_ROOT` and `DSH_SOURCE` and sets
+    `DSH_SWARM_TEST_TIER=hermetic`, under which `resolveHarnessRoot` searches for no checkout and says the test
+    belongs to the host tier. The host tier sets its own environment and never inherits that marker (`86286e1`), and
+    the marker belongs to `scripts/harness-target.mjs`, the module that reads it, so release selection imports no test
+    runner (`a576dfe`).
+  - `link:dsh` is an overlay on what `npm ci` installed (`b7dd1a6`). It links every Harness package the checkout
+    provides, replacing an earlier link or an installed copy, which must be the checkout's version; it keeps every
+    other devDependency the lockfile installed and links the checkout's copy, at the pinned version, only where npm
+    installed none (so a link farm has jsdom); and it reports every conflict before it touches `node_modules`. Before,
+    it refused any installed package, so `npm ci` and `link:dsh` could not be combined.
+  - The slice review's medium finding (`9c72c73`): `npm ci` (npm 10.9.8, its `npm-ci:rm` step) deletes every entry of
+    `node_modules` before it installs, through a symbolic link too, so in a checkout whose `node_modules` links to a
+    shared link farm it empties that farm for every checkout using it, before any lifecycle script runs. No code in
+    the repository can prevent it, so the operations guide (+zh-CN) gives the step: remove the link itself
+    (`rm node_modules`, no trailing slash) first. The deletion and the safe order were both reproduced in scratch.
+- **T1: one gate manifest, and every run records every suite** (`6931cba`, `3121c8c`, `a3f40fc`, `c01fc0e`; documents
+  `812a8d2`; batch repair `ef3d05f`, `a8f48f5`). The gate was kept by hand in three places that had drifted apart:
+  `verify` ran eight commands; `round.mjs gate` hard-coded its optional suites, so it never had `test:oracle`, and
+  `promote` checked only `gate.green`; and the batch gates kept outside the repository ran no `test:isolation` until
+  2026-10-23 and no `test:load` between 2026-09-24 and then.
+  - The `gate` block of `package.json` is the one manifest: `typecheck`, `test`, then every `test:*` script, each with
+    what it needs beyond `npm ci`. `harness` (the built checkout), `sandbox` (the macOS sandbox with a nested
+    `sandbox_apply` permitted) and `browser` (one the checkout's Playwright launches) are probed. `provider` and
+    `better-sidebar` are opt-in, named with `--with`, so `verify` never makes a billable request by default. Fifteen
+    suites need no opt-in, and three do.
+  - `scripts/gate.mjs` is `npm run verify`. It runs every suite whose prerequisites are present, in manifest order,
+    stops at the first failure, and writes a record, `artifacts/gate/<commit>.json` unless `--record` names another
+    file. The record holds the commit, whether the tree had uncommitted changes (read before any suite runs), the
+    Harness release and commit, each prerequisite as found, and each suite as passed, failed, skipped with what it
+    lacked, or not run. The last line says whether the run was a complete gate (`gateVerdict`: every suite passed,
+    except one skipped only for an opt-in prerequisite its entry declares), and an incomplete one names each lacking
+    prerequisite's reason once (`c01fc0e`). A checkout that `DSH_HARNESS_ROOT` or `DSH_SOURCE` names but that does not
+    exist stops the run before any suite (exit 2), and the suites run with `DSH_HARNESS_ROOT` set to the checkout the
+    probe found. `--plan` prints the plan and runs nothing.
+  - `round.mjs gate` runs the gated commit's own `scripts/gate.mjs` in a clean worktree with a temporary npm cache,
+    keeps the record in `<lab>/gates/<sha>.json` after removing an earlier one, and exits 0 only for a complete gate
+    of the manifest in the commit's own `package.json` (`3121c8c`); `--full` and `--browser` are gone. `promote` reads
+    the record against the same manifest: it must list exactly the commit's suites and be of that commit with no
+    uncommitted changes, and every suite must have passed except one skipped for an opt-in prerequisite. A green
+    record that names no suites, which is what the round gate wrote up to 2026-09-10, is refused.
+  - `.github/workflows/verify.yml` (`a3f40fc`) runs `npm ci` and `npm run verify` on `macos-15` with Node 22.22.3,
+    read-only permissions, no secrets and no persisted credentials, and uploads the record. With no checkout there, it
+    runs six suites (`typecheck`, `npm test`, `test:packed`, `test:replay`, `test:oracle`, `test:load`) and records
+    the other twelve as skipped. It takes effect only when it is pushed.
+  - The batch repair (`ef3d05f`). The probe read the ambient `process.env`, and which checkout counts as named had
+    three owners: `resolveHarnessRoot`, and copies of `DSH_HARNESS_ROOT ?? DSH_SOURCE` in the gate and in the fault
+    loader (`tests/faults/loader.mjs`). `resolveHarnessRoot(explicit, env)` now reads the variables and the tier
+    marker from `env` and throws `NamedHarnessRootError` for a named root that does not exist, and the gate and the
+    fault loader tell a named checkout from an empty search by that type. `probePrerequisites(manifest, optIns, env)`
+    hands one environment to the harness, sandbox (`DSH_SWARM_SKIP_SANDBOX_PREFLIGHT`) and browser
+    (`DSH_SMOKE_BROWSER`) probes, and `verify` passes `process.env`, which the suites then run in.
+  - The documents (`812a8d2`). The header of this page now says that the round-4 baselines' "the owner runs them in
+    the round gate" describe the practice of that time, when the round gate last ran, and which suites the hand-kept
+    lists lacked; past entries are unchanged. Reproduce runs `npm run verify`. The operations guide (+zh-CN) describes
+    the manifest, the record, the round gate, `promote` and CI, and its suite table gains a Needs column and the
+    suites it lacked. Known-limitations lists the gate's limits.
+- **F2: the panel reads every item it renders at admission** (`4965ede`, `afb0583`; documents `bf4f298`).
+  `validateState` read snapshots through `readSnapshot` but took drafts, saved requests (`starts`) and the default
+  budget as sent, and request replies reached component state unread; the panel dereferences all of them in render. A
+  malformed item threw there, and on 0.2.1-rc.2 the host's slot error boundary then retires the Agent Swarm tab's
+  registration: the tab stays blank in every conversation until the page reloads, and the monitor's own recovery never
+  shows. No producer in a real run sends such an item (every draft passes `validatePlan`); the gap was against the
+  client's own rule that every dereferenced field is read at admission.
+  - `src/client/projection.ts` has one reader per rendered item: `readDraft`, `readStart` and `readBudget` beside
+    `readSnapshot` (`4965ede`), which now reads the mission budget and baseline through them, and `readDelivery` and
+    `readDeliveryApplication` (`afb0583`). Each checks the fields its renderers and the client's own merges read.
+    `validateState`, for the initial read, the snapshot and delta updates and the delivery panel's recheck, refuses a
+    state whose draft, start or default budget fails its reader, or whose `starts` is not a list: the last good view
+    stays, "Invalid swarm state from host" shows, and a full read is retried. A heartbeat's budget is read by the same
+    `readBudget` instead of its own key list.
+  - `admitReply` turns a reply whose item fails its reader into the request error its caller already shows
+    (`afb0583`): mission control, task cancel and launch replies through `readSnapshot`, a draft save through
+    `readDraft`, a saved-request control through `readStart` (its id and owner binding stay `requestStartControl`'s),
+    a delivery inspection through `readDelivery`, and an application through `readDeliveryApplication`, with its
+    optional snapshot through `readSnapshot`. The draft editor's inline advisories guard is gone; `readDraft` owns
+    that rule.
+  - One budget rule for render: every limit is a finite number, and a fixed deadline, when set, is one. The
+    heartbeat's safe-integer check was the only stricter rule; whole numbers in range stay the runtime's policy, which
+    refuses a save that breaks it. A mission budget whose `deadlineAt` is set but not a number is now refused like any
+    other.
+  - No error boundary was added, as the verification advised; known-limitations records what the host's boundary does
+    with a render error that admission does not cover.
+
+**Review repair round** (2026-10-24; `ef3d05f` to `24c02ea`). The first gate run, at `bf4f298`, failed one test
+(below), and the batch review found gaps in the tests of the three runners and that F3's start line went beyond the
+approved fix. Each fix has a test that fails without it.
+
+1. `ef3d05f`: the failing test, `tests/gate-manifest.test.mjs:58` ("npm run verify is the gate runner, and a suite
+   runs exactly when it lacks no prerequisite"), called `probePrerequisites(manifest)` in-process and asserted that no
+   checkout was found. It failed on correct code whenever the shell exported `DSH_HARNESS_ROOT`, as the batch's
+   instructions and its gate runner do, and with a checkout found it also launched Chrome. The cause was the probe's
+   reading of the ambient environment (the T1 item above). The test now probes `tierEnvironment('hermetic')` over a
+   manifest without `sandbox`, so it gives the same result in any shell and starts no browser; it also probes a
+   synthetic checkout named only in the environment it passes, and a missing `DSH_SOURCE`, which must stop the gate.
+2. `a8f48f5`: the one subprocess test of `gate.mjs` ran `--record` on a clean tree with no checkout, and the round
+   test only gated and promoted the HEAD of a clean tree, so fifteen of the review's mutants of the documented
+   contract survived (G01 to G06, G08 to G11, R01 to R05). A new subprocess test names a synthetic checkout through
+   `DSH_SOURCE` and a symbolic link. `--plan` runs no suite and writes no record; `--bogus`, `--with gpu` and
+   `--with harness` exit 2; a missing `DSH_HARNESS_ROOT` or `DSH_SOURCE` exits 2 before any suite; and with
+   `--with provider` and an untracked file every suite runs with `DSH_HARNESS_ROOT` equal to the root the record
+   names, the opt-in suite runs, and the record is dirty, green and complete. The round test commits a later revision
+   that adds `test:oracle` before it gates the earlier one, so the record must be the earlier commit's, of its
+   manifest and from its own runner. It gates that commit again with `--with provider`, promotes it against its own
+   manifest while the working tree lists another, and refuses copies of the record that name another commit or a dirty
+   tree. With a complete earlier record in place, a gate that writes none (a missing named checkout) must leave none
+   and say so. `gateVerdict` gains rows for an opt-in skip the suite's entry does not declare and for `dirty: null`.
+3. `b9f9df9`: `npm test`, CI and the gate's `test` suite all go through the main block of `scripts/test-tiers.mjs`, of
+   which only `--list` ran as a process, so three mutants survived: an exit of 0 whatever the run did (T01), the
+   caller's environment for the hermetic tier (T02), and dropped `node --test` options (T04). A process test now runs
+   the runner in a scratch project, started by a caller that exported `DSH_HARNESS_ROOT`, `DSH_SOURCE` and a tier
+   marker, with `--test-name-pattern=^selected`. The hermetic run exits 1, sees no checkout and the hermetic marker,
+   skips the unselected test and leaves out the host-tier file; the host run keeps the caller's checkout and drops the
+   marker.
+4. `66813a8` and `24c02ea`: the F3 start line (above).
+5. T2's claim that `npm ci && npm test` passes from a clean clone had never been run. It now has, twice (below).
+
+All 22 mutants, the 18 the review left surviving among them, each re-applied to a scratch copy of the head, fail at
+least one test; P01 and P02 put the probe back on `process.env`, and F01 removes the fault loader's named-checkout
+check.
+
+**User-facing changes.**
+
+- Each install's store and workspaces root follow one rule, the same for both mounts: the row's config, else
+  `$DSH_AGENT_SWARM_ROOT`, else `$DSH_HOME/agent-swarm` (`~/.dsh/agent-swarm` without `DSH_HOME`), resolved at start
+  as the host resolves its home. An install that ran up to `ba9a758` with a root its composed row did not configure,
+  and with `DSH_HOME` naming another home or `DSH_AGENT_SWARM_ROOT` set, opens a new, empty store after the upgrade,
+  and nothing on a stock profile says so. Nothing adopts the old store; the operations guide's storage-roots note
+  gives the step that keeps it. `statePath` and `workspacesRoot` have no schema default any more.
+- The plugin needs the peer `@deepseek-ai/dsh-home-paths` `0.2.1-rc.2`, which the host provides, and declares
+  `@deepseek-ai/dsh-client-ui-session` as an optional peer.
+- One start line at info names the two roots, the step that chose each, and whether the store is new. It reaches only
+  a log exporter the profile mounts, and the 0.2.1-rc.2 Web and Desktop profiles mount none.
+- The panel refuses a malformed or version-skewed draft, saved request or budget, as it already refused a malformed
+  snapshot, with "Invalid swarm state from host" and keeps the last good view, instead of the tab going blank in every
+  conversation until a reload. A malformed reply to a save, a launch, a control, a cancel, a saved-request control or
+  a delivery request is shown as that request's error. A heartbeat budget with a fractional limit is now shown (the
+  runtime still refuses a save of it), and a mission budget whose `deadlineAt` is set but not a number is refused.
+- Development. `npm ci && npm test` runs the hermetic tier from a fresh clone with no Harness checkout, and `npm test`
+  no longer runs `tests/r17-profile.test.mjs`, which `test:bundle` runs. `npm run link:dsh` works after `npm ci` and
+  must be run again after every `npm ci`; where `node_modules` is a link, remove the link before `npm ci`.
+  `npm run verify` runs the gate manifest: a suite whose prerequisite is missing is recorded as skipped, not failed,
+  so `verify` can exit 0 on an incomplete gate, which its last line and `artifacts/gate/<commit>.json` report.
+  `round.mjs gate` takes `--with` instead of `--full` and `--browser`, and `promote` refuses a record that is not a
+  complete gate of the commit's manifest, which every record written before 2026-10-24 is not.
+
+**The full-log oracle at the head against `ba9a758`** (`npm run test:oracle`). No commit changed a line, and nothing
+was re-recorded. The oracle and replay scenarios drive `SwarmRuntime` directly (`scripts/replay/scenario.mjs`), not
+through `apply()`, where the roots are now chosen, and the client and the scripts the batch changes write no log.
+Every slice's own run, both gate runs and the three `npm run verify` runs below reproduced all 12 logs, and the
+`test:replay` digest is unchanged, `sha256:61a921e64088b78b957cd6aeaa563d5436d4a6eae4b0130725d1f3c74c6f971e`.
+
+**Regressions.** The full suite (`node --test tests/*.test.mjs`) has 2038 tests at `ba9a758`, 2044 after F3, 2056
+after T2, 2063 after T1, 2072 at `bf4f298` and 2075 at `24c02ea`: F3 adds 6, T2 12, T1 7, F2 9 and the repair round 3.
+The host tier has 8 of them at the head (7 at `ba9a758`), and the hermetic tier 2067. The counts at `ba9a758` (whose
+tests are those of `1218e86`), `bf4f298` and `24c02ea` are run counts; the others count the tests the files declare at
+each slice's tip.
+
+- F3: `tests/state-roots.test.mjs` (new, 5 tests) checks each step of the rule against the host's `resolveDshHome`
+  under a temporary OS home: the default; `DSH_HOME` absolute, blank, `~`-prefixed and relative;
+  `DSH_AGENT_SWARM_ROOT`; a configured root per field, which must be absolute; and the start line, one info line that
+  is the same whether or not the default home or a dropped root holds a store. `ba9a758` has no such module, and
+  against the slice's `lib/state-roots.js` 4 of the 5 fail, the start-line test among them.
+  `tests/r17-profile.test.mjs` replaces the evaluation of the `!!js` expression with the assertion that both mounts
+  insert the row with an empty config, runs every real host under its own `HOME`, and adds a real direct-mount host
+  under an isolated `DSH_HOME`, with the host's console exporter at its default threshold. That host must open the
+  isolated home's store, leave the default home's store unopened, and log one info line that ends with the roots it
+  opened. It times out against the `src/index.ts` before `aa21247`.
+- T2: `tests/declared-dependencies.test.mjs` (new, 4 tests): every package `src/`, `tests/` and `scripts/` import, for
+  a value or a type, is a devDependency pinned to one version; every package `src/` imports is a peer; and the
+  lockfile declares exactly `package.json`'s dependencies and resolves every `dsh-*` package to the release. It fails
+  on each against the manifest before `3f9279b`. `tests/link-dsh.test.mjs` (new, 4 tests) runs `linkHarness` on
+  scratch manifests: after `npm ci` it replaces the Harness packages and keeps the lockfile's tools; on an empty
+  `node_modules` it builds the whole farm, every declared tool and its bins included; it refuses, changing nothing, on
+  a version mismatch or a declared package found nowhere; and it removes a stale link into the checkout and keeps an
+  unrelated manual one. The old script refused the `npm ci` case and left jsdom out of a farm.
+  `tests/test-tiers.test.mjs` (new, 4 tests at T2's tip) pins the split, the hermetic environment, the two npm scripts
+  and the import direction; its host-tier environment check fails against the `tierEnvironment` before `86286e1`, and
+  its closure check against the import before `a576dfe`. The default-search test in `tests/harness-support.test.mjs`
+  now also asserts the hermetic case, which fails against the resolver before `0582a89` (it returned the built
+  sibling).
+- T1: `tests/gate-manifest.test.mjs` (new, 7 tests at T1's tip): every `test:*` script is in the manifest and `verify`
+  is its runner; the plan, the verdict and a real run's record; the real `round.mjs gate` and `promote` in a scratch
+  repository; and the CI workflow, which must run exactly `npm ci` and `npm run verify` with no secret, provider key,
+  named checkout or opt-in. Before `6931cba` there is no manifest, and the `promote` before `3121c8c` accepts a green
+  record that names no suites (reproduced: exit 0).
+- F2 (9 tests): `tests/r12-client-fixes.test.mjs` (3) pins the reader matrices, the monitor's refusal that keeps the
+  last good view, and the control and cancel replies; `tests/live-state.test.mjs` (1) that snapshot and delta updates
+  refuse a malformed draft or start and every path reads the budget by one rule; `tests/web-api.test.mjs` (1) that the
+  panel admits what the real web API sends, a draft reply, the state, a delta and a heartbeat;
+  `tests/client-start-controls.test.mjs` (1) that a saved-request reply bound to its request is still read; and
+  `tests/client-admission.test.mjs` (new, 3) mounts `ActivityPanel`, the draft editor and the delivery panel in jsdom
+  with malformed state and replies. Against a build with the fix reverted 8 of them failed, with the real render
+  errors (reading `title` and `map` of undefined, and "Objects are not valid as a React child"), missing refusals and
+  adopted replies.
+- The repair round adds one test to `tests/test-tiers.test.mjs` and two to `tests/gate-manifest.test.mjs` (above),
+  rewrites `tests/state-roots.test.mjs` for the plain line, and makes the direct-mount test assert that the line ends
+  with the roots it opened.
+
+**Gates**, each with `node_modules` installed by npm from the lockfile and the pinned clone (`dsh-v0.2.1-rc.2`,
+`687f282e86`) linked over it with `npm run link:dsh` (356 Harness packages), and with `DSH_HARNESS_ROOT` set to that
+clone. The two runs in the table used the batch's gate runner outside the repository, whose suite list is kept by hand
+(batch A's list, which has no `test:validation-repair-web`); `npm run verify` ran after them (below).
+
+| Check | `bf4f298` (2026-10-24 07:19 to 07:35) | `24c02ea` (2026-10-24 08:21 to 08:31) |
+| --- | --- | --- |
+| `npm run typecheck` / `npm run build` | passed / passed | passed / passed |
+| `node --test tests/*.test.mjs` (both tiers, in the runner's environment) | 2071/2072 (320 s): `tests/gate-manifest.test.mjs:58` failed (below) | 2075/2075 (315 s), 0 cancelled, 0 skipped |
+| The hermetic tier through `scripts/test-tiers.mjs` | 2064/2064 (349 s) | 2067/2067 in the clean clone, and in `npm run verify` (below) |
+| `npm run test:harness` | passed, 4 scripts | passed, 4 scripts |
+| `npm run test:replay` | digest unchanged | digest unchanged |
+| `npm run test:oracle` | 12/12 identical | 12/12 identical |
+| `npm run test:pack` | passed (257 archive entries, 257 published files) | passed (257, 257) |
+| `npm run test:profile` | passed | passed |
+| `npm run test:bundle` (the host tier) | 8/8 | 8/8 |
+| `node scripts/faults/run.mjs` | 24/24 | 24/24 |
+| `npm run test:web` | passed, 13 checks (31 s) | passed, 13 checks (35 s) |
+| `npm run test:command-web` | passed, 11 checks (61 s) | passed, 11 checks (62 s) |
+| `npm run test:isolation` | 6/6 | 6/6 |
+| `npm run test:load` | D8 load envelope OK: observation bounded (max 1039 B and 1042 B, ratio 1.00x) | the same |
+
+The pack has three files more than at `1218e86`: `lib/state-roots.js` with its `.d.ts` and `.js.map`. Every web
+smoke's `report.json` records `harnessHead` `687f282e8625c6b8d11ff58211a90524be2e4317` and 79 plugin JavaScript files
+(78 at `1218e86`), with plugin JavaScript sha256 `c8c97d44…` at `bf4f298` and `204a4c7d…` at `24c02ea`. The harness,
+pack and profile logs carry 24, 10 and 6 `[mission_operation_pending]` lines at `bf4f298` and 18, 8 and 7 at
+`24c02ea`; those gates exited 0, as batch A's did with such lines.
+
+At `bf4f298` one test failed, `tests/gate-manifest.test.mjs:58`, at its assertion that the probe found no checkout
+(`true !== false`, line 68). It was not a timing failure: the test failed on every run with `DSH_HARNESS_ROOT`
+exported, which is how every gate runs, and `ef3d05f` fixed its cause (above). Every other gate passed on its first
+run.
+
+At `24c02ea` every gate passed on its first run, so nothing was re-run. Load averages read 26, 37 and 36 (one, five
+and fifteen minutes) when the run started, mostly `fseventsd` and Spotlight, and about 13 at the end. No timing test
+failed.
+
+**Clean-clone runs** (T2). `npm ci && npm test` ran in a clean clone of the branch with a fresh npm cache, no
+`DSH_HARNESS_ROOT`, `DSH_SOURCE` or tier marker in the environment, no `link:dsh` and no linked `node_modules`, on
+Node 22.22.3 and npm 10.9.8. `npm ci` installed 230 packages from the lockfile, 95 of them `@deepseek-ai` packages
+with no symbolic link among them (`dsh-agent` 0.2.1-rc.2), and the hermetic tier passed 2064/2064 at `bf4f298` (364 s)
+and 2067/2067 at `24c02ea` (349 s). `npm ci` reported 54 audit findings (4 moderate, 50 high) in the devDependency
+tree.
+
+**`npm run verify`.** The T1 slice ran it once at `812a8d2`, a complete gate: 15 suites passed, and the three opt-in
+ones were skipped. After the gate runs above it ran three times on `24c02ea`, on the same tree and setup, and each
+record reads `dirty: false`. The probe found the pinned clone, the sandbox (nested `sandbox_apply` permitted) and a
+browser (recorded as `chromium 155.0.8059.85`); `provider` and `better-sidebar` were not named, so
+`test:sidebar-service`, `test:deepseek` and `test:command-deepseek` were recorded as skipped for them. Run by run:
+
+- 08:35 to 08:44, load averages up to 110 from other work on the machine. Typecheck, `npm test` (the hermetic tier
+  through its runner, 2067/2067), `test:packed`, `test:replay`, `test:oracle`, `test:load`, `test:faults` (24/24) and
+  `test:bundle` (8/8) passed, and the run stopped at `test:harness`: `tests/harness-launch-refusal.mjs:221` read two
+  owner turns where it expects the refusal and its repair in one (`[1, 2]` against `[1]`). The six suites after it
+  were recorded as not run. That script then passed 3 of 3 alone at a load average of 8.7. The only `src/` change on
+  its path is the root rule in `apply()`, and the script configures both roots.
+- 08:46 to 08:57. Those eight suites and `test:harness` (4 scripts), `test:pack` (257, 257), `test:profile` and
+  `test:isolation` (6/6) passed, and the run stopped at `test:web`. After the worker conversation the smoke clicks the
+  owner's session in the host's Sessions tree by a name matching `/^Prepare a staged swarm for /`, and that tree item
+  read `Completed Prepare a staged swarm for now`, so the click timed out after 30 s (`scripts/smoke-web.mjs:104`,
+  which the batch does not change). Run alone right after, `test:web` (13 checks), `test:command-web` (11) and
+  `test:validation-repair-web` (13) passed.
+- 09:00 to 09:13, load averages 7 to 25: a complete gate. All 15 suites passed: typecheck; `npm test`, 2067/2067
+  (391 s); `test:packed`; `test:replay`, digest unchanged; `test:oracle`, 12/12 identical; `test:load`, the D8
+  envelope OK (1039 B and 1042 B, ratio 1.00x); `test:faults`, 24/24; `test:bundle`, 8/8; `test:harness`, 4 scripts;
+  `test:pack`, 257 archive entries and 257 published files; `test:profile`; `test:isolation`, 6/6; `test:web`, 13
+  checks; `test:command-web`, 11; and `test:validation-repair-web`, 13. Every smoke's `report.json` names
+  `harnessHead` `687f282e86` and plugin JavaScript `204a4c7d…`. The run took 12 min 28 s, and its log carries 113
+  `[mission_operation_pending]` lines across its suites.
+
+**Repair-round checks** (before the final gates): typecheck and build; the two gate-manifest tests by name, 2/2 (0/1
+before); the affected hermetic files (`declared-dependencies`, `gate-manifest`, `harness-support`, `state-roots`,
+`test-tiers`, `web-smoke-runner`, `packaging`) 45/45 with `DSH_HARNESS_ROOT` exported, and a subset 36/36 under
+`env -u DSH_HARNESS_ROOT -u DSH_SOURCE DSH_SWARM_TEST_TIER=hermetic`; `test:bundle` 8/8; faults 24/24, since the fault
+loader changed; `node scripts/gate.mjs --plan`, which with the pinned clone planned all 15 suites that need no opt-in,
+and with `DSH_HARNESS_ROOT=/nonexistent/harness` exited 2 naming that path; the 22 mutants (above); and the rewritten
+state-roots tests against the slice's `lib/state-roots.js` (4 of 5 fail). `test:oracle` was not re-run there, since
+only the text of the start line changed in `src/`.
+
+**Not exercised.**
+
+- The round gate and `promote` ran only in scratch repositories inside `tests/gate-manifest.test.mjs`, never on a
+  commit of this repository, and nothing makes a merge go through them: batches are merged by hand.
+- The CI workflow has not run on GitHub, because it is not pushed. The hermetic tier has never run on Linux, and the
+  `sandbox` prerequisite exists only on macOS.
+- The root rule ran on real CLI Web hosts (`test:bundle`, both mounts) and in unit tests, never on Desktop, whose
+  runtime is a child process launched with its own environment, and never on a real home that an install up to
+  `ba9a758` left with a store in `~/.dsh/agent-swarm` (the direct-mount test fabricates that store).
+- Admission ran on mounted components in jsdom and against the real web API's replies; the web smokes ran the rebuilt
+  client only with well-formed state.
+- The real-provider smokes (`test:deepseek`, `test:command-deepseek`) and `test:sidebar-service` did not run.
+
+**Open after this batch** (not adopted here).
+
+- Roots. F3's remaining medium finding is the owner's decision: on a stock profile a store that moved still opens
+  empty with no notice. Meeting "a `DSH_HOME` change or an upgrade never silently opens an empty store" would take a
+  durable `swarm/install` record of each start's roots and their steps, projected into the panel or `swarm_observe`
+  (web-api `stateFor`, the client's `validateState`, `ActivityPanel`, the locale and the event registry). A `DSH_HOME`
+  given through a symbolic link (macOS `/tmp`, `/var`) still makes the first mission fail with
+  `workspacesRoot must be canonical`; the rule could canonicalize the roots it derives with the host's
+  `canonicalizeWatchPath` (`@deepseek-ai/dsh-home-paths`) and leave configured roots as given.
+- The gate. The batch gate runner outside the repository still keeps its own suite list and runs
+  `node --test tests/*.test.mjs` in its own environment instead of the hermetic tier's runner; pointing it at
+  `npm run verify -- --record <file>` or `round.mjs gate` would put batch merges on the manifest. The workflow pins
+  `actions/checkout`, `setup-node` and `upload-artifact` to `@v4` tags, not commit SHAs. Wall-clock tests (R14-F2(a)
+  in `tests/fallthrough-witness.test.mjs`, `S1/R17-G5`) may fail on a slower CI runner; R14-F2(a) failed once in T1's
+  fresh-clone emulation under load and passed 5/5 alone. Because `verify` stops at the first failure, one
+  load-sensitive suite leaves every later one unrun, as two of the three runs at `24c02ea` show. AGENTS.md names only
+  typecheck and the affected tests, and the local runbooks still describe `round.mjs gate --full`.
+- Load-sensitive checks the `verify` runs met, in paths the batch does not change.
+  `tests/harness-launch-refusal.mjs:221` counts the owner's turns after it has waited for the owner to go idle and for
+  its own reader to stop, so a second turn that starts in that interval fails it. `scripts/smoke-web.mjs:104` finds
+  the owner's session by a name anchored at its start, which the host's `Completed` status prefix breaks. Neither has
+  been reproduced on demand.
+- Pre-existing, found on the way. `scripts/test-tiers.mjs`, `scripts/link-dsh.mjs`, `scripts/load/run.mjs` and
+  `tests/refusal-inventory.mjs` compare `process.argv[1]` with their own path without resolving links, so started by
+  an absolute path through one (macOS `/var`) they do nothing; `gate.mjs` compares real paths. `resolveHarnessRoot`'s
+  default search reads the process's home (`os.homedir()`), not `env.HOME`. A blank `DSH_HARNESS_ROOT` with
+  `DSH_SOURCE` set counts as nothing named, since `??` keeps the blank value. The gate's summary prints
+  `Harness <version> at null` for a checkout that is not a Git repository. The hermetic runner does not isolate
+  `HOME`. `npm ci` reports 54 audit findings in the devDependency tree, which needs a dependency review.
+  Known-limitations' "Coverage on 0.2.1-rc.2" still says that the real-provider smokes last ran on 2026-10-22 and that
+  `test:load` was not exercised on 0.2.1-rc.2, which batch A's live smokes and the gates since 2026-10-23 contradict.
+- The panel. `validateState` does not check a full state's `workspace`, `writable` and `ownerLive`, which the
+  heartbeat checks; they are primitives and cannot break render. `WorkerHistory` reads its history page itself rather
+  than through a reader in `projection.ts`, and no test refuses a malformed page.
+- A shared link farm built before `b7dd1a6` has no jsdom. Rebuild it with the new `link:dsh` (no `npm ci`), or, in
+  each checkout that links it, remove the link before `npm ci && npm run link:dsh`.
+
 ## Self-review batch A: CORE-02, CORE-05, CORE-01, CORE-04, CORE-03, and CORE-06 from the live smoke (2026-10-24)
 
 **Head**: `1218e86`, where the final gates ran (the third gate run below), and this record's revision
