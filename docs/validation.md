@@ -22,6 +22,9 @@ against `ba9a758` at `24c02ea`: +277 −39, net +238. By slice: F3 +148 −10 (n
 T1 none, F2 +150 −29 (+121), and the repair round +18 −43 (−25). `scripts/` is +582 −109 (net +473) and `tests/` +1230
 −73, and the batch adds `package-lock.json` and `.github/workflows/verify.yml`.
 
+**Merged** as `7f72669` (2026-10-24) on `ba9a758`, after both live smokes passed at `e4344df` (`1a0b7c2`). Main had not
+moved, so the merged tree is `1a0b7c2`'s.
+
 **What each slice leaves at the head.**
 
 - **F3: one rule chooses the store and workspaces roots, for both mounts** (`aa21247`; documents `05c13b1`; slice
