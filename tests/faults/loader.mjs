@@ -13,7 +13,7 @@ import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { PROJECT } from './harness.mjs'
-import { assertSupportedHarness, resolveHarnessRoot as resolveTarget } from '../../scripts/harness-target.mjs'
+import { NamedHarnessRootError, assertSupportedHarness, resolveHarnessRoot as resolveTarget } from '../../scripts/harness-target.mjs'
 import { assertEveryEntryActive, harnessEntry, importHarness, workingDirectoryRows } from '../fixtures/built-harness.mjs'
 
 /**
@@ -24,10 +24,9 @@ import { assertEveryEntryActive, harnessEntry, importHarness, workingDirectoryRo
  * used (a missing path, say) reports its own cause.
  */
 export function resolveHarnessRoot(explicit) {
-  const supplied = explicit ?? process.env.DSH_HARNESS_ROOT ?? process.env.DSH_SOURCE
   let root
   try { root = resolveTarget(explicit) } catch (error) {
-    if (supplied) throw new Error(`The fault suite cannot use the Harness checkout ${supplied}: ${error.message}`, { cause: error })
+    if (error instanceof NamedHarnessRootError) throw new Error(`The fault suite cannot use the Harness checkout ${error.named}: ${error.message}`, { cause: error })
     throw new Error('The fault suite needs a built Harness checkout; set DSH_HARNESS_ROOT (see compatibility.json)')
   }
   assertSupportedHarness(root)

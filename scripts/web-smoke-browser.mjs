@@ -37,9 +37,9 @@ async function openAuthenticatedWeb(page, launchUrl, checks) {
  * `chromium` is Playwright's own build). The gate's browser prerequisite
  * (scripts/gate.mjs) is that this launches.
  */
-export async function launchSmokeBrowser(harnessRoot) {
+export async function launchSmokeBrowser(harnessRoot, env = process.env) {
   const { chromium } = await import(pathToFileURL(join(harnessRoot, 'apps/web/node_modules/playwright/index.mjs')).href)
-  const channel = process.env.DSH_SMOKE_BROWSER ?? 'chrome'
+  const channel = env.DSH_SMOKE_BROWSER ?? 'chrome'
   return chromium.launch({ headless: true, ...(channel === 'chromium' ? {} : { channel }) })
 }
 

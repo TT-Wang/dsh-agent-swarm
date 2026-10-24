@@ -27,6 +27,8 @@ const PROJECT = fileURLToPath(new URL('..', import.meta.url))
 const packageJson = JSON.parse(readFileSync(join(PROJECT, 'package.json'), 'utf8'))
 const manifest = readManifest()
 const OPT_IN = Object.keys(PREREQUISITES).filter(name => PREREQUISITES[name].optIn)
+const [{ version: RELEASE }] = JSON.parse(readFileSync(join(PROJECT, 'compatibility.json'), 'utf8')).supportedHosts
+const escape = text => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 
 test('the manifest lists every test:* script once, after typecheck and the hermetic tier, with prerequisites the gate defines', () => {
   const testScripts = Object.keys(packageJson.scripts).filter(name => name.startsWith('test:'))
@@ -63,13 +65,33 @@ test('npm run verify is the gate runner, and a suite runs exactly when it lacks 
   assert.deepEqual(none.map(suite => suite.name), Object.keys(manifest), 'the plan keeps the manifest order')
   for (const suite of none) assert.deepEqual(suite.missing, manifest[suite.name])
   assert.deepEqual(none.filter(suite => !suite.missing.length).map(suite => suite.name), ['typecheck', 'test', 'test:packed', 'test:replay', 'test:oracle', 'test:load'], 'the suites a fresh clone runs')
-  // Probed as a fresh clone (the hermetic tier this file runs in): no checkout, so no browser either, and an opt-in only when named.
-  const found = await probePrerequisites(manifest)
+})
+
+test('the probe reads only the environment it is given: a fresh clone\'s finds no checkout and no browser, and a named checkout is used or stops the gate', async t => {
+  // Probed in a fresh clone's environment, whatever environment runs this file
+  // (a developer's shell exports DSH_HARNESS_ROOT): no checkout, so no browser
+  // either, and an opt-in only when named. Only what a suite needs is probed.
+  const fresh = tierEnvironment('hermetic')
+  const needs = { 'test:host': ['harness'], 'test:web': ['harness', 'browser'], 'test:billable': ['provider'] }
+  const found = await probePrerequisites(needs, [], fresh)
+  assert.deepEqual(Object.keys(found), ['harness', 'browser', 'provider'], 'a prerequisite no suite needs is not probed')
   assert.equal(found.harness.present, false)
   assert.match(found.harness.reason, /hermetic test tier has no Harness checkout/)
   assert.deepEqual(found.browser, { present: false, reason: "the browser suites drive the Harness checkout's Playwright, and there is no checkout" })
   assert.deepEqual(found.provider, { present: false, reason: 'opt-in: run with --with provider' })
-  assert.equal((await probePrerequisites(manifest, ['provider'])).provider.present, true)
+  assert.equal((await probePrerequisites(needs, ['provider'], fresh)).provider.present, true)
+
+  // The same environment naming a checkout: the probe takes the one it names, whatever this process's environment says.
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'gate-probe-')))
+  t.after(() => rmSync(root, { recursive: true, force: true }))
+  const checkout = join(root, 'harness')
+  mkdirSync(checkout)
+  writeFileSync(join(checkout, 'package.json'), JSON.stringify({ version: RELEASE }))
+  const host = { 'test:host': ['harness'] }
+  assert.deepEqual(await probePrerequisites(host, [], { ...fresh, DSH_HARNESS_ROOT: checkout }), { harness: { present: true, root: checkout, version: RELEASE, commit: null } })
+  // A named checkout that does not exist is the gate's configuration error, never a quiet skip.
+  const missing = join(root, 'no-such-harness')
+  await assert.rejects(probePrerequisites(host, [], { ...fresh, DSH_SOURCE: missing }), { message: new RegExp(`^DSH_HARNESS_ROOT or DSH_SOURCE names ${escape(missing)}, which the gate cannot use: ENOENT`) })
 })
 
 test('gateVerdict: a record is complete only when it lists the manifest and every suite a complete gate needs passed', () => {

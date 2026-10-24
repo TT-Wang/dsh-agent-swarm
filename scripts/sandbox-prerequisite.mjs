@@ -26,13 +26,13 @@ export const SANDBOX_PREREQUISITE_MESSAGE = [
   'DSH_SWARM_SKIP_SANDBOX_PREFLIGHT=1 to attempt the composition anyway.',
 ].join('\n')
 
-export function sandboxPreflightDisabled() {
-  return process.env.DSH_SWARM_SKIP_SANDBOX_PREFLIGHT === '1'
+export function sandboxPreflightDisabled(env = process.env) {
+  return env.DSH_SWARM_SKIP_SANDBOX_PREFLIGHT === '1'
 }
 
-/** Probe whether this process can apply a nested macOS sandbox profile. */
-export async function probeNestedSandbox() {
-  if (sandboxPreflightDisabled()) return { usable: true, skipped: true, reason: 'DSH_SWARM_SKIP_SANDBOX_PREFLIGHT=1' }
+/** Probe whether this process can apply a nested macOS sandbox profile; `env` says whether the probe is skipped. */
+export async function probeNestedSandbox(env = process.env) {
+  if (sandboxPreflightDisabled(env)) return { usable: true, skipped: true, reason: 'DSH_SWARM_SKIP_SANDBOX_PREFLIGHT=1' }
   if (process.platform !== 'darwin') return { usable: true, skipped: true, reason: 'probe is macOS-only' }
   try {
     await execute('sandbox-exec', ['-p', '(version 1)(allow default)', '/usr/bin/true'], { timeout: 10_000 })
@@ -54,9 +54,9 @@ export async function probeNestedSandbox() {
  * probe above, and an inconclusive probe does not withhold it, as it does not
  * abort a smoke.
  */
-export async function sandboxPrerequisite() {
-  const probe = await probeNestedSandbox()
-  if (sandboxPreflightDisabled()) return { present: true, detail: probe.reason }
+export async function sandboxPrerequisite(env = process.env) {
+  const probe = await probeNestedSandbox(env)
+  if (sandboxPreflightDisabled(env)) return { present: true, detail: probe.reason }
   if (process.platform !== 'darwin') return { present: false, reason: `the suites that need it have run only under the macOS sandbox, and this host is ${process.platform}; DSH_SWARM_SKIP_SANDBOX_PREFLIGHT=1 attempts them anyway` }
   if (!probe.usable) return { present: false, reason: 'macOS denies a nested sandbox_apply here: this process runs inside an outer workspace-write sandbox' }
   if (probe.skipped) return { present: false, reason: probe.reason }

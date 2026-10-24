@@ -35,26 +35,29 @@ import { execFileSync, spawnSync } from 'node:child_process'
 import { mkdirSync, readFileSync, realpathSync, writeFileSync } from 'node:fs'
 import { dirname, join, relative, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { resolveHarnessRoot } from './harness-target.mjs'
+import { NamedHarnessRootError, resolveHarnessRoot } from './harness-target.mjs'
 import { sandboxPrerequisite } from './sandbox-prerequisite.mjs'
 import { TIERS } from './test-tiers.mjs'
 import { launchSmokeBrowser } from './web-smoke-browser.mjs'
 
 const PROJECT = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 
-/** What a suite can need beyond `npm ci`, in the order they are probed (browser after harness). */
+/**
+ * What a suite can need beyond `npm ci`, in the order they are probed (browser
+ * after harness). A probe reads only the environment it is given.
+ */
 export const PREREQUISITES = {
   harness: {
     description: TIERS.host,
-    probe: () => harnessPrerequisite(),
+    probe: (found, env) => harnessPrerequisite(env),
   },
   sandbox: {
     description: 'the macOS sandbox, with a nested sandbox_apply permitted (scripts/sandbox-prerequisite.mjs)',
-    probe: () => sandboxPrerequisite(),
+    probe: (found, env) => sandboxPrerequisite(env),
   },
   browser: {
     description: "a browser the Harness checkout's Playwright launches (DSH_SMOKE_BROWSER, default chrome)",
-    probe: found => browserPrerequisite(found.harness),
+    probe: (found, env) => browserPrerequisite(found.harness, env),
   },
   provider: {
     description: 'a live DeepSeek provider key (DEEPSEEK_API_KEY): the suites make billable requests',
@@ -88,15 +91,17 @@ export const readManifest = (project = PROJECT) => gateManifest(JSON.parse(readF
 /**
  * Probe the prerequisites the manifest needs, each once: { name: { present,
  * reason | detail } }. An opt-in prerequisite is present only when `optIns`
- * names it.
+ * names it. Every probe reads `env`, the environment the suites will run in,
+ * and nothing else: what is found depends on that input, not on the process
+ * that probes.
  */
-export async function probePrerequisites(manifest, optIns = []) {
+export async function probePrerequisites(manifest, optIns = [], env = process.env) {
   const needed = new Set(Object.values(manifest).flat())
   const found = {}
   for (const [name, prerequisite] of Object.entries(PREREQUISITES)) {
     if (!needed.has(name)) continue
     if (prerequisite.optIn) found[name] = optIns.includes(name) ? { present: true, detail: `named with --with ${name}` } : { present: false, reason: `opt-in: run with --with ${name}` }
-    else found[name] = await prerequisite.probe(found)
+    else found[name] = await prerequisite.probe(found, env)
   }
   return found
 }
@@ -139,21 +144,20 @@ export function gateVerdict(manifest, record, { commit } = {}) {
   return { complete: problems.length === 0, problems, reasons }
 }
 
-function harnessPrerequisite() {
-  const named = process.env.DSH_HARNESS_ROOT ?? process.env.DSH_SOURCE
+function harnessPrerequisite(env) {
   let root
-  try { root = resolveHarnessRoot() } catch (error) {
-    if (named) throw new GateConfigurationError(`DSH_HARNESS_ROOT or DSH_SOURCE names ${named}, which the gate cannot use: ${error.message}`)
+  try { root = resolveHarnessRoot(undefined, env) } catch (error) {
+    if (error instanceof NamedHarnessRootError) throw new GateConfigurationError(`DSH_HARNESS_ROOT or DSH_SOURCE names ${error.named}, which the gate cannot use: ${error.message}`)
     return { present: false, reason: error.message }
   }
   const version = (() => { try { return JSON.parse(readFileSync(join(root, 'package.json'), 'utf8')).version ?? null } catch { return null } })()
   return { present: true, root, version, commit: gitOutput(root, 'rev-parse', 'HEAD') }
 }
 
-async function browserPrerequisite(harness) {
+async function browserPrerequisite(harness, env) {
   if (harness?.present !== true) return { present: false, reason: "the browser suites drive the Harness checkout's Playwright, and there is no checkout" }
   let browser
-  try { browser = await launchSmokeBrowser(harness.root) } catch (error) {
+  try { browser = await launchSmokeBrowser(harness.root, env) } catch (error) {
     return { present: false, reason: `the checkout's Playwright launches no browser here: ${String(error?.message ?? error).split('\n')[0]}` }
   }
   const detail = `${browser.browserType().name()} ${browser.version()}`
@@ -212,12 +216,13 @@ async function main() {
   // The tree is read before any suite runs: what a suite writes is not what was gated.
   const commit = gitOutput(PROJECT, 'rev-parse', 'HEAD')
   const status = commit === null ? null : gitOutput(PROJECT, 'status', '--porcelain')
-  const found = await probePrerequisites(manifest, options.optIns)
+  const found = await probePrerequisites(manifest, options.optIns, process.env)
   const plan = planGate(manifest, found)
   if (options.plan) {
     process.stdout.write(suiteTable(plan.map(suite => ({ ...suite, status: suite.missing.length ? 'skip' : 'run' })), found).join('\n') + '\n')
     return 0
   }
+  // The suites run in the environment the probe read, with DSH_HARNESS_ROOT set to the checkout it found.
   const env = { ...process.env, ...(found.harness?.present ? { DSH_HARNESS_ROOT: found.harness.root } : {}) }
   const suites = []
   let failed = false
