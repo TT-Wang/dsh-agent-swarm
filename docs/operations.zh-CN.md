@@ -234,7 +234,7 @@ npm ci
 npm test
 ```
 
-在任何机器上，它都按全新克隆的条件运行：移除 `DSH_HARNESS_ROOT` 和 `DSH_SOURCE`，并关闭对检出的查找，所以需要检出的测试会在这一层失败，它应属于宿主层。宿主层和其他大多数套件需要位于发布提交的已构建 Harness 0.2.1-rc.2 检出。`npm ci` 之后设置 `DSH_HARNESS_ROOT` 并运行 `npm run link:dsh`（见[构建与安装](#build-and-install)），然后：
+在任何机器上，它都按全新克隆的条件运行：移除 `DSH_HARNESS_ROOT` 和 `DSH_SOURCE`，并关闭对检出的查找，所以需要检出的测试会在这一层失败，它应属于宿主层。全新克隆的上层目录中也没有 `node_modules`。Node 和 TypeScript 会在导入文件之上每一级目录的 `node_modules` 中查找包，因此若检出的路径或其真实路径之上存在 `node_modules`，封闭层的运行器和 `npm run verify` 会拒绝运行（退出码 2，不运行任何内容）：在那里运行可能靠 `npm ci` 从未安装的包通过。宿主层和其他大多数套件需要位于发布提交的已构建 Harness 0.2.1-rc.2 检出。`npm ci` 之后设置 `DSH_HARNESS_ROOT` 并运行 `npm run link:dsh`（见[构建与安装](#build-and-install)），然后：
 
 ```sh
 npm run verify

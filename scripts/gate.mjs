@@ -26,6 +26,11 @@
  * skipped quietly. The suites then run with DSH_HARNESS_ROOT set to the checkout
  * the probe found, so the record names the checkout every suite used.
  *
+ * A node_modules directory above the checkout (ancestorNodeModules in
+ * scripts/test-tiers.mjs) also stops the run before any suite (exit 2): the
+ * typecheck and the suites would find packages there that neither npm ci nor
+ * link:dsh put in the checkout, and the record could not say so.
+ *
  *   node scripts/gate.mjs [--with provider,better-sidebar] [--record <file>] [--plan]
  *
  * --record defaults to artifacts/gate/<commit>.json; --plan probes and prints
@@ -37,7 +42,7 @@ import { dirname, join, relative, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { NamedHarnessRootError, resolveHarnessRoot } from './harness-target.mjs'
 import { sandboxPrerequisite } from './sandbox-prerequisite.mjs'
-import { TIERS } from './test-tiers.mjs'
+import { TIERS, ancestorRefusal } from './test-tiers.mjs'
 import { launchSmokeBrowser } from './web-smoke-browser.mjs'
 
 const PROJECT = resolve(dirname(fileURLToPath(import.meta.url)), '..')
@@ -212,6 +217,8 @@ function summary(record, verdict, recordPath) {
 
 async function main() {
   const options = parseArguments(process.argv.slice(2))
+  const refusal = ancestorRefusal(PROJECT)
+  if (refusal) throw new GateConfigurationError(`refusing to gate this checkout: ${refusal}`)
   const manifest = readManifest()
   // The tree is read before any suite runs: what a suite writes is not what was gated.
   const commit = gitOutput(PROJECT, 'rev-parse', 'HEAD')

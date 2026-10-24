@@ -220,7 +220,7 @@ npm ci
 npm test
 ```
 
-It runs on every machine as that clone would: `DSH_HARNESS_ROOT` and `DSH_SOURCE` are removed and the search for a checkout is off, so a test that needs one fails there and belongs to the host tier. The host tier and most other suites need a built Harness 0.2.1-rc.2 checkout at the release commit. After `npm ci`, set `DSH_HARNESS_ROOT` and run `npm run link:dsh` (see [Build and install](#build-and-install)), then:
+It runs on every machine as that clone would: `DSH_HARNESS_ROOT` and `DSH_SOURCE` are removed and the search for a checkout is off, so a test that needs one fails there and belongs to the host tier. A fresh clone also has no `node_modules` above it. Node and TypeScript look for a package in the `node_modules` of every directory above the file that imports it, so the hermetic tier's runner and `npm run verify` refuse a checkout with one above its path or its real path (exit 2, before anything runs): a run there could pass on packages `npm ci` never installed. The host tier and most other suites need a built Harness 0.2.1-rc.2 checkout at the release commit. After `npm ci`, set `DSH_HARNESS_ROOT` and run `npm run link:dsh` (see [Build and install](#build-and-install)), then:
 
 ```sh
 npm run verify
