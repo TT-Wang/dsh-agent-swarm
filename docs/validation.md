@@ -15,6 +15,10 @@ and not pushed; this record is documentation only. Three commits: `fa69cc0` (the
 its census), `9d2d1bb` (the ancestor guard) and `ee0ce61` (the packages the client code loads, its census and
 `link:dsh`'s pnpm-store lookup). `src/` is unchanged.
 
+**Merged** as `4cb95c8` (2026-10-24) on `10fef21`, after an independent reviewer re-ran `npm ci && npm run verify` in a
+fresh clone at `6a62173` (6 passed, 0 failed, 12 skipped; the hermetic tier 2072/2072). Main had not moved, so the
+merged tree is `6a62173`'s.
+
 **The failure.** The first GitHub Actions run of `.github/workflows/verify.yml` (macos-15, Node 22.22.3),
 `npm ci && npm run verify` at `10fef21`, failed its first suite: `src/client/DraftEditor.tsx(47,18)` and `(49,78)`
 TS18046 (`'state' is of type 'unknown'`) and `src/client/navigation.ts(15,25)` TS7006. The owner's session
