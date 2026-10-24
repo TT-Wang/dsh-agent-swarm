@@ -24,8 +24,8 @@
  *      served boot graph;
  *   6. a real host on the DIRECT mount under an isolated `DSH_HOME` opens that
  *      home's store, not the default home's, and logs one start line, at the
- *      rank a console exporter shows by default, naming the roots it chose and
- *      the store the default home already holds;
+ *      rank a console exporter shows by default, naming only the roots it
+ *      chose, not the store the default home already holds;
  *   7. a caller-supplied preview root moves both roots — through the `--patch`
  *      overlay the attended preview already uses, and through
  *      `DSH_AGENT_SWARM_ROOT`.
@@ -266,7 +266,7 @@ test('a real dsh web host mounts the declared bundle at $DSH_HOME/agent-swarm an
   }
 })
 
-test('the direct mount under an isolated DSH_HOME opens that home\'s store, and its one start line names the default home\'s store where a default exporter shows it', { timeout: 180_000 }, async () => {
+test('the direct mount under an isolated DSH_HOME opens that home\'s store, leaves the default home\'s alone, and its one start line names the roots it opened where a default exporter shows it', { timeout: 180_000 }, async () => {
   const root = await tempDirectory('dsh-swarm-direct-root-')
   let running
   try {
@@ -279,8 +279,7 @@ test('the direct mount under an isolated DSH_HOME opens that home\'s store, and 
     await writeFile(defaultStore, '')
     // The Web profile mounts no log exporter; this overlay adds the host's console
     // exporter at its default threshold (info), where an operator who mounts one
-    // reads the plugin's start report. Cordis ranks a warning below info
-    // (ERROR 0, INFO 1, WARN 2), so this exporter drops warnings.
+    // reads the plugin's start report.
     const patch = join(root, 'console-logger.patch.yml')
     await writeFile(patch, JSON.stringify([{ insert: [{
       id: 'logger-console',
@@ -290,13 +289,13 @@ test('the direct mount under an isolated DSH_HOME opens that home\'s store, and 
     running = await bootWeb({ root, home, patch })
     const store = join(home, 'agent-swarm', 'swarm.sqlite')
     await until(() => existsSync(store), 'the store under the isolated Harness home')
-    const named = `agent-swarm: store ${store} ($DSH_HOME, new), workspaces ${join(home, 'agent-swarm', 'workspaces')} ($DSH_HOME). A store already exists at ${defaultStore}; its missions are not moved.`
-    await until(() => running.output().includes(named), 'the start line that names the default home\'s store')
+    const line = `agent-swarm: store ${store} ($DSH_HOME, new), workspaces ${join(home, 'agent-swarm', 'workspaces')} ($DSH_HOME)`
+    await until(() => running.output().includes(line), 'the start line that names the roots it opened')
     assert.equal(readFileSync(defaultStore).length, 0, 'the default home\'s store is never opened')
     const reports = running.output().split('\n').filter(line => line.includes('agent-swarm: store '))
     assert.equal(reports.length, 1, 'the start report is one line')
     assert.match(reports[0], /^\[I\] /, 'it is logged at info, the rank the exporter shows by default')
-    assert.ok(reports[0].includes(`set DSH_AGENT_SWARM_ROOT=${dirname(defaultStore)} `), `it names the root that keeps the old store: ${reports[0]}`)
+    assert.ok(reports[0].endsWith(line), `it names only the roots it opened, not the default home's store, which may be another host's: ${reports[0]}`)
   } finally {
     if (running !== undefined) await running.stop()
     await rm(root, { recursive: true, force: true })

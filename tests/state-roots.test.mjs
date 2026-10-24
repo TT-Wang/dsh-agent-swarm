@@ -4,11 +4,12 @@
  * row's config, else `$DSH_AGENT_SWARM_ROOT`, else the Harness home +
  * `/agent-swarm`, where the home is the host's own `resolveDshHome` (a blank
  * `$DSH_HOME` is unset, `~` is expanded, a relative value is resolved). The
- * start report is one line at info per start; when a new store opens while a
- * lower step of the rule already holds one, that line names both paths.
+ * start report is one line at info per start naming the roots it opened, the
+ * step that chose each and whether the store is new; it looks for no other
+ * store.
  *
  * The OS home is a temporary directory for this whole file, so the default
- * step and the stores the report probes never touch the operator's `~/.dsh`.
+ * step and the stores this file creates never touch the operator's `~/.dsh`.
  */
 import test from 'node:test'
 import assert from 'node:assert/strict'
@@ -46,7 +47,6 @@ test('with nothing configured or set, both roots are the default Harness home\'s
     statePath: store(defaultRoot),
     workspacesRoot: workspaces(defaultRoot),
     sources: { statePath: 'default', workspacesRoot: 'default' },
-    otherStores: [],
   })
 })
 
@@ -70,10 +70,7 @@ test('$DSH_HOME moves both roots with the Harness home, resolved exactly as the 
     assert.equal(roots.workspacesRoot, workspaces(root), `DSH_HOME=${JSON.stringify(value)}`)
     assert.equal(roots.statePath, join(resolveDshHome(undefined, env), 'agent-swarm', 'swarm.sqlite'), 'the home is the host\'s own resolveDshHome')
     assert.deepEqual(roots.sources, { statePath: source, workspacesRoot: source })
-    // Only a home other than the default leaves the default home's store as a lower step.
-    assert.deepEqual(roots.otherStores, root === defaultRoot ? [] : [store(defaultRoot)], `DSH_HOME=${JSON.stringify(value)}`)
   }
-  assert.deepEqual(swarmRoots({}, { DSH_HOME: join(osHome, '.dsh') }).otherStores, [], 'a $DSH_HOME naming the default home is that home once')
 })
 
 test('$DSH_AGENT_SWARM_ROOT wins over the Harness home and is read by the same rule', () => {
@@ -83,21 +80,18 @@ test('$DSH_AGENT_SWARM_ROOT wins over the Harness home and is read by the same r
     statePath: '/srv/preview/swarm.sqlite',
     workspacesRoot: '/srv/preview/workspaces',
     sources: { statePath: SWARM_ROOT_ENV, workspacesRoot: SWARM_ROOT_ENV },
-    otherStores: ['/srv/dsh/agent-swarm/swarm.sqlite', store(defaultRoot)],
   })
   assert.equal(swarmRoots({}, { ...home, [SWARM_ROOT_ENV]: ' ' }).statePath, '/srv/dsh/agent-swarm/swarm.sqlite', 'a blank root is unset')
   assert.equal(swarmRoots({}, { [SWARM_ROOT_ENV]: '~/preview' }).statePath, join(osHome, 'preview', 'swarm.sqlite'))
   assert.equal(swarmRoots({}, { [SWARM_ROOT_ENV]: 'rel/preview' }).statePath, join(process.cwd(), 'rel', 'preview', 'swarm.sqlite'))
-  assert.deepEqual(swarmRoots({}, { [SWARM_ROOT_ENV]: defaultRoot }).otherStores, [], 'a root naming the default one is that root once')
 })
 
-test('a configured root wins per field, must be absolute, and leaves no other store to report', () => {
+test('a configured root wins per field and must be absolute', () => {
   const env = { DSH_HOME: '/srv/dsh', [SWARM_ROOT_ENV]: '/srv/preview' }
   assert.deepEqual(swarmRoots({ statePath: '/cfg/state.sqlite' }, env), {
     statePath: '/cfg/state.sqlite',
     workspacesRoot: '/srv/preview/workspaces',
     sources: { statePath: 'config', workspacesRoot: SWARM_ROOT_ENV },
-    otherStores: [],
   })
   assert.deepEqual(swarmRoots({ workspacesRoot: '/cfg/worktrees' }, env).sources, { statePath: SWARM_ROOT_ENV, workspacesRoot: 'config' })
   const both = swarmRoots({ statePath: '/cfg/state.sqlite', workspacesRoot: '/cfg/worktrees' }, env)
@@ -107,7 +101,7 @@ test('a configured root wins per field, must be absolute, and leaves no other st
   }
 })
 
-test('the start report is one info line per start, and a new store opened beside a lower step\'s store names that store in the same line', t => {
+test('the start report is one info line per start naming the roots it opened and whether the store is new, and it names no other store', t => {
   const scratch = realpathSync(mkdtempSync(join(tmpdir(), 'state-roots-')))
   t.after(() => rmSync(scratch, { recursive: true, force: true }))
   const trialHome = join(scratch, 'trial-home')
@@ -117,54 +111,35 @@ test('the start report is one info line per start, and a new store opened beside
 
   // No store anywhere: the roots, and that the store is new.
   const quiet = recorder()
-  assert.deepEqual(reportSwarmRoots(quiet, roots), [])
+  assert.equal(reportSwarmRoots(quiet, roots), undefined)
   assert.deepEqual(quiet.calls, [['info', trialLine]])
 
-  // The default home holds a store and this home's is new: the same line names it.
-  // Cordis ranks a warning below info (ERROR 0, INFO 1, WARN 2), so a log
-  // exporter at its default threshold would drop a separate warning while it
-  // shows the routine roots; the actionable part rides the line it shows.
+  // The default home holds a store, as does a root this environment does not name: the line is the same.
+  // Under an isolated home the default home's store can be another live host's,
+  // so whether it is this host's to keep is the operator's call (the upgrade note),
+  // never advice the start line gives.
   touch(store(defaultRoot))
-  const named = recorder()
-  assert.deepEqual(reportSwarmRoots(named, roots), [store(defaultRoot)])
-  assert.equal(named.calls.length, 1, 'one line per start')
-  const [[level, line]] = named.calls
-  assert.equal(level, 'info', 'at the rank an exporter shows by default')
-  assert.ok(line.startsWith(`${trialLine}. A store already exists at ${store(defaultRoot)}; its missions are not moved. `), line)
-  assert.ok(line.endsWith(`stop this host and set ${SWARM_ROOT_ENV}=${defaultRoot} (or configure statePath and workspacesRoot).`), line)
+  touch(store(join(scratch, 'dropped-root')))
+  const beside = recorder()
+  reportSwarmRoots(beside, roots)
+  assert.deepEqual(beside.calls, [['info', trialLine]], 'one line, at info, the rank an exporter shows by default')
 
-  // Once this home's store exists it is not new, whatever else exists.
+  // Once this home's store exists it is not new.
   touch(trialStore)
   const reopened = recorder()
-  assert.deepEqual(reportSwarmRoots(reopened, roots), [])
+  reportSwarmRoots(reopened, roots)
   assert.deepEqual(reopened.calls, [['info', trialLine.replace(', new)', ')')]])
 
-  // A newly set $DSH_AGENT_SWARM_ROOT: every lower store is named in the one line, and the hint names the nearest one's root.
+  // Each root names the step that chose it.
+  const own = recorder()
   const ownRoot = join(scratch, 'own-root')
-  const moved = recorder()
-  const own = swarmRoots({}, { DSH_HOME: trialHome, [SWARM_ROOT_ENV]: ownRoot })
-  assert.deepEqual(reportSwarmRoots(moved, own), [trialStore, store(defaultRoot)])
-  assert.deepEqual(moved.calls.map(([level]) => level), ['info'])
-  assert.ok(moved.calls[0][1].includes(`($${SWARM_ROOT_ENV}, new)`), moved.calls[0][1])
-  assert.ok(moved.calls[0][1].includes(`A store already exists at ${trialStore} and at ${store(defaultRoot)};`), moved.calls[0][1])
-  assert.ok(moved.calls[0][1].includes(`set ${SWARM_ROOT_ENV}=${join(trialHome, 'agent-swarm')} `), 'the hint names the nearest store\'s root')
-
-  // Only the lower steps of this environment are probed: once $DSH_AGENT_SWARM_ROOT
-  // is dropped, the store it named is no step of the rule and is never named.
-  touch(store(ownRoot))
-  const dropped = recorder()
-  const otherHome = join(scratch, 'other-home')
-  assert.deepEqual(reportSwarmRoots(dropped, swarmRoots({}, { DSH_HOME: otherHome })), [store(defaultRoot)])
-  assert.ok(!dropped.calls[0][1].includes(ownRoot), dropped.calls[0][1])
-
-  // A configured store is the caller's statement: new or not, it names no other store.
+  reportSwarmRoots(own, swarmRoots({ workspacesRoot: join(scratch, 'configured') }, { DSH_HOME: trialHome, [SWARM_ROOT_ENV]: ownRoot }))
+  assert.deepEqual(own.calls, [['info', `agent-swarm: store ${store(ownRoot)} ($${SWARM_ROOT_ENV}, new), workspaces ${join(scratch, 'configured')} (configured)`]])
   const configured = recorder()
-  assert.deepEqual(reportSwarmRoots(configured, swarmRoots({ statePath: join(scratch, 'configured', 'swarm.sqlite') }, { DSH_HOME: trialHome })), [])
-  assert.deepEqual(configured.calls.map(([level]) => level), ['info'])
-  assert.match(configured.calls[0][1], /\(configured, new\), workspaces .* \(\$DSH_HOME\)$/)
+  reportSwarmRoots(configured, swarmRoots({ statePath: join(scratch, 'configured', 'swarm.sqlite') }, {}))
+  assert.deepEqual(configured.calls, [['info', `agent-swarm: store ${join(scratch, 'configured', 'swarm.sqlite')} (configured, new), workspaces ${workspaces(defaultRoot)} (default home)`]])
 
   // Logging never vetoes the plugin.
-  const fresh = swarmRoots({}, { DSH_HOME: trialHome, [SWARM_ROOT_ENV]: join(scratch, 'fresh-root') })
-  assert.deepEqual(reportSwarmRoots({ info() { throw new Error('logger down') } }, fresh), [trialStore, store(defaultRoot)])
-  assert.deepEqual(reportSwarmRoots(undefined, fresh), [trialStore, store(defaultRoot)])
+  assert.doesNotThrow(() => reportSwarmRoots({ info() { throw new Error('logger down') } }, roots))
+  assert.doesNotThrow(() => reportSwarmRoots(undefined, roots))
 })
