@@ -13,6 +13,9 @@
  * - keeps every other devDependency npm installed (the lockfile owns compilers,
  *   types, React and jsdom), and links the checkout's copy, with its bins, only
  *   where npm installed none; that copy must be the version package.json pins.
+ *   The copy is one the checkout's root, web app or conversation UI installed,
+ *   or one in its pnpm store, which also holds the packages its client packages
+ *   bundle (checkoutCopy).
  *
  * Every conflict is reported before node_modules is touched, and a declared
  * package it can neither keep nor link is a conflict: nothing is skipped silently.
@@ -59,6 +62,21 @@ function isHarnessLink(path) {
   return false
 }
 
+/**
+ * The checkout's copy of `name`, a package it does not publish: where its
+ * root, web app or conversation UI installed it, or in its pnpm store
+ * (node_modules/.pnpm/<name>@<version>[_<peers>]/node_modules/<name>). A copy
+ * at `version` comes first, else the first copy found, whose version the caller
+ * reports; undefined when the checkout has none at all.
+ */
+function checkoutCopy(harness, name, version) {
+  const installed = ['node_modules', 'packages/client/web/node_modules', 'packages/client/ui-conversation/node_modules'].map(base => join(harness, base, name))
+  const store = join(harness, 'node_modules/.pnpm')
+  const stored = existsSync(store) ? readdirSync(store).filter(leaf => leaf.startsWith(`${name.replace('/', '+')}@`)).sort().map(leaf => join(store, leaf, 'node_modules', name)) : []
+  const copies = [...installed, ...stored].filter(path => existsSync(join(path, 'package.json')))
+  return copies.find(path => readManifest(path).version === version) ?? copies[0]
+}
+
 /** The bins a package declares, as { name: path within the package }. */
 function binsOf(manifest) {
   if (typeof manifest.bin === 'string') return { [manifest.name.split('/').pop()]: manifest.bin }
@@ -86,8 +104,7 @@ export function linkHarness(repo, harness) {
   for (const [name, version] of Object.entries(readManifest(repo).devDependencies ?? {})) {
     if (packages.has(name)) continue
     if (holding(join(modules, name)) === 'copy') { kept.push(name); continue }
-    const source = name.startsWith('@deepseek-ai/') ? undefined
-      : ['node_modules', 'packages/client/web/node_modules', 'packages/client/ui-conversation/node_modules'].map(base => join(harness, base, name)).find(path => existsSync(join(path, 'package.json')))
+    const source = name.startsWith('@deepseek-ai/') ? undefined : checkoutCopy(harness, name, version)
     if (source === undefined) { conflicts.push(`${name}: declared in devDependencies, but npm installed none and the checkout has none`); continue }
     const provided = readManifest(source).version
     if (provided !== version) { conflicts.push(`${name}: package.json pins ${version}, the checkout has ${provided}`); continue }

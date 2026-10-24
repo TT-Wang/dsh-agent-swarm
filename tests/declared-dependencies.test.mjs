@@ -24,6 +24,15 @@
  * file they read, must be one the lockfile installs where that file's package
  * finds it, so the typecheck reads the same declarations from `npm ci` as from
  * the host.
+ *
+ * The same holds for code. The client packages import at run time packages
+ * that are only their devDependencies, because the host's web build bundles
+ * them: dsh-client-ui-primitives imports shiki, katex, micromark and clsx, and
+ * dsh-client-store zustand and immer. The UI tests evaluate the real client
+ * bundles, which load them, so they failed in a fresh clone with
+ * ERR_MODULE_NOT_FOUND. Here every package the JavaScript of an installed
+ * Harness package imports must be one the lockfile installs where that package
+ * finds it.
  */
 import test from 'node:test'
 import assert from 'node:assert/strict'
@@ -40,7 +49,7 @@ const lock = read('package-lock.json')
 
 /** The package a bare specifier names, or undefined for a relative path, a URL or a Node builtin. */
 function packageOf(specifier) {
-  if (/^[./]/.test(specifier) || /^[a-z]+:/.test(specifier)) return undefined
+  if (/^[./#]/.test(specifier) || /^[a-z]+:/.test(specifier)) return undefined
   const segments = specifier.split('/')
   const name = specifier.startsWith('@') ? segments.slice(0, 2).join('/') : segments[0]
   return builtinModules.includes(name) ? undefined : name
@@ -125,7 +134,7 @@ test('a bare specifier names its package; relative paths, URLs and Node builtins
   assert.equal(packageOf('@deepseek-ai/dsh-session/types'), '@deepseek-ai/dsh-session')
   assert.equal(packageOf('react-dom/client'), 'react-dom')
   assert.equal(packageOf('jsdom'), 'jsdom')
-  for (const local of ['./x.mjs', '../lib/runtime.js', '/abs/path.mjs', 'node:fs', 'fs', 'child_process', 'file:///x.mjs']) assert.equal(packageOf(local), undefined, local)
+  for (const local of ['./x.mjs', '../lib/runtime.js', '/abs/path.mjs', '#internal/x', 'node:fs', 'fs', 'child_process', 'file:///x.mjs']) assert.equal(packageOf(local), undefined, local)
 })
 
 test('every package src, tests and scripts import is a devDependency pinned to one version', () => {
@@ -172,6 +181,55 @@ test('every package the typecheck reads declarations from is one npm ci installs
   assert.deepEqual([...missing.values()].sort(), [], 'npm installs no package\'s devDependencies: declare each in devDependencies at the version the host has (its @types package for a types-only name such as mdast)')
   for (const name of ['@deepseek-ai/dsh-client-store', '@deepseek-ai/dsh-api-remotes', '@deepseek-ai/dsh-api-remote-access']) {
     assert.ok(reached.has(name), `the census reads the Harness packages' declarations, which import ${name}, not only the plugin's own imports`)
+  }
+})
+
+/**
+ * The files of the installed package at `directory` that Node can load: the
+ * JavaScript its exports and main name, and every file those import by a
+ * relative path. A built checkout's lib/ holds more (tsc's intermediate output
+ * beside the declarations), which nothing loads and npm does not publish.
+ */
+function runtimeFiles(directory) {
+  const manifest = JSON.parse(readFileSync(join(directory, 'package.json'), 'utf8'))
+  const queue = []
+  const collect = (value, condition) => {
+    if (typeof value === 'string') { if (condition !== 'types' && /\.[cm]?js$/.test(value) && !value.includes('*')) queue.push(join(directory, value)) }
+    else if (value !== null && typeof value === 'object') for (const [key, target] of Object.entries(value)) collect(target, key)
+  }
+  collect(manifest.exports)
+  collect(manifest.main)
+  const files = new Set()
+  while (queue.length) {
+    const file = queue.pop()
+    if (files.has(file) || !existsSync(file)) continue
+    files.add(file)
+    for (const { fileName } of ts.preProcessFile(readFileSync(file, 'utf8'), true, true).importedFiles) {
+      if (/^\.\.?\//.test(fileName) && /\.[cm]?js$/.test(fileName)) queue.push(join(dirname(file), fileName))
+    }
+  }
+  return [...files]
+}
+
+test('every package the code of an installed Harness package imports is one npm ci installs where that package finds it', () => {
+  const missing = new Map(), loaded = new Set()
+  for (const path of Object.keys(lock.packages).filter(path => /(?:^|\/)node_modules\/@deepseek-ai\/[^/]+$/.test(path))) {
+    const directory = join(PROJECT, path)
+    // A link farm holds only the checkout's packages, and only at the top level; npm ci installs every entry.
+    if (!existsSync(join(directory, 'package.json'))) continue
+    const { name } = JSON.parse(readFileSync(join(directory, 'package.json'), 'utf8'))
+    for (const file of runtimeFiles(directory)) {
+      loaded.add(relative(PROJECT, file))
+      for (const { fileName } of ts.preProcessFile(readFileSync(file, 'utf8'), true, true).importedFiles) {
+        const imported = packageOf(fileName)
+        if (imported === undefined || imported === name || visibleFrom(path, imported)) continue
+        if (!missing.has(imported)) missing.set(imported, `${imported} (imported by ${relative(PROJECT, file)})`)
+      }
+    }
+  }
+  assert.deepEqual([...missing.values()].sort(), [], 'a client package\'s run-time imports are its devDependencies, which npm does not install: declare each in devDependencies at the version the checkout\'s copy of the importing package resolves')
+  for (const file of ['node_modules/@deepseek-ai/dsh-client-ui-primitives/lib/index.js', 'node_modules/@deepseek-ai/dsh-client-ui-commands/lib/client.js']) {
+    assert.ok(loaded.has(file), `the census reads ${file}, which the UI tests load`)
   }
 })
 
