@@ -360,7 +360,11 @@ only the text of the start line changed in `src/`.
   `ba9a758` left with a store in `~/.dsh/agent-swarm` (the direct-mount test fabricates that store).
 - Admission ran on mounted components in jsdom and against the real web API's replies; the web smokes ran the rebuilt
   client only with well-formed state.
-- The real-provider smokes (`test:deepseek`, `test:command-deepseek`) and `test:sidebar-service` did not run.
+- `test:sidebar-service` did not run. The owner's session ran the real-provider smokes at `e4344df` (this record) on
+  `deepseek-official` / `deepseek-v4-flash`: `test:deepseek` passed (33,943 tokens, 15 steps) and `test:command-deepseek`
+  passed (owner 81,377 tokens, workers 34,213, 17 model responses; the owner's first launch was refused for the effort
+  `low` and repaired in one relaunch). No report or log holds a credential. Known-limitations' coverage bullet now
+  says so, and that the owner's 5203 preview ran a real mission on 0.2.1-rc.2.
 
 **Open after this batch** (not adopted here).
 
@@ -391,8 +395,6 @@ only the text of the start line changed in `src/`.
   `DSH_SOURCE` set counts as nothing named, since `??` keeps the blank value. The gate's summary prints
   `Harness <version> at null` for a checkout that is not a Git repository. The hermetic runner does not isolate
   `HOME`. `npm ci` reports 54 audit findings in the devDependency tree, which needs a dependency review.
-  Known-limitations' "Coverage on 0.2.1-rc.2" still says that the real-provider smokes last ran on 2026-10-22 and that
-  `test:load` was not exercised on 0.2.1-rc.2, which batch A's live smokes and the gates since 2026-10-23 contradict.
 - The panel. `validateState` does not check a full state's `workspace`, `writable` and `ownerLive`, which the
   heartbeat checks; they are primitives and cannot break render. `WorkerHistory` reads its history page itself rather
   than through a reader in `projection.ts`, and no test refuses a malformed page.
