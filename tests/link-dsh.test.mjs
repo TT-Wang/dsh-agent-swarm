@@ -87,6 +87,36 @@ test('on an empty node_modules, link-dsh builds the whole link farm, every decla
   assert.deepEqual(linkHarness(s.repo, s.harness), { ...result, kept: [], replaced: [] })
 })
 
+test('a devDependency the checkout installed only in its pnpm store is linked from there, at the version package.json pins', t => {
+  const s = scene(t)
+  const store = join(s.harness, 'node_modules/.pnpm')
+  // The packages the client packages bundle: the checkout's pnpm store has them, under their peers' suffix.
+  writePackage(join(store, 'zustand@4.4.0/node_modules/zustand'), { name: 'zustand', version: '4.4.0' })
+  writePackage(join(store, 'zustand@4.5.7_immer@10.2.0_react@18.3.1/node_modules/zustand'), { name: 'zustand', version: '4.5.7' })
+  writePackage(join(store, '@shikijs+langs@4.4.3/node_modules/@shikijs/langs'), { name: '@shikijs/langs', version: '4.4.3' })
+  // A copy installed at another version does not hide the store's copy at the pinned one.
+  writePackage(join(s.harness, 'node_modules/diff'), { name: 'diff', version: '8.0.0' })
+  writePackage(join(store, 'diff@9.0.0/node_modules/diff'), { name: 'diff', version: '9.0.0' })
+  writePackage(join(store, 'diff-sequences@9.0.0/node_modules/diff-sequences'), { name: 'diff-sequences', version: '9.0.0' })
+  const manifest = JSON.parse(readFileSync(join(s.repo, 'package.json'), 'utf8'))
+  const declare = extra => writePackage(s.repo, { ...manifest, devDependencies: { ...manifest.devDependencies, ...extra } })
+  declare({ zustand: '4.5.7', '@shikijs/langs': '4.4.3', diff: '9.0.0' })
+  const result = linkHarness(s.repo, s.harness)
+  assert.deepEqual([...result.tools].sort(), ['@shikijs/langs', 'diff', 'jsdom', 'react', 'typescript', 'zustand'])
+  assert.equal(s.target('zustand'), join(store, 'zustand@4.5.7_immer@10.2.0_react@18.3.1/node_modules/zustand'))
+  assert.equal(s.target('@shikijs/langs'), join(store, '@shikijs+langs@4.4.3/node_modules/@shikijs/langs'))
+  assert.equal(s.target('diff'), join(store, 'diff@9.0.0/node_modules/diff'))
+  // A pinned version the checkout has nowhere is a conflict that names a version it has; none at all is the other conflict.
+  rmSync(s.modules, { recursive: true })
+  declare({ zustand: '5.0.0', anser: '2.3.5' })
+  assert.throws(() => linkHarness(s.repo, s.harness), error => {
+    assert.match(error.message, /zustand: package\.json pins 5\.0\.0, the checkout has 4\.4\.0/)
+    assert.match(error.message, /anser: declared in devDependencies, but npm installed none and the checkout has none/)
+    return true
+  })
+  assert.ok(!existsSync(s.modules), 'nothing was linked')
+})
+
 test('link-dsh refuses, changing nothing, when the lockfile and the checkout name different versions or a declared package is nowhere', t => {
   const s = scene(t)
   s.npmCi({ '@deepseek-ai/dsh-agent': '0.2.1-rc.1' })

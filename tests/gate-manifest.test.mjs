@@ -222,6 +222,19 @@ test('the gate runs every suite with the checkout it probed, stops before any su
     nothingRan(variable)
   }
 
+  // A node_modules above the checkout stops it before any suite (exit 2), --plan included: the suites would find
+  // packages there that the checkout's own node_modules does not have, and no record could say so.
+  const above = join(repo.root, 'node_modules')
+  mkdirSync(above)
+  for (const args of [[], ['--plan']]) {
+    const refused = await gate(args, named)
+    assert.equal(refused.code, 2, `${args.join(' ')}: ${refused.stdout}`)
+    assert.match(refused.stderr, new RegExp(`^gate: refusing to gate this checkout: ${escape(above)} is above this checkout\\. Node and TypeScript find a package npm ci did not install`))
+    assert.equal(refused.stdout, '', 'nothing was planned')
+    nothingRan(`node_modules above, ${args.join(' ') || 'a run'}`)
+  }
+  rmSync(above, { recursive: true })
+
   // The named checkout, --with provider and an untracked file: every suite runs with the checkout the record names, and the record says the tree was dirty.
   writeFileSync(join(repo.source, 'untracked.txt'), 'not committed\n')
   const result = await gate(['--with', 'provider'], named)

@@ -34,7 +34,7 @@ npm run link:dsh
 npm run build
 ```
 
-`link:dsh` 把该检出中的每个 Harness 包链接进 `node_modules`，使挂载的插件运行在宿主自己的模块上，并从检出链接插件声明的构建工具。单独使用时不需要 `npm install`。它也可以在 `npm ci` 之后运行（见[开发与验证](#development-and-verification)）：这时它先确认 npm 安装的每个 Harness 包与检出中的版本相同，再用检出中的包替换它，并保留 lockfile 安装的工具。`npm ci` 会删除这些链接，因此每次 `npm ci` 之后都要重新运行 `link:dsh`。如果 `node_modules` 本身是一个链接，`npm ci` 还会清空它指向的目录；在这样的检出中运行它之前，请先阅读[开发与验证](#development-and-verification)。
+`link:dsh` 把该检出中的每个 Harness 包链接进 `node_modules`，使挂载的插件运行在宿主自己的模块上，并从检出链接插件声明的构建工具和其他包；工作区包都未安装的，从检出的 pnpm store 链接。单独使用时不需要 `npm install`。它也可以在 `npm ci` 之后运行（见[开发与验证](#development-and-verification)）：这时它先确认 npm 安装的每个 Harness 包与检出中的版本相同，再用检出中的包替换它，并保留 lockfile 安装的工具。`npm ci` 会删除这些链接，因此每次 `npm ci` 之后都要重新运行 `link:dsh`。如果 `node_modules` 本身是一个链接，`npm ci` 还会清空它指向的目录；在这样的检出中运行它之前，请先阅读[开发与验证](#development-and-verification)。
 
 使用匹配版本的 Harness CLI，在插件仓库根目录选择以下**一种**挂载方式。
 
@@ -234,7 +234,7 @@ npm ci
 npm test
 ```
 
-在任何机器上，它都按全新克隆的条件运行：移除 `DSH_HARNESS_ROOT` 和 `DSH_SOURCE`，并关闭对检出的查找，所以需要检出的测试会在这一层失败，它应属于宿主层。宿主层和其他大多数套件需要位于发布提交的已构建 Harness 0.2.1-rc.2 检出。`npm ci` 之后设置 `DSH_HARNESS_ROOT` 并运行 `npm run link:dsh`（见[构建与安装](#build-and-install)），然后：
+在任何机器上，它都按全新克隆的条件运行：移除 `DSH_HARNESS_ROOT` 和 `DSH_SOURCE`，并关闭对检出的查找，所以需要检出的测试会在这一层失败，它应属于宿主层。全新克隆的上层目录中也没有 `node_modules`。Node 和 TypeScript 会在导入文件之上每一级目录的 `node_modules` 中查找包，因此若检出的路径或其真实路径之上存在 `node_modules`，封闭层的运行器和 `npm run verify` 会拒绝运行（退出码 2，不运行任何内容）：在那里运行可能靠 `npm ci` 从未安装的包通过。宿主层和其他大多数套件需要位于发布提交的已构建 Harness 0.2.1-rc.2 检出。`npm ci` 之后设置 `DSH_HARNESS_ROOT` 并运行 `npm run link:dsh`（见[构建与安装](#build-and-install)），然后：
 
 ```sh
 npm run verify
@@ -268,7 +268,7 @@ GitHub Actions 工作流（`.github/workflows/verify.yml`）在每次推送到 `
 | `npm run test:sidebar-service` | `better-sidebar`（需显式选择） | 已安装的 Better Sidebar 服务契约与 swarm 侧栏适配器。 |
 | `npm run test:deepseek` / `test:command-deepseek` | `harness`、`provider`（需显式选择） | 在真实 DeepSeek 供应商上运行一次 mission 和 `/agent-swarm` 命令；会计费。 |
 
-`src/`、`tests/` 或 `scripts/` 导入的包必须是精确版本的 devDependency；`src/` 导入的包还必须是 peer dependency。`tests/declared-dependencies.test.mjs` 检查这一点，并检查 `package-lock.json` 与 `package.json` 一致。
+`src/`、`tests/` 或 `scripts/` 导入的包必须是精确版本的 devDependency；`src/` 导入的包还必须是 peer dependency。`tests/declared-dependencies.test.mjs` 检查这一点，并检查 `package-lock.json` 与 `package.json` 一致。它还检查类型检查读取声明的每个包都由 `npm ci` 安装在导入它的包能找到的位置。0.2.1-rc.2 客户端包的声明会导入仅属于它们自身 devDependencies 的包，npm 不会随之安装；在 `skipLibCheck` 下，这样的导入解析为空且不报错，从而改变插件据以检查的类型。因此 `package.json` 把这些包（27 个 Harness 包、`lexical` 和 `@types/mdast`）声明为发布所用版本的 devDependencies，尽管插件本身一个也不导入。代码也是如此：客户端包在运行时导入仅属于其 devDependencies 的包，因为宿主的 web 构建会把它们打包进去（`dsh-client-ui-primitives` 导入 shiki、katex、micromark 和 clsx，`dsh-client-store` 导入 zustand 和 immer），而 UI 测试加载的是真实的客户端 bundle。该测试检查 `npm ci` 安装了已安装 Harness 包的 JavaScript 导入的每个包，因此 `package.json` 也按检出中导入方包所解析的版本声明了这 21 个包。
 
 这些测试使用临时 profile 和 Git 工作区，供应商回复由脚本提供。它们验证集成行为，不代表模型规划成功率。`npm run test:deepseek` 和 `npm run test:command-deepseek` 会发起真实供应商请求，可能产生费用，所以 `verify` 只在加上 `--with provider` 时运行它们。已完成的运行及其边界记录在[验证文档](validation.md)。
 
