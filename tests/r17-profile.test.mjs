@@ -3,14 +3,15 @@
  *
  * The shipped bundle package (`profile/`) declares its `dsh.bundle.patch`, its
  * prerequisite bundles, the supported Harness releases and the bundle layer it
- * conflicts with, and its composition states the two roots it owns as portable
- * loader expressions. These tests prove, on this checkout:
+ * conflicts with. Its composition, like the plugin package's own layer, inserts
+ * the plugin row with no root of its own: the plugin chooses both roots at start
+ * by one rule (F3, src/state-roots.ts). These tests prove, on this checkout:
  *
  *   1. the package metadata names the patch, the prerequisites, the supported
  *      Harness releases and the conflicting bundle layer;
- *   2. the shipped composition names no user-specific absolute path: both roots
- *      are `!!js` expressions over `DSH_AGENT_SWARM_ROOT`, `DSH_HOME` and `HOME`,
- *      and they equal the plugin's own documented default when nothing is set;
+ *   2. the shipped composition names no user-specific absolute path, and both
+ *      mounts insert the row with an empty config, so neither carries a second
+ *      copy of the root rule;
  *   3. the host's own profile loader (`loadProfile` + `composeEntries`, the same
  *      functions `dsh --profile` composes with) reads the declared bundle from
  *      a real profile directory into exactly one plugin row, and that row names
@@ -18,19 +19,26 @@
  *      client UI;
  *   4. the declared conflict is real: composing the plugin package's own bundle
  *      layer together with this one inserts the same row id twice;
- *   5. a real `dsh --profile web` host boots that profile with the shipped
- *      defaults, opens its store under the portable default root and serves the
- *      plugin's client bundle in the served boot graph;
- *   6. a caller-supplied preview root moves both roots — through the `--patch`
+ *   5. a real `dsh --profile web` host boots that profile, opens its store under
+ *      `$DSH_HOME/agent-swarm` and serves the plugin's client bundle in the
+ *      served boot graph;
+ *   6. a real host on the DIRECT mount under an isolated `DSH_HOME` opens that
+ *      home's store, not the default home's, and logs one start line, at the
+ *      rank a console exporter shows by default, naming only the roots it
+ *      chose, not the store the default home already holds;
+ *   7. a caller-supplied preview root moves both roots — through the `--patch`
  *      overlay the attended preview already uses, and through
  *      `DSH_AGENT_SWARM_ROOT`.
  *
+ * Every host here runs with its own OS home (`HOME`) under the test root, so
+ * the default step of the root rule never reaches the operator's `~/.dsh`.
+ *
  * The profile directories these tests mount mirror the state that
- * `dsh plugin --profile web add file:<checkout>/profile` leaves (the bundle as
- * a profile dependency plus its `file:..` payload resolvable) without invoking
- * a package manager, so the declared check needs no pnpm binary; the install
- * command itself is exercised by the round's recorded mounting evidence and by
- * the attended deployment.
+ * `dsh plugin --profile web add file:<checkout>/profile` (or `link:<checkout>`
+ * for the direct mount) leaves (the layer as a profile dependency plus its
+ * payload resolvable) without invoking a package manager, so the declared check
+ * needs no pnpm binary; the install command itself is exercised by the round's
+ * recorded mounting evidence and by the attended deployment.
  */
 import test from 'node:test'
 import assert from 'node:assert/strict'
@@ -38,8 +46,8 @@ import { spawn } from 'node:child_process'
 import { existsSync, readFileSync, realpathSync } from 'node:fs'
 import { access, mkdir, readFile, rm, symlink, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
-import { dirname, isAbsolute, join } from 'node:path'
-import { fileURLToPath } from 'node:url'
+import { dirname, join } from 'node:path'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 import { tempDirectory } from './temp-root.mjs'
 import { resolveHarnessRoot, assertSupportedHarness } from '../scripts/harness-target.mjs'
 import { importHarness } from './fixtures/built-harness.mjs'
@@ -59,20 +67,24 @@ const shippedPatches = loadOverlayPatches('r17-profile-test', join(bundleDir, bu
 const shippedRow = shippedPatches.flatMap(patch => patch.insert ?? []).find(entry => entry.id === 'dsh-external-agent-swarm')
 const prerequisites = bundle.dsh.bundle.requires.bundles
 
-/** Mount the profile the same way the CLI install leaves it: the bundle declared in `dsh.profile.bundles` with its payload resolvable beside it. */
-async function mountProfile(root, name = 'web') {
+/**
+ * Mount the profile the same way the CLI install leaves it: the bundle declared
+ * in `dsh.profile.bundles` with its payload resolvable beside it, or, for the
+ * direct mount, the plugin package itself as the layer.
+ */
+async function mountProfile(root, { name = 'web', direct = false } = {}) {
   const home = join(root, 'home')
   const dir = join(home, 'profiles', name)
   const bundleLink = join(dir, 'node_modules', ...bundle.name.split('/'))
   const payloadLink = join(dir, 'node_modules', ...plugin.name.split('/'))
-  await mkdir(dirname(bundleLink), { recursive: true })
+  await mkdir(dirname(payloadLink), { recursive: true })
   await writeFile(join(dir, 'package.json'), JSON.stringify({
     name: `dsh-profile-${name}`,
     private: true,
-    // The declared prerequisites come first, then the bundle — the order its metadata requires.
-    dsh: { profile: { bundles: [...prerequisites, bundle.name] } },
+    // The declared prerequisites come first, then the layer — the order the bundle's metadata requires.
+    dsh: { profile: { bundles: [...prerequisites, direct ? plugin.name : bundle.name] } },
   }, null, 2) + '\n')
-  await symlink(bundleDir, bundleLink, 'dir')
+  if (!direct) await symlink(bundleDir, bundleLink, 'dir')
   await symlink(project, payloadLink, 'dir')
   return { home, dir }
 }
@@ -90,6 +102,8 @@ async function bootWeb({ root, home, patch, env = {} }) {
     cwd: run,
     env: {
       ...process.env,
+      // The host's own OS home: the default Harness home the root rule falls back to stays under this root.
+      HOME: join(root, 'os-home'),
       DSH_HOME: home,
       DSH_TELEMETRY_DISABLED: '1',
       DSH_AGENTS_HOME: join(root, 'agents-home'),
@@ -178,30 +192,17 @@ test('the bundle package declares its patch, prerequisites and conflicts in its 
   assert.equal(bundle.dependencies?.[plugin.name], 'file:..', 'the bundle carries the platform it mounts as its own dependency')
 })
 
-test('the shipped composition states portable roots and names no user-specific absolute path', () => {
+test('the shipped composition names no user-specific absolute path, and both mounts leave the roots to the plugin\'s one rule', () => {
   const text = readFileSync(join(bundleDir, bundle.dsh.bundle.patch), 'utf8')
   for (const forbidden of ['/Users/', '/home/', '/root/', project, process.cwd(), homedir()]) {
     assert.ok(!text.includes(forbidden), `the shipped composition must not name ${forbidden}`)
   }
+  assert.ok(!text.includes('!!js'), 'the composition evaluates nothing: a second copy of the root rule would drift from the plugin\'s')
   assert.ok(shippedRow, 'the composition must insert the plugin row')
   assert.equal(shippedRow.name, plugin.name)
-  const statePath = shippedRow.config?.statePath?.__jsExpr
-  const workspacesRoot = shippedRow.config?.workspacesRoot?.__jsExpr
-  assert.equal(typeof statePath, 'string', 'statePath must be a loader expression, never a literal path')
-  assert.equal(typeof workspacesRoot, 'string', 'workspacesRoot must be a loader expression, never a literal path')
-  const evaluate = (expression, env) => new Function('process', `return (${expression})`)({ env })
-  // The zero-variable default is the plugin's own documented default.
-  assert.equal(evaluate(statePath, { HOME: homedir() }), join(homedir(), '.dsh/agent-swarm/swarm.sqlite'))
-  assert.equal(evaluate(workspacesRoot, { HOME: homedir() }), join(homedir(), '.dsh/agent-swarm/workspaces'))
-  // DSH_HOME relocates the whole platform, as every other Harness-owned root does.
-  assert.equal(evaluate(statePath, { HOME: '/home/probe', DSH_HOME: '/srv/dsh' }), '/srv/dsh/agent-swarm/swarm.sqlite')
-  assert.equal(evaluate(workspacesRoot, { HOME: '/home/probe', DSH_HOME: '/srv/dsh' }), '/srv/dsh/agent-swarm/workspaces')
-  // A caller names the preview root without editing the shipped composition.
-  assert.equal(evaluate(statePath, { HOME: '/home/probe', DSH_HOME: '/srv/dsh', DSH_AGENT_SWARM_ROOT: '/srv/preview' }), '/srv/preview/swarm.sqlite')
-  assert.equal(evaluate(workspacesRoot, { HOME: '/home/probe', DSH_HOME: '/srv/dsh', DSH_AGENT_SWARM_ROOT: '/srv/preview' }), '/srv/preview/workspaces')
-  for (const resolved of [evaluate(statePath, { HOME: homedir() }), evaluate(workspacesRoot, { HOME: homedir() })]) {
-    assert.ok(isAbsolute(resolved), 'a resolved root must be absolute for the plugin to accept it')
-  }
+  assert.deepEqual(shippedRow.config, {}, 'the bundle row carries no root of its own')
+  const directRow = loadOverlayPatches('r17-profile-test', join(project, 'cordis.patch.yml')).flatMap(patch => patch.insert ?? []).find(entry => entry.id === shippedRow.id)
+  assert.deepEqual(directRow, shippedRow, 'the direct mount inserts the same row, so a mount switch cannot change the store')
 })
 
 test('the host profile loader composes the declared bundle into one plugin row, and the client UI rides that row', async () => {
@@ -216,7 +217,7 @@ test('the host profile loader composes the declared bundle into one plugin row, 
     const inserted = rows.filter(row => row.id === 'dsh-external-agent-swarm')
     assert.equal(inserted.length, 1, 'the declared composition must insert the plugin row exactly once')
     assert.equal(inserted[0].name, plugin.name)
-    assert.equal(typeof inserted[0].config?.statePath?.__jsExpr, 'string', 'the composed row carries the shipped portable roots')
+    assert.deepEqual(inserted[0].config, {}, 'the composed row carries no root: the plugin chooses it at start')
     // A later layer — the deployment's --patch overlay — replaces the row's whole config,
     // so the caller supplies its preview root without editing the shipped composition.
     const callerRoot = join(root, 'caller-preview')
@@ -245,7 +246,7 @@ test('the declared conflict is real: the plugin package layer would insert the s
   assert.equal(duplicate.length, 2, 'mounting both bundle layers duplicates the row, so the declared conflict is a real mount conflict')
 })
 
-test('a real dsh web host mounts the declared bundle at the portable default root and serves its client UI', { timeout: 180_000 }, async () => {
+test('a real dsh web host mounts the declared bundle at $DSH_HOME/agent-swarm and serves its client UI', { timeout: 180_000 }, async () => {
   const root = await tempDirectory('dsh-swarm-profile-boot-')
   let running
   try {
@@ -258,7 +259,43 @@ test('a real dsh web host mounts the declared bundle at the portable default roo
     assert.equal(client.url, `plugins/??${plugin.name}/client.js&rev=${client.rev}`, 'the boot graph must serve the client bundle of the inserted row')
     assert.deepEqual(client.inject, plugin.dsh.client.inject, 'the mounted client half must carry the declared inject list')
     const store = join(home, 'agent-swarm', 'swarm.sqlite')
-    await until(() => existsSync(store), 'the store under the portable default root')
+    await until(() => existsSync(store), 'the store under the Harness home')
+  } finally {
+    if (running !== undefined) await running.stop()
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('the direct mount under an isolated DSH_HOME opens that home\'s store, leaves the default home\'s alone, and its one start line names the roots it opened where a default exporter shows it', { timeout: 180_000 }, async () => {
+  const root = await tempDirectory('dsh-swarm-direct-root-')
+  let running
+  try {
+    const { home } = await mountProfile(root, { direct: true })
+    // The default Harness home of this host's OS home already holds a store: the
+    // one a build that ignored DSH_HOME opened. An empty file stays empty only if
+    // nothing opens it as a database.
+    const defaultStore = join(root, 'os-home', '.dsh', 'agent-swarm', 'swarm.sqlite')
+    await mkdir(dirname(defaultStore), { recursive: true })
+    await writeFile(defaultStore, '')
+    // The Web profile mounts no log exporter; this overlay adds the host's console
+    // exporter at its default threshold (info), where an operator who mounts one
+    // reads the plugin's start report.
+    const patch = join(root, 'console-logger.patch.yml')
+    await writeFile(patch, JSON.stringify([{ insert: [{
+      id: 'logger-console',
+      name: pathToFileURL(join(harnessRoot, 'vendor/logger-console/lib/index.js')).href,
+      config: { colors: false, showTime: '' },
+    }] }], null, 2) + '\n')
+    running = await bootWeb({ root, home, patch })
+    const store = join(home, 'agent-swarm', 'swarm.sqlite')
+    await until(() => existsSync(store), 'the store under the isolated Harness home')
+    const line = `agent-swarm: store ${store} ($DSH_HOME, new), workspaces ${join(home, 'agent-swarm', 'workspaces')} ($DSH_HOME)`
+    await until(() => running.output().includes(line), 'the start line that names the roots it opened')
+    assert.equal(readFileSync(defaultStore).length, 0, 'the default home\'s store is never opened')
+    const reports = running.output().split('\n').filter(line => line.includes('agent-swarm: store '))
+    assert.equal(reports.length, 1, 'the start report is one line')
+    assert.match(reports[0], /^\[I\] /, 'it is logged at info, the rank the exporter shows by default')
+    assert.ok(reports[0].endsWith(line), `it names only the roots it opened, not the default home's store, which may be another host's: ${reports[0]}`)
   } finally {
     if (running !== undefined) await running.stop()
     await rm(root, { recursive: true, force: true })

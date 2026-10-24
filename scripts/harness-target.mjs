@@ -7,17 +7,49 @@ import { fileURLToPath } from 'node:url'
 import { execFileSync } from 'node:child_process'
 
 const project = resolve(dirname(fileURLToPath(import.meta.url)), '..')
+
 /**
- * An explicit root is taken as given. Otherwise the candidates are the
- * installed source `~/.dsh/source/current`, then the sibling checkout named
- * for the release compatibility.json supports, without its dots and hyphens
- * (0.2.1-rc.2 is `deepseek-harness-021rc2`).
+ * The environment variable whose value `hermetic` turns the search below off.
+ * The hermetic test tier's runner (scripts/test-tiers.mjs) sets it; this
+ * module reads it, so the operator scripts that select a release depend on no
+ * test runner.
+ */
+export const TIER_ENV = 'DSH_SWARM_TEST_TIER'
+
+/**
+ * A checkout that was named, by the caller or by DSH_HARNESS_ROOT or
+ * DSH_SOURCE, and does not exist. `named` is the name as given; the message is
+ * the cause's. A caller that must not skip a named checkout quietly (the gate,
+ * the fault suite) tells it from an empty search by this type, so which
+ * checkout is named stays this module's rule.
+ */
+export class NamedHarnessRootError extends Error {
+  constructor(named, cause) {
+    super(cause.message, { cause })
+    this.name = 'NamedHarnessRootError'
+    this.named = named
+  }
+}
+
+/**
+ * An explicit root is taken as given, else the one DSH_HARNESS_ROOT or
+ * DSH_SOURCE names; a named root that does not exist throws
+ * NamedHarnessRootError. Otherwise the candidates are the installed source
+ * `~/.dsh/source/current`, then the sibling checkout named for the release
+ * compatibility.json supports, without its dots and hyphens (0.2.1-rc.2 is
+ * `deepseek-harness-021rc2`).
  * A candidate is taken only when it is a supported release and built (its CLI
  * entry exists), so an unbuilt checkout never shadows a built sibling.
+ * The hermetic test tier (scripts/test-tiers.mjs) searches nowhere: it runs as
+ * a fresh clone would, where no checkout exists.
+ * @param env - the environment the variables and the tier marker are read from.
  */
-export function resolveHarnessRoot(explicit) {
-  const supplied = explicit ?? process.env.DSH_HARNESS_ROOT ?? process.env.DSH_SOURCE
-  if (supplied) return realpathSync(resolve(supplied))
+export function resolveHarnessRoot(explicit, env = process.env) {
+  const supplied = explicit ?? env.DSH_HARNESS_ROOT ?? env.DSH_SOURCE
+  if (supplied) {
+    try { return realpathSync(resolve(supplied)) } catch (error) { throw new NamedHarnessRootError(supplied, error) }
+  }
+  if (env[TIER_ENV] === 'hermetic') throw new Error('The hermetic test tier has no Harness checkout; a test that needs one belongs to the host tier (HOST_TIER in scripts/test-tiers.mjs)')
   const supported = new Set(JSON.parse(readFileSync(join(project, 'compatibility.json'), 'utf8')).supportedHosts.map(host => host.version))
   const siblings = [...supported].map(version => join(project, `../deepseek-harness-${version.replace(/[.-]/g, '')}`))
   for (const candidate of [join(homedir(), '.dsh/source/current'), ...siblings]) {

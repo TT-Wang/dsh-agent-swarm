@@ -21,6 +21,8 @@
 - Harness 中可用的模型和供应商配置。**API key 和凭据由 Harness 管理**；插件默认使用主会话的模型。请在宿主中配置凭据，无需把 key 复制到插件中。
 - 本地 Git 项目。目前未实现分布式 worker 或非 Git 工作区。
 
+<a id="build-and-install"></a>
+
 ## 构建与安装
 
 ```sh
@@ -32,7 +34,7 @@ npm run link:dsh
 npm run build
 ```
 
-`link:dsh` 从该 Harness 检出链接共享运行时包和构建工具。插件目录不需要另行执行 `npm install`。
+`link:dsh` 把该检出中的每个 Harness 包链接进 `node_modules`，使挂载的插件运行在宿主自己的模块上，并从检出链接插件声明的构建工具。单独使用时不需要 `npm install`。它也可以在 `npm ci` 之后运行（见[开发与验证](#development-and-verification)）：这时它先确认 npm 安装的每个 Harness 包与检出中的版本相同，再用检出中的包替换它，并保留 lockfile 安装的工具。`npm ci` 会删除这些链接，因此每次 `npm ci` 之后都要重新运行 `link:dsh`。如果 `node_modules` 本身是一个链接，`npm ci` 还会清空它指向的目录；在这样的检出中运行它之前，请先阅读[开发与验证](#development-and-verification)。
 
 使用匹配版本的 Harness CLI，在插件仓库根目录选择以下**一种**挂载方式。
 
@@ -50,7 +52,7 @@ node "$DSH_HARNESS_ROOT/apps/cli/lib/bin.js" plugin --profile web add "link:$PWD
 node "$DSH_HARNESS_ROOT/apps/cli/lib/bin.js" plugin --profile web add "file:$PWD/profile"
 ```
 
-[Bundle profile](../profile/README.md) 将插件和 Web 客户端一起安装，在必需的 `@deepseek-ai/dsh-base`、`@deepseek-ai/dsh-web-app` 层之后挂载。它显式声明可移植的存储根目录：优先使用 `$DSH_AGENT_SWARM_ROOT`，否则使用 `$DSH_HOME/agent-swarm`。可以通过该变量覆盖路径，或使用针对 `dsh-external-agent-swarm` 行的 `--patch` 覆盖层。
+[Bundle profile](../profile/README.md) 将插件和 Web 客户端一起安装，在必需的 `@deepseek-ai/dsh-base`、`@deepseek-ai/dsh-web-app` 层之后挂载。它和直接挂载一样，以空配置插入插件行，所以两种挂载打开的是同一个存储：插件在启动时按[存储根目录规则](#storage-roots)自行确定根目录。要使用其他根目录，可以设置 `DSH_AGENT_SWARM_ROOT`，或使用针对 `dsh-external-agent-swarm` 行的 `--patch` 覆盖层。
 
 **不要同时使用两种方式。** 两者会插入相同的 Loader 行，bundle 元数据已声明此冲突。
 
@@ -73,7 +75,7 @@ node "$DSH_HARNESS_ROOT/apps/cli/lib/bin.js" --profile web
 
 插件只在 0.2.1-rc.2 上运行。在 0.1.5-rc.3 或 0.1.7-rc.1 上用过的 Harness 主目录（`DSH_HOME`）和插件状态需要一次性迁过来，不需要额外的迁移步骤：0.2.1-rc.2 能读取已有的会话日志，宿主版本的变化也不会触及插件的存储（`swarm.sqlite`，schema 8）。但迁过去之后就回不来了，所以首次在 0.2.1-rc.2 上启动前：
 
-1. **停止宿主并备份主目录。** 把 `$DSH_HOME/sessions` 和插件状态一起复制：`statePath`（默认是 `~/.dsh/agent-swarm/swarm.sqlite` 及同目录的 `-wal`、`-shm` 文件；这个默认值不随 `DSH_HOME` 变化）和 `workspacesRoot`。回到 0.1.x 的唯一办法是恢复这份备份，在 0.2.1-rc.2 上完成的一切都会丢弃；同时还要换回不晚于 `a28b116` 的插件版本：0.1.7-rc.1 会拒绝安装当前插件并跳过已挂载的插件；0.1.5-rc.3 没有这项检查，当前插件会记录一条宿主不受支持的错误日志，在那里也不应指望它能正常工作。
+1. **停止宿主并备份主目录。** 把 `$DSH_HOME/sessions` 和插件状态一起复制，插件状态要从在 0.1.x 上运行的那个插件实际存放的位置复制：`statePath` 及同目录的 `-wal`、`-shm` 文件，以及 `workspacesRoot`。那个插件（不晚于 `a28b116` 的版本）会把插件行组合后没有配置的根目录放在 `~/.dsh/agent-swarm`，不管 `DSH_HOME` 是什么：直接挂载总是如此；bundle 挂载在后面的层替换了插件行的配置、又没有重新写出两个根目录时也是如此。保留了自身根目录的 bundle 插件行使用 `$DSH_AGENT_SWARM_ROOT`，未设置时使用 `$DSH_HOME/agent-swarm`（没有 `DSH_HOME` 时为 `~/.dsh/agent-swarm`）。当前插件可能会为同一个安装选出另一个根目录，见[存储根目录](#storage-roots)。回到 0.1.x 的唯一办法是恢复这份备份，在 0.2.1-rc.2 上完成的一切都会丢弃；同时还要换回不晚于 `a28b116` 的插件版本：0.1.7-rc.1 会拒绝安装当前插件并跳过已挂载的插件；0.1.5-rc.3 没有这项检查，当前插件会记录一条宿主不受支持的错误日志，在那里也不应指望它能正常工作。
 2. **检查共享的 agent 指令文件。** 0.2.1-rc.2 除了 `$DSH_HOME/AGENTS.md`，还会读取共享 agents 目录（`$DSH_AGENTS_HOME`，默认 `~/.agents`）中的 `AGENTS.md`。worker 挂载其 owner 的 agent 预设，因此在 Standard、Creator 和 PTC 预设下，这个文件会进入每个 owner 和 worker 的提示词；Minimal 预设不加载指令文件。
 3. **仍有进行中任务的主目录不要迁回 0.1.x。**
 
@@ -129,8 +131,8 @@ node "$DSH_HARNESS_ROOT/apps/cli/lib/bin.js" --profile web
 
 | 配置项 | 默认值 | 用途 |
 | --- | --- | --- |
-| `statePath` | `~/.dsh/agent-swarm/swarm.sqlite` | 持久协调状态；每个文件只允许一个活跃运行时。 |
-| `workspacesRoot` | `~/.dsh/agent-swarm/workspaces` | 快照、成员 worktree 和验证检出，必须位于源仓库之外。 |
+| `statePath` | `<root>/swarm.sqlite`，按[根目录规则](#storage-roots)确定 | 持久协调状态；每个文件只允许一个活跃运行时。 |
+| `workspacesRoot` | `<root>/workspaces`，按[根目录规则](#storage-roots)确定 | 快照、成员 worktree 和验证检出，必须位于源仓库之外。 |
 | `verificationDependencyDirs` | `["node_modules", ".venv", "venv", "vendor", ".tox"]` | 提供给干净验证检出的已安装依赖目录。 |
 | `verificationDependencyMode` | `"link"` | 未启用下方显式链接读取许可时，实际生效模式是 `copy`。 |
 | `allowDependencyLinkReads` | `false` | 允许配置的 `link` 模式，包括沿链接读取源项目工具链。 |
@@ -144,9 +146,23 @@ node "$DSH_HARNESS_ROOT/apps/cli/lib/bin.js" --profile web
 | `leaseMs` | `120000` | attempt 租约，在观察到真实操作时续租。 |
 | `tickMs` | `1000` | 调度器 tick 间隔。 |
 
-**仅修改 `DSH_HOME` 不会隔离插件的默认存储。** 多个独立 Harness 进程应通过 profile 覆盖层各自设置绝对路径的 `statePath` 和 `workspacesRoot`，或使用 bundle 的显式根目录。数据库 owner 锁会拒绝第二个活跃运行时，并指出持有进程。已退出进程遗留的锁可以回收；不要通过删除协调状态来解决活跃进程之间的所有权冲突。
-
 这些基础设施配置不替代主 agent 对具体任务预算和策略的决策。保留的 worktree 和 Git refs 需要显式清理。
+
+<a id="storage-roots"></a>
+
+### 存储根目录
+
+两种挂载都以空配置插入插件行，插件在启动时为 `statePath` 和 `workspacesRoot` 各自取下列第一个给出它的来源（`src/state-roots.ts`）：
+
+1. 插件行自己的 `statePath` 或 `workspacesRoot`，必须是绝对路径；
+2. `$DSH_AGENT_SWARM_ROOT`，即 `<root>/swarm.sqlite` 和 `<root>/workspaces`；
+3. Harness 主目录下的 `agent-swarm` 目录：`$DSH_HOME`，未设置时为 `~/.dsh`。
+
+主目录按宿主自己的方式解析：空白的 `DSH_HOME` 视为未设置，开头的 `~` 会展开，相对路径按宿主启动时的目录解析。`DSH_AGENT_SWARM_ROOT` 按同一规则读取。和所有 `DSH_*` 变量一样，它只能来自启动宿主的环境：Harness 拒绝在 `.env` 文件里设置它，Desktop 保留它被启动时的值，而不是登录 shell 里的值。因此主目录不同的宿主无需额外配置就各自使用独立的存储。workspaces 根目录必须是规范路径，所以位于符号链接之下的主目录要用真实路径给出（macOS 上的 `/tmp` 和 `/var` 都是链接），否则第一个任务会被 `workspacesRoot must be canonical, without symlinks` 拒绝。数据库 owner 锁会拒绝同一存储上的第二个活跃运行时，并指出持有进程。已退出进程遗留的锁可以回收；不要通过删除协调状态来解决活跃进程之间的所有权冲突。
+
+插件启动时会记录一行日志，写明它打开的根目录、各自的来源以及存储是否是新建的，例如 `agent-swarm: store /srv/dsh/agent-swarm/swarm.sqlite ($DSH_HOME), workspaces /srv/dsh/agent-swarm/workspaces ($DSH_HOME)`。插件不会查找其他存储，也不会接管任何存储：以前的环境留在别处的存储（例如隔离主目录下的 `~/.dsh/agent-swarm`）可能属于另一个宿主，是否沿用它由运维者决定（见下面的升级说明）。这一行以 info 级别记录，也就是日志导出器默认的阈值。0.2.1-rc.2 的 Web 和 Desktop profile 都没有挂载日志导出器，所以只有在 profile 挂载了导出器（例如 `@deepseek-ai/cordis-plugin-logger-console`）时才能看到这一行；面板和存储都不会记录它。
+
+**升级插件行有根目录未配置的安装。** 不晚于 `ba9a758` 时，插件行组合后没有配置的根目录就是 `~/.dsh/agent-swarm/…`，不管 `DSH_HOME` 或 `DSH_AGENT_SWARM_ROOT` 是什么。直接挂载的插件行两个根目录都不配置。bundle 挂载的插件行当时配置了两个根目录，但按 id 指向这一行的后续层（例如 `--patch` 覆盖层，或为了添加 `authorizedWorkspaces` 而修改的 profile 自身的 `cordis.patch.yml`）会替换这一行的整个配置，所以没有重新写出两个根目录的层会把它们丢掉。如果这样的安装曾在 `DSH_HOME` 指向其他主目录、或设置了 `DSH_AGENT_SWARM_ROOT` 的环境下运行，现在规则会把每个未配置的根目录从 `~/.dsh/agent-swarm` 移走：未配置的 `statePath` 会打开一个新的空存储，而在默认的 profile 上没有任何提示（见上面的启动日志）。保留了自身根目录的 bundle 插件行当时选出的根目录与现在的规则相同，只有空白、以 `~` 开头或相对路径的值例外：那时它的表达式会得到一个相对根目录（插件会拒绝），或一个位于文件系统根的目录（`/agent-swarm/…`；空白的 `DSH_AGENT_SWARM_ROOT` 则是 `/swarm.sqlite`）。要保留发生了迁移的安装的任务，请停止宿主，再以指向旧根目录（`~/.dsh/agent-swarm`）的 `DSH_AGENT_SWARM_ROOT` 重新启动，或者在 profile 覆盖层里配置两个根目录（从 Dock 启动的 Desktop 不会从登录 shell 取得任何 `DSH_*` 值）。不要改为移动文件：成员 worktree 是以绝对路径注册到 Git 的。只有当那个存储确实属于这个宿主时才这样做：如果默认主目录上的宿主也在使用 `~/.dsh/agent-swarm`，那它就是那个宿主的存储，其 owner 锁会拒绝第二个活跃运行时。插件行组合后配置了两个根目录的安装不受影响；由于现在随附的插件行都不再带根目录，替换这一行配置的层也不会再移动存储。
 
 ### 授权其他工作区
 
@@ -209,29 +225,52 @@ Worker 隔离依赖配置的 Harness 沙箱。会话工作目录在回合结束�
 
 ## 开发与验证
 
-链接 Harness 0.2.1-rc.2 检出后：
+行为测试分为两层，清单在 `scripts/test-tiers.mjs`。封闭层（hermetic）只需要 `package-lock.json` 锁定的包，其中包括来自 npm registry 的 0.2.1-rc.2 Harness 包，因此全新克隆无需 Harness 检出即可运行：
+
+```sh
+git clone https://github.com/TT-Wang/dsh-agent-swarm.git
+cd dsh-agent-swarm
+npm ci
+npm test
+```
+
+在任何机器上，它都按全新克隆的条件运行：移除 `DSH_HARNESS_ROOT` 和 `DSH_SOURCE`，并关闭对检出的查找，所以需要检出的测试会在这一层失败，它应属于宿主层。宿主层和其他大多数套件需要位于发布提交的已构建 Harness 0.2.1-rc.2 检出。`npm ci` 之后设置 `DSH_HARNESS_ROOT` 并运行 `npm run link:dsh`（见[构建与安装](#build-and-install)），然后：
 
 ```sh
 npm run verify
 ```
 
-该命令执行类型检查、构建、行为测试、打包工件加载、真实 Loader 组合、CLI profile 安装、声明式 bundle 检查和两条浏览器工作流。
+`npm run verify` 运行 gate。它唯一的清单是 `package.json` 的 `gate` 块：在 `typecheck` 和 `test` 之后列出每个 `test:*` 脚本，以及它在 `npm ci` 安装的包之外还需要什么。前提条件共五种。`harness` 是已构建的检出，`sandbox` 是允许嵌套 `sandbox_apply` 的 macOS 沙箱，`browser` 是检出中的 Playwright 能启动的浏览器（`DSH_SMOKE_BROWSER`，默认 `chrome`）。这三种会实际探测。`provider`（真实的 DeepSeek key）和 `better-sidebar`（已安装的 Better Sidebar 0.18.0）需要显式选择：它们的套件会发起计费请求或依赖第三方安装，所以只有点名时才运行，例如 `npm run verify -- --with provider`。verify 按清单顺序运行前提条件齐全的每个套件，遇到第一个失败即停止。`DSH_HARNESS_ROOT` 或 `DSH_SOURCE` 指定的检出若不存在，会在任何套件运行前停止；之后各套件运行时，`DSH_HARNESS_ROOT` 被设为探测找到的检出。
 
-| 命令 | 覆盖范围 |
-| --- | --- |
-| `npm test` | 构建和完整行为测试。 |
-| `npm run test:faults` | 故障注入；每个场景须证明故障实际发生。 |
-| `npm run test:replay` | 基于持久日志的确定性回放。 |
-| `npm run test:oracle` | 全日志 oracle：回放场景和时钟化的故障场景必须留下已记录的事件、行和适配器调用轨迹（`scripts/replay/oracle/`）。 |
-| `npm run test:load` | 负载下的准入和调度。 |
-| `npm run test:isolation` | 仅宿主执行的沙箱和工作区隔离检查。 |
-| `npm run test:harness` | 真实 Harness Loader 组合。 |
-| `npm run test:pack` / `npm run test:packed` | 打包工件加载与声明行为。 |
-| `npm run test:profile` | 真实 CLI profile 安装与生命周期。 |
-| `npm run test:bundle` | Bundle 元数据、可移植根目录、宿主组合与真实 profile 启动。 |
-| `npm run test:web` / `npm run test:command-web` | 侧栏和 `/agent-swarm` 浏览器工作流。 |
+它逐个打印套件的结果：通过、失败、跳过（附缺少的前提条件及原因），或因前面的失败而未运行；并把同样的内容写成一份记录，`artifacts/gate/<commit>.json`（用 `--record <file>` 可写到别处）。记录包含 commit、工作树是否有未提交的修改、Harness 发布版本及其 commit、探测到的每个前提条件和每个套件。有套件失败时 verify 以 1 退出；跳过的套件不会让它失败。最后一行说明本次运行是否是一次完整的 gate：除了只因缺少需显式选择的前提条件而跳过的套件，其余每个套件都已通过。`node scripts/gate.mjs --plan` 只显示会运行什么以及原因，不运行任何套件。清单漏掉某个 `test:*` 脚本时，`tests/gate-manifest.test.mjs` 会失败。
 
-这些测试使用临时 profile 和 Git 工作区，供应商回复由脚本提供。它们验证集成行为，不代表模型规划成功率。`npm run test:deepseek` 和 `npm run test:command-deepseek` 会发起真实供应商请求，可能产生费用，不包含在 `verify` 中。已完成的运行及其边界记录在[验证文档](validation.md)。
+`node scripts/round.mjs gate --commit <sha>` 在一个干净的 worktree 中运行该 commit 自己的 gate，并把记录保存在 lab 中（`--lab`，默认 `~/.dsh/agent-swarm-lab`）。只有完整的 gate 才以 0 退出。`node scripts/round.mjs promote` 只在该记录列出的套件与该 commit 的清单完全一致、记录完整、且记录的正是该 commit 并无未提交修改时，才应用这个 commit。清单出现之前 round gate 写下的记录没有列出任何套件，会被拒绝。round gate 最后一次运行是在 2026-09-10；之后的各批次是依据保存在仓库之外的 gate 运行合并的（见[验证文档](validation.md)）。
+
+GitHub Actions 工作流（`.github/workflows/verify.yml`）在每次推送到 `main` 和每个 pull request 时，在 macOS runner 上不带任何 secret 地运行 `npm ci` 和 `npm run verify`。在那里它运行不需要其他前提条件的套件：类型检查、`npm test`、`test:packed`、`test:replay`、`test:oracle` 和 `test:load`；其余套件记为跳过，并上传记录。需要检出、沙箱或浏览器的套件只在具备这些条件的机器上运行。
+
+`npm ci` 在安装前会删除 `node_modules` 中的全部内容；如果 `node_modules` 是符号链接，它删除的是链接所指目录中的内容。若某个检出的 `node_modules` 链接到多个检出共用的链接集合（link farm），这会清空该链接集合，所有共用它的检出都受影响。因此请先删除链接本身（`rm node_modules`，末尾不加斜杠）：`npm ci` 随后安装到一个新目录，链接集合保持原样。
+
+| 命令 | 需要 | 覆盖范围 |
+| --- | --- | --- |
+| `npm run typecheck` | 无 | 两个 TypeScript 项目（`tsconfig.json`、`tsconfig.client.json`）。 |
+| `npm test` | 无 | 构建和行为测试的封闭层：宿主层未列出的每个 `tests/*.test.mjs`。 |
+| `npm run test:packed` | 无 | 在已构建的目录树上运行打包工件冒烟测试；`npm test` 也会运行它。 |
+| `npm run test:replay` | 无 | 基于持久日志的确定性回放。 |
+| `npm run test:oracle` | 无 | 全日志 oracle：回放场景和时钟化的故障场景必须留下已记录的事件、行和适配器调用轨迹（`scripts/replay/oracle/`）。 |
+| `npm run test:load` | 无 | 负载下的准入和调度。 |
+| `npm run test:faults` | `harness` | 故障注入；每个场景须证明故障实际发生。 |
+| `npm run test:bundle` | `harness` | 行为测试的宿主层（`tests/r17-profile.test.mjs`）：Bundle 元数据、两种挂载插入的空配置插件行、宿主组合，以及两种挂载在真实 profile 启动时的根目录规则和启动日志。 |
+| `npm run test:harness` | `harness`、`sandbox` | 真实 Harness Loader 组合。 |
+| `npm run test:pack` | `harness`、`sandbox` | 从干净检出打出的 tarball 加载打包工件。 |
+| `npm run test:profile` | `harness`、`sandbox` | 真实 CLI profile 安装与生命周期。 |
+| `npm run test:isolation` | `harness`、`sandbox` | 仅宿主执行的沙箱和工作区隔离检查。 |
+| `npm run test:web` / `test:command-web` / `test:validation-repair-web` | `harness`、`browser` | 侧栏和 `/agent-swarm` 浏览器工作流，以及无效计划的修复。 |
+| `npm run test:sidebar-service` | `better-sidebar`（需显式选择） | 已安装的 Better Sidebar 服务契约与 swarm 侧栏适配器。 |
+| `npm run test:deepseek` / `test:command-deepseek` | `harness`、`provider`（需显式选择） | 在真实 DeepSeek 供应商上运行一次 mission 和 `/agent-swarm` 命令；会计费。 |
+
+`src/`、`tests/` 或 `scripts/` 导入的包必须是精确版本的 devDependency；`src/` 导入的包还必须是 peer dependency。`tests/declared-dependencies.test.mjs` 检查这一点，并检查 `package-lock.json` 与 `package.json` 一致。
+
+这些测试使用临时 profile 和 Git 工作区，供应商回复由脚本提供。它们验证集成行为，不代表模型规划成功率。`npm run test:deepseek` 和 `npm run test:command-deepseek` 会发起真实供应商请求，可能产生费用，所以 `verify` 只在加上 `--with provider` 时运行它们。已完成的运行及其边界记录在[验证文档](validation.md)。
 
 真实 Loader 组合（`test:harness`、`test:pack`、故障套件的供应商层，以及走 DeepSeek API key 路由的 `test:deepseek`、`test:command-deepseek` 和 `scripts/check-cancel-freeze.mjs`）挂载当前宿主已构建的包；检出缺少某个包时，组合失败并给出该包的名字。启动后每个启用的行都必须处于激活状态：仍在等待某个服务的行会让启动失败，并指出它等待的服务。这些组合挂载以测试工作区为根的 `@deepseek-ai/dsh-fs-local` 和 `@deepseek-ai/dsh-working-directory`，`bash` 的工作目录由 working-directory 服务提供。DeepSeek 路由取自 `@deepseek-ai/dsh-llm-deepseek-api-key`。
 

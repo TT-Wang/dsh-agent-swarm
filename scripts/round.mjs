@@ -3,10 +3,10 @@
  *
  * The swarm missions themselves are agent-driven; this script owns the
  * deterministic half so a round cannot skip them:
- *   gate    - prove a commit green in a clean checkout (typecheck, build, full
- *             unit suite, clean-pack assertion, plus every declared optional
- *             suite: test:faults, test:replay, test:load, test:isolation)
- *             before anything is promoted;
+ *   gate    - prove a commit in a clean checkout: run that commit's own gate
+ *             (scripts/gate.mjs, the manifest in its package.json, the same
+ *             runner `npm run verify` is) and keep its record;
+ *   promote - apply a commit whose recorded gate is complete for its manifest;
  *   mount   - build + preflight + restart the lab host from the linked checkout
  *             (never the controller host that serves the user's session);
  *   new     - open a round record;
@@ -17,10 +17,15 @@
  *   node scripts/round.mjs <gate|promote|mount|soak|new|record|status> [options]
  *
  * Common options: --lab <dir> (default ~/.dsh/agent-swarm-lab), --round <n>
- * gate:    --commit <sha> (default HEAD); --full adds the Loader composition,
- *          profile and pack smokes; --browser adds the live browser smokes
- * promote: --commit <sha> --dry-run; requires a recorded green gate for that
- *          exact commit and a clean tree in its paths; never commits by itself
+ * gate:    --commit <sha> (default HEAD); --with <prerequisites> is passed to the
+ *          gate (its opt-in suites). It runs every suite of the commit's
+ *          manifest whose prerequisites this host has, records each suite as
+ *          passed, failed, skipped (with what it lacked) or not run in
+ *          <lab>/gates/<sha>.json, and exits 0 only for a complete gate
+ * promote: --commit <sha> --dry-run; requires that commit's recorded gate to
+ *          list exactly the suites its package.json manifest lists, every one
+ *          passed except one skipped only for an opt-in prerequisite (gateVerdict
+ *          in scripts/gate.mjs), and a clean tree in its paths; never commits
  * mount:   --harness <dir> (default: the running lab host's, else the one
  *          recorded in the lab's server.json); update-preview refuses a
  *          Harness outside compatibility.json unless --allow-unsupported-harness
@@ -35,6 +40,7 @@ import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSyn
 import { homedir, tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { gateManifest, gateVerdict } from './gate.mjs'
 import { findHost, readServer } from './host.mjs'
 
 const project = fileURLToPath(new URL('../', import.meta.url))
@@ -109,26 +115,21 @@ if (command === 'mount') {
   process.exit(result.status ?? 1)
 }
 
+/** The gate manifest of `sha`, read from its committed package.json. */
+const manifestAt = sha => gateManifest(JSON.parse(execFileSync('git', ['-C', project, 'show', `${sha}:package.json`], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })))
+
 if (command === 'gate') {
   const commit = value('--commit', 'HEAD')
   const sha = execFileSync('git', ['-C', project, 'rev-parse', commit], { encoding: 'utf8' }).trim()
+  let manifest
+  try { manifest = manifestAt(sha) } catch (error) { fail(`${sha.slice(0, 12)} cannot be gated: ${error.message}`) }
+  const recordPath = join(lab, 'gates', `${sha}.json`)
+  mkdirSync(join(lab, 'gates'), { recursive: true })
+  // A record is this run's or none: an earlier run's never survives a run that wrote nothing.
+  rmSync(recordPath, { force: true })
   const checkout = mkdtempSync(join(tmpdir(), 'swarm-round-gate-'))
-  const results = []
-  const commands = [
-    ['typecheck', 'npm run typecheck'],
-    ['build', 'npm run build'],
-    ['unit', 'node --test tests/*.test.mjs'],
-    ['pack', 'npm pack --dry-run --json --cache "$(mktemp -d)" | node -e \'const d=JSON.parse(require("node:fs").readFileSync(0,"utf8"));const p=d[0].files.map(f=>f.path);if(!p.includes("lib/index.js")||!p.includes("lib/client.js")){console.error("tarball missing built code");process.exit(1)}\''],
-    ...(args.includes('--full') || args.includes('--browser') ? [
-      ['harness', 'npm run test:harness'],
-      ['profile', 'npm run test:profile'],
-      ['pack-smoke', 'npm run test:pack'],
-    ] : []),
-    ...(args.includes('--browser') ? [
-      ['web', 'npm run test:web'],
-      ['command-web', 'npm run test:command-web'],
-    ] : []),
-  ]
+  const npmCache = mkdtempSync(join(tmpdir(), 'swarm-round-gate-npm-'))
+  let exitCode
   try {
     // A real worktree, not a `git archive` extraction: the repository's own
     // acceptance commands include `npm run test:pack`, which materializes the
@@ -136,27 +137,19 @@ if (command === 'gate') {
     rmSync(checkout, { recursive: true, force: true })
     execFileSync('git', ['-C', project, 'worktree', 'add', '--detach', checkout, sha], { stdio: ['ignore', 'pipe', 'inherit'] })
     symlinkSync(join(project, 'node_modules'), join(checkout, 'node_modules'), 'dir')
-    // Optional suites: run any the artifact declares, so a new suite cannot
-    // silently stay outside the gate the way round-2's test:faults did.
-    const optionalSuites = ['test:faults', 'test:replay', 'test:load', 'test:isolation']
-    const declaredScripts = new Set(Object.keys(JSON.parse(readFileSync(join(checkout, 'package.json'), 'utf8')).scripts ?? {}))
-    for (const name of optionalSuites) if (declaredScripts.has(name)) commands.push([name, `npm run ${name}`])
-    for (const [name, shell] of commands) {
-      const started = Date.now()
-      const result = spawnSync('sh', ['-c', shell], { cwd: checkout, env: { ...process.env, npm_config_cache: join(checkout, '.npm-cache') }, stdio: 'inherit' })
-      results.push({ name, exitCode: result.status ?? 1, durationMs: Date.now() - started })
-      if ((result.status ?? 1) !== 0) break
-    }
+    // The commit's own runner and manifest, so the suites gated are the ones that commit declares.
+    const gateArgs = [join(checkout, 'scripts/gate.mjs'), '--record', recordPath, ...(args.includes('--with') ? ['--with', value('--with', '')] : [])]
+    exitCode = spawnSync(process.execPath, gateArgs, { cwd: checkout, env: { ...process.env, npm_config_cache: npmCache }, stdio: 'inherit' }).status ?? 1
   } finally {
     spawnSync('git', ['-C', project, 'worktree', 'remove', '--force', checkout], { stdio: 'ignore' })
     spawnSync('git', ['-C', project, 'worktree', 'prune'], { stdio: 'ignore' })
     rmSync(checkout, { recursive: true, force: true })
+    rmSync(npmCache, { recursive: true, force: true })
   }
-  const green = results.length === commands.length && results.every(result => result.exitCode === 0)
-  mkdirSync(join(lab, 'gates'), { recursive: true })
-  writeFileSync(join(lab, 'gates', `${sha}.json`), JSON.stringify({ commit: sha, green, results, at: stamp() }, null, 2) + '\n')
-  process.stdout.write(JSON.stringify({ command: 'gate', commit: sha, green, results }, null, 2) + '\n')
-  process.exit(green ? 0 : 1)
+  if (!existsSync(recordPath)) fail(`the gate of ${sha.slice(0, 12)} wrote no record (exit ${exitCode})`)
+  const verdict = gateVerdict(manifest, JSON.parse(readFileSync(recordPath, 'utf8')), { commit: sha })
+  process.stdout.write(JSON.stringify({ command: 'gate', commit: sha, record: recordPath, complete: verdict.complete, problems: verdict.problems, reasons: verdict.reasons }, null, 2) + '\n')
+  process.exit(verdict.complete ? 0 : 1)
 }
 
 if (command === 'promote') {
@@ -166,8 +159,14 @@ if (command === 'promote') {
   // history-dependent work: a shallow clone may not contain the artifact's
   // parent, and the refusal must still name the missing gate (fault F4).
   const gateFile = join(lab, 'gates', `${sha}.json`)
-  const gate = existsSync(gateFile) ? JSON.parse(readFileSync(gateFile, 'utf8')) : undefined
-  if (gate?.green !== true) fail(`no recorded green gate for ${sha.slice(0, 12)}; run: node scripts/round.mjs gate --commit ${sha.slice(0, 12)} --full`)
+  if (!existsSync(gateFile)) fail(`no recorded green gate for ${sha.slice(0, 12)}; run: node scripts/round.mjs gate --commit ${sha.slice(0, 12)}`)
+  // A record proves what its suites say, so it is read against the manifest the
+  // commit itself declares, not taken at its word: a record a dormant or older
+  // gate wrote, or one that skipped a suite this host could not run, is refused.
+  let verdict
+  try { verdict = gateVerdict(manifestAt(sha), JSON.parse(readFileSync(gateFile, 'utf8')), { commit: sha }) }
+  catch (error) { fail(`the recorded gate for ${sha.slice(0, 12)} cannot be checked: ${error.message}`) }
+  if (!verdict.complete) fail(`the recorded gate for ${sha.slice(0, 12)} is not a complete gate of its manifest:\n${[...verdict.problems, ...Object.entries(verdict.reasons).map(([need, reason]) => `${need}: ${reason}`)].map(line => `- ${line}`).join('\n')}\nrun: node scripts/round.mjs gate --commit ${sha.slice(0, 12)}`)
   // An integration artifact's parent may be an internal merge commit, so its
   // delta is not its content. --base names the mission baseline the artifact is
   // authoritative against; default stays the parent for simple task artifacts.

@@ -61,6 +61,18 @@ test('recovery sends requestId, never missionId or a frontend budget, and reads 
   await assert.rejects(requestStartControl(async () => ({ request: saved({ id: 'other-request' }) }), 'owner-a', saved(), 'stop'), /Invalid saved request response/)
 })
 
+test('F2: a saved-request reply bound to the request is still read by its reader before it can reach the panel', async () => {
+  for (const [label, reply] of [
+    ['no request', {}],
+    ['no goal', { request: saved({ goal: undefined }) }],
+    ['an error that is not text', { request: saved({ error: { code: 'planning_failed' } }) }],
+    ['a malformed project snapshot', { request: saved({ baseline: { snapshotCommit: 'b'.repeat(40), changedPaths: 'src/' } }) }],
+    ['no update time', { request: saved({ updatedAt: undefined }) }],
+  ]) {
+    await assert.rejects(requestStartControl(async () => reply, 'owner-a', saved(), 'retry'), /Invalid saved request response from host/, label)
+  }
+})
+
 test('late recovery replies cannot overwrite a newer epoch or another owner', () => {
   const newer = saved({ status: 'stopped', planningEpoch: 3, updatedAt: 250 })
   const stale = saved({ status: 'planning', planningEpoch: 2, updatedAt: 300 })

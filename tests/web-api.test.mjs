@@ -25,6 +25,8 @@ import { PolicyError } from '../lib/policy-error.js'
 import { errorTypeFor } from '../lib/trace.js'
 import { AdmissionError, TaskGraphAdmissionError } from '../lib/admission.js'
 import { memberRoutes } from '../lib/model-selection.js'
+import { mergeUpdate, validateState } from '../lib/types/client/monitor.js'
+import { readDraft } from '../lib/types/client/projection.js'
 import { FakeWorkers, NO_GRANTS, budget as defaultBudget, makeRuntime } from './faults/harness.mjs'
 
 const budget = { ...defaultBudget, maxTokens: 100000, maxSteps: 100, maxTasks: 10, maxExperiments: 2 }
@@ -743,6 +745,25 @@ test('watch observes draft-only planning changes and validates its bounded wait/
   }
   const idle = (await f.rpc('watch', { sessionId: f.ownerId, afterRevision: draftUpdate.revision, waitMs: 5 })).result.value
   assert.equal(idle.kind, 'heartbeat')
+})
+
+test('F2: the panel admits what the web API sends it: a draft reply, the state, a delta and a heartbeat', async t => {
+  const f = await fixture(t)
+  const initial = (await f.rpc('state', { sessionId: f.ownerId })).result.value
+  const reply = (await f.rpc('create-draft', { sessionId: f.ownerId, input: f.input })).result.value
+  assert.equal(readDraft(reply.draft), reply.draft, 'a saved draft passes the reader the editor reads it through')
+  f.runtime.create({ sessionId: f.ownerId }, f.input, { grantRoot: f.input.workspace, source: 'session' })
+  f.runtime.requestStart({ sessionId: f.ownerId }, { commandId: 'panel-admission', goal: 'Prepare reviewable work', workspace: f.input.workspace }, { grantRoot: f.input.workspace, source: 'session' })
+  const state = (await f.rpc('state', { sessionId: f.ownerId })).result.value
+  assert.deepEqual([state.snapshots.length, state.drafts.length, state.starts.length], [1, 1, 1])
+  validateState(state, f.ownerId)
+  const delta = (await f.rpc('watch', { sessionId: f.ownerId, afterRevision: initial.revision, waitMs: 0 })).result.value
+  assert.equal(delta.kind, 'delta')
+  const merged = mergeUpdate(initial, delta, f.ownerId)
+  assert.deepEqual([merged.snapshots.length, merged.drafts[0].id, merged.starts[0].goal], [1, reply.draft.id, 'Prepare reviewable work'])
+  const heartbeat = (await f.rpc('watch', { sessionId: f.ownerId, afterRevision: delta.revision, waitMs: 5 })).result.value
+  assert.equal(heartbeat.kind, 'heartbeat')
+  assert.deepEqual(mergeUpdate(merged, heartbeat, f.ownerId).defaultBudget, state.defaultBudget)
 })
 
 test('native watch wakes on commit and releases observers when its plugin unloads', async t => {

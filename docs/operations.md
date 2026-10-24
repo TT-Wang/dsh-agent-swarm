@@ -32,7 +32,7 @@ npm run link:dsh
 npm run build
 ```
 
-`link:dsh` links the shared runtime packages and build tools from that Harness checkout. A separate `npm install` in the plugin directory is not needed.
+`link:dsh` links every Harness package from that checkout into `node_modules`, so the mounted plugin runs on the host's own modules, and links the build tools the plugin declares from it. On its own it needs no `npm install`. It also works over `npm ci` (see [Development and verification](#development-and-verification)): it then replaces each Harness package npm installed with the checkout's, after checking that both are the same version, and keeps the tools the lockfile installed. `npm ci` removes the links, so run `link:dsh` again after it. When `node_modules` is itself a link, `npm ci` also empties the directory it points to; see [Development and verification](#development-and-verification) before running it there.
 
 Choose **one** of the following mounts, using the matching Harness CLI and running the command from the plugin checkout root.
 
@@ -50,7 +50,7 @@ The plugin package itself becomes a profile bundle layer. Keep the linked direct
 node "$DSH_HARNESS_ROOT/apps/cli/lib/bin.js" plugin --profile web add "file:$PWD/profile"
 ```
 
-The [bundle profile](../profile/README.md) installs the plugin and its Web client together, after the required `@deepseek-ai/dsh-base` and `@deepseek-ai/dsh-web-app` layers. It declares portable storage roots: `$DSH_AGENT_SWARM_ROOT`, otherwise `$DSH_HOME/agent-swarm`. Override that variable or use a `--patch` overlay targeting the `dsh-external-agent-swarm` row.
+The [bundle profile](../profile/README.md) installs the plugin and its Web client together, after the required `@deepseek-ai/dsh-base` and `@deepseek-ai/dsh-web-app` layers. Like the direct mount, it inserts the plugin row with an empty config, so both mounts open the same store: the plugin chooses its roots at start by the [storage root rule](#storage-roots). To choose other roots, set `DSH_AGENT_SWARM_ROOT` or use a `--patch` overlay targeting the `dsh-external-agent-swarm` row.
 
 **Do not mount both alternatives.** Both insert the same Loader row, and the bundle declares that conflict in its metadata.
 
@@ -71,7 +71,7 @@ If several Harness checkouts run on the same machine, use a separate linked plug
 
 The plugin runs only on 0.2.1-rc.2. A Harness home (`DSH_HOME`) and plugin state that ran on 0.1.5-rc.3 or 0.1.7-rc.1 move to it once, without a migration step: 0.2.1-rc.2 reads the existing session logs, and the host change does not touch the plugin's store (`swarm.sqlite`, schema 8). The way back is closed, so before the first start on 0.2.1-rc.2:
 
-1. **Stop the host and back up the home.** Copy `$DSH_HOME/sessions` together with the plugin's state: `statePath` (by default `~/.dsh/agent-swarm/swarm.sqlite` with its `-wal` and `-shm` files; this default ignores `DSH_HOME`) and `workspacesRoot`. Going back to 0.1.x means restoring that backup, which discards everything done on 0.2.1-rc.2, and running a plugin revision up to `a28b116`: 0.1.7-rc.1 refuses to install the current plugin and skips a mounted one, and 0.1.5-rc.3 has no such gate: the current plugin logs that the host is unsupported and is not expected to work there.
+1. **Stop the host and back up the home.** Copy `$DSH_HOME/sessions` together with the plugin's state where the plugin that ran on 0.1.x kept it: `statePath` with its `-wal` and `-shm` files, and `workspacesRoot`. That plugin, a revision up to `a28b116`, kept a root its composed row did not configure in `~/.dsh/agent-swarm` whatever `DSH_HOME` was: always on the direct mount, and on the bundle mount when a later layer replaced the row's config without both roots. A bundle row that kept its roots used `$DSH_AGENT_SWARM_ROOT`, else `$DSH_HOME/agent-swarm` (`~/.dsh/agent-swarm` without `DSH_HOME`). The current plugin may choose another root for the same install; see [storage roots](#storage-roots). Going back to 0.1.x means restoring that backup, which discards everything done on 0.2.1-rc.2, and running a plugin revision up to `a28b116`: 0.1.7-rc.1 refuses to install the current plugin and skips a mounted one, and 0.1.5-rc.3 has no such gate: the current plugin logs that the host is unsupported and is not expected to work there.
 2. **Review the shared agent instructions.** 0.2.1-rc.2 also loads `AGENTS.md` from the shared agents directory (`$DSH_AGENTS_HOME`, by default `~/.agents`), beside `$DSH_HOME/AGENTS.md`. Workers mount their owner's agent preset, so under the Standard, Creator and PTC presets that file reaches every owner and worker prompt. The Minimal preset loads no instruction files.
 3. **Do not move a home with live missions back to 0.1.x.**
 
@@ -125,8 +125,8 @@ Settings belong to Loader row `dsh-external-agent-swarm`. The full schema is in 
 
 | Setting | Default | Purpose |
 | --- | --- | --- |
-| `statePath` | `~/.dsh/agent-swarm/swarm.sqlite` | Durable coordination state; one live runtime per file. |
-| `workspacesRoot` | `~/.dsh/agent-swarm/workspaces` | Snapshots, member worktrees and verification checkouts. Must be outside the source repository. |
+| `statePath` | `<root>/swarm.sqlite`, by the [root rule](#storage-roots) | Durable coordination state; one live runtime per file. |
+| `workspacesRoot` | `<root>/workspaces`, by the [root rule](#storage-roots) | Snapshots, member worktrees and verification checkouts. Must be outside the source repository. |
 | `verificationDependencyDirs` | `["node_modules", ".venv", "venv", "vendor", ".tox"]` | Installed dependency directories made available to clean verification checkouts. |
 | `verificationDependencyMode` | `"link"` | Effective mode is `copy` unless the explicit link-read opt-in below is enabled. |
 | `allowDependencyLinkReads` | `false` | Allows configured `link` mode, including read-through access to the source toolchain. |
@@ -140,9 +140,21 @@ Settings belong to Loader row `dsh-external-agent-swarm`. The full schema is in 
 | `leaseMs` | `120000` | Attempt lease, renewed while a real operation is observed. |
 | `tickMs` | `1000` | Scheduler tick interval (minimum 10), and the unit of the tick-derived windows: the review grace of an unreviewed submission (one tick, at least 1 s), and the preparation back-off bound and failed-start retry (one tick each). |
 
-**Changing `DSH_HOME` alone does not isolate the plugin's default storage.** For independent Harness processes, give each its own absolute `statePath` and `workspacesRoot` through a profile overlay, or use the bundle's explicit roots. A database owner lock rejects a second live runtime and identifies the holding process. A lock left by a dead process can be reclaimed; do not delete coordination state to resolve a live ownership conflict.
-
 These infrastructure settings do not replace the primary agent's task-specific budgets and policies. Retained worktrees and Git refs require explicit cleanup.
+
+### Storage roots
+
+Both mounts insert the plugin row with an empty config, and the plugin chooses each of `statePath` and `workspacesRoot` at start, from the first of these that names it (`src/state-roots.ts`):
+
+1. the row's own `statePath` or `workspacesRoot`, which must be absolute;
+2. `$DSH_AGENT_SWARM_ROOT`, as `<root>/swarm.sqlite` and `<root>/workspaces`;
+3. the Harness home's `agent-swarm` directory: `$DSH_HOME`, else `~/.dsh`.
+
+The home is resolved the way the host resolves it: a blank `DSH_HOME` is unset, a leading `~` is expanded, and a relative path is resolved against the directory the host started in. `DSH_AGENT_SWARM_ROOT` is read by the same rule. Like every `DSH_*` name it comes only from the environment that launches the host: Harness refuses it in a `.env` file, and Desktop keeps the value it was launched with, not the login shell's. Hosts with separate homes therefore keep separate stores with no further configuration. The workspaces root must be canonical, so give a home under a symbolic link by its real path (on macOS `/tmp` and `/var` are links): otherwise the first mission is refused with `workspacesRoot must be canonical, without symlinks`. A database owner lock rejects a second live runtime on one store and identifies the holding process. A lock left by a dead process can be reclaimed; do not delete coordination state to resolve a live ownership conflict.
+
+At start the plugin logs one line naming the roots it opened, the step that chose each, and whether the store is new, for example `agent-swarm: store /srv/dsh/agent-swarm/swarm.sqlite ($DSH_HOME), workspaces /srv/dsh/agent-swarm/workspaces ($DSH_HOME)`. It looks for no other store and adopts none: a store an earlier environment left elsewhere, such as `~/.dsh/agent-swarm` under an isolated home, may belong to another host, so whether to keep it is the operator's call (see the upgrade note below). The line is logged at info, the threshold a log exporter uses by default. The 0.2.1-rc.2 Web and Desktop profiles mount no log exporter, so the line appears only where a profile mounts one, such as `@deepseek-ai/cordis-plugin-logger-console`, and neither the panel nor the store records it.
+
+**Upgrading an install whose row left a root unconfigured.** Up to `ba9a758`, a root the composed plugin row did not configure was `~/.dsh/agent-swarm/…`, whatever `DSH_HOME` or `DSH_AGENT_SWARM_ROOT` said. The direct mount's row configures neither root. The bundle mount's row configured both, but a later layer that targets the row by id, such as a `--patch` overlay or the profile's own `cordis.patch.yml` adding `authorizedWorkspaces`, replaces the row's whole config, so a layer that did not restate both roots dropped them. If such an install ran with `DSH_HOME` naming another home, or with `DSH_AGENT_SWARM_ROOT` set, the rule now moves each unconfigured root out of `~/.dsh/agent-swarm`: an unconfigured `statePath` opens a new, empty store, and on a stock profile nothing says so (see the start line above). A bundle mount whose row kept its roots chose them as the rule does now, except under a blank, `~`-prefixed or relative value: its expression then named a relative root, which the plugin refused, or one at the filesystem root (`/agent-swarm/…`, or `/swarm.sqlite` for a blank `DSH_AGENT_SWARM_ROOT`). To keep the missions of an install that moved, stop the host and start it again with `DSH_AGENT_SWARM_ROOT` set to the old root (`~/.dsh/agent-swarm`), or configure both roots in a profile overlay (a Desktop started from the Dock takes no `DSH_*` value from the login shell). Do not move the files instead: member worktrees are registered with Git under their absolute paths. Do this only when that store is this host's own: if a host on the default home also uses `~/.dsh/agent-swarm`, it is that host's store, and its owner lock refuses a second live runtime. An install whose composed row configures both roots is unaffected, and since no shipped row carries a root any more, a layer that replaces the row's config no longer moves the store.
 
 ### Authorize another workspace
 
@@ -199,29 +211,52 @@ Mount the swarm and slice layers in the same profile using each project's instal
 
 ## Development and verification
 
-After linking a Harness 0.2.1-rc.2 checkout:
+The behavioral suite has two tiers, listed in `scripts/test-tiers.mjs`. The hermetic tier needs only the packages `package-lock.json` pins, which include the 0.2.1-rc.2 Harness packages from the npm registry, so a fresh clone runs it without a Harness checkout:
+
+```sh
+git clone https://github.com/TT-Wang/dsh-agent-swarm.git
+cd dsh-agent-swarm
+npm ci
+npm test
+```
+
+It runs on every machine as that clone would: `DSH_HARNESS_ROOT` and `DSH_SOURCE` are removed and the search for a checkout is off, so a test that needs one fails there and belongs to the host tier. The host tier and most other suites need a built Harness 0.2.1-rc.2 checkout at the release commit. After `npm ci`, set `DSH_HARNESS_ROOT` and run `npm run link:dsh` (see [Build and install](#build-and-install)), then:
 
 ```sh
 npm run verify
 ```
 
-This runs typecheck, build, the behavioral suite, packaged-artifact loading, real Loader composition, CLI profile installation, the declarative bundle checks and both browser workflows.
+`npm run verify` runs the gate. Its one manifest is the `gate` block of `package.json`: every `test:*` script, after `typecheck` and `test`, with what it needs beyond the packages `npm ci` installs. There are five prerequisites. `harness` is the built checkout, `sandbox` is the macOS sandbox with a nested `sandbox_apply` permitted, and `browser` is a browser the checkout's Playwright launches (`DSH_SMOKE_BROWSER`, default `chrome`). These three are probed. `provider` (a live DeepSeek key) and `better-sidebar` (an installed Better Sidebar 0.18.0) are opt-in: their suites make billable requests or need a third-party install, so they run only when named, as in `npm run verify -- --with provider`. Verify runs every suite whose prerequisites are present, in the manifest's order, and stops at the first failure. A checkout that `DSH_HARNESS_ROOT` or `DSH_SOURCE` names but that does not exist stops it before any suite; the suites then run with `DSH_HARNESS_ROOT` set to the checkout the probe found.
 
-| Command | Coverage |
-| --- | --- |
-| `npm test` | Build and the full behavioral suite. |
-| `npm run test:faults` | Fault injection; each scenario must establish that its fault fired. |
-| `npm run test:replay` | Deterministic replay over the durable log. |
-| `npm run test:oracle` | The full-log oracle: the replay scenario and the clocked fault scenarios must leave the recorded events, rows and adapter call trace (`scripts/replay/oracle/`). |
-| `npm run test:load` | Admission and scheduling under load. |
-| `npm run test:isolation` | Host-only sandbox and workspace confinement. |
-| `npm run test:harness` | Real Harness Loader composition. |
-| `npm run test:pack` / `npm run test:packed` | Packaged-artifact loading and declared behavior. |
-| `npm run test:profile` | Real CLI profile installation and lifecycle. |
-| `npm run test:bundle` | Bundle metadata, portable roots, host composition and real profile boot. |
-| `npm run test:web` / `npm run test:command-web` | Sidebar and `/agent-swarm` browser workflows. |
+It prints each suite as passed, failed, skipped (with the prerequisite it lacked and why) or not run after a failure, and writes the same as a record, `artifacts/gate/<commit>.json` (`--record <file>` puts it elsewhere). The record holds the commit, whether the tree had uncommitted changes, the Harness release and commit, each prerequisite as found and each suite. Verify exits 1 when a suite failed; a skipped suite does not fail it. Its last line says whether the run was a complete gate: every suite passed except those skipped only for an opt-in prerequisite. `node scripts/gate.mjs --plan` shows what would run and why without running anything. `tests/gate-manifest.test.mjs` fails when a `test:*` script is missing from the manifest.
 
-These suites use temporary profiles and Git workspaces with scripted provider responses. They establish integration behavior, not model planning success rates. `npm run test:deepseek` and `npm run test:command-deepseek` make real provider requests, can incur charges and are excluded from `verify`. Completed runs and their limits are recorded in [validation](validation.md).
+`node scripts/round.mjs gate --commit <sha>` runs that commit's own gate in a clean worktree and keeps the record in the lab (`--lab`, default `~/.dsh/agent-swarm-lab`). It exits 0 only for a complete gate. `node scripts/round.mjs promote` applies the commit only when that record lists exactly the suites the commit's manifest lists, is complete, and is of that commit with no uncommitted changes. A record the round gate wrote before the manifest existed names no suites and is refused. The round gate last ran on 2026-09-10; later batches were merged on gate runs kept outside the repository (see [validation](validation.md)).
+
+The GitHub Actions workflow (`.github/workflows/verify.yml`) runs `npm ci` and `npm run verify` on a macOS runner with no secrets on every push to `main` and every pull request. There it runs the suites that need nothing more: typecheck, `npm test`, `test:packed`, `test:replay`, `test:oracle` and `test:load`. It records the others as skipped and uploads the record. The suites that need the checkout, the sandbox or a browser run only on a machine that has them.
+
+`npm ci` deletes everything in `node_modules` before it installs, and when `node_modules` is a symbolic link it deletes the contents of the directory the link points to. In a checkout whose `node_modules` links to a link farm that other checkouts share, that empties the farm for all of them. Remove the link itself first (`rm node_modules`, without a trailing slash): `npm ci` then installs into a new directory and leaves the farm as it was.
+
+| Command | Needs | Coverage |
+| --- | --- | --- |
+| `npm run typecheck` | nothing | Both TypeScript projects (`tsconfig.json`, `tsconfig.client.json`). |
+| `npm test` | nothing | Build and the hermetic tier of the behavioral suite: every `tests/*.test.mjs` the host tier does not list. |
+| `npm run test:packed` | nothing | The packed-artifact smoke on the built tree; `npm test` also runs it. |
+| `npm run test:replay` | nothing | Deterministic replay over the durable log. |
+| `npm run test:oracle` | nothing | The full-log oracle: the replay scenario and the clocked fault scenarios must leave the recorded events, rows and adapter call trace (`scripts/replay/oracle/`). |
+| `npm run test:load` | nothing | Admission and scheduling under load. |
+| `npm run test:faults` | `harness` | Fault injection; each scenario must establish that its fault fired. |
+| `npm run test:bundle` | `harness` | The host tier of the behavioral suite (`tests/r17-profile.test.mjs`): bundle metadata, the empty-config plugin row both mounts insert, host composition, and the root rule and start line on real profile boots of both mounts. |
+| `npm run test:harness` | `harness`, `sandbox` | Real Harness Loader composition. |
+| `npm run test:pack` | `harness`, `sandbox` | Packaged-artifact loading from a clean checkout's tarball. |
+| `npm run test:profile` | `harness`, `sandbox` | Real CLI profile installation and lifecycle. |
+| `npm run test:isolation` | `harness`, `sandbox` | Host-only sandbox and workspace confinement. |
+| `npm run test:web` / `test:command-web` / `test:validation-repair-web` | `harness`, `browser` | Sidebar and `/agent-swarm` browser workflows, and the repair of an invalid plan. |
+| `npm run test:sidebar-service` | `better-sidebar` (opt-in) | The installed Better Sidebar service contract with the swarm sidebar adapter. |
+| `npm run test:deepseek` / `test:command-deepseek` | `harness`, `provider` (opt-in) | A mission and the `/agent-swarm` command on the real DeepSeek provider; billable. |
+
+A package that `src/`, `tests/` or `scripts/` imports must be a devDependency at an exact version, and also a peer dependency when `src/` imports it; `tests/declared-dependencies.test.mjs` checks this and that `package-lock.json` matches `package.json`.
+
+These suites use temporary profiles and Git workspaces with scripted provider responses. They establish integration behavior, not model planning success rates. `npm run test:deepseek` and `npm run test:command-deepseek` make real provider requests and can incur charges, so `verify` runs them only with `--with provider`. Completed runs and their limits are recorded in [validation](validation.md).
 
 The real Loader compositions (`test:harness`, `test:pack`, the fault suite's provider tier, and `test:deepseek`, `test:command-deepseek` and `scripts/check-cancel-freeze.mjs` on the DeepSeek API-key route) mount the running host's built packages; a package the checkout lacks fails the composition with its name, and every enabled row must be active after boot: a row still waiting for a service fails the boot and names that service. They mount `@deepseek-ai/dsh-fs-local` and `@deepseek-ai/dsh-working-directory` rooted at the test workspace; the working-directory service gives `bash` its directory. The DeepSeek route comes from `@deepseek-ai/dsh-llm-deepseek-api-key`.
 

@@ -151,6 +151,56 @@ test('heartbeat refreshes native lifecycle and configuration metadata without al
   assert.equal(updated.revision, initial.revision)
 })
 
+test('F2: snapshot and delta updates refuse a malformed draft or start, and every path reads the budget by one rule', () => {
+  const budget = uiSnapshot().mission.budget
+  const draft = () => ({ id: 'draft-1', ownerSessionId: 'owner', revision: 1, status: 'draft', createdAt: 1, updatedAt: 1,
+    input: { workspace: '/repo', title: 'Plan', objective: 'Do it', scope: ['**'], acceptance: ['Done'], budget: { ...budget },
+      members: [{ key: 'builder', name: 'Builder', role: 'Build' }], workstreams: [{ key: 'delivery', title: 'Delivery', objective: 'Deliver' }],
+      tasks: [{ key: 'deliver', workstreamKey: 'delivery', title: 'Deliver', objective: 'Deliver', kind: 'integration', scope: ['**'], acceptance: [], covers: ['c1'], checks: ['npm test'] }] } })
+  const start = () => ({ id: 'start-1', ownerSessionId: 'owner', goal: 'Do it', status: 'failed', createdAt: 1, updatedAt: 2, error: 'Planning failed',
+    baseline: { sourceHead: 'a'.repeat(40), snapshotCommit: 'b'.repeat(40), planningWorkspace: '/planning', changedPaths: [], createdAt: 1 } })
+  const items = (revision = 2) => ({ ...state('owner', revision), drafts: [draft()], starts: [start()] })
+  const initial = items(1)
+  const update = (kind, next) => ({ kind, ownerSessionId: 'owner', revision: next.revision, state: next, missionIds: ['mission-demo'] })
+  for (const kind of ['snapshot', 'delta']) assert.equal(mergeUpdate(initial, update(kind, items()), 'owner').drafts[0].id, 'draft-1', `a ${kind} of well-formed items is admitted`)
+  for (const [label, mutate] of [
+    ['a draft without input', next => { delete next.drafts[0].input }],
+    ['a draft whose tasks are not a list', next => { next.drafts[0].input.tasks = 'deliver' }],
+    ['a draft task without a scope', next => { delete next.drafts[0].input.tasks[0].scope }],
+    ['a start with a malformed baseline', next => { next.starts[0].baseline = { snapshotCommit: 'b'.repeat(40) } }],
+    ['a start whose error is not text', next => { next.starts[0].error = { code: 'failed' } }],
+    ['no initial budget', next => { delete next.defaultBudget }],
+  ]) {
+    for (const kind of ['snapshot', 'delta']) {
+      const next = items(); mutate(next)
+      assert.throws(() => mergeUpdate(initial, update(kind, next), 'owner'), /Invalid swarm state from host/, `${kind}: ${label}`)
+    }
+  }
+  // A snapshot, a delta and a heartbeat agree on every budget (the initial read is checked as a snapshot is).
+  const { maxSteps: _omitted, ...missingLimit } = budget
+  for (const [label, value, admitted] of [
+    ['integer limits', { ...budget, maxWorkers: 2 }, true],
+    ['a fixed deadline', { ...budget, deadlineAt: Date.UTC(2026, 9, 30) }, true],
+    ['a fractional limit', { ...budget, maxTokens: 1.5 }, true],
+    ['a missing limit', missingLimit, false],
+    ['a string limit', { ...budget, maxTasks: '20' }, false],
+    ['a string deadline', { ...budget, deadlineAt: 'tomorrow' }, false],
+    ['null', null, false],
+  ]) {
+    const outcomes = ['snapshot', 'delta', 'heartbeat'].map(kind => {
+      const next = { ...items(), defaultBudget: value }
+      try {
+        const merged = mergeUpdate(initial, kind === 'heartbeat' ? { kind, ownerSessionId: 'owner', revision: 2, defaultBudget: value } : update(kind, next), 'owner')
+        return merged.defaultBudget === value
+      } catch (error) {
+        assert.match(error.message, /Invalid swarm (state|budget metadata)/)
+        return false
+      }
+    })
+    assert.deepEqual(outcomes, [admitted, admitted, admitted], label)
+  }
+})
+
 test('delivery consumes the runtime target instead of the first accepted integration', () => {
   const base = uiSnapshot()
   const artifact = commit => ({ commit, baseCommit: 'f'.repeat(40), workspace: '/workspace/demo', changedPaths: ['src/change.ts'] })

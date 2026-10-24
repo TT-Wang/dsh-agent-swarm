@@ -31,6 +31,18 @@ async function openAuthenticatedWeb(page, launchUrl, checks) {
   checks.push('native launch authentication remains enabled: unauthenticated index401, token exchange, HttpOnly cookie, authenticated index200')
 }
 
+/**
+ * The browser the smokes drive: the checkout's own Playwright, headless, on the
+ * channel DSH_SMOKE_BROWSER names (default `chrome`, the installed Google Chrome;
+ * `chromium` is Playwright's own build). The gate's browser prerequisite
+ * (scripts/gate.mjs) is that this launches.
+ */
+export async function launchSmokeBrowser(harnessRoot, env = process.env) {
+  const { chromium } = await import(pathToFileURL(join(harnessRoot, 'apps/web/node_modules/playwright/index.mjs')).href)
+  const channel = env.DSH_SMOKE_BROWSER ?? 'chrome'
+  return chromium.launch({ headless: true, ...(channel === 'chromium' ? {} : { channel }) })
+}
+
 /** Current Harness has a resident Lexical contenteditable composer. */
 export function composerFor(page) { return page.locator('[data-composer-input][contenteditable="true"]').first() }
 
@@ -240,9 +252,7 @@ export async function runWebSmoke({ name, scriptedLlm, pluginConfig, prepare, ob
       await new Promise(resolve => { process.once('SIGINT', resolve); process.once('SIGTERM', resolve) })
       return
     }
-    const { chromium } = await import(pathToFileURL(join(harnessRoot, 'apps/web/node_modules/playwright/index.mjs')).href)
-    const browserChannel = process.env.DSH_SMOKE_BROWSER ?? 'chrome'
-    browser = await chromium.launch({ headless: true, ...(browserChannel === 'chromium' ? {} : { channel: browserChannel }) })
+    browser = await launchSmokeBrowser(harnessRoot)
     page = await browser.newPage({ viewport: { width: 1440, height: 1000 }, locale: 'en-US' })
     const pageErrors = []
     page.on('pageerror', error => pageErrors.push(error.message))

@@ -1,8 +1,6 @@
 /** DeepSeek Harness plugin: a durable swarm runtime over existing agent/session APIs. */
 import type { Context, Fiber } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
-import { homedir } from 'node:os'
-import { join, isAbsolute } from 'node:path'
 import { loadWorkspaceGrants } from './authorization.ts'
 import { applyPendingRestore } from './store.ts'
 import { SwarmRuntime } from './runtime.ts'
@@ -17,14 +15,17 @@ import { registerWebApi } from './web-api.ts'
 import { bindHostTelemetry, type HostTelemetrySink } from './trace.ts'
 import type { Budget, WorkspaceGrant } from './types.ts'
 import { reportHarnessSupport } from './host-version.ts'
+import { reportSwarmRoots, swarmRoots } from './state-roots.ts'
 
 declare module '@deepseek-ai/cordis' { interface Context { swarm: SwarmRuntime } }
 
 export const name = 'agent-swarm'
 export const inject = ['agents', 'sessions', 'tools', 'systemPrompt', 'llm', 'sessionPersistence', 'sandbox', 'sandboxPolicy', 'approval']
 export interface Config {
-  statePath: string
-  workspacesRoot: string
+  /** Absolute store path; unset, it follows the one root rule in src/state-roots.ts. */
+  statePath?: string
+  /** Absolute workspaces root; unset, it follows the one root rule in src/state-roots.ts. */
+  workspacesRoot?: string
   leaseMs: number
   tickMs: number
   planningTimeoutMs: number
@@ -70,8 +71,8 @@ export interface Config {
   maxOwnerReplyNudges: number
 }
 export const Config: z<Config> = z.object({
-  statePath: z.string().default(join(homedir(), '.dsh/agent-swarm/swarm.sqlite')),
-  workspacesRoot: z.string().default(join(homedir(), '.dsh/agent-swarm/workspaces')),
+  statePath: z.string().description('Absolute store path. Unset: $DSH_AGENT_SWARM_ROOT/swarm.sqlite, else <Harness home>/agent-swarm/swarm.sqlite.'),
+  workspacesRoot: z.string().description('Absolute workspaces root. Unset: $DSH_AGENT_SWARM_ROOT/workspaces, else <Harness home>/agent-swarm/workspaces.'),
   leaseMs: z.natural().min(100).default(120000),
   tickMs: z.natural().min(10).default(1000),
   workerStartTimeoutMs: z.natural().min(100).default(60000),
@@ -136,7 +137,10 @@ export function installHostTelemetry(ctx: Context, runtime: unknown): Fiber {
 export async function apply(ctx: Context, config: Config): Promise<void> {
   // An unsupported host is logged, not refused: refusing is the host's peer-range gate, where it has one.
   reportHarnessSupport(ctx.logger)
-  if (!isAbsolute(config.statePath) || !isAbsolute(config.workspacesRoot)) throw new Error('Swarm statePath and workspacesRoot must be absolute')
+  // F3: both roots come from one rule, here at start, in the environment the
+  // host resolved its home from; neither mount's row carries a root of its own.
+  const roots = swarmRoots(config)
+  const settings = { ...config, statePath: roots.statePath, workspacesRoot: roots.workspacesRoot }
   // Human authorization is read exactly once here, from plugin configuration.
   // Nothing below re-reads the profile and no model tool can reach this value.
   const grants = await loadWorkspaceGrants(config.authorizedWorkspaces)
@@ -144,11 +148,13 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
   // so a corrupted or deleted state file recovers at the next host start
   // instead of starting empty. Applying here (not in a model tool) keeps the
   // swap outside any live runtime's ownership.
-  const restored = applyPendingRestore(config.statePath)
-  const workers = new HarnessWorkers(ctx, config)
+  const restored = applyPendingRestore(settings.statePath)
+  // After the restore, so a restored store is not reported as a new one.
+  reportSwarmRoots(ctx.logger, roots)
+  const workers = new HarnessWorkers(ctx, settings)
   // The profile passes unknown keys through; the runtime clock and the manual
   // tick are never among them.
-  const runtime = new SwarmRuntime({ ...config, now: undefined, manualTick: undefined, maxTasksPerMember: config.maxAttempts, grants }, workers)
+  const runtime = new SwarmRuntime({ ...settings, now: undefined, manualTick: undefined, maxTasksPerMember: config.maxAttempts, grants }, workers)
   if (restored !== undefined) runtime.store.transaction(() => runtime.store.event('swarm/install', 'store/restored', 'runtime',
     { snapshot: restored.snapshot, requestedAt: restored.requestedAt, ...(restored.requestedBy === undefined ? {} : { requestedBy: restored.requestedBy }) }))
   ctx.effect(() => () => runtime.dispose(), 'swarm.runtime')
