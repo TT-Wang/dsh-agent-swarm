@@ -15,7 +15,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { execFile, execFileSync } from 'node:child_process'
-import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -110,17 +110,22 @@ test('gateVerdict: a record is complete only when it lists the manifest and ever
   assert.deepEqual([bothSkipped.problems, bothSkipped.reasons], [['test:billable was skipped: no harness, provider'], { harness: 'no checkout here', provider: 'opt-in' }], 'an opt-in suite that also lacked a host prerequisite is not excused')
   assert.deepEqual(gateVerdict(small, record([{ name: 'typecheck', status: 'fail', exitCode: 2 }, { name: 'test:host', status: 'not-run' }, pass('test:billable')])).problems, ['typecheck failed (exit 2)', 'test:host did not run: an earlier suite failed'])
   assert.deepEqual(gateVerdict(small, { ...complete, commit: 'c2', dirty: true }, { commit: 'c1' }).problems, ['the record is of commit c2, not c1', 'the record is of a tree with uncommitted changes, not of the commit alone'])
+  // A record that cannot say its tree was clean is not of the commit alone either.
+  assert.deepEqual(gateVerdict(small, { ...complete, dirty: null }, { commit: 'c1' }).problems, ['the record is of a tree with uncommitted changes, not of the commit alone'])
+  // An opt-in excuses a skip only for a suite whose own manifest entry names it.
+  const undeclared = gateVerdict(small, record([pass('typecheck'), { name: 'test:host', status: 'skipped', missing: ['provider'] }, pass('test:billable')]))
+  assert.deepEqual([undeclared.problems, undeclared.reasons], [['test:host was skipped: no provider'], { provider: 'opt-in' }])
 })
 
 const git = (cwd, ...args) => execFileSync('git', ['-c', 'user.name=Gate Test', '-c', 'user.email=gate@example.invalid', '-c', 'commit.gpgsign=false', '-c', 'core.hooksPath=/dev/null', ...args], { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim()
 
-/** A scratch repository holding `entry` with its local imports and a package.json whose gate block is `gate`. */
-async function scratchRepo(t, entry, scripts, gate) {
+/** A scratch repository holding `entry` with its local imports, `extra` files, and a package.json whose gate block is `gate`. */
+async function scratchRepo(t, entry, scripts, gate, extra = {}) {
   const root = realpathSync(mkdtempSync(join(tmpdir(), 'gate-manifest-')))
   t.after(() => rmSync(root, { recursive: true, force: true }))
   const source = join(root, 'source')
   // As in the repository, node_modules is ignored: the round gate links it into its checkout.
-  const files = { ...await withLocalImports(PROJECT, entry), 'compatibility.json': readFileSync(join(PROJECT, 'compatibility.json'), 'utf8'), '.gitignore': 'node_modules\n' }
+  const files = { ...await withLocalImports(PROJECT, entry), 'compatibility.json': readFileSync(join(PROJECT, 'compatibility.json'), 'utf8'), '.gitignore': 'node_modules\n', ...extra }
   for (const [path, content] of Object.entries(files)) { mkdirSync(dirname(join(source, path)), { recursive: true }); writeFileSync(join(source, path), content) }
   const commit = (scriptsNow, gateNow, message) => {
     writeFileSync(join(source, 'package.json'), JSON.stringify({ name: 'gate-fixture', version: '0.0.0', private: true, scripts: scriptsNow, gate: gateNow }, null, 2) + '\n')
@@ -131,9 +136,9 @@ async function scratchRepo(t, entry, scripts, gate) {
   return { root, source, head: commit(scripts, gate, 'baseline'), commit }
 }
 
-/** Run node as a fresh clone would (no checkout named, none searched for), whatever machine runs this file. */
-const run = (args, cwd) => new Promise(resolve => {
-  execFile(process.execPath, args, { cwd, env: tierEnvironment('hermetic'), timeout: 120_000, maxBuffer: 8 * 1024 * 1024 }, (error, stdout, stderr) => {
+/** Run node as a fresh clone would (no checkout named, none searched for), whatever machine runs this file, with `env` over that. */
+const run = (args, cwd, env = {}) => new Promise(resolve => {
+  execFile(process.execPath, args, { cwd, env: { ...tierEnvironment('hermetic'), ...env }, timeout: 120_000, maxBuffer: 8 * 1024 * 1024 }, (error, stdout, stderr) => {
     resolve({ code: error ? (typeof error.code === 'number' ? error.code : 1) : 0, stdout: String(stdout), stderr: String(stderr) })
   })
 })
@@ -166,39 +171,136 @@ test('the gate records every suite: passed, skipped with what it lacked, failed,
   assert.match(result.stdout, /incomplete:\n {2}test:host was skipped: no harness\n {2}test:broken failed \(exit 3\)\n {2}test:after did not run: an earlier suite failed\n/)
 })
 
+/** A suite script that appends its name and the DSH_HARNESS_ROOT it ran with to $GATE_TRACE. */
+const TRACE = "import { appendFileSync } from 'node:fs'\nappendFileSync(process.env.GATE_TRACE, `${process.env.npm_lifecycle_event}\\t${process.env.DSH_HARNESS_ROOT ?? ''}\\n`)\n"
+
+test('the gate runs every suite with the checkout it probed, stops before any suite for a checkout it cannot use or an argument it does not take, and records a dirty tree', async t => {
+  const traced = 'node trace.mjs'
+  const repo = await scratchRepo(t, 'scripts/gate.mjs', { typecheck: traced, test: traced, 'test:host': traced, 'test:billable': traced }, { typecheck: [], test: [], 'test:host': ['harness'], 'test:billable': ['harness', 'provider'] }, { 'trace.mjs': TRACE })
+  const tracePath = join(repo.root, 'trace.log')
+  const ran = () => existsSync(tracePath) ? readFileSync(tracePath, 'utf8').trim().split('\n').map(line => line.split('\t')) : []
+  const recordPath = join(repo.root, 'record.json')
+  const gate = (args, env) => run(['scripts/gate.mjs', '--record', recordPath, ...args], repo.source, { GATE_TRACE: tracePath, ...env })
+  const nothingRan = label => {
+    assert.equal(existsSync(recordPath), false, `${label}: no record`)
+    assert.deepEqual(ran(), [], `${label}: no suite ran`)
+  }
+  // A checkout of the supported release with a commit, named by DSH_SOURCE through a symbolic
+  // link: the suites read DSH_HARNESS_ROOT, which the gate sets to the checkout it found.
+  const checkout = join(repo.root, 'harness')
+  mkdirSync(checkout)
+  writeFileSync(join(checkout, 'package.json'), JSON.stringify({ version: RELEASE }))
+  git(checkout, 'init', '-q'); git(checkout, 'add', '-A'); git(checkout, 'commit', '-q', '-m', 'release')
+  const release = git(checkout, 'rev-parse', 'HEAD')
+  symlinkSync(checkout, join(repo.root, 'harness-link'))
+  const named = { DSH_SOURCE: join(repo.root, 'harness-link') }
+
+  // --plan probes and prints the plan; it runs no suite and writes no record.
+  const plan = await gate(['--plan'], named)
+  assert.equal(plan.code, 0, plan.stderr)
+  assert.deepEqual(plan.stdout.trimEnd().split('\n'), ['  run      typecheck', '  run      test', '  run      test:host', '  skip     test:billable  no provider', 'skipped for:', '  provider: opt-in: run with --with provider'])
+  nothingRan('--plan')
+
+  // An argument or opt-in the gate does not take stops it before any suite (exit 2).
+  for (const [args, message] of [
+    [['--bogus'], /^gate: unknown argument "--bogus"; usage: /],
+    [['--with', 'gpu'], /^gate: --with names "gpu"; the opt-in prerequisites are provider, better-sidebar\n$/],
+    [['--with', 'harness'], /^gate: --with names "harness"; the opt-in prerequisites are provider, better-sidebar\n$/],
+  ]) {
+    const refused = await gate(args, named)
+    assert.equal(refused.code, 2, `${args.join(' ')}: ${refused.stdout}`)
+    assert.match(refused.stderr, message)
+    nothingRan(args.join(' '))
+  }
+
+  // A named checkout that does not exist stops the run before any suite (exit 2): it is never skipped quietly.
+  const missing = join(repo.root, 'no-such-harness')
+  for (const variable of ['DSH_HARNESS_ROOT', 'DSH_SOURCE']) {
+    const refused = await gate([], { [variable]: missing })
+    assert.equal(refused.code, 2, `${variable}: ${refused.stdout}`)
+    assert.match(refused.stderr, new RegExp(`^gate: DSH_HARNESS_ROOT or DSH_SOURCE names ${escape(missing)}, which the gate cannot use: ENOENT`))
+    nothingRan(variable)
+  }
+
+  // The named checkout, --with provider and an untracked file: every suite runs with the checkout the record names, and the record says the tree was dirty.
+  writeFileSync(join(repo.source, 'untracked.txt'), 'not committed\n')
+  const result = await gate(['--with', 'provider'], named)
+  assert.equal(result.code, 0, result.stderr)
+  const record = JSON.parse(readFileSync(recordPath, 'utf8'))
+  assert.deepEqual(record.harness, { root: checkout, version: RELEASE, commit: release })
+  assert.deepEqual(ran(), ['typecheck', 'test', 'test:host', 'test:billable'].map(name => [name, record.harness.root]), 'each suite ran with the checkout the record names')
+  assert.deepEqual(record.suites.map(suite => [suite.name, suite.status]), [['typecheck', 'pass'], ['test', 'pass'], ['test:host', 'pass'], ['test:billable', 'pass']])
+  assert.deepEqual(record.prerequisites, { harness: { present: true }, provider: { present: true, detail: 'named with --with provider' } })
+  assert.equal(record.commit, repo.head)
+  assert.equal(record.dirty, true)
+  assert.equal(record.green, true)
+  assert.equal(record.complete, true, 'complete for the manifest; the round gate and promote also require a clean tree of the commit')
+  assert.match(result.stdout, new RegExp(`gate: 4 passed, 0 failed, 0 skipped, 0 not run \\(commit ${repo.head}, with uncommitted changes; Harness ${escape(RELEASE)} at ${release}\\)`))
+})
+
 test('the round gate runs the commit\'s own gate, and promote takes its record only when it is complete for that commit\'s manifest', async t => {
   const repo = await scratchRepo(t, 'scripts/round.mjs', { typecheck: ok, test: ok, 'test:host': ok }, { typecheck: [], test: [], 'test:host': ['harness'] })
   const lab = join(repo.root, 'lab')
-  const round = (...args) => run([join(repo.source, 'scripts/round.mjs'), ...args, '--lab', lab], repo.source)
-  const recordOf = sha => JSON.parse(readFileSync(join(lab, 'gates', `${sha}.json`), 'utf8'))
+  const round = (args, env) => run([join(repo.source, 'scripts/round.mjs'), ...args, '--lab', lab], repo.source, env)
+  const gateFile = sha => join(lab, 'gates', `${sha}.json`)
+  const recordOf = sha => JSON.parse(readFileSync(gateFile(sha), 'utf8'))
+  const suitesOf = record => record.suites.map(suite => [suite.name, suite.status])
 
   // A host without the checkout: the gate records the skip, and neither it nor promote calls that complete.
-  const incomplete = await round('gate', '--commit', repo.head)
+  const incomplete = await round(['gate', '--commit', repo.head])
   assert.equal(incomplete.code, 1, incomplete.stderr)
   const reported = JSON.parse(incomplete.stdout.slice(incomplete.stdout.lastIndexOf('{\n  "command"')))
   assert.deepEqual([reported.problems, reported.reasons], [['test:host was skipped: no harness'], { harness: recordOf(repo.head).prerequisites.harness.reason }])
-  assert.deepEqual(recordOf(repo.head).suites.map(suite => [suite.name, suite.status]), [['typecheck', 'pass'], ['test', 'pass'], ['test:host', 'skipped']], 'the record lists the commit\'s manifest, in its order')
-  const refused = await round('promote', '--commit', repo.head, '--dry-run')
+  assert.deepEqual(suitesOf(recordOf(repo.head)), [['typecheck', 'pass'], ['test', 'pass'], ['test:host', 'skipped']], 'the record lists the commit\'s manifest, in its order')
+  const refused = await round(['promote', '--commit', repo.head, '--dry-run'])
   assert.equal(refused.code, 2)
   assert.match(refused.stderr, new RegExp(`the recorded gate for ${repo.head.slice(0, 12)} is not a complete gate of its manifest:\\n- test:host was skipped: no harness\\n- harness: The hermetic test tier has no Harness checkout`))
 
-  // The next commit gives its host suite only an opt-in prerequisite: the same host now gates it completely.
+  // A gate that writes no record leaves none, so an earlier record never stands in for it, even a complete one.
+  const earlier = { commit: repo.head, dirty: false, prerequisites: {}, suites: ['typecheck', 'test', 'test:host'].map(name => ({ name, status: 'pass', exitCode: 0 })) }
+  assert.equal(gateVerdict({ typecheck: [], test: [], 'test:host': ['harness'] }, earlier, { commit: repo.head }).complete, true, 'the earlier record is a complete gate of the commit')
+  writeFileSync(gateFile(repo.head), JSON.stringify(earlier))
+  const unusable = await round(['gate', '--commit', repo.head], { DSH_HARNESS_ROOT: join(repo.root, 'no-such-harness') })
+  assert.equal(unusable.code, 2, unusable.stdout)
+  assert.match(unusable.stderr, new RegExp(`round: the gate of ${repo.head.slice(0, 12)} wrote no record \\(exit 2\\)`))
+  assert.equal(existsSync(gateFile(repo.head)), false, 'the earlier record is gone')
+
+  // The next commit gives its host suite only an opt-in prerequisite, and the one after it adds a suite.
   const next = repo.commit({ typecheck: ok, test: ok, 'test:host': ok }, { typecheck: [], test: [], 'test:host': ['provider'] }, 'opt-in host suite')
-  const complete = await round('gate', '--commit', next)
+  const later = repo.commit({ typecheck: ok, test: ok, 'test:host': ok, 'test:oracle': ok }, { typecheck: [], test: [], 'test:host': ['provider'], 'test:oracle': [] }, 'a new suite')
+  // Gated while the working tree is at `later`: next's own runner, in next's checkout, records next and its manifest.
+  const complete = await round(['gate', '--commit', next])
   assert.equal(complete.code, 0, complete.stderr)
-  const promoted = await round('promote', '--commit', next, '--dry-run')
+  assert.deepEqual([recordOf(next).commit, recordOf(next).dirty, recordOf(next).complete], [next, false, true])
+  assert.deepEqual(suitesOf(recordOf(next)), [['typecheck', 'pass'], ['test', 'pass'], ['test:host', 'skipped']], 'next\'s suites, without the test:oracle the working tree lists; the opt-in skip is excused')
+  // --with reaches that gate: the opt-in suite runs.
+  const opted = await round(['gate', '--commit', next, '--with', 'provider'])
+  assert.equal(opted.code, 0, opted.stderr)
+  assert.deepEqual(suitesOf(recordOf(next)), [['typecheck', 'pass'], ['test', 'pass'], ['test:host', 'pass']])
+  // promote reads the record against next's manifest, not the working tree's.
+  const promoted = await round(['promote', '--commit', next, '--dry-run'])
   assert.equal(promoted.code, 0, promoted.stderr)
   assert.equal(JSON.parse(promoted.stdout).gated, true)
+  // It takes the record only as one of next itself, of a clean tree.
+  const gated = recordOf(next)
+  for (const [tampered, problem] of [
+    [{ ...gated, commit: repo.head }, `the record is of commit ${repo.head}, not ${next}`],
+    [{ ...gated, dirty: true }, 'the record is of a tree with uncommitted changes, not of the commit alone'],
+  ]) {
+    writeFileSync(gateFile(next), JSON.stringify(tampered))
+    const taken = await round(['promote', '--commit', next, '--dry-run'])
+    assert.equal(taken.code, 2, taken.stdout)
+    assert.match(taken.stderr, new RegExp(`\\n- ${escape(problem)}\\n`))
+  }
 
   // A record that is green but names no suites, as the round gate wrote until the manifest, proves nothing about them.
-  const later = repo.commit({ typecheck: ok, test: ok, 'test:host': ok, 'test:oracle': ok }, { typecheck: [], test: [], 'test:host': ['provider'], 'test:oracle': [] }, 'a new suite')
-  writeFileSync(join(lab, 'gates', `${later}.json`), JSON.stringify({ commit: later, green: true, results: [{ name: 'typecheck', exitCode: 0 }], at: 'then' }))
-  const dormant = await round('promote', '--commit', later, '--dry-run')
+  writeFileSync(gateFile(later), JSON.stringify({ commit: later, green: true, results: [{ name: 'typecheck', exitCode: 0 }], at: 'then' }))
+  const dormant = await round(['promote', '--commit', later, '--dry-run'])
   assert.equal(dormant.code, 2)
   assert.match(dormant.stderr, /the record lists no suites/)
   // Nor does a record of the previous manifest: the suite the commit added is not in it.
-  writeFileSync(join(lab, 'gates', `${later}.json`), JSON.stringify({ ...recordOf(next), commit: later }))
-  const stale = await round('promote', '--commit', later, '--dry-run')
+  writeFileSync(gateFile(later), JSON.stringify({ ...gated, commit: later }))
+  const stale = await round(['promote', '--commit', later, '--dry-run'])
   assert.equal(stale.code, 2)
   assert.match(stale.stderr, /the record lacks test:oracle, which the manifest lists/)
 })
