@@ -6,8 +6,10 @@
  */
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { execFileSync } from 'node:child_process'
-import { readdirSync, readFileSync } from 'node:fs'
+import { execFile, execFileSync } from 'node:child_process'
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { TIER_ENV } from '../scripts/harness-target.mjs'
 import { withLocalImports } from './fixtures/local-imports.mjs'
@@ -46,4 +48,41 @@ test('the tier marker belongs to harness-target, which reads it: the operator sc
   const closure = Object.keys(await withLocalImports(PROJECT, 'scripts/harness-target.mjs'))
   assert.ok(!closure.includes('scripts/test-tiers.mjs'), `harness-target imports ${closure.join(', ')}`)
   assert.ok(Object.keys(await withLocalImports(PROJECT, 'scripts/test-tiers.mjs')).includes('scripts/harness-target.mjs'), 'the runner takes the marker from harness-target')
+})
+
+/** A test file whose tests named `selected...` write the tier environment they saw to <project>/<name>.json, and whose other test writes unselected.json. */
+const ENV_PROBE = name => `import test from 'node:test'
+import { writeFileSync } from 'node:fs'
+const seen = file => writeFileSync(new URL('../' + file + '.json', import.meta.url), JSON.stringify({ root: process.env.DSH_HARNESS_ROOT ?? null, source: process.env.DSH_SOURCE ?? null, tier: process.env.${TIER_ENV} ?? null }))
+test('selected: the environment', () => seen(${JSON.stringify(name)}))
+test('unselected', () => seen('unselected'))
+`
+
+test('the runner gives each tier its environment and its files, forwards node --test options, and exits with the run\'s failure', async t => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'test-tiers-')))
+  t.after(() => rmSync(root, { recursive: true, force: true }))
+  const files = {
+    ...await withLocalImports(PROJECT, 'scripts/test-tiers.mjs'),
+    'tests/a-hermetic.test.mjs': ENV_PROBE('hermetic'),
+    'tests/b-failing.test.mjs': "import test from 'node:test'\ntest('selected: a failure', () => { throw new Error('this file fails') })\n",
+    ...Object.fromEntries(HOST_TIER.map(file => [file, ENV_PROBE('host')])),
+  }
+  for (const [path, content] of Object.entries(files)) { mkdirSync(dirname(join(root, path)), { recursive: true }); writeFileSync(join(root, path), content) }
+  const seen = name => existsSync(join(root, `${name}.json`)) ? JSON.parse(readFileSync(join(root, `${name}.json`), 'utf8')) : undefined
+  // A caller that exported a checkout and the marker; no node:test context, so the runner's node --test runs its files.
+  const caller = { PATH: process.env.PATH, HOME: process.env.HOME, DSH_HARNESS_ROOT: '/named/checkout', DSH_SOURCE: '/named/source', [TIER_ENV]: 'elsewhere' }
+  const runner = tier => new Promise(done => execFile(process.execPath, ['scripts/test-tiers.mjs', tier, '--test-name-pattern=^selected'], { cwd: root, env: caller, timeout: 60_000 }, (error, stdout, stderr) => done({ code: error ? error.code : 0, output: `${stdout}${stderr}` })))
+
+  const hermetic = await runner('hermetic')
+  assert.equal(hermetic.code, 1, `a failing file fails the run: ${hermetic.output}`)
+  assert.deepEqual(seen('hermetic'), { root: null, source: null, tier: 'hermetic' }, 'the hermetic tier runs as a fresh clone would, whatever the caller exported')
+  assert.equal(seen('unselected'), undefined, 'the node --test options reach the run')
+  assert.equal(seen('host'), undefined, 'a host-tier file is not in the hermetic tier')
+  assert.match(hermetic.output, /this file fails/)
+
+  rmSync(join(root, 'tests/b-failing.test.mjs'))
+  const host = await runner('host')
+  assert.equal(host.code, 0, host.output)
+  assert.deepEqual(seen('host'), { root: '/named/checkout', source: '/named/source', tier: null }, 'the host tier keeps the caller\'s checkout and never the marker')
+  assert.equal(seen('unselected'), undefined)
 })
