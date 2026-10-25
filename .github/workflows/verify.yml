@@ -29,6 +29,9 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22.22.3
+          # Keep npm's download cache, keyed by package-lock.json, between runs: the
+          # devDependency tree is large, and npm ci then installs from the cache.
+          cache: npm
       - run: npm ci
       - run: npm run verify
       - if: always()

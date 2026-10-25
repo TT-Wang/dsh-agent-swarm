@@ -246,7 +246,7 @@ npm run verify
 
 `node scripts/round.mjs gate --commit <sha>` 在一个干净的 worktree 中运行该 commit 自己的 gate，并把记录保存在 lab 中（`--lab`，默认 `~/.dsh/agent-swarm-lab`）。只有完整的 gate 才以 0 退出。`node scripts/round.mjs promote` 只在该记录列出的套件与该 commit 的清单完全一致、记录完整、且记录的正是该 commit 并无未提交修改时，才应用这个 commit。清单出现之前 round gate 写下的记录没有列出任何套件，会被拒绝。round gate 最后一次运行是在 2026-09-10；之后的各批次是依据保存在仓库之外的 gate 运行合并的（见[验证文档](validation.md)）。
 
-GitHub Actions 工作流（`.github/workflows/verify.yml`）在每次推送到 `main` 和每个 pull request 时，在 macOS runner 上不带任何 secret 地运行 `npm ci` 和 `npm run verify`。在那里它运行不需要其他前提条件的套件：类型检查、`npm test`、`test:packed`、`test:replay`、`test:oracle` 和 `test:load`；其余套件记为跳过，并上传记录。需要检出、沙箱或浏览器的套件只在具备这些条件的机器上运行。
+GitHub Actions 工作流（`.github/workflows/verify.yml`）在每次推送到 `main` 和每个 pull request 时，在 macOS runner 上不带任何 secret 地运行 `npm ci` 和 `npm run verify`，并在两次运行之间保留 npm 的下载缓存（以 `package-lock.json` 为键）。在那里它运行不需要其他前提条件的套件：类型检查、`npm test`、`test:packed`、`test:replay`、`test:oracle` 和 `test:load`；其余套件记为跳过，并上传记录。需要检出、沙箱或浏览器的套件只在具备这些条件的机器上运行。
 
 `npm ci` 在安装前会删除 `node_modules` 中的全部内容；如果 `node_modules` 是符号链接，它删除的是链接所指目录中的内容。若某个检出的 `node_modules` 链接到多个检出共用的链接集合（link farm），这会清空该链接集合，所有共用它的检出都受影响。因此请先删除链接本身（`rm node_modules`，末尾不加斜杠）：`npm ci` 随后安装到一个新目录，链接集合保持原样。
 
